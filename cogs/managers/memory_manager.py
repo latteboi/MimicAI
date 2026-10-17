@@ -1240,12 +1240,11 @@ class MemoryManager:
             return False, f"Could not find a training example with ID `{example_id}` for profile '{profile_name}'."
 
     async def _execute_training_analysis(self, interaction: discord.Interaction, owner_id: int,
-                                         profile_name: str, count: int, verbosity: int,
-                                         model_name: Optional[str] = None):
+                                         profile_name: str, count: int, verbosity: int):
         """Writes a style guide from the newest `count` examples into AI Instructions slot 4.
 
-        On the profile's LTM summariser chain, with `model_name` first when one was
-        typed. `owner_id` is the profile's owner, who is not the invoker under /mod.
+        On the profile's own Training Analysis chain. `owner_id` is the profile's owner,
+        who is not the invoker under /mod.
         """
         examples = await asyncio.to_thread(self._load_training_shard, str(owner_id), profile_name) or []
         if not examples:
@@ -1277,8 +1276,7 @@ class MemoryManager:
                 return await model.generate_content_async([prompt])
 
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                *self.cog.api_service.model_chain(
-                    {**p_cfg, "ltm_model": model_name} if model_name else p_cfg, "ltm_model", owner_id),
+                *self.cog.api_service.model_chain(p_cfg, "training_analysis_model", owner_id),
                 _attempt, label="Training analysis")
             response_text = getattr(resp, "text", None)
 

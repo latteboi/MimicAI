@@ -80,9 +80,20 @@ async def send_status(interaction: discord.Interaction, text: str) -> None:
     followup would leave this sitting above it, and a view's timeout edits the original
     response, which has to be that reply.
     """
-    await interaction.response.send_message(
-        embed=discord.Embed(description=f"{PLACEHOLDER_EMOJI} {text}", colour=discord.Colour.blurple()),
-        ephemeral=True)
+    await interaction.response.send_message(embed=_status_embed(text), ephemeral=True)
+
+
+def _status_embed(text: str) -> discord.Embed:
+    return discord.Embed(description=f"{PLACEHOLDER_EMOJI} {text}", colour=discord.Colour.blurple())
+
+
+async def update_status(interaction: discord.Interaction, text: str) -> None:
+    """Rewrites `send_status`'s embed as a slow command moves on. Progress only: a failed
+    edit is not the command's failure, so it is swallowed."""
+    try:
+        await interaction.edit_original_response(embed=_status_embed(text))
+    except discord.HTTPException:
+        pass
 
 
 async def settle_status(interaction: discord.Interaction, content: Optional[str] = None, *,

@@ -19,7 +19,7 @@ from .utils.character_card import (PNG_SIGNATURE, CardError, prompt_text, profil
                                    read_lorebook)
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import (ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered,
-                                  send_status, settle_status)
+                                  send_status, settle_status, update_status)
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
 from .gui.gui_generate import GeneratedProfileView
 from .gui.gui_hub import HubPublicLibraryView
@@ -1939,8 +1939,14 @@ class MimicCog(EventListeners, commands.Cog):
             await settle_status(interaction, block)
             return
         self.session_manager._mark_session_accessed(interaction.channel_id)
-        message = await self.generation_service.manual_compaction(
-            interaction.channel_id, undo=undo, keep=keep)
+        try:
+            message = await self.generation_service.manual_compaction(
+                interaction.channel_id, undo=undo, keep=keep,
+                progress=lambda text: update_status(interaction, text))
+        except Exception as e:
+            # Settled whatever happened: left alone, the status reads "Folding..." for good.
+            print(f"/compact failed in channel {interaction.channel_id}: {type(e).__name__}: {e}")
+            message = "❌ Compaction failed partway. Anything already folded is kept."
         await settle_status(interaction, message)
 
     @app_commands.command(name="train", description="Arms this channel to capture a training example from reactions (1️⃣ input, 2️⃣ output).")

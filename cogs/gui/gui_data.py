@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..MimicCog import MimicCog
     from .gui_profiles import ProfileManageView
+    from .gui_slot_models import TrainingAnalysisView
 
 from .base_components import (PAGE_NAV_VALUES, BaseBulkProfileView, BlockedGuard, PageJumpModal, add_button,
                               add_select, build_confirm_view, paged_nav_options)
@@ -451,7 +452,12 @@ class DataManageView(BlockedGuard, ui.View):
 
         add_button(self, "Add", self.add_callback, style=discord.ButtonStyle.success, row=4, emoji="➕")
         if self.mode == 'training' and not self.is_borrowed and self.entries:
-            async def analyse_cb(i): await i.response.send_modal(AnalyseExamplesModal(self))
+            async def analyse_cb(i):
+                # Imported here: gui_slot_models adopts ModelPickerMixin from gui_profiles,
+                # which imports this module.
+                from .gui_slot_models import TrainingAnalysisView
+                view = TrainingAnalysisView(self.cog, self)
+                await i.response.edit_message(embed=view.embed(), view=view)
             add_button(self, "Analyse", analyse_cb, style=discord.ButtonStyle.blurple, row=4)
         if self.parent_manage_view:
             add_button(self, "Back to Dashboard", self.back_callback, row=4, emoji="⬅️")
@@ -667,33 +673,30 @@ class DataManageView(BlockedGuard, ui.View):
         await interaction.followup.send(embed=embed, ephemeral=True)
 
 class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
-    def __init__(self, parent_view: 'DataManageView'):
+    """How many examples and how long a guide, on the profile's Training Analysis models."""
+
+    def __init__(self, parent_view: 'TrainingAnalysisView'):
         super().__init__()
         self.parent_view = parent_view
         self.count_input = ui.TextInput(label="Number of Examples to Process", placeholder="Default: 10", default="10", required=True, min_length=1, max_length=3)
         self.verbosity_input = ui.TextInput(label="Target Verbosity (50 - 3000 chars)", placeholder="Default: 800", default="800", required=True, min_length=2, max_length=4)
-        self.model_input = ui.TextInput(label="Analysis Model (optional)", placeholder="Blank: this profile's LTM model, with fallback", required=False)
         self.add_item(self.count_input)
         self.add_item(self.verbosity_input)
-        self.add_item(self.model_input)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             count = int(self.count_input.value)
             verbosity = int(self.verbosity_input.value)
-            model_name = self.model_input.value.strip()
             
             if not (50 <= verbosity <= 3000): raise ValueError("Verbosity out of range.")
             if count < 1: raise ValueError("Count too low.")
-            if model_name and not model_name.upper().startswith(("GOOGLE/", "OPENROUTER/")):
-                raise ValueError("Model must start with GOOGLE/ or OPENROUTER/.")
         except ValueError as e:
             await interaction.response.send_message(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}", ephemeral=True); return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.parent_view.cog.memory_manager._execute_training_analysis(
-            interaction, self.parent_view.user_id, self.parent_view.profile_name, count, verbosity,
-            model_name or None)
+        view = self.parent_view
+        await view.cog.memory_manager._execute_training_analysis(
+            interaction, view.user_id, view.profile_name, count, verbosity)
 
 class PrivacyDashboardView(BlockedGuard, ui.View):
     # Open to a blocked user. Export and deletion are theirs whatever their standing --

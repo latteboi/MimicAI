@@ -13,7 +13,7 @@ from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, billable_out
                              strip_history_envelope, turn_posted_at)
 from ..utils.data_policy import may_pick_training_models
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
-                              paged_nav_options,
+                              paged_nav_options, send_status, settle_status, update_status,
                               add_select, build_pagination_controls,
                               bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
@@ -1064,8 +1064,6 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
     threshold_input = ui.TextInput(label=f"Compact after N turns ({COMPACTION_THRESHOLD_MIN}-{COMPACTION_THRESHOLD_MAX})", placeholder=f"Default: {COMPACTION_THRESHOLD_DEFAULT}", required=True, max_length=3)
     chunk_input = ui.TextInput(label="Turns to fold each time", placeholder=f"Default: {COMPACTION_CHUNK_DEFAULT}", required=True, max_length=3)
     length_input = ui.TextInput(label=f"Synopsis length in words ({COMPACTION_SYNOPSIS_WORDS_MIN}-{COMPACTION_SYNOPSIS_WORDS_MAX})", placeholder=f"Default: {COMPACTION_SYNOPSIS_WORDS_DEFAULT}", required=False, max_length=3)
-    model_input = ui.TextInput(label="Summariser Model", required=False, max_length=100)
-    fallback_input = ui.TextInput(label="Fallback Model", required=False, max_length=100)
 
     def __init__(self, view: 'SessionConfigView'):
         super().__init__()
@@ -1076,14 +1074,6 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
         # Blank until a length is chosen, so an unset one keeps following the default.
         if "max_words" in (view.session.get("compaction") or {}):
             self.length_input.default = str(cfg["max_words"])
-        # Blank until chosen, like the length, and the placeholder names what blank runs:
-        # the LTM summariser's chain under the session owner's provider preference.
-        own = compaction_model_config(view.session)
-        self.model_input.default = own["ltm_model"]
-        self.fallback_input.default = own["ltm_fallback_model"]
-        primary, fallbacks = view.cog.api_service.model_chain({}, "ltm_model", view.session.get("owner_id"))
-        self.model_input.placeholder = f"Blank: {primary}"[:100]
-        self.fallback_input.placeholder = f"Blank: {fallbacks[0] if fallbacks else 'none'}"[:100]
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -1101,16 +1091,6 @@ class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
             cfg.pop("max_words", None)
         else:
             cfg["max_words"] = length
-        # Unprefixed ids default to Google. Both providers are valid here -- unlike image,
-        # speech and grounding, summarisation is an ordinary text slot.
-        for field, key in ((self.model_input, "model"), (self.fallback_input, "fallback_model")):
-            raw = field.value.strip()
-            if not raw:
-                cfg.pop(key, None)
-            elif raw.upper().startswith(("GOOGLE/", "OPENROUTER/", "OLLAMA/")):
-                cfg[key] = raw
-            else:
-                cfg[key] = "GOOGLE/" + raw
 
         # Re-read through the clamp so the embed shows what will actually run rather
         # than what was typed.
@@ -2376,8 +2356,8 @@ class SessionConfigView(BlockedGuard, ui.View):
         self._add_modal_button("Edit Settings & AI Director", ProactivitySettingsModal)
 
         async def open_director_models(i: discord.Interaction):
-            # Imported here: gui_director adopts ModelPickerMixin from gui_profiles, which imports this module.
-            from .gui_director import DirectorModelView
+            # Imported here: gui_slot_models adopts ModelPickerMixin from gui_profiles, which imports this module.
+            from .gui_slot_models import DirectorModelView
             view = DirectorModelView(self.cog, self)
             await i.response.edit_message(embed=view.embed(), view=view)
         add_button(self, "Director Model\u2026", open_director_models)
@@ -2398,7 +2378,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
         embed.add_field(name="Length", value=f"About `{cfg['max_words']}` words", inline=True)
         primary, fallbacks = self.cog.api_service.model_chain(
-            compaction_model_config(self.session), "ltm_model", self.session.get("owner_id"))
+            compaction_model_config(self.session), "compaction_model", self.session.get("owner_id"))
         embed.add_field(
             name="Summariser",
             value=f"`{primary}`" + ("\nFallbacks: " + " \u2192 ".join(f"`{m}`" for m in fallbacks)
@@ -2434,6 +2414,12 @@ class SessionConfigView(BlockedGuard, ui.View):
             on_off_style=True)
         self._add_modal_button("Edit Settings", CompactionSettingsModal)
 
+        async def open_summariser_models(i: discord.Interaction):
+            from .gui_slot_models import CompactionModelView
+            view = CompactionModelView(self.cog, self)
+            await i.response.edit_message(embed=view.embed(), view=view)
+        add_button(self, "Summariser Model\u2026", open_summariser_models)
+
         # One-off actions, a row below the standing switch: the same as /compact.
         self._add_modal_button("Compact Now", CompactNowModal, row=1, style=discord.ButtonStyle.secondary)
 
@@ -2447,10 +2433,19 @@ class SessionConfigView(BlockedGuard, ui.View):
         if not self._viewer_is_admin():
             await i.response.send_message("Only server administrators can compact a session.", ephemeral=True)
             return
-        await i.response.defer(ephemeral=True, thinking=True)
-        message = await self.cog.generation_service.manual_compaction(
-            self.original_interaction.channel_id, **kwargs)
-        await i.followup.send(message, ephemeral=True)
+        undo = kwargs.get("undo")
+        await send_status(i, "Unfolding the synopsis..." if undo else "Folding the conversation into its synopsis...")
+        try:
+            message = await self.cog.generation_service.manual_compaction(
+                self.original_interaction.channel_id, **kwargs,
+                progress=lambda text: update_status(i, text))
+        except Exception as e:
+            # Settled whatever happened, as /compact is: Discord's bare "thinking..." used to
+            # sit here with no word of progress, and for good if the run raised.
+            print(f"Compaction tab failed in channel {self.original_interaction.channel_id}: "
+                  f"{type(e).__name__}: {e}")
+            message = "❌ Compaction failed partway. Anything already folded is kept."
+        await settle_status(i, message)
         await self.update_display()
 
 

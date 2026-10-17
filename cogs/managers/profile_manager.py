@@ -33,7 +33,7 @@ from ..utils.constants import (
     DEFAULT_SAFETY_SETTINGS,
     CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS,
     CONTENT_RATING_REASON_LABELS, CONTENT_RATING_REASON_FALLBACK,
-    DEFAULT_CONTENT_CLASSIFIER_PROMPT,
+    DEFAULT_CONTENT_CLASSIFIER_PROMPT, REFUSAL_CONFIRMERS,
     CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_GENERAL,
     CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED, PLACEMENT_REFUSALS, REFUSED_INDEX_FILE,
     CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS,
@@ -101,6 +101,14 @@ _REFUSED_INDEX_LOCK = threading.Lock()
 #: The one line the classifier is asked for, bolded or quoted at most. Anything else is no
 #: verdict -- never General: a model declining in words must not rate a profile clean.
 _VERDICT_LINE = re.compile(r"\W*(GENERAL|ADULT)\b[^\w:]*(?::\W*(\w+))?")
+#: The refusal check's one word, matched the same way.
+_CONFIRM_LINE = re.compile(r"\W*(YES|NO)\b", re.IGNORECASE)
+
+
+def _awaits_review(rating: Dict[str, Any]) -> bool:
+    """A refusal the operator has yet to settle: disputed, unconfirmed, or appealed. A
+    confirmed or upheld one settles itself and stays off the review list."""
+    return rating.get("verdict") == CONTENT_RATING_REFUSED and bool(rating.get("review"))
 
 
 def _clean_imported_prompts(value: Any) -> Any:
@@ -3013,12 +3021,91 @@ class ProfileManager:
 
         return {"mime_type": content_type, "data": data}
 
+    def _classifier_attempts(self, owner_id: int) -> Tuple[Dict[str, Any], List[tuple]]:
+        """(the /mod tab's settings, [(provider, model, adapter, role)]) for this owner.
+
+        Ships the attachment describer's chain, for the same reasons, on the profile
+        owner's provider: its Primary, then its Fallback, on the owner's own key alone.
+        Never a server's -- a profile is not owned by one -- and never the bot owner's: a
+        user with no key gets no verdict, and the profile stays Pending. Built here rather
+        than by the model factory, so only the two providers this loop knows are routed;
+        `/mod` offers no other, and the tab's thinking and Hosts & Tier are applied here
+        too. A repeat is tried once, as `run_with_fallback` does.
+        """
+        attempts = []
+        side = self.effective_provider(owner_id)
+        settings = system_settings(self.cog, "classifier", side)
+        chain = dict.fromkeys(system_model(self.cog, k, side) for k in CLASSIFIER_KEYS)
+        for role, value in zip(("primary", "fallback"), chain):
+            if value.startswith("GOOGLE/"):
+                attempts.append(("gemini", value[len("GOOGLE/"):], GoogleGenAIModel, role))
+            elif value.startswith("OPENROUTER/"):
+                attempts.append(("openrouter", value[len("OPENROUTER/"):], OpenRouterModel, role))
+        return settings, attempts
+
+    async def _ask_classifier(self, owner_id: int, attempt: tuple, settings: Dict[str, Any],
+                              instruction: str, payload: list, answer: re.Pattern) -> Tuple[str, str, str]:
+        """One model's reply to `instruction`: (status, text, why it is no answer).
+
+        `status` is "success" when `answer` matches the text, "no_verdict" when the model
+        replied without one -- blocked, empty, or words in place of the line -- "api_error"
+        when the call failed, and "no_key" when the owner has no usable key for it.
+        """
+        provider, model_name, model_cls, role = attempt
+        key = self.cog.storage_manager._get_api_key_for_user(owner_id, provider)
+        if not key:
+            # No key covers two cases: none assigned for this provider, or the
+            # assigned key inside its rate-limit cooldown window. Recorded rather
+            # than skipped in silence, so a run that never reached a provider does
+            # not look identical to one that failed at it.
+            return "no_key", "", f"{provider}: no usable key (unassigned, or in rate-limit cooldown)"
+        status, raw, why = "api_error", "", ""
+        try:
+            # Resolved, never `{}`: an adapter handed no thinking params reasons at
+            # "high". The classifier slot ships Medium, as /mod may change it.
+            kwargs = {"api_key": key, "model_name": model_name, "system_instruction": instruction,
+                      "thinking_params": resolve_thinking_params(settings, "classifier", role)}
+            if model_cls is GoogleGenAIModel:
+                kwargs["safety_settings"] = DEFAULT_SAFETY_SETTINGS
+            else:
+                kwargs["endpoint"] = resolve_openrouter_endpoint(settings, model_name)
+                kwargs["service_tier"] = resolve_openrouter_service_tier(settings)
+            model = model_cls(**kwargs)
+            # No sampling parameters: each model judges at its own defaults. Claude
+            # takes none, and thinking refuses the greedy ones where a model does.
+            response = await model.generate_content_async(payload)
+            candidate = response.candidates[0] if response and response.candidates else None
+            parts = (candidate.content.parts or []) if candidate and candidate.content else []
+            raw = "".join(getattr(p, "text", None) or "" for p in parts).strip()
+            if answer.match(raw):
+                status = "success"
+            else:
+                status = "no_verdict"
+                block = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
+                finish = getattr(candidate, "finish_reason", None)
+                why = ("answered without a verdict" if raw
+                       else f"blocked ({block})" if block
+                       else f"no text (finish reason {finish})" if finish else "no text")
+        except Exception as e:
+            why = f"{provider}: {e}"
+        finally:
+            self.cog._log_api_call(user_id=0, guild_id=None, context="content_classification",
+                                   model_used=model_name, status=status)
+        return status, raw, why
+
     async def _classify_profile_content(self, owner_id: int, profile_name: str) -> Optional[Dict[str, Any]]:
         """Runs the classifier over one profile and returns a content_rating record.
 
-        Returns None when no verdict could be reached -- no key, or every provider
-        failed -- so the caller can leave the profile unclassified and retry rather
-        than recording a wrong verdict.
+        The Primary first; the Fallback when it is down or replies without a verdict,
+        since it is a different model and may judge what the first would not. Returns None
+        when neither gave one -- no key, every provider failed, or no verdict from any --
+        so the caller can leave the profile unclassified and retry, or flag it for the
+        operator, rather than recording a wrong verdict.
+
+        A refusing code refuses the profile and strikes its owner, so the other model is
+        asked whether it holds, in that code's words (`REFUSAL_CONFIRMERS`). Agreed, the
+        refusal is `confirmed_by` that model and settles itself. Disputed, or with no
+        answer, it is still Refused but waits on the operator's `review`, with no strike.
         """
         self._last_classify_flagged = False  # a raise before any answer flags nothing
         surface = await asyncio.to_thread(self._moderated_surface, owner_id, profile_name)
@@ -3037,89 +3124,28 @@ class ProfileManager:
 
         payload = [{"role": "user", "parts": parts}]
 
-        # Ships the attachment describer's chain, for the same reasons, on the profile
-        # owner's provider: its Primary, then its Fallback, on the owner's own key alone.
-        # Never a server's -- a profile is not owned by one -- and never the bot owner's: a
-        # user with no key gets no verdict, and the profile stays Pending. Built here rather
-        # than by the model factory, so only the two providers this loop knows are routed;
-        # `/mod` offers no other, and the tab's thinking and Hosts & Tier are applied here
-        # too. A repeat is tried once, as `run_with_fallback` does.
-        attempts = []
-        side = self.effective_provider(owner_id)
-        settings = system_settings(self.cog, "classifier", side)
-        chain = dict.fromkeys(system_model(self.cog, k, side) for k in CLASSIFIER_KEYS)
-        for role, value in zip(("primary", "fallback"), chain):
-            if value.startswith("GOOGLE/"):
-                attempts.append(("gemini", value[len("GOOGLE/"):], GoogleGenAIModel, role))
-            elif value.startswith("OPENROUTER/"):
-                attempts.append(("openrouter", value[len("OPENROUTER/"):], OpenRouterModel, role))
-
-        raw = None
-        used_model = None
-        status = None
-        model_name = None
-        failures = []
-        no_verdict = None
-        for provider, model_name, model_cls, role in attempts:
-            key = self.cog.storage_manager._get_api_key_for_user(owner_id, provider)
-            if not key:
-                # No key covers two cases: none assigned for this provider, or the
-                # assigned key inside its rate-limit cooldown window. Recorded rather
-                # than skipped in silence, so a run that never reached a provider does
-                # not look identical to one that failed at it.
-                failures.append(f"{provider}: no usable key (unassigned, or in rate-limit cooldown)")
-                continue
-            status = "api_error"
-            try:
-                # Resolved, never `{}`: an adapter handed no thinking params reasons at
-                # "high". The classifier slot ships Medium, as /mod may change it.
-                kwargs = {"api_key": key, "model_name": model_name, "system_instruction": prompt_text,
-                          "thinking_params": resolve_thinking_params(settings, "classifier", role)}
-                if model_cls is GoogleGenAIModel:
-                    kwargs["safety_settings"] = DEFAULT_SAFETY_SETTINGS
-                else:
-                    kwargs["endpoint"] = resolve_openrouter_endpoint(settings, model_name)
-                    kwargs["service_tier"] = resolve_openrouter_service_tier(settings)
-                model = model_cls(**kwargs)
-                # No sampling parameters: each model judges at its own defaults. Claude
-                # takes none, and thinking refuses the greedy ones where a model does.
-                response = await model.generate_content_async(payload)
-                candidate = response.candidates[0] if response and response.candidates else None
-                parts = (candidate.content.parts or []) if candidate and candidate.content else []
-                raw = "".join(getattr(p, "text", None) or "" for p in parts).strip()
-                if _VERDICT_LINE.match(raw):
-                    status = "success"
-                else:
-                    # It answered, with no verdict: blocked, empty, or words in place of
-                    # the line. Not an outage, so the next model is not asked -- it would
-                    # judge exactly what this one would not -- and the operator reviews it.
-                    status = "no_verdict"
-                    block = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
-                    finish = getattr(candidate, "finish_reason", None)
-                    no_verdict = ("answered without a verdict" if raw
-                                  else f"blocked ({block})" if block
-                                  else f"no text (finish reason {finish})" if finish else "no text")
-            except Exception as e:
-                failures.append(f"{provider}: {e}")
-            finally:
-                self.cog._log_api_call(user_id=0, guild_id=None, context="content_classification",
-                                       model_used=model_name, status=status)
+        settings, attempts = self._classifier_attempts(owner_id)
+        raw, answered_by = None, None
+        failures, no_verdicts = [], []
+        for n, attempt in enumerate(attempts):
+            status, text, why = await self._ask_classifier(
+                owner_id, attempt, settings, prompt_text, payload, _VERDICT_LINE)
             if status == "success":
-                used_model = model_name
+                raw, answered_by = text, n
                 break
-            if no_verdict:
-                break
+            if status == "no_verdict":
+                no_verdicts.append(f"{attempt[1]}: {why}")
+            else:
+                failures.append(why)
 
-        self._last_classify_flagged = bool(no_verdict)
-        if status != "success":
-            if no_verdict:
-                failures.append(f"{model_name}: {no_verdict}")
-            self._last_classify_failure = "; ".join(failures) or "unknown"
-            # No provider was even reachable because none had a usable key, or the model
-            # answered without a verdict. Retrying cannot help within the backoff window
+        if answered_by is None:
+            # A model replying with no verdict is never General and never Refused: the
+            # operator reviews it. Retrying cannot help within the backoff window either
             # -- a key is not going to appear in fifteen seconds, and a block is not
             # lifted -- so tell the caller not to bother.
-            self._last_classify_retryable = not no_verdict and (
+            self._last_classify_flagged = bool(no_verdicts)
+            self._last_classify_failure = "; ".join(failures + no_verdicts) or "unknown"
+            self._last_classify_retryable = not no_verdicts and (
                 not all("no usable key" in f for f in failures) if failures else True)
             return None
 
@@ -3137,16 +3163,26 @@ class ProfileManager:
         record = {
             "verdict": verdict,
             "hash": surface_hash,
-            "model": used_model,
+            "model": attempts[answered_by][1],
             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "reason": reason,
             "source": "classifier",
         }
-        if reason == "MINOR_SAFETY":
+        if reason in REFUSAL_CONFIRMERS:
             # Refused whatever the head said: a GENERAL beside this code is a model
             # contradicting itself, and the operator's review settles it either way. What
             # the head said is kept for that review to restore (`clear_classifier_verdict`).
             record.update(verdict=CONTENT_RATING_REFUSED, underlying=verdict)
+            other = next((a for i, a in enumerate(attempts) if i != answered_by), None)
+            status, text, _why = (await self._ask_classifier(
+                owner_id, other, settings,
+                self.cog.global_prompts.get(*REFUSAL_CONFIRMERS[reason]),
+                payload, _CONFIRM_LINE) if other else ("no_key", "", ""))
+            confirmed = _CONFIRM_LINE.match(text) if status == "success" else None
+            if confirmed and confirmed.group(1).upper() == "YES":
+                record["confirmed_by"] = other[1]
+            else:
+                record["review"] = "disputed" if confirmed else "unconfirmed"
         return record
 
     def _store_content_rating(self, owner_id: int, profile_name: str, rating: Dict[str, Any]) -> bool:
@@ -3188,7 +3224,7 @@ class ProfileManager:
         self._invalidate_content_rating(owner_id, profile_name)
         self._delist_unless_publishable(owner_id, profile_name)
         self._set_refused_entry(owner_id, self._get_pid_from_name(owner_id, profile_name),
-                                profile_name if rating.get("verdict") == CONTENT_RATING_REFUSED else None)
+                                profile_name if _awaits_review(rating) else None)
         return True
 
     async def rating_is_stale(self, owner_id: int, profile_name: str) -> bool:
@@ -3287,10 +3323,12 @@ class ProfileManager:
     # --- Refused profiles, for /mod ----------------------------------------------
     #
     # REFUSED_INDEX_FILE, "<owner_id>:<pid>" -> {"name", "at"}: the operator's review list,
-    # of profiles Refused and of those the model gave no verdict for (`flagged`). Answering
-    # "which?" from the shards would decrypt every profile on the instance. Written where a
-    # verdict lands, is cleared or is not given. A profile deleted or reset since is not
-    # removed here: `refused_profiles` drops whatever no longer reads either when asked.
+    # of refusals awaiting review (`_awaits_review`: disputed, unconfirmed or appealed) and
+    # of profiles no model gave a verdict for (`flagged`). A confirmed or upheld refusal is
+    # not on it: it settled itself. Answering "which?" from the shards would decrypt every
+    # profile on the instance. Written where a verdict lands, is cleared, appealed, upheld
+    # or is not given. A profile deleted or reset since is not removed here:
+    # `refused_profiles` drops whatever no longer reads either when asked.
 
     def _set_refused_entry(self, owner_id: int, pid: Optional[str], name: Optional[str]) -> None:
         """Lists `pid` as refused under `name`, or delists it when `name` is None."""
@@ -3305,19 +3343,21 @@ class ProfileManager:
                 return
             IOManager.write_json(index, REFUSED_INDEX_FILE)
 
-    def refused_profiles(self) -> List[Tuple[int, str, int, Optional[str]]]:
-        """(owner_id, current name, listed at, why flagged -- None when Refused) for each
-        profile still awaiting review, oldest first. Reads one config per entry, so call
-        it in a thread."""
+    def refused_profiles(self) -> List[Tuple[int, str, int, Optional[str], Optional[str]]]:
+        """(owner_id, current name, listed at, why flagged -- None when Refused, why a
+        refusal awaits review -- None when flagged) for each profile still awaiting review,
+        oldest first. Reads one config per entry, so call it in a thread."""
         index = IOManager.read_json(REFUSED_INDEX_FILE) or {}
         live, stale = [], []
         for key, entry in index.items():
             owner, _, pid = key.partition(":")
             name = self._get_name_from_pid(int(owner), pid) if owner.isdigit() else None
             config = self._get_profile_config(int(owner), name, False) if name else None
-            flagged = ((config or {}).get("content_rating") or {}).get("flagged")
-            if config is not None and (self._verdict_of(config) == CONTENT_RATING_REFUSED or flagged):
-                live.append((int(owner), name, int(entry.get("at") or 0), flagged))
+            rating = (config or {}).get("content_rating") or {}
+            flagged = rating.get("flagged")
+            review = rating.get("review") if _awaits_review(rating) else None
+            if config is not None and (review or flagged):
+                live.append((int(owner), name, int(entry.get("at") or 0), flagged, review))
             else:
                 stale.append(key)
         if stale:
@@ -3392,7 +3432,7 @@ class ProfileManager:
         """Operator appeal: pins a lighter verdict for exactly the content that was flagged.
 
         An Adult verdict clears to General. A Refusal clears to what the classifier's own
-        verdict was beside its MINOR_SAFETY code -- a false positive on an adult persona
+        verdict was beside its refusing code -- a false positive on an adult persona
         stays Adult. Keyed to the current surface hash, so the override lapses the moment
         the persona changes -- a cleared profile cannot be edited into what was flagged
         and keep its clearance.
@@ -3445,8 +3485,38 @@ class ProfileManager:
             "source": "owner_override",
         }
         if verdict == CONTENT_RATING_REFUSED:
-            record.update(reason="MINOR_SAFETY", underlying=CONTENT_RATING_ADULT)
+            # No code: the operator refused it, and the dashboard says so.
+            record.update(reason=None, underlying=CONTENT_RATING_ADULT, upheld_by=moderator_id)
         return self._store_content_rating(owner_id, profile_name, record)
+
+    def appeal_refusal(self, owner_id: int, profile_name: str) -> bool:
+        """The owner asks the operator to review a refusal that settled itself. Not one the
+        operator already decided (`upheld_by`), so once per refusal: a new one, after an edit
+        and a re-rating, may be appealed again."""
+        config = self._get_profile_config(owner_id, profile_name, False)
+        rating = (config or {}).get("content_rating") or {}
+        if (rating.get("verdict") != CONTENT_RATING_REFUSED or rating.get("review")
+                or rating.get("upheld_by")):
+            return False
+        config["content_rating"] = {**rating, "review": "appealed"}
+        self._save_profile_config(owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
+        self._set_refused_entry(owner_id, self._get_pid_from_name(owner_id, profile_name), profile_name)
+        return True
+
+    def uphold_refusal(self, owner_id: int, profile_name: str, moderator_id: int) -> bool:
+        """The operator's review agrees with a refusal awaiting it: it settles, leaves the
+        review list, and the caller strikes it (`add_strike` counts a profile once)."""
+        config = self._get_profile_config(owner_id, profile_name, False)
+        rating = (config or {}).get("content_rating") or {}
+        if not _awaits_review(rating):
+            return False
+        config["content_rating"] = {**{k: v for k, v in rating.items() if k != "review"},
+                                    "upheld_by": moderator_id}
+        self._save_profile_config(owner_id, profile_name, config, False)
+        self._invalidate_content_rating(owner_id, profile_name)
+        self._set_refused_entry(owner_id, self._get_pid_from_name(owner_id, profile_name), None)
+        return True
 
     def _is_owner_declared_adult(self, owner_id: int, profile_name: str) -> bool:
         """True when the adult verdict came from the owner rather than the classifier.
@@ -3573,6 +3643,19 @@ class ProfileManager:
             # running if the check never landed.
             if (int(owner_id), profile_name) in self.cog.pending_classifications:
                 return False, "This profile is already being re-rated."
+            # Only once edited: the same text asked again is a re-roll, until one answer
+            # comes back clean. An owner who thinks the refusal wrong appeals it instead.
+            rating = (await asyncio.to_thread(self._get_profile_config, owner_id, profile_name, False)
+                      or {}).get("content_rating") or {}
+            current = await asyncio.to_thread(
+                lambda: self._surface_hash(self._moderated_surface(owner_id, profile_name)))
+            if rating.get("hash") == current:
+                if rating.get("review"):
+                    return False, "The bot operator is reviewing this refusal."
+                return False, ("This profile has not changed since it was refused, so it would "
+                               "be judged on the same text. Edit it first"
+                               + ("." if rating.get("upheld_by") else
+                                  ", or choose Request Review if you think the refusal is a mistake."))
             self.schedule_content_classification(owner_id, profile_name)
             return True, ("Submitted. It stays Refused until the new verdict lands, which "
                           "usually takes a few seconds.")
@@ -3815,8 +3898,10 @@ class ProfileManager:
 
                 if rating:
                     stored = await asyncio.to_thread(self._store_content_rating, owner_id, profile_name, rating)
-                    if stored and rating.get("verdict") == CONTENT_RATING_REFUSED:
-                        # On the loop: the strike shares blacklist.json with /mod's writes.
+                    if stored and rating.get("confirmed_by"):
+                        # Two models agreed; a refusal awaiting review strikes only when
+                        # the operator upholds it (`uphold_refusal`). On the loop: the
+                        # strike shares blacklist.json with /mod's writes.
                         self.cog.server_manager.add_strike(
                             owner_id, self._get_pid_from_name(owner_id, profile_name), profile_name)
                     return
@@ -4367,7 +4452,8 @@ class ProfileManager:
         providers = {}
         for label, key in (("Response", "primary_model"), ("Image", "image_generation_model"),
                            ("Audio", "speech_model"), ("Grounding", "grounding_rag_model"),
-                           ("Critic", "critic_model"), ("LTM", "ltm_model")):
+                           ("Critic", "critic_model"), ("LTM", "ltm_model"),
+                           ("Training", "training_analysis_model")):
             primary, fallbacks = model_chain(resolved, key, preferred)
             providers[key] = {model_provider(m) for m in (primary, *fallbacks)}
             rest = [m for m in dict.fromkeys(fallbacks) if m != primary]

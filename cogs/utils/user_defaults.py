@@ -39,7 +39,8 @@ import functools
 from typing import Any, Dict, List, Optional, Tuple
 
 from .constants import (AUTO_DEFAULT, AUTO_MODEL_PREFIX, AUTO_SLOT_PAIRS, AUTO_TIERS, MODEL_PROVIDERS,
-                        OPENROUTER_SHIPPED_MODELS, UTILITY_FALLBACK_KEYS)
+                        OPENROUTER_SHIPPED_MODELS, UTILITY_FALLBACK_KEYS,
+                        GOOGLE_SESSION_MODELS, SESSION_SLOT_PAIRS)
 from .helpers import is_real_model
 
 #: Config keys that must never be defaulted regardless of what the table says.
@@ -242,6 +243,8 @@ def _served(primary_key: str, provider: str) -> List[str]:
     """The category's shipped models `provider` serves, Primary first."""
     if provider == "openrouter":
         return list(OPENROUTER_SHIPPED_MODELS.get(primary_key, ()))
+    if primary_key in GOOGLE_SESSION_MODELS:
+        return list(GOOGLE_SESSION_MODELS[primary_key])
     shipped = platform_model_defaults()
     return [name for name in (shipped.get(primary_key), shipped.get(MODEL_SLOT_PAIRS[primary_key]))
             if is_real_model(name)]
@@ -300,14 +303,16 @@ def model_chain(config: Optional[Dict[str, Any]], primary_key: str,
     The profile's own Primary and Fallback, or the shipped ones where it set none. An
     explicit NO_FALLBACK stops at the Primary: it has always meant "do not retry on anything".
 
-    `cross_provider_fallback` is no profile's setting: compaction and the Director put it in
-    the config they build, for a chain billed to a server key that may hold either provider
-    (`compaction_model_config`). It adds `cross_provider_model` behind the Fallback.
+    `cross_provider_fallback` is no profile's setting: the Director puts it in the config it
+    builds, for a chain billed to a server key that may hold either provider
+    (`director_model_config`). It adds `cross_provider_model` behind the Fallback.
+
+    `primary_key` may also be a session's own chain (SESSION_SLOT_PAIRS), read the same way.
     """
     config = config or {}
     shipped = shipped_chain(primary_key, preferred)
     primary = config.get(primary_key) or shipped[0]
-    stored = config.get(MODEL_SLOT_PAIRS[primary_key])
+    stored = config.get({**MODEL_SLOT_PAIRS, **SESSION_SLOT_PAIRS}[primary_key])
     if stored and not is_real_model(stored):
         return primary, ()
     fallback = stored or (shipped[1] if len(shipped) > 1 else None)

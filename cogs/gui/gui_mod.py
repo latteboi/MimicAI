@@ -768,14 +768,20 @@ class ModProfilesModal(ui.Modal, title="Enter User ID"):
         self.parent_view._build_view()
         await i.response.edit_message(embed=self.parent_view._get_embed(), view=self.parent_view)
 
+#: Why a refusal waits on the operator, as the Review Queue says it.
+_REVIEW_WORDING = {"disputed": "second model disagreed", "unconfirmed": "second model could not answer",
+                   "appealed": "owner appealed"}
+
+
 class ModProfilesView(ModBaseView):
     def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
         super().__init__(cog, interaction, "profiles", target_user_id=target_user_id)
         self.current_page = 0
-        #: (owner_id, name, listed at, why flagged or None if Refused), once Review Queue has
+        #: `refused_profiles`' rows -- (owner_id, name, listed at, why flagged, why a refusal
+        #: awaits review) -- once Review Queue has
         #: been pressed. Read in a thread on the press: each entry is checked against its
         #: profile's own rating.
-        self.refused_rows: Optional[List[Tuple[int, str, int, Optional[str]]]] = None
+        self.refused_rows: Optional[List[Tuple[int, str, int, Optional[str], Optional[str]]]] = None
         self._build_view()
 
     def _resolve_profiles(self) -> List[str]:
@@ -836,9 +842,10 @@ class ModProfilesView(ModBaseView):
         add_button(self, "Reset All Content Ratings", reset_cb, style=discord.ButtonStyle.danger,
                    row=0)
 
-        # Profiles the content rating refused (MINOR_SAFETY), or gave no verdict for: the
-        # operator's review queue. Opening one lands on its dashboard in mod view, where
-        # Content Safety offers Clear, or a verdict for a flagged one.
+        # Refusals awaiting review -- the second model disagreed or could not answer, or the
+        # owner appealed -- and profiles no model gave a verdict for: the operator's review
+        # queue. Opening one lands on its dashboard in mod view, where Content Safety offers
+        # Clear or Uphold, or a verdict for a flagged one.
         async def refused_cb(i: discord.Interaction):
             await i.response.defer()
             self.refused_rows = await asyncio.to_thread(self.cog.profile_manager.refused_profiles)
@@ -858,13 +865,14 @@ class ModProfilesView(ModBaseView):
                     self.original_interaction, pname, target_user_id=int(owner))
                 await self.original_interaction.edit_original_response(embed=embed, view=pm_view)
             options = []
-            for owner, name, at, flagged in self.refused_rows[:DROPDOWN_MAX_OPTIONS]:
+            for owner, name, at, flagged, review in self.refused_rows[:DROPDOWN_MAX_OPTIONS]:
                 user = self.cog.bot.get_user(owner)
                 day = f"{datetime.datetime.fromtimestamp(at, datetime.timezone.utc):%Y-%m-%d}"
                 options.append(discord.SelectOption(
                     label=f"{name} — {user.name if user else owner}"[:100], value=f"{owner}:{name}",
                     emoji="⚠️" if flagged else "⛔",
-                    description=(f"Flagged {day}: {flagged}" if flagged else f"Refused {day}")[:100]))
+                    description=(f"Flagged {day}: {flagged}" if flagged
+                                 else f"Refused {day}: {_REVIEW_WORDING.get(review, review)}")[:100]))
             add_select(self, options, refused_sel, placeholder="Review a profile...", row=3)
         
         if self.target_user_id:
@@ -901,9 +909,11 @@ class ModProfilesView(ModBaseView):
             embed.add_field(
                 name="⛔ Review queue",
                 value=(f"**{len(self.refused_rows) - flagged}** refused and **{flagged}** flagged, "
-                       "oldest first.\n⛔ The content rating found it sexualises a minor; it runs "
-                       "nowhere until you Clear it under Content Safety.\n⚠️ The rating model gave "
-                       "no verdict; it stays Pending until you rate or refuse it there."
+                       "oldest first.\n⛔ One model found it sexualises a minor or a real "
+                       "person, and the second disagreed or could not answer, or its owner "
+                       "appealed. It runs nowhere; Uphold it under Content Safety to strike "
+                       "it, or Clear it.\n⚠️ No rating "
+                       "model gave a verdict; it stays Pending until you rate or refuse it there."
                        if self.refused_rows else "None awaiting review."),
                 inline=False)
         if not self.target_user_id:
@@ -977,6 +987,9 @@ MOD_PROMPT_CATEGORIES = [
         ("Attachment Describer (Simulated vision)", "MEDIA_DESCRIPTION", DEFAULT_MEDIA_DESCRIPTION),
         ("Anti-Repetition Critic", "ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT),
         ("Content Classifier (18+ gating)", "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT),
+        ("Content Classifier · Minor Check", "CONTENT_CONFIRMER", DEFAULT_CONTENT_CONFIRMER_PROMPT),
+        ("Content Classifier · Real Person Check", "CONTENT_CONFIRMER_REAL_PERSON",
+         DEFAULT_REAL_PERSON_CONFIRMER_PROMPT),
     ]),
     ("Memory & Training", [
         ("LTM Summarization", "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS),

@@ -327,6 +327,7 @@ UTILITY_FALLBACK_KEYS = {
     'grounding_rag_model': 'grounding_rag_fallback_model',
     'critic_model': 'critic_fallback_model',
     'ltm_model': 'ltm_fallback_model',
+    'training_analysis_model': 'training_analysis_fallback_model',
 }
 
 #: (stored value, wording, description). "" is the default tier and what every profile
@@ -969,9 +970,12 @@ UNREADABLE_MEDIA_DEFAULT = 'off'
 #: model describing the file, the profile falls to `off`, which is a complete behaviour
 #: rather than an error. Cover on the other provider is a Fallback `/mod` sets there.
 #:
-#: ling reads images and video, not audio, so a voice message on OpenRouter's chain is the
-#: free router's to place.
-MEDIA_DESCRIBER_MODEL = 'OPENROUTER/inclusionai/ling-3.0-flash-vl'
+#: Haiku reads images, not audio or video, so a voice message or a clip on OpenRouter's chain
+#: is the free router's to place.
+CLAUDE_HAIKU_MODEL = 'OPENROUTER/anthropic/claude-haiku-5.5'
+MEDIA_DESCRIBER_MODEL = CLAUDE_HAIKU_MODEL
+#: What Response, the critic and the LTM summariser ship on OpenRouter, ahead of the free router.
+OPENROUTER_UTILITY_MODEL = 'OPENROUTER/inclusionai/ling-3.0-flash-vl'
 
 #: OpenRouter's own router over its free models: costs nothing, and picks a model able to
 #: read the request. Its limits are the key owner's account, not the bot's.
@@ -1008,10 +1012,11 @@ _MEDIA_READER_CHAINS = {
     'openrouter': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER),
 }
 #: The classifier's verdict decides who may see a profile, so it ships one steady model a
-#: side and no Fallback: a second model is a second opinion an owner could shop for, and
-#: one asked after the first gave no verdict judges exactly what the first would not read.
-_CLASSIFIER_CHAINS = {'gemini': ('GOOGLE/gemini-3-flash-preview', NO_FALLBACK),
-                      'openrouter': ('OPENROUTER/anthropic/claude-haiku-5.5', NO_FALLBACK)}
+#: side, and Gemini 3.8 Flash on both as the last resort: asked only when the Primary is
+#: down or gives no verdict, and to confirm a Primary's refusal. Never at the owner's
+#: request, so it is no second opinion they can shop for. `_classify_profile_content`.
+_CLASSIFIER_CHAINS = {'gemini': ('GOOGLE/gemini-3-flash-preview', 'GOOGLE/gemini-3.8-flash'),
+                      'openrouter': (CLAUDE_HAIKU_MODEL, 'OPENROUTER/google/gemini-3.8-flash')}
 #: Each reader's slots, Primary then Fallback.
 DESCRIBER_KEYS = ('describer_model', 'describer_fallback_model')
 CLASSIFIER_KEYS = ('classifier_model', 'classifier_fallback_model')
@@ -1019,7 +1024,7 @@ CLASSIFIER_KEYS = ('classifier_model', 'classifier_fallback_model')
 #: on `/import` -- under the user's own Override Defaults. `generator_models`.
 _GENERATOR_CHAINS = {
     'gemini': (PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME),
-    'openrouter': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER),
+    'openrouter': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
 }
 GENERATOR_KEYS = ('generator_model', 'generator_fallback_model')
 SYSTEM_MODEL_DEFAULTS_BY_PROVIDER = {
@@ -1029,24 +1034,30 @@ SYSTEM_MODEL_DEFAULTS_BY_PROVIDER = {
 }
 
 #: What each category ships on OpenRouter, Primary then Fallback: its own models, not
-#: Gemini routed through it. The critic, the LTM summariser and session compaction take
-#: the describer's two. Every id read off /api/v1/models on 2026-10-12.
+#: Gemini routed through it. Every id read off /api/v1/models on 2026-10-12.
 #: `user_defaults._served`.
 #:
-#: Grounding ships one, so its Fallback is Google's researcher. The slot must actually
-#: search, and DeepSeek was measured to on 2026-09-25 with an instruction attached --
-#: through Exa, having no search of its own (prod_tests/native_tools_live.py). A second
-#: joins it once measured the same way.
+#: Grounding must actually search. DeepSeek was measured to on 2026-09-25 with an
+#: instruction attached (prod_tests/native_tools_live.py); Haiku, which replaced it, has not
+#: been, and the free router behind it may pick a model that answers without searching.
 OPENROUTER_SHIPPED_MODELS = {
-    'primary_model': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER),
+    'primary_model': (OPENROUTER_UTILITY_MODEL, OPENROUTER_FREE_ROUTER),
     'image_generation_model': ('OPENROUTER/inclusionai/ming-image-0.1-design',
                                'OPENROUTER/recraft/recraft-v4.1-flash'),
     'speech_model': ('OPENROUTER/fish-audio/s2.1-pro-free:free',
                      'OPENROUTER/deepgram/flux-tts:free'),
-    'critic_model': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER),
-    'ltm_model': (MEDIA_DESCRIBER_MODEL, OPENROUTER_FREE_ROUTER),
-    'grounding_rag_model': ('OPENROUTER/deepseek/deepseek-v4-flash-0731',),
+    'critic_model': (OPENROUTER_UTILITY_MODEL, OPENROUTER_FREE_ROUTER),
+    'ltm_model': (OPENROUTER_UTILITY_MODEL, OPENROUTER_FREE_ROUTER),
+    'grounding_rag_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
+    'training_analysis_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
+    'compaction_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
 }
+
+#: Chains kept per session rather than per profile, so no Set Models category ships them:
+#: the session synopsis. Google's side here; OpenRouter's is in the table above, which
+#: `user_defaults.model_chain` reads for both. Stored under `session['compaction']`.
+SESSION_SLOT_PAIRS = {'compaction_model': 'compaction_fallback_model'}
+GOOGLE_SESSION_MODELS = {'compaction_model': (UTILITY_MODEL, UTILITY_FALLBACK_MODEL)}
 
 #: MimicAI Auto: a text model the bot owner points at models in /mod -> System Models,
 #: per tier and slot, so a profile follows the owner's pick instead of holding the day's id -- a
@@ -1077,14 +1088,14 @@ AUTO_TIER_KEYS = {(tier, slot): (f'auto_{tier}_{stem}model', f'auto_{tier}_{stem
 AUTO_TIER_TABS = {(tier, slot): f'auto_{tier}_{stem}'.rstrip('_')
                   for tier, _wording, _desc in AUTO_TIERS for slot, stem in _AUTO_STEMS.items()}
 #: Free ships OpenRouter's free router alone, not the shipped Primary, which costs -- bar
-#: grounding, on its shipped researcher: the router picks any model, and one that never calls
-#: the search answers anyway. Budget and Recommended ship unset, and a tier with no Primary is
+#: grounding, which ships the shipped researcher pair, so a new OpenRouter profile (seeded on
+#: Free) searches with it. Budget and Recommended ship unset, and a tier with no Primary is
 #: offered to no one.
 SYSTEM_MODEL_DEFAULTS.update({key: NO_FALLBACK for keys in AUTO_TIER_KEYS.values() for key in keys})
-SYSTEM_MODEL_DEFAULTS.update(
-    (AUTO_TIER_KEYS['free', slot][0],
-     OPENROUTER_SHIPPED_MODELS[slot][0] if slot == 'grounding_rag_model' else OPENROUTER_FREE_ROUTER)
-    for slot in AUTO_SLOT_PAIRS)
+SYSTEM_MODEL_DEFAULTS.update((AUTO_TIER_KEYS['free', slot][0], OPENROUTER_FREE_ROUTER)
+                             for slot in AUTO_SLOT_PAIRS)
+SYSTEM_MODEL_DEFAULTS.update(zip(AUTO_TIER_KEYS['free', 'grounding_rag_model'],
+                                 OPENROUTER_SHIPPED_MODELS['grounding_rag_model']))
 #: The owner's Hosts & Tier for Auto, in the System Models file: pins keyed by model id, as
 #: a profile's are, and a Default Tier per Auto tier. A profile's own never reach an Auto model.
 AUTO_ENDPOINTS_KEY = 'auto_endpoints'
@@ -1766,11 +1777,35 @@ DEFAULT_CONTENT_CLASSIFIER_PROMPT = (
     "- Directs or invites explicit sexual content, or describes sexual acts in graphic detail.\n"
     "- Is defined primarily around sexual availability, fetish content, or erotic roleplay.\n"
     "- Directs graphic gore, torture, or sexualised violence.\n"
-    "- Sexualises a character described as a minor, in any framing.\n\n"
+    "- Portrays a real person known for genocide, mass atrocity or terrorism -- Adolf "
+    "Hitler, or another such dictator, war criminal or terrorist -- as its character.\n"
+    "- Encourages, instructs or glorifies self-harm, suicide or disordered eating: a "
+    "character who urges the user towards it, not one who struggles with it.\n"
+    "- Is built around hatred of a real group of people -- slurs or contempt for a race, "
+    "ethnicity, religion, nationality, sexuality, gender or disability -- rather than a "
+    "prejudiced villain within a story.\n"
+    "- Is built to abuse the user: degradation, humiliation, coercive control or stalking "
+    "as the point of the character.\n"
+    "- Glorifies or pushes hard drug use as its purpose, such as a dealer or a \"trip "
+    "sitter\" urging use.\n"
+    "- Sexualises a character stated or clearly implied to be under 18, in any framing.\n"
+    "- Sexualises a real, identifiable person -- alive or within living memory, public "
+    "figure or private individual -- who is named, unmistakably described, or shown in a "
+    "photograph as the avatar.\n\n"
     "Answer GENERAL for everything else, including:\n"
-    "- Romance, flirtation, attraction, innuendo and suggestive humour.\n"
+    "- Romance, flirtation, attraction, innuendo and suggestive humour, and possessive or "
+    "jealous romance that stops short of abusing the user.\n"
+    "- Adult characters with a youthful look, a petite build or an anime art style, when "
+    "stated to be adults.\n"
+    "- Grief, depression, trauma and abuse written with care, and characters who live "
+    "with them.\n"
+    "- War, crime, horror and combat as story; drinking, smoking, gambling and drugs "
+    "mentioned in passing.\n"
+    "- Religion, politics, and satire of public figures without sexual content.\n"
     "- Dark, violent, horror, morally grey or villainous characters, where the violence "
     "is narrative rather than gratuitous physical detail.\n"
+    "- Other historical, political and real-world figures portrayed as characters, and "
+    "fictional villains however monstrous.\n"
     "- Rude, abrasive, profane or unpleasant personalities.\n"
     "- Suggestive artwork, revealing outfits, or an attractive appearance.\n\n"
     "Judge what the profile is FOR, not whether individual words are coarse. A blunt or "
@@ -1781,13 +1816,64 @@ DEFAULT_CONTENT_CLASSIFIER_PROMPT = (
     "  SEXUAL_EXPLICIT   -- explicit sexual content or graphic sexual acts\n"
     "  SEXUAL_FOCUS      -- the persona is built around sexual availability, fetish or erotica\n"
     "  GRAPHIC_VIOLENCE  -- gore, torture or sexualised violence\n"
-    "  MINOR_SAFETY      -- sexualises a character described as a minor\n"
+    "  REAL_ATROCITY     -- a real dictator, war criminal or terrorist known for mass killing\n"
+    "  SELF_HARM         -- encourages self-harm, suicide or disordered eating\n"
+    "  HATE              -- built around hatred of a real group of people\n"
+    "  ABUSIVE           -- built to abuse, degrade or control the user\n"
+    "  DRUGS             -- glorifies or pushes hard drug use\n"
+    "  MINOR_SAFETY      -- sexualises a character stated or clearly implied to be under 18;"
+    " never for violence, cruelty or extremism alone\n"
+    "  REAL_PERSON       -- sexualises a real, identifiable person; never a fictional "
+    "character, a parody without sexual content, or a figure from centuries ago\n"
     "  NONE              -- use this for GENERAL\n"
     "Never quote, paraphrase or describe the profile itself. The category code is the "
     "entire reason; do not add words to it.\n"
     "Example: ADULT: SEXUAL_EXPLICIT\n"
     "Example: GENERAL: NONE"
 )
+
+#: The second model's one question about a MINOR_SAFETY finding, which refuses a profile
+#: outright and strikes its owner. Narrow on purpose: it is asked whether *this* finding
+#: holds, not to rate the profile again, so a villain or a dictator the first model
+#: misfiled under it is not refused. /mod's `CONTENT_CONFIRMER`; `REFUSAL_CONFIRMERS`.
+DEFAULT_CONTENT_CONFIRMER_PROMPT = (
+    "You check one finding about a roleplay character profile for a Discord bot: that it "
+    "sexualises a minor. Judge any avatar images with the text.\n\n"
+    "Answer YES only if both are true:\n"
+    "- A character in the profile is stated or clearly implied to be under 18: an age, a "
+    "school year, or being called a child. Youthful looks, a small build, the words "
+    "\"girl\" or \"boy\", or an art style do not make a character a minor on their own.\n"
+    "- That character is sexualised: sexual content, sexual availability, or a sexualised "
+    "description involving them.\n\n"
+    "Answer NO for everything else, including violent, cruel, extremist and historical "
+    "figures however dark, adults in sexual content, and minors written with no sexual "
+    "content.\n\n"
+    "Reply with exactly one word: YES or NO."
+)
+
+#: The same question about a REAL_PERSON finding. /mod's `CONTENT_CONFIRMER_REAL_PERSON`.
+DEFAULT_REAL_PERSON_CONFIRMER_PROMPT = (
+    "You check one finding about a roleplay character profile for a Discord bot: that it "
+    "sexualises a real person. Judge any avatar images with the text.\n\n"
+    "Answer YES only if both are true:\n"
+    "- The profile portrays a real, identifiable person who is alive or died within living "
+    "memory: it names them, describes them unmistakably, or its avatar is a photograph of "
+    "them. A fictional character is not a real person, even one an actor plays, and nor is "
+    "an original character who happens to share a real person's name.\n"
+    "- That person is sexualised: sexual content, sexual availability, or a sexualised "
+    "description involving them.\n\n"
+    "Answer NO for everything else, including real people portrayed without sexual "
+    "content, satire and parody of public figures, historical figures from centuries ago, "
+    "and fictional characters however explicit.\n\n"
+    "Reply with exactly one word: YES or NO."
+)
+
+#: The codes that refuse a profile, each with the /mod prompt key and shipped wording of
+#: the second model's check. A code missing here rates Adult and is never refused.
+REFUSAL_CONFIRMERS = {
+    "MINOR_SAFETY": ("CONTENT_CONFIRMER", DEFAULT_CONTENT_CONFIRMER_PROMPT),
+    "REAL_PERSON": ("CONTENT_CONFIRMER_REAL_PERSON", DEFAULT_REAL_PERSON_CONFIRMER_PROMPT),
+}
 
 # What a stored content_rating reason renders as. The classifier returns one of these
 # codes rather than prose, because a free-text reason quoted the persona back at whoever
@@ -1797,7 +1883,13 @@ CONTENT_RATING_REASON_LABELS = {
     "SEXUAL_EXPLICIT": "Explicit sexual content",
     "SEXUAL_FOCUS": "Sexually-focused persona",
     "GRAPHIC_VIOLENCE": "Graphic violence",
+    "REAL_ATROCITY": "Real-world atrocity",
+    "SELF_HARM": "Self-harm encouragement",
+    "HATE": "Hatred of a real group",
+    "ABUSIVE": "Abusive towards the user",
+    "DRUGS": "Drug glorification",
     "MINOR_SAFETY": "Minor safety",
+    "REAL_PERSON": "Sexualises a real person",
 }
 
 CONTENT_RATING_REASON_FALLBACK = "Adult themes"
@@ -1858,9 +1950,9 @@ CONTENT_RATING_UNRATED = "unrated"
 CONTENT_RATING_PENDING = "pending"
 CONTENT_RATING_GENERAL = "general"
 CONTENT_RATING_ADULT = "adult"
-#: The classifier found the profile sexualises a minor (MINOR_SAFETY). It runs nowhere and
-#: nothing but a new verdict or the bot owner's Clear moves it: no edit, declaration,
-#: import or failed re-check relaxes it. Terms of Service §7 promises this.
+#: The classifier found what the Terms forbid outright (`REFUSAL_CONFIRMERS`). It runs
+#: nowhere and nothing but a new verdict or the bot owner's Clear moves it: no edit,
+#: declaration, import or failed re-check relaxes it. Terms of Service §7 promises this.
 CONTENT_RATING_REFUSED = "refused"
 
 CONTENT_RATING_LABELS = {
@@ -1901,8 +1993,8 @@ CONTENT_RATING_BLURBS = {
         "Global Chat."
     ),
     CONTENT_RATING_REFUSED: (
-        "This profile's content rating found that it sexualises a minor, which the Terms of "
-        "Service forbid. It cannot run anywhere, be shared, published, or used in Global "
+        "This profile's content rating found that it sexualises a minor or a real person, "
+        "which the Terms of Service forbid. It cannot run anywhere, be shared, published, or used in Global "
         "Chat until the bot operator reviews it."
     ),
 }
@@ -2267,6 +2359,10 @@ COMPACTION_MAX_CHUNK_RATIO = 0.8
 COMPACT_KEEP_DEFAULT = 10
 COMPACT_KEEP_MAX = 100
 COMPACT_PASS_MAX_CHARS = 120_000
+#: No pass starts after this long. Discord's interaction token lasts 15 minutes, and a pass
+#: can take three models' timeouts (about six): one starting later than this could finish
+#: after the token, leaving the status on "Folding..." for good with the channel held.
+COMPACT_RUN_DEADLINE_SECONDS = 480
 
 # The summariser has no defaults of its own: an unset one runs the LTM summariser's chain,
 # which is the same job -- `SessionCompactionMixin._generate_synopsis`.

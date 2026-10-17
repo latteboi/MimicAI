@@ -1,6 +1,7 @@
+import time
 import uuid
 import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from ...utils.constants import (
     COMPACTION_CHUNK_DEFAULT, COMPACTION_CHUNK_MIN, COMPACTION_MAX_CHUNK_RATIO,
@@ -8,8 +9,16 @@ from ...utils.constants import (
     COMPACTION_SYNOPSIS_WORDS_MIN, COMPACTION_THRESHOLD_DEFAULT, COMPACTION_THRESHOLD_MAX,
     COMPACTION_THRESHOLD_MIN, DEFAULT_SESSION_SYNOPSIS_PROMPT,
     DEFAULT_SESSION_SYNOPSIS_USER_PROMPT, GREEDY_SAMPLING, SESSION_BUSY_FLAGS,
-    COMPACT_KEEP_DEFAULT, COMPACT_PASS_MAX_CHARS, PURGE_BUSY_WAIT_TIMEOUT_SECONDS,
+    COMPACT_KEEP_DEFAULT, COMPACT_PASS_MAX_CHARS, COMPACT_RUN_DEADLINE_SECONDS,
+    PURGE_BUSY_WAIT_TIMEOUT_SECONDS,
 )
+
+#: Says how far a manual compaction has got, to whoever is watching its status.
+Progress = Callable[[str], Awaitable[None]]
+
+
+async def _no_progress(_text: str) -> None:
+    pass
 from ...utils.helpers import _resolve_zoneinfo, restamp_turn, resolve_thinking_params, turn_posted_at
 from ...managers.session_manager import SessionManager, intern_turn, reply_tags, turn_lookup, with_reply
 
@@ -21,18 +30,14 @@ _SEEDED_MODELS = {"model": "OPENROUTER/amazon/nova-micro-v1",
 
 
 def compaction_model_config(session: Dict[str, Any]) -> Dict[str, Optional[str]]:
-    """The session's own summariser choice as LTM slots, None where it made none.
-
-    Compaction is the LTM summariser's job on a whole scene, so it runs that category's
-    chain -- `model_chain(this, "ltm_model", ...)` -- under the session owner's preference.
-    With the cross-provider fallback (`model_chain`): it is billed to the server's key,
-    which may hold either provider, and a failure here is silent.
+    """The session's own summariser choice, None where it made none, for
+    `model_chain(this, "compaction_model", ...)`: unchosen, the synopsis's shipped chain under
+    the session owner's preference. A Primary and a Fallback, never a third model.
     """
     raw = session.get("compaction") or {}
     chosen = {key: (str(raw.get(key) or "").strip() or None) for key in _SEEDED_MODELS}
-    return {**{slot: None if chosen[key] == _SEEDED_MODELS[key] else chosen[key]
-               for key, slot in (("model", "ltm_model"), ("fallback_model", "ltm_fallback_model"))},
-            "cross_provider_fallback": True}
+    return {slot: None if chosen[key] == _SEEDED_MODELS[key] else chosen[key]
+            for key, slot in (("model", "compaction_model"), ("fallback_model", "compaction_fallback_model"))}
 
 
 def resolve_compaction_settings(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -257,12 +262,14 @@ class SessionCompactionMixin:
             (channel_id, None, None), session.get("type", "multi"), structural=True)
 
     async def manual_compaction(self, channel_id: int, *, undo: bool = False,
-                                keep: int = COMPACT_KEEP_DEFAULT) -> str:
+                                keep: int = COMPACT_KEEP_DEFAULT,
+                                progress: Progress = _no_progress) -> str:
         """`/compact` and the Compaction tab's buttons: fold now, or unfold everything.
 
         Returns what to tell whoever asked. Claims the channel for the whole run, as
         /memorise does: a round captures `batch_start_index` when it starts, and a
         synopsis inserted under it would shift every turn that round is about to read.
+        `progress` hears each wait and each pass, so a long run does not look stalled.
         """
         session = self.cog.multi_profile_channels.get(channel_id)
         if not session:
@@ -272,6 +279,8 @@ class SessionCompactionMixin:
                 channel_id, session.get("type", "multi"))
             if not session:
                 return "Could not load this session's transcript."
+        if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
+            await progress("Waiting for the current round to finish...")
         if not await self.cog.session_manager._wait_for_session_flags(
                 session, SESSION_BUSY_FLAGS, PURGE_BUSY_WAIT_TIMEOUT_SECONDS):
             return (f"The session is still busy after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
@@ -280,20 +289,28 @@ class SessionCompactionMixin:
         try:
             if undo:
                 return await self._unfold_all(channel_id, session)
-            return await self._fold_all(channel_id, session, keep)
+            return await self._fold_all(channel_id, session, keep, progress)
         finally:
             session["is_compacting"] = False
 
-    async def _fold_all(self, channel_id: int, session: Dict[str, Any], keep: int) -> str:
-        """Fold every public turn but the newest `keep`, in passes of bounded size."""
+    async def _fold_all(self, channel_id: int, session: Dict[str, Any], keep: int,
+                        progress: Progress = _no_progress) -> str:
+        """Fold every public turn but the newest `keep`, in passes of bounded size, starting
+        none after COMPACT_RUN_DEADLINE_SECONDS."""
         settings = self._compaction_settings(session)
-        folded, failed = 0, False
+        folded, failed, out_of_time = 0, False, False
+        deadline = time.monotonic() + COMPACT_RUN_DEADLINE_SECONDS
         while True:
             log = session.get("unified_log") or []
             candidates = self._compactable_indices(log)
             foldable = candidates[:max(0, len(candidates) - keep)]
             if not foldable:
                 break
+            if time.monotonic() > deadline:
+                out_of_time = True
+                break
+            await progress(f"Folding the conversation into its synopsis... {folded} turn(s) so far, "
+                           f"{len(foldable)} to go.")
             # Oldest first, up to the size cap, and always at least one turn: a single
             # turn over the cap -- a long pasted file -- is still a turn to fold.
             indices, size = [], 0
@@ -330,6 +347,8 @@ class SessionCompactionMixin:
         message = f"Folded {folded} turn(s) into the session synopsis; {remaining} live turn(s) remain."
         if failed:
             message += " The summariser failed partway, so some of those were meant to be folded too."
+        if out_of_time:
+            message += " It stopped there to finish within Discord's time limit; run it again to fold the rest."
         return " ".join([message, *notes])
 
     async def _unfold_all(self, channel_id: int, session: Dict[str, Any]) -> str:
@@ -386,7 +405,7 @@ class SessionCompactionMixin:
         try:
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
                 *self.cog.api_service.model_chain(
-                    compaction_model_config(session), "ltm_model", session.get("owner_id")),
+                    compaction_model_config(session), "compaction_model", session.get("owner_id")),
                 _attempt, label="Session synopsis")
         except Exception as e:
             print(f"[Compaction] Synopsis generation failed for channel {channel_id}: {e}")

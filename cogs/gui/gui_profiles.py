@@ -2990,6 +2990,8 @@ class ModelPickerMixin(ReportErrorMixin):
                       ("critic_fallback_model", "Critic Fallback", UTILITY_FALLBACK_MODEL)),
         'ltm':       (("ltm_model", "LTM Summariser", UTILITY_MODEL),
                       ("ltm_fallback_model", "LTM Fallback", UTILITY_FALLBACK_MODEL)),
+        'training':  (("training_analysis_model", "Training Analysis", PRIMARY_MODEL_NAME),
+                      ("training_analysis_fallback_model", "Training Fallback", FALLBACK_MODEL_NAME)),
     }
 
     _CATEGORY_LABELS = (
@@ -2999,6 +3001,7 @@ class ModelPickerMixin(ReportErrorMixin):
         ("grounding", "Grounding Summariser", "Summarises web search results in RAG mode."),
         ("critic", "Anti-Repetition Critic", "Screens replies for semantic repetition."),
         ("ltm", "LTM Summariser", "Turns conversations into long-term memories."),
+        ("training", "Training Analysis", "Writes a style guide from training examples."),
     )
 
     #: Categories Ollama cannot serve, so the API switch skips it: grounding must run a web
@@ -6807,6 +6810,11 @@ class ContentSafetyView(BlockedGuard, ui.View):
         if verdict == CONTENT_RATING_REFUSED:
             add_button(self, "Submit for Re-rating", self.submit_cb,
                        style=discord.ButtonStyle.success, row=0)
+            # Only one that settled itself: the rest are waiting on the operator, or were
+            # decided by them (`appeal_refusal`).
+            if not self.is_mod_view and not rating.get("review") and not rating.get("upheld_by"):
+                add_button(self, "Request Review", self.appeal_cb,
+                           style=discord.ButtonStyle.secondary, row=0)
 
         if verdict == CONTENT_RATING_PENDING and not stalled:
             add_button(self, "Check for a Verdict", self.recheck_cb,
@@ -6828,6 +6836,9 @@ class ContentSafetyView(BlockedGuard, ui.View):
                 add_button(self, "Clear Refusal" if verdict == CONTENT_RATING_REFUSED
                            else "Clear Adult Verdict", self.clear_cb,
                            style=discord.ButtonStyle.danger, row=1)
+            if verdict == CONTENT_RATING_REFUSED and rating.get("review"):
+                add_button(self, "Uphold Refusal", self.uphold_cb,
+                           style=discord.ButtonStyle.success, row=1)
 
             add_button(self, "Force Re-classify", self.force_cb,
                        style=discord.ButtonStyle.secondary, row=1)
@@ -6864,11 +6875,22 @@ class ContentSafetyView(BlockedGuard, ui.View):
         # Why, when the verdict came from the classifier. A category code, never the
         # model's own words about somebody's persona.
         if verdict == CONTENT_RATING_REFUSED:
+            review = rating.get("review")
+            if review == "appealed":
+                where = "You asked for a review, and the bot operator will look at it."
+            elif review:
+                where = ("A second check did not confirm this, so the bot operator will review "
+                         "it. It counts as no strike unless the review upholds it.")
+            elif rating.get("upheld_by"):
+                where = "The bot operator reviewed it and upheld the refusal."
+            else:
+                where = ("Only the bot operator can clear this. If you think it is a mistake, "
+                         "choose Request Review, once.")
             embed.add_field(
                 name="Reason", value=(
-                    f"{CONTENT_RATING_REASON_LABELS['MINOR_SAFETY']}.\nOnly the bot operator "
-                    "can clear this. Edit the persona and choose Submit for Re-rating to have "
-                    "it rated again; it stays Refused until then."), inline=False)
+                    f"{CONTENT_RATING_REASON_LABELS.get(rating.get('reason'), 'Refused on review')}"
+                    f".\n{where}\nTo have it rated again, edit the persona and choose Submit for "
+                    "Re-rating; it stays Refused until then."), inline=False)
         if verdict == CONTENT_RATING_ADULT:
             if pm._is_owner_declared_adult(self.user_id, self.profile_name):
                 if rating.get("checked"):
@@ -6963,6 +6985,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
                       f"hash: `{rating.get('hash') or '—'}`\n"
                       f"at: `{rating.get('at') or '—'}`\n"
                       f"flagged: `{rating.get('flagged') or '—'}`\n"
+                      f"confirmed by: `{rating.get('confirmed_by') or '—'}`\n"
+                      f"review: `{rating.get('review') or '—'}`\n"
                       f"distributed: `{self.distributed}`")
             embed.add_field(name="Operator detail", value=detail, inline=False)
 
@@ -7059,6 +7083,22 @@ class ContentSafetyView(BlockedGuard, ui.View):
             # stays until lifted under Blacklist, which the operator decides.
             self.cog.server_manager.remove_strikes(
                 self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name))
+        await self._refresh(i)
+
+    async def appeal_cb(self, i: discord.Interaction):
+        await i.response.defer()
+        appealed = await asyncio.to_thread(
+            self.cog.profile_manager.appeal_refusal, self.user_id, self.profile_name)
+        await i.followup.send("Sent to the bot operator for review." if appealed
+                              else "This refusal cannot be appealed again.", ephemeral=True)
+        await self._refresh(i)
+
+    async def uphold_cb(self, i: discord.Interaction):
+        await i.response.defer()
+        pm = self.cog.profile_manager
+        if await asyncio.to_thread(pm.uphold_refusal, self.user_id, self.profile_name, i.user.id):
+            self.cog.server_manager.add_strike(
+                self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name), self.profile_name)
         await self._refresh(i)
 
     def _review_cb(self, verdict: str):
