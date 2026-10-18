@@ -5,7 +5,8 @@
 
 # Discord gateway + slash commands. Pulls aiohttp in transitively; nothing here
 # imports aiohttp directly any more.
-discord.py>=2.4
+# 2.7.1: what /start's Create Account form (modal checkboxes, radio group) is built on.
+discord.py>=2.7.1
 
 # Encoding and persistence. Every .json.gz on disk is Fernet-encrypted zstd
 # (the extension is historical), serialised with orjson.

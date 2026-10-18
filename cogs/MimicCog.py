@@ -1904,7 +1904,8 @@ class MimicCog(EventListeners, commands.Cog):
 
             summarised, skipped, failed = await self.generation_service.memorise_seats(
                 session, targets, guild_id, interaction.user.display_name, interaction.user.id,
-                interaction.channel, source="memorise")
+                interaction.channel, source="memorise",
+                progress=lambda text: update_status(interaction, text))
 
             lines = []
             if summarised:

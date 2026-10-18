@@ -44,11 +44,13 @@ _STATIC_DASHBOARDS = [
         [
             ("Setup", [
                 "A context banner: where you are, your role there, whether that server has a key",
-                "A five-step checklist, probed live: provider, key, character, add to channel, speak",
+                "A five-step checklist, probed live: account, key, character, add to channel, speak",
                 "Under it, the current step's text and buttons; a dropdown jumps to any step",
                 "Steps that cannot be done from here are greyed with the reason, not hidden",
-                "Step 1 Choose a provider: OpenRouter (recommended), Google (paid key) or None "
-                "(no model defaults); choosing registers you, and nothing is stored before it",
+                "Step 1 Create your account: Create Account opens a form to accept the Terms and "
+                "Privacy Policy and choose OpenRouter (recommended), Google (paid key) or None (no "
+                "model defaults); submitting registers you, and nothing is stored before it. "
+                "Read the Terms opens /terms. Picked again later, the step switches provider",
                 "Step 2 Add your API key: Get a key (link), Paste key (made your Personal key), "
                 "both providers' with None; "
                 "servers you administer, ticked in a paged dropdown and saved as ticked",

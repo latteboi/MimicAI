@@ -9,6 +9,7 @@ from ...utils.constants import (LTM_DUPLICATE_SIMILARITY, LTM_EXCERPT_TURNS,
 from ...utils.helpers import _resolve_zoneinfo, ltm_flag_enabled, restamp_turn, turn_posted_at
 from ...managers.memory_manager import encode_embedding_b64
 from ...managers.session_manager import reply_tags, turn_lookup, with_reply
+from .compaction import Progress, _no_progress
 
 
 def ltm_backlog(log: List[Dict[str, Any]], pid: str, read_through: Optional[str] = None,
@@ -112,15 +113,16 @@ class LtmCaptureMixin:
     async def memorise_seats(
         self, session: Dict[str, Any], seats: List[Dict[str, Any]], guild_id: Optional[int],
         author: str, user_id: int, channel: Optional[discord.abc.Messageable] = None,
-        source: str = "auto",
+        source: str = "auto", progress: Progress = _no_progress,
     ) -> Tuple[List[str], List[str], List[str]]:
         """Writes a memory now for each of `seats`: (made, skipped, none) as display names.
 
         The body of `/memorise`, and what `/suspend` runs once the log is deleted, from the
         session it still holds: the turns since a seat's last memory are held nowhere else.
+        `progress` hears each seat as its summariser starts: they run one after another.
         """
         made, skipped, none = [], [], []
-        for seat in seats:
+        for number, seat in enumerate(seats, start=1):
             name = seat["profile_name"]
             index = self.cog.profile_manager._get_user_index(seat["owner_id"])
             settings = self.cog.profile_manager._get_profile_config(
@@ -133,6 +135,8 @@ class LtmCaptureMixin:
                 continue
             seat["_ltm_running"] = True
             try:
+                await progress(f"Writing {name}'s memories"
+                               + (f" ({number} of {len(seats)})..." if len(seats) > 1 else "..."))
                 created, detail = await self._summarize_and_store_ltm(
                     session, seat, settings, guild_id, author, user_id,
                     warning_channel=channel, source=source)

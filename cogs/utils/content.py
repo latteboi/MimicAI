@@ -661,9 +661,23 @@ WIZARD_COPY = {
         "It needs a key with **billing turned on**.\n"
         "**None** sets no default models: new characters start without one, and you choose in "
         "`/settings` → Override Defaults.\n\n"
-        "Choosing is how you set MimicAI up — nothing is stored for you before it. New characters "
-        "start on your choice; a model you pick yourself stays picked. Change it any time here or in "
-        "`/settings` → Override Defaults."
+        "**Create Account** asks you to accept the Terms and choose one: that is how you set MimicAI "
+        "up, and nothing is stored for you before it. New characters start on your choice; a model you "
+        "pick yourself stays picked. Change it any time here or in `/settings` → Override Defaults."
+    ),
+    # The Create Account form's own text, above its two ticks and the provider choice.
+    # `{date}` is the Terms' effective date: what is accepted is the version in force.
+    "account": (
+        "Creating an account is how you set MimicAI up: from then on your characters, keys and "
+        "settings are stored under your Discord ID. Nothing is stored for you before it.\n\n"
+        "**Where your messages go.** A reply sends the character, the recent conversation and any "
+        "attachments to the AI provider that character uses, and memory, ratings and web searches use "
+        "the same providers. Each is billed to whichever API key pays for it, including work beyond "
+        "the reply you see.\n"
+        "**What you control.** `/privacy` exports everything stored under your account, or deletes it.\n"
+        "**Adult profiles** are for those 18 and over.\n\n"
+        "This summarises the Terms of Service and Privacy Policy in force from {date}. "
+        "**Read the Terms** on the setup screen, or `/terms`, shows both in full."
     ),
     # Sent once None is chosen: the one choice that leaves something still to do.
     "provider_none": (
@@ -793,7 +807,7 @@ DEFAULT_HELP_DOCS = {
     # --- GETTING STARTED ---
     "start/setup_wizard.txt": (
         "Command: `/start` opens a guided setup wizard. It is the first thing a new user should run.\n"
-        "Concept: Five steps -- choose a provider (OpenRouter, Google or None), add your API key for it, get a character, add it to a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
+        "Concept: Five steps -- create your account (accept the Terms and choose a provider: OpenRouter, Google or None), add your API key for it, get a character, add it to a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
         "One screen: the checklist, then the step you are on with its buttons. The dropdown jumps to any step; a finished step you pick keeps its buttons where that makes sense -- switch provider, get another character, reopen the cast.\n"
         "Adding a key: works anywhere, a server channel included. 'Get a key' opens the provider's key page; 'Paste key' opens a private form, validates the key, saves it and makes it your Personal key. If you administer any servers, a dropdown under the step lists them -- the one you ran it in first, 21 per page with Previous, Next and jump-to-page -- and each tick is saved as you make it, with a confirmation first if another key already serves that server. `/settings` -> API Keys still manages all four slots.\n"
         "Context awareness: The wizard states where you are and what you can do there. Adding a character to a channel requires server administrator permission, or a channel on Open casting. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
@@ -802,7 +816,7 @@ DEFAULT_HELP_DOCS = {
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I do not know where to begin.' Fix: Run `/start`.\n"
         "- Symptom: 'Which API key should I get first?' or 'Do I have to pay to use this?' Fix: OpenRouter. One key reaches a few hundred models and some of them are free to run (DeepSeek V4 0731, and OpenRouter's Free Models Router), and only models some host is known to serve without training on prompts are offered. Add a paid Google Gemini key afterwards for Gemini's speech and image models.\n"
-        "- Symptom: 'The key step is locked.' or 'It says to run /start first.' Fix: Pick a provider first (None is fine). Choosing is how you set MimicAI up: nothing can be created, borrowed or saved for you before it. The key step then asks for that provider's key, or either with None.\n"
+        "- Symptom: 'The key step is locked.' or 'It says to run /start first.' Fix: Create your account first: press Create Account on step 1, tick the Terms and Privacy Policy, and choose a provider (None is fine). It is how you set MimicAI up: nothing can be created, borrowed or saved for you before it. The key step then asks for that provider's key, or either with None.\n"
         "- Symptom: 'Google refused my key.' Fix: Only a billing-enabled (paid) Google key is accepted. Turn billing on for the key's project, or choose OpenRouter instead.\n"
         "- Symptom: 'Add it to this channel is locked: needs an API key assigned to this server.' Fix: An administrator ticks the server in the key step's dropdown, or assigns a key in `/settings` -> API Keys.\n"
         "- Symptom: 'Add it to this channel is locked: needs an administrator.' Fix: Choosing a channel's cast needs server administrator permission, or Open casting. Ask an admin to run `/session config`, or make your own server to test in.\n"

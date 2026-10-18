@@ -34,7 +34,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from ..utils.constants import (CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, MODEL_PROVIDERS,
                                PROVIDER_CHOICES, PROVIDER_NONE, defaultConfig)
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
-from ..utils.content import HELP_CATEGORIES, SERVER_KEY_PITCH, WIZARD_COPY, WIZARD_TOUR
+from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, SERVER_KEY_PITCH, WIZARD_COPY,
+                             WIZARD_TOUR)
 from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
                               add_select)
 from .gui_settings import (KEY_SLOTS, SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
@@ -111,7 +112,7 @@ class _Step:
 # step table rather than inside `_Step` so a new gate is one line in each of two
 # places that sit together, and never a message assembled in the renderer.
 _GATE_REASONS = {
-    "provider": "pick a provider first (None is fine)",
+    "provider": "create your account first",
     "server_key": "needs an API key assigned to this server",
     "can_cast": "needs an administrator, or Open casting (anyone may add characters)",
 }
@@ -120,8 +121,9 @@ _GATE_REASONS = {
 WIZARD_STEPS = (
     # First: it decides which key the next step asks for, and it can be answered anywhere.
     # Answering it is registering -- the one way in (`ProfileManager.is_registered`) -- so
-    # every step that would store something waits on it.
-    _Step("provider", "Choose a provider",
+    # every step that would store something waits on it. The first answer comes only
+    # through `CreateAccountModal`, with the Terms accepted; the buttons are for switching.
+    _Step("provider", "Create your account",
           ("1. Getting Started", "API Keys and Where They Apply"),
           lambda s: bool(s["provider"]), repeatable=True,
           actions=("_act_prefer_openrouter", "_act_prefer_gemini", "_act_prefer_none"),
@@ -530,6 +532,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         "_act_prefer_openrouter": ("OpenRouter (recommended)", discord.ButtonStyle.success),
         "_act_prefer_gemini": ("Google", discord.ButtonStyle.secondary),
         "_act_prefer_none": ("None", discord.ButtonStyle.secondary),
+        "_act_create_account": ("Create Account", discord.ButtonStyle.success),
+        "_act_terms": ("📜 Read the Terms", discord.ButtonStyle.secondary),
         "_act_library": ("🏛️ Browse Library", discord.ButtonStyle.success),
         "_act_generate": ("✨ Generate one", discord.ButtonStyle.primary),
         "_act_cast": ("Open Cast Editor", discord.ButtonStyle.success),
@@ -541,6 +545,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         return [chosen] if chosen in KEY_PAGES else list(KEY_PAGES)
 
     def _action_buttons(self, step: _Step) -> List[ui.Button]:
+        if step.key == "provider" and not self._done(step):
+            return [self._make_action_button(name) for name in ("_act_create_account", "_act_terms")]
         if step.key != "key":
             return [self._make_action_button(name) for name in step.actions]
         providers = self._key_providers()
@@ -615,7 +621,22 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
     async def _act_prefer_none(self, interaction: discord.Interaction):
         await self._prefer(interaction, PROVIDER_NONE)
 
+    async def _act_create_account(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(CreateAccountModal(self))
+
+    async def _act_terms(self, interaction: discord.Interaction):
+        await self.cog.terms_slash.callback(self.cog, interaction)
+
     async def _prefer(self, interaction: discord.Interaction, provider: str):
+        """A provider button, which switches an account's provider. One left on a wizard
+        drawn before its account was deleted opens the Create Account form instead: an
+        account is never made without the Terms accepted."""
+        if not self.cog.profile_manager.is_registered(self.user_id):
+            await interaction.response.send_modal(CreateAccountModal(self))
+            return
+        await self._choose(interaction, provider)
+
+    async def _choose(self, interaction: discord.Interaction, provider: str):
         """Asked here, stored by the setter Override Defaults uses, and changed in either.
         The first answer registers the user: see `ProfileManager.is_registered`."""
         await interaction.response.defer()
@@ -720,3 +741,49 @@ class NewProfileModal(ui.Modal):
             image=self.image_input.values[0] if self.image_input.values else None,
             display_name=(self.display_name_input.value or "").strip() or None,
             avatar_url=(self.avatar_url_input.value or "").strip() or None)
+
+
+#: The Create Account form's provider choices, in the step's button order.
+_ACCOUNT_PROVIDERS = (
+    ("openrouter", "OpenRouter (recommended)",
+     "One key for Claude, GPT, DeepSeek and hundreds more, some free."),
+    ("gemini", "Google", "Gemini, with Google's image and speech models. Needs billing on."),
+    (PROVIDER_NONE, "None", "No default models: you choose them in /settings."),
+)
+
+#: What Create Account must have ticked, every one.
+_CONSENTS = {"terms": "I accept the Terms of Service",
+             "privacy": "I have read the Privacy Policy"}
+
+
+class CreateAccountModal(ui.Modal):
+    """Step 1's form: the Terms and the provider, in one submit, which is registering.
+
+    One form rather than an accept step ahead of the provider step, so there is never an
+    account without a provider for `is_registered` to answer about. Nothing new is stored:
+    `registered_at` is when the Terms were accepted, and which Terms is the version in
+    force that day.
+    """
+
+    def __init__(self, wizard: StartWizardView):
+        super().__init__(title="Create Your Account")
+        self.wizard = wizard
+        self.add_item(ui.TextDisplay(WIZARD_COPY["account"].format(date=LEGAL_EFFECTIVE_DATE)))
+        self.consent = ui.CheckboxGroup(
+            min_values=len(_CONSENTS), max_values=len(_CONSENTS),
+            options=[discord.CheckboxGroupOption(label=label, value=value)
+                     for value, label in _CONSENTS.items()])
+        self.add_item(ui.Label(text="Tick both to continue", component=self.consent))
+        self.provider = ui.RadioGroup(options=[
+            discord.RadioGroupOption(label=label, value=value, description=description)
+            for value, label, description in _ACCOUNT_PROVIDERS])
+        self.add_item(ui.Label(text="Your provider", component=self.provider,
+                               description="What new characters run on. Change it any time."))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Discord enforces both, but this is where an account is made, so it is checked here.
+        if set(self.consent.values) != set(_CONSENTS) or self.provider.value not in PROVIDER_CHOICES:
+            await interaction.response.send_message(
+                "Tick both boxes and choose a provider to create your account.", ephemeral=True)
+            return
+        await self.wizard._choose(interaction, self.provider.value)

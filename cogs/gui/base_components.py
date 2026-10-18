@@ -1,3 +1,5 @@
+import asyncio
+import time
 import traceback
 
 import discord
@@ -79,26 +81,65 @@ async def send_status(interaction: discord.Interaction, text: str) -> None:
     the response itself. The reply must then *replace* it, through `settle_status`: a
     followup would leave this sitting above it, and a view's timeout edits the original
     response, which has to be that reply.
+
+    It ticks as a reply's placeholder does: every ten seconds the embed shows how long the
+    command has run, so a slow model call does not look stalled.
     """
     await interaction.response.send_message(embed=_status_embed(text), ephemeral=True)
+    interaction.extras["status"] = [text, time.monotonic()]
+    interaction.extras["status_ticker"] = asyncio.create_task(_tick_status(interaction))
 
 
-def _status_embed(text: str) -> discord.Embed:
-    return discord.Embed(description=f"{PLACEHOLDER_EMOJI} {text}", colour=discord.Colour.blurple())
+def _status_embed(text: str, elapsed: float = 0.0) -> discord.Embed:
+    description = f"{PLACEHOLDER_EMOJI} {text}"
+    if elapsed >= 10:
+        description += f"\n-# {int(elapsed) // 60}:{int(elapsed) % 60:02d}"
+    return discord.Embed(description=description, colour=discord.Colour.blurple())
+
+
+def _status_now(interaction: discord.Interaction) -> discord.Embed:
+    """The status as it stands: its latest text, and how long the command has run."""
+    text, started = interaction.extras["status"]
+    return _status_embed(text, time.monotonic() - started)
+
+
+async def _tick_status(interaction: discord.Interaction) -> None:
+    """Redraws the status every ten seconds until `settle_status` cancels it. Bounded by the
+    interaction token's fifteen minutes, and ended by the first edit that fails, so a
+    command that died without settling stops ticking too."""
+    for _ in range(15 * 6):
+        await asyncio.sleep(10)
+        try:
+            await interaction.edit_original_response(embed=_status_now(interaction))
+        except Exception:
+            return
 
 
 async def update_status(interaction: discord.Interaction, text: str) -> None:
-    """Rewrites `send_status`'s embed as a slow command moves on. Progress only: a failed
-    edit is not the command's failure, so it is swallowed."""
+    """Rewrites `send_status`'s embed as a slow command moves on, keeping its running time.
+    Progress only: a failed edit is not the command's failure, so it is swallowed."""
+    interaction.extras.setdefault("status", [text, time.monotonic()])[0] = text
     try:
-        await interaction.edit_original_response(embed=_status_embed(text))
+        await interaction.edit_original_response(embed=_status_now(interaction))
     except discord.HTTPException:
         pass
 
 
 async def settle_status(interaction: discord.Interaction, content: Optional[str] = None, *,
                         embed: Optional[discord.Embed] = None, view=discord.utils.MISSING) -> None:
-    """Replace `send_status`'s embed with the reply -- what the first followup after a defer does."""
+    """Replace `send_status`'s embed with the reply -- what the first followup after a defer does.
+
+    Text arrives in the status's own embed, so the reply takes its place rather than
+    jumping to bare text, and gets an embed's 4096 characters where a message stops at
+    2000. A longer `/help ask` answer used to fail this edit and leave the status spinning.
+    """
+    ticker = interaction.extras.pop("status_ticker", None)
+    if ticker is not None:
+        ticker.cancel()
+        # Waited out, so no tick is still being written when the reply is.
+        await asyncio.wait((ticker,))
+    if content is not None and embed is None:
+        embed, content = discord.Embed(description=content[:4096], colour=discord.Colour.blurple()), None
     await interaction.edit_original_response(content=content, embed=embed, view=view)
 
 

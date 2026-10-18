@@ -252,7 +252,7 @@ PROVIDER_NONE = "none"
 PROVIDER_CHOICES = {**MODEL_PROVIDERS, PROVIDER_NONE: "None"}
 
 #: What every path that would create a user's data says to someone who has not set up.
-NOT_REGISTERED = ("Run `/start` first and choose a provider -- it is how you set MimicAI "
+NOT_REGISTERED = ("Run `/start` first and create your account -- it is how you set MimicAI "
                   "up, and nothing is stored for you until you do.")
 
 #: A value, deliberately not an alias for FALLBACK_MODEL_NAME: it was spelled that way

@@ -8,8 +8,8 @@ import time
 import asyncio
 import urllib.parse
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
-from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, billable_output_tokens,
-                             clean_model_name, openrouter_routing, resolve_auto_model,
+from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, _yield_message_chunks,
+                             billable_output_tokens, clean_model_name, openrouter_routing, resolve_auto_model,
                              strip_history_envelope, turn_posted_at)
 from ..utils.data_policy import may_pick_training_models
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
@@ -2402,11 +2402,12 @@ class SessionConfigView(BlockedGuard, ui.View):
             inline=False,
         )
         if synopses:
-            latest = next(
-                (t.get("content", "") for t in reversed(log) if t.get("type") == "synopsis"), ""
-            )
+            latest = self._latest_synopsis()
             if latest:
-                embed.add_field(name="Latest Synopsis", value=f"```{latest[:900]}```", inline=False)
+                # A field holds 1024 characters and a synopsis runs to 800 words, so this is a
+                # preview, cut where a reader can see it is. Read Synopsis shows all of it.
+                preview = latest if len(latest) <= 900 else latest[:900].rsplit(" ", 1)[0] + " \u2026"
+                embed.add_field(name="Latest Synopsis", value=f"```{preview}```", inline=False)
 
         self._add_toggle(
             "Toggle Rolling Synopsis", enabled,
@@ -2426,6 +2427,21 @@ class SessionConfigView(BlockedGuard, ui.View):
         async def uncompact(i: discord.Interaction):
             await self._run_manual_compaction(i, undo=True)
         add_button(self, "Uncompact", uncompact, row=1, disabled=not (folded or synopses))
+
+        async def read_synopsis(i: discord.Interaction):
+            # Read at the press: a round may have folded a newer one since the tab was drawn.
+            embeds = [discord.Embed(description=chunk, color=discord.Color.blurple())
+                      for chunk in _yield_message_chunks(self._latest_synopsis() or "(none)", 4096)]
+            embeds[0].title = "Latest Synopsis"
+            await i.response.send_message(embed=embeds[0], ephemeral=True)
+            for embed in embeds[1:]:
+                await i.followup.send(embed=embed, ephemeral=True)
+        add_button(self, "\U0001F4DC Read Synopsis", read_synopsis, row=1,
+                   style=discord.ButtonStyle.secondary, disabled=not synopses)
+
+    def _latest_synopsis(self) -> str:
+        return next((t.get("content", "") for t in reversed(self.session.get("unified_log") or [])
+                     if t.get("type") == "synopsis"), "")
 
     async def _run_manual_compaction(self, i: discord.Interaction, **kwargs):
         # Re-tested where it is acted on, as the tab bar is: this spends summariser calls,
