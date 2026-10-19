@@ -282,7 +282,7 @@ class ProfileManager:
         return profile_name in self._system_index()
 
     def _resolve_owner_and_pid(self, user_id: int, profile_name: str,
-                               is_borrowed: bool = False) -> Tuple[int, str]:
+                               is_borrowed: bool = False, strict: bool = False) -> Tuple[int, Optional[str]]:
         """(owner whose tree holds the shard, PID within it).
 
         Resolving the PID alone is not enough for a System profile: the shard lives
@@ -292,14 +292,21 @@ class ProfileManager:
 
         A borrow short-circuits -- the borrow shard genuinely belongs to the
         borrower, and its config is what names the source.
+
+        A name that maps to nothing comes back as the PID itself, unless `strict`, when
+        it comes back None. Soft is for reads: `_borrow_source` answers a vanished
+        source with its PID as the name. Writes are strict, as `_get_shard_path`'s are:
+        soft, a stale name minted `profiles/<name>/profile.json.gz`, and the next
+        rebuild adopted that as a profile nobody made.
         """
         index = self._get_user_index(user_id)
+        miss = None if strict else profile_name
 
         if is_borrowed:
             mapping = index.get("borrowed", {})
             if isinstance(mapping, dict):
-                return user_id, mapping.get(profile_name, profile_name)
-            return user_id, profile_name
+                return user_id, mapping.get(profile_name, miss)
+            return user_id, profile_name if profile_name in (mapping or ()) else miss
 
         personal = index.get("personal", {})
         if isinstance(personal, dict) and profile_name in personal:
@@ -310,15 +317,17 @@ class ProfileManager:
             return int(defaultConfig.DISCORD_OWNER_ID), system[profile_name]
 
         if isinstance(personal, dict):
-            return user_id, personal.get(profile_name, profile_name)
-        return user_id, profile_name
+            return user_id, personal.get(profile_name, miss)
+        return user_id, profile_name if profile_name in (personal or ()) else miss
 
-    def _resolve_prompt_owner_and_pid(self, user_id: int, profile_name: str) -> Tuple[int, str]:
+    def _resolve_prompt_owner_and_pid(self, user_id: int, profile_name: str,
+                                      strict: bool = False) -> Tuple[int, Optional[str]]:
         """(owner whose tree holds the shard, PID) without needing an is_borrowed flag.
 
         The prompt accessors take a name and no class, so they search personal,
         then borrowed, then System -- a borrow keeps its own copy of the prompts,
-        which is why it is consulted before the System fallback.
+        which is why it is consulted before the System fallback. `strict` as
+        `_resolve_owner_and_pid`'s.
         """
         index = self._get_user_index(user_id)
         for key in ("personal", "borrowed"):
@@ -330,10 +339,7 @@ class ProfileManager:
         if profile_name in system:
             return int(defaultConfig.DISCORD_OWNER_ID), system[profile_name]
 
-        return user_id, profile_name
-
-    def _get_pid_from_name(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> str:
-        return self._resolve_owner_and_pid(user_id, profile_name, is_borrowed)[1]
+        return user_id, None if strict else profile_name
 
     def _get_pid_from_name(self, user_id: int, profile_name: str) -> Optional[str]:
         """The PID this name resolves to for this user, or None if it resolves to none.
@@ -1111,8 +1117,9 @@ class ProfileManager:
     def _save_profile(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
         if not profile_name:
             return
-        eff_owner, pid = self._resolve_owner_and_pid(user_id, profile_name, is_borrowed)
+        eff_owner, pid = self._resolve_owner_and_pid(user_id, profile_name, is_borrowed, strict=True)
         if not pid:
+            print(f"Profile save skipped: '{profile_name}' resolves to no profile for {user_id}.")
             return
         # A resolved owner that is not the caller means a System profile reached
         # here under a member's id. Reads resolve across trees on purpose -- that is
@@ -1296,7 +1303,70 @@ class ProfileManager:
         # so both entries must go -- the stale key would otherwise linger until the
         # LRU evicted it.
         self._invalidate_content_rating(user_id, old_name)
+
+        # What holds the name in memory, carried across. The child bot registry is
+        # rebuilt only on a reconnect, so until then the bot answered under the old
+        # name -- no config, no persona -- and `/session swap` could not find it.
+        for p in (p for s in self.cog.multi_profile_channels.values() for p in s.get("profiles", [])):
+            if p["owner_id"] == user_id and p["profile_name"] == old_name:
+                p["profile_name"] = new_name
+        by_name = self.cog.child_bots_by_owner_profile
+        for bot_id, bot in self.cog.child_bots.items():
+            if bot.get("owner_id") == user_id and bot.get("pid") == pid:
+                bot["profile_name"] = new_name
+                by_name.pop((user_id, old_name), None)
+                by_name[(user_id, new_name)] = bot_id
+        old_key, new_key = ("global", user_id, old_name), ("global", user_id, new_name)
+        for cache in (self.cog.global_chat_sessions, self.cog.session_last_accessed):
+            if old_key in cache:
+                cache[new_key] = cache.pop(old_key)
         return True
+
+    async def delete_profiles(self, user_id: int, names: List[str]) -> int:
+        """Delete these profiles of one user, a personal one with every borrow of it.
+        Returns how many went.
+
+        The one delete, as `_rename_profile` is the one rename, and it forgets what holds
+        the name in memory for the same reason. Left behind, a linked child bot kept its
+        gateway connection and answered with no persona until a restart, and a new profile
+        given the old name wore the deleted one's avatar, rating and Global Chat. A seat in
+        a session is `_ensure_session_hydrated`'s to drop, by PID, on its next use.
+
+        The index is edited here on the loop -- `_get_user_index` hands back the dict every
+        handler shares -- and saved only after the directories are gone: shard first, index
+        second, or a crash in between leaves a shard nothing names, which a rebuild adopts.
+        """
+        index = self._get_user_index(user_id)
+        doomed = []
+        for name in names:
+            category = "borrowed" if name in index.get("borrowed", {}) else "personal"
+            if name not in index.get(category, {}):
+                continue
+            # Before the pop: the borrows' cached ratings are found by resolving them here.
+            self._invalidate_content_rating(user_id, name)
+            pid = index[category].pop(name)
+            if category == "personal":
+                self._cascade_delete_borrowed_profiles(user_id, pid)
+            doomed.append(pid)
+            self.cog.user_appearances.get(str(user_id), {}).pop(name, None)
+            key = ("global", user_id, name)
+            for cache in (self.cog.global_chat_sessions, self.cog.session_last_accessed,
+                          self.cog.dirty_sessions):
+                cache.pop(key, None)
+        if not doomed:
+            return 0
+
+        for bot_id, bot in list(self.cog.child_bots.items()):
+            if bot.get("owner_id") == user_id and bot.get("pid") in doomed:
+                self.cog.child_bots.pop(bot_id, None)
+                self.cog.child_bots_by_owner_profile.pop((user_id, bot.get("profile_name")), None)
+                await self.cog.manager_queue.put({"action": "shutdown_bot", "bot_id": bot_id})
+
+        profiles_dir = os.path.join(USERS_DIR, str(user_id), "profiles")
+        await asyncio.to_thread(lambda: [shutil.rmtree(os.path.join(profiles_dir, pid), ignore_errors=True)
+                                         for pid in doomed])
+        self._save_user_index(user_id, index)
+        return len(doomed)
 
     def _duplicate_profile(self, user_id: int, source_name: str, target_name: str) -> Tuple[bool, str]:
         user_index = self._get_user_index(user_id)
@@ -2324,8 +2394,10 @@ class ProfileManager:
         decides what to do about the rating going stale, interactively where there
         is a user to ask, and via resolve_stale_rating everywhere else.
         """
-        eff_owner, pid = self._resolve_prompt_owner_and_pid(user_id, profile_name)
-        if not pid: return
+        eff_owner, pid = self._resolve_prompt_owner_and_pid(user_id, profile_name, strict=True)
+        if not pid:
+            print(f"Prompt save skipped: '{profile_name}' resolves to no profile for {user_id}.")
+            return
         # See the note in _save_profile: reads cross into the bot owner's tree for a
         # System profile, writes do not.
         if eff_owner != user_id: return
@@ -4292,7 +4364,6 @@ class ProfileManager:
         for k in keys_to_del:
             self.cog.global_chat_sessions.pop(k, None)
             self.cog.session_last_accessed.pop(k, None)
-            self.cog.ltm_recall_history.pop(k, None)
 
         await interaction.followup.send("Account Deleted. All your profiles, memories, and settings have been permanently erased from this instance.", ephemeral=True)
 

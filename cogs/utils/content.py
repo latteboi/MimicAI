@@ -741,6 +741,23 @@ WIZARD_COPY = {
     ),
 }
 
+#: `/start`'s warning: for each permission in `BOT_PERMISSIONS`, the name Discord's settings
+#: give it and what goes wrong without it. Keyed by discord.py's flag names, which is what
+#: iterating a Permissions yields: `read_messages`, not its alias `view_channel`.
+PERMISSION_EFFECTS = {
+    "read_messages": ("View Channels", "can't see this channel at all"),
+    "send_messages": ("Send Messages", "can't post here"),
+    "send_messages_in_threads": ("Send Messages in Threads", "can't post in threads"),
+    "read_message_history": ("Read Message History", "can't reply to a message or read back earlier ones"),
+    "embed_links": ("Embed Links", "game tables and other embeds don't show"),
+    "attach_files": ("Attach Files", "a reply carrying an image or voice line fails"),
+    "add_reactions": ("Add Reactions", "can't react to messages"),
+    "external_emojis": ("Use External Emojis", "emojis from other servers show as text"),
+    "bypass_slowmode": ("Bypass Slowmode", "slowmode holds up a reply sent in several parts"),
+    "manage_webhooks": ("Manage Webhooks", "characters post under my name and avatar, not their own"),
+    "manage_messages": ("Manage Messages", "`/purge` leaves other people's messages behind"),
+}
+
 #: The second track: things worth knowing once setup is finished. Not steps -- none of
 #: them is a prerequisite and none has a completion state -- so they are pages, and a
 #: checklist that could never be finished is exactly what keeping them separate avoids.
@@ -1151,7 +1168,7 @@ DEFAULT_HELP_DOCS = {
         "Concept: Long-Term Memory (LTM) is a persistent, vector-embedded archive of past conversations. Maximum 5,000 memories per profile.\n"
         "Settings: Auto-Creation, Auto-Recall and Memory Search are three switches on one screen at `/profile manage` -> Memory -> Memory Settings, with a Creation Mode select and Creation Interval, Recall Context Size and Relevance Threshold behind its Parameters button.\n"
         "Creation: Each character keeps its own place in the conversation. Once it has replied 'Creation Interval' times since its last memory -- or 40 turns have passed, in a busy scene -- an auxiliary model reads everything said since then (the newest 40 turns at most) and keeps up to three things worth remembering, each stored and recalled on its own, or nothing. It reads public turns only -- never whispers -- with every time shown on that character's clock, and the scene's synopsis as background. A memory too close to one the character already has is dropped. If the model cannot be reached, the same turns are tried again one interval later. In 'When flagged' mode a character can end a reply with a marker (never shown, and carrying no text) that makes a memory due two replies in rather than at the interval; the Creation Interval is then the longest it waits, and for its next two replies the character is told a memory was written, so it does not flag the same moment twice. Only the timing changes: the same model reads the same public turns and may still keep nothing. Whispers, regenerations and Global Chat never flag. Toggle this off from 'Auto-Creation' if you would rather curate by hand. `/suspend` writes one last memory for each character before it clears the session.\n"
-        "Auto-Recall: When a user speaks, their prompt is embedded and compared against the LTM archive. If the score exceeds the 'Relevance Threshold', the memory is injected as `<archive_context>`, dated on the character's clock. New profiles start with this off, and turning Auto-Creation on turns it on with it; a profile created before the switch existed keeps recalling as it always did. Turning it off costs nothing per turn -- no shard read and no embedding.\n"
+        "Auto-Recall: When a user speaks, their prompt is embedded and compared against the LTM archive. If the score exceeds the 'Relevance Threshold', the memory is injected as `<archive_context>`, dated on the character's clock. A recalled memory stays there for the character's next three replies, so it can be referred back to, then rests a while before it can be recalled unprompted again. New profiles start with this off, and turning Auto-Creation on turns it on with it; a profile created before the switch existed keeps recalling as it always did. Turning it off stops the search -- no embedding per turn -- though what Memory Search found is still kept for its three replies.\n"
         "Memory Search: Retrieval above is automatic and searches on the turn's own wording. Turning on 'Memory Search' also lets the character run its own search, with a query it writes, when a reply needs something it cannot see -- which finds what the turn's wording would miss. While it is on the automatic pass tightens to its surest matches and the rest is reached by asking, so the stored Relevance Threshold applies again the moment it goes off. It costs one extra model request on the turns it actually searches, and needs a Google or OpenRouter model.\n"
         "Keys: Embedding uses the server's Google key, or its OpenRouter key when there is none or the Google request fails. Both ask for the same Google model, so one archive holds memories embedded either way.\n"
         "Where a memory applies: Every memory belongs to the server it formed in and is recalled only there. A profile used in several servers keeps a separate archive per server, and none of them reach global chat.\n"

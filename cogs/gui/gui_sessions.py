@@ -151,12 +151,23 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
         self.user_id = user_id
         self.profile_name = profile_name
         self.session_key = ('global', user_id, profile_name)
-        
+        # The card never times out, so it holds the profile by PID and its name only as
+        # of the last press: a rename between presses otherwise played the old name.
+        self.pid = cog.profile_manager._get_pid_from_name(user_id, profile_name)
+
+    def _follow_rename(self):
+        name = self.pid and self.cog.profile_manager._get_name_from_pid(
+            self.user_id, self.pid, include_borrowed=True)
+        if name and name != self.profile_name:
+            self.profile_name = name
+            self.session_key = ('global', self.user_id, name)
+
     async def initialize(self):
         await self._load_current_session()
         self._build_view()
-        
+
     async def _load_current_session(self) -> Dict:
+        self._follow_rename()
         # From disk, never an empty shell: the card outlives its cache entry, and an empty
         # log put back here is what the next Play would find and save over the history.
         session_data = self.cog.global_chat_sessions.get(self.session_key)
@@ -273,6 +284,7 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
         self.cog.bot.loop.create_task(self._wait_and_unlock(self.session_key, deadline, time_left))
 
     async def play_callback(self, interaction: discord.Interaction):
+        self._follow_rename()
         session_data = self.cog.global_chat_sessions.get(self.session_key)
         if not session_data: return
         

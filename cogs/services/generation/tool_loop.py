@@ -254,6 +254,8 @@ class LoopResult:
     #: One `function_call_label` per call, in the order they were made.
     calls: List[str] = field(default_factory=list)
     memories: List[str] = field(default_factory=list)
+    #: [id, similarity] for each memory, which the reply's trace keeps (`meta["ltm_ids"]`).
+    memory_ids: List[List[Any]] = field(default_factory=list)
     sources: List[Dict[str, Any]] = field(default_factory=list)
     #: The budget ran out: the last request forbade calls, so the character answered
     #: with what it had rather than asking again.
@@ -319,6 +321,8 @@ async def run(cog, model, contents: List[Any], gen_config: Optional[Dict[str, An
         for call, value in answered:
             result.calls.append(function_call_label(call, value))
             if isinstance(value, dict):
+                # For the trace alone: taken off before `exchange_turns` answers the model.
+                result.memory_ids.extend(value.pop("ltm_ids", None) or ())
                 result.memories.extend(m for m in (value.get(RECALL.found_key) or ())
                                        if isinstance(m, str))
                 result.sources.extend(src for src in (value.get(SEARCH_WEB.found_key) or ())

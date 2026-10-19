@@ -70,6 +70,8 @@ class ReplyAttempt:
     #: through a function response rather than the injected archive block, so nothing
     #: downstream can recover them from the prompt -- and the trace is judged on them.
     recalled_memories: List[str] = field(default_factory=list)
+    #: Their [id, similarity] pairs, which the trace keeps so they are held afterwards.
+    recalled_ids: List[List[Any]] = field(default_factory=list)
     #: Pages the character's own `search_web` calls cited. The legacy grounding mode
     #: collects its sources before the turn starts and the native one leaves them on the
     #: final response; this mode's arrive mid-turn on a function result, so without this
@@ -220,9 +222,11 @@ def _merge_sources(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
     return out
 
 
-def reply_meta(attempt: ReplyAttempt, *, duration: float, training_examples, ltm_recall_text,
+def reply_meta(attempt: ReplyAttempt, *, duration: float, training_examples, ltm_recall,
                sources, neuro_state, critic: Optional[Dict] = None, ltm_flag: bool = False) -> Dict:
-    """The trace a generated turn carries. Small: it rides in every turn of the log."""
+    """The trace a generated turn carries. Small: it rides in every turn of the log.
+
+    `ltm_recall` is the automatic pass's `LtmRecall`, or None where none ran."""
     response = attempt.response
     meta = {
         "duration": round(duration, 2),
@@ -240,16 +244,23 @@ def reply_meta(attempt: ReplyAttempt, *, duration: float, training_examples, ltm
     # automatic pass injected, then whatever it fetched by calling `recall`. Only the
     # first used to be recorded, and a tool result never touches the prompt text -- so
     # switching Memory Search on, which raises the automatic threshold, made the audit
-    # read `0 memories` on precisely the turns that had recalled the most.
-    lines = ([l.strip() for l in ltm_recall_text.split('\n')
-              if l.strip() and not l.startswith("<")] if ltm_recall_text else [])
-    lines.extend(m.strip() for m in attempt.recalled_memories if m and m.strip())
+    # read `0 memories` on precisely the turns that had recalled the most. The memories
+    # themselves, never lines of the block: its wording is /mod's, and carries prose.
+    lines = [m.strip() for m in [*(ltm_recall.summaries if ltm_recall else ()),
+                                 *attempt.recalled_memories] if m and m.strip()]
     seen = set()
     for line in lines:
         clipped = line[:100] + "..." if len(line) > 100 else line
         if clipped not in seen:
             seen.add(clipped)
             meta["ltms_recalled"].append(clipped)
+    # What `_recent_recalls` reads the hold and the cooldown back from: newly recalled
+    # only, so a held memory is not re-held forever. Sparse.
+    ids: Dict[Any, Any] = {}
+    for ltm_id, sim in [*(ltm_recall.ids if ltm_recall else ()), *attempt.recalled_ids]:
+        ids.setdefault(ltm_id, sim)
+    if ids:
+        meta["ltm_ids"] = [[ltm_id, sim] for ltm_id, sim in ids.items()]
     if neuro_state:
         meta["neuro_state"] = neuro_state
     if critic:
@@ -372,6 +383,7 @@ class ReplyMixin:
                 # history, and the trace describes the reply that was actually posted.
                 run.looped.record(attempt.extra_meta)
                 attempt.recalled_memories = run.looped.memories
+                attempt.recalled_ids = run.looped.memory_ids
                 attempt.search_sources = run.looped.sources
             if answered:
                 attempt.answered_by = run.model

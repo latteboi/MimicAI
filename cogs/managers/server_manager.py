@@ -510,7 +510,7 @@ class ServerManager:
 
         if suspend_sessions:
             # A channel session has no host -- `_participant_key` is (owner_id,
-            # profile_name) and that is the only claim anyone has on one. So this is
+            # pid) and that is the only claim anyone has on one. So this is
             # "every session one of their profiles is seated in", which is also what
             # keeps generating in their name.
             seated = [cid for cid, session in self.cog.multi_profile_channels.items()

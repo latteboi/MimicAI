@@ -182,12 +182,8 @@ content classifier that confines profiles declared 18+ to age-restricted channel
    - **Reset Token** to get your bot token.
    - Under *Privileged Gateway Intents*, enable **Presence**, **Server Members** and
      **Message Content**. All three are required.
-4. Under **OAuth2 → URL Generator**:
-   - Scopes: `bot`, `applications.commands`.
-   - Permissions: `Administrator`, or individually — View Channels, Send Messages, Send
-     Messages in Threads, Manage Messages, Manage Webhooks, Embed Links, Attach Files,
-     Read Message History, Use External Emojis, Bypass Slowmode.
-   - Use the generated link to invite the bot.
+
+There is no invite link to build: the bot prints its own once it runs (step 3).
 
 ### 2. Install
 
@@ -210,6 +206,10 @@ source .venv/bin/activate && python3 BotManager.py
 # Windows
 .venv\Scripts\python.exe BotManager.py
 ```
+
+Once it is online the console prints `Invite link: …`. Open it to add the bot to your
+server; `/invite` posts the same link from inside Discord. A self-hosted bot's link asks for
+**Administrator**, since it is your own bot. The official bot's asks only for what it uses.
 
 ### 4. Add an API key
 

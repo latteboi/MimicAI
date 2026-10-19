@@ -375,9 +375,11 @@ class SpeakAsMixin:
             turn_object = {
                 "turn_id": turn_id,
                 "is_user": False,
+                # The seat's, as the worker's turns are: the owner the PID belongs to. A
+                # borrow was filed under its source, so the pair named no one profile.
                 "speaker_pid": self.cog.profile_manager._get_pid_from_name_any(ctx["user_id"], ctx["profile_name"]),
-                "owner_id": ctx["effective_owner_id"],
-                "profile_name": ctx["effective_profile_name"],
+                "owner_id": ctx["user_id"],
+                "profile_name": ctx["profile_name"],
                 "message_ids": [],
                 "content": history_line,
                 # Who put these words in the character's mouth. The attribution used to

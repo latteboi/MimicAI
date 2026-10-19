@@ -62,6 +62,8 @@ class EventListeners:
             await self.server_manager.enforce_guild_blocks()
 
             await self._cache_command_ids()
+            # A fresh self-hosted bot is in no server yet, so there is nowhere to run /invite.
+            print(f"Invite link: {invite_url(self.bot, self.bot.user.id, BOT_PERMISSIONS)}")
             self.profile_manager._get_or_create_system_profile("mimicguide")
             self.bot.loop.create_task(self.help_service._load_and_embed_docs())
             
@@ -289,13 +291,13 @@ class EventListeners:
                     
                     if turn_object and turn_object.get("is_user") is False:
                         bot_pid = turn_object.get("speaker_pid")
-                        o_id = turn_object.get("owner_id")
-                        p_name = turn_object.get("profile_name")
-                        
-                        replied_to_participant = next((p for p in session.get('profiles', []) if self.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name']) == bot_pid), None)
-                        
-                        if not replied_to_participant and o_id and p_name:
+
+                        replied_to_participant = next((p for p in session.get('profiles', []) if self.session_manager.participant_identity(p)[1] == bot_pid), None)
+                        speaker = None if replied_to_participant else self.session_manager.turn_speaker(turn_object)
+
+                        if speaker:
                             # Reconstruct ephemeral participant
+                            o_id, p_name = speaker
                             method = 'webhook'
                             bot_id = None
                             linked_bot_id = self.child_bots_by_owner_profile.get((o_id, p_name))
@@ -304,7 +306,7 @@ class EventListeners:
                                 bot_id = linked_bot_id
                             
                             replied_to_participant = {
-                                "owner_id": o_id, "profile_name": p_name,
+                                "owner_id": o_id, "profile_name": p_name, "pid": bot_pid,
                                 "method": method, "bot_id": bot_id, "ephemeral": True
                             }
 
@@ -993,7 +995,6 @@ class EventListeners:
                                 self.global_chat_sessions.pop(session_key, None)
                                 self.session_last_accessed.pop(session_key, None)
                                 await self.session_manager._delete_session_from_disk(session_key, 'global_chat')
-                                self.ltm_recall_history.pop(session_key, None)
                             else:
                                 await self.session_manager._save_session_to_disk(session_key, 'global_chat', session_data)
                                 self.session_manager._mark_session_accessed(session_key)

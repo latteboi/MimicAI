@@ -11,7 +11,7 @@ import asyncio
 import datetime
 import traceback
 from collections import OrderedDict
-from typing import TYPE_CHECKING, Dict, List, Any, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Any, NamedTuple, Optional, Sequence, Tuple
 import discord
 
 
@@ -50,7 +50,8 @@ from ..utils.constants import (
     defaultConfig, DEFAULT_SAFETY_SETTINGS,
     MAX_LTM_SUMMARY_CHARACTERS, MIN_HISTORY_FOR_LTM_CREATION, LTM_MAX_PER_CAPTURE,
     DEFAULT_TRAINING_ANALYST_PROMPT, GREEDY_SAMPLING,
-    RECALL_TOOL_MAX, RECALL_TOOL_THRESHOLD,
+    RECALL_TOOL_MAX, RECALL_TOOL_THRESHOLD, LTM_HOLD_REPLIES, LTM_RECALL_SPAN,
+    DEFAULT_ARCHIVE_CONTEXT,
 )
 from ..utils.helpers import (TURN_TIME_FORMAT, Timeout, _format_api_error, _resolve_zoneinfo,
                             clip_to_sentence, ltm_auto_recall_enabled,
@@ -283,6 +284,42 @@ def _cached_vectors(cache, key, max_rows, build, *build_args):
     return vectors
 
 
+def _recent_recalls(log: list, speaker_pid: str) -> Tuple[List[str], Dict[str, Tuple[int, float]]]:
+    """What a speaker's recent replies recalled, read off their traces (`meta["ltm_ids"]`).
+
+    The ids still held -- recalled within its last `LTM_HOLD_REPLIES` replies, newest
+    first -- and {id: (turns back, similarity)} for the cooldown. Derived from the log
+    rather than kept beside it, so it survives a restart, and a deleted or regenerated
+    turn takes its recalls with it.
+    """
+    held: List[str] = []
+    recalls: Dict[str, Tuple[int, float]] = {}
+    replies = 0
+    for back, turn in enumerate(reversed(log[-LTM_RECALL_SPAN:]), 1):
+        if turn.get("speaker_pid") != speaker_pid:
+            continue
+        replies += 1
+        for ltm_id, sim in (turn.get("meta") or {}).get("ltm_ids") or ():
+            if ltm_id not in recalls:
+                recalls[ltm_id] = (back, sim)
+                if replies <= LTM_HOLD_REPLIES:
+                    held.append(ltm_id)
+    return held, recalls
+
+
+def _trace_ids(found) -> List[List[Any]]:
+    """`_search_ltm`'s fresh recalls as a reply's trace stores them: [[id, similarity]]."""
+    return [[ltm_id, round(sim, 3)] for ltm_id, sim, _ in found if ltm_id]
+
+
+class LtmRecall(NamedTuple):
+    """One automatic pass: the block injected, the memories in it, and the ids newly
+    recalled. The trace reads `summaries` rather than the block, whose wording /mod owns."""
+    text: Optional[str] = None
+    summaries: Sequence[str] = ()
+    ids: Sequence[Sequence[Any]] = ()
+
+
 # --- Training shard vector cache -----------------------------------------------
 #
 # Same stat-stamped, pre-normalised scheme as the LTM cache above, for the same reason:
@@ -407,11 +444,14 @@ class MemoryManager:
         """Resolves which user/profile folder LTM data should be read from or written to,
         redirecting to the borrower's local copy when running inside a borrowed multi-profile session."""
         if session_owner_id and session_owner_id != profile_owner_id:
-            recip_index = self.cog.profile_manager._get_user_index(session_owner_id)
-            current_pid = self.cog.profile_manager._get_pid_from_name_any(profile_owner_id, profile_name)
-            for b_name in recip_index.get("borrowed", []):
-                b_config = self.cog.profile_manager._get_profile_config(session_owner_id, b_name, True) or {}
-                if int(b_config.get("original_owner_id", 0)) == profile_owner_id and b_config.get("original_profile_id") == current_pid:
+            pm = self.cog.profile_manager
+            # The borrow index, not a read of every borrow's config.
+            held = {b_pid for borrower, b_pid in pm._borrowers_of(
+                profile_owner_id, pm._get_pid_from_name(profile_owner_id, profile_name))
+                    if borrower == session_owner_id}
+            borrowed = pm._get_user_index(session_owner_id).get("borrowed")
+            for b_name, b_pid in (borrowed.items() if isinstance(borrowed, dict) else ()):
+                if b_pid in held:
                     return session_owner_id, b_name
         return profile_owner_id, profile_name
 
@@ -699,8 +739,11 @@ class MemoryManager:
                           profile_name: str, msg_content: str, author_dn: str,
                           guild_id: Optional[int], triggering_user_id: int, *,
                           threshold: Optional[float] = None, size: Optional[int] = None,
-                          use_cooldown: bool = True) -> List[str]:
-        """The memories `msg_content` retrieves, each prefixed with the date it was made.
+                          use_cooldown: bool = True, search: bool = True,
+                          ) -> Tuple[List[str], List[Tuple[str, float, str]]]:
+        """(held, found): the summaries this speaker's recent replies recalled and still
+        hold, and (id, similarity, summary) for what `msg_content` newly retrieves --
+        each summary prefixed with the date it was made.
 
         Shared by the automatic pass and the `recall` function, which want the same
         search on different terms. The keyword arguments are what differs: an explicit
@@ -710,35 +753,28 @@ class MemoryManager:
         That last one matters. The cooldown exists to stop the same memory being
         *re-injected unasked* every turn it happens to match. A character that has just
         asked for something is entitled to be told, however recently it was last shown.
+
+        Both read off `history`, which must be the session's log: a held memory stays
+        in the archive block for `LTM_HOLD_REPLIES` replies so the character can refer
+        back to it, and is kept out of the search meanwhile so it never shows twice.
+        `search` False returns the held ones alone, without embedding anything.
         """
-        index = self.cog.profile_manager._get_user_index(profile_owner_id)
-        is_borrowed = profile_name in index.get("borrowed", [])
+        held_ids, recalls = (_recent_recalls(
+            history, self.cog.profile_manager._get_pid_from_name_any(profile_owner_id, profile_name))
+            if use_cooldown else ([], {}))
+        if not search and not held_ids:
+            return [], []
 
-        if is_borrowed:
-            borrowed_data = self.cog.profile_manager._get_profile_config(profile_owner_id, profile_name, True) or {}
-            owner_id = int(borrowed_data.get("original_owner_id", profile_owner_id))
-            owner_profile_id = borrowed_data.get("original_profile_id")
-
-            if owner_profile_id:
-                # Same dead `config.json.gz` path as the hub carried: the file is
-                # profile.json.gz with the config nested inside. Reading the missing
-                # path yielded {}, and the `if not params_source: return None` below
-                # then returned before retrieval -- so every borrowed profile (each
-                # borrow writes original_profile_id) silently recalled no long-term
-                # memories at all.
-                owner_profile_data = self.cog.profile_manager._get_profile_by_pid(owner_id, owner_profile_id) or {}
-                params_source = owner_profile_data.get("config") or {}
-            else:
-                owner_profile_name = borrowed_data.get("original_profile_name", profile_name)
-                params_source = self.cog.profile_manager._get_profile_config(owner_id, owner_profile_name, False) or {}
-
-            params_to_use = borrowed_data
+        pm = self.cog.profile_manager
+        # A borrow's source through its PID pointer, as everywhere -- see _borrow_source.
+        params_source = pm.author_config(profile_owner_id, profile_name)
+        if profile_name in pm._get_user_index(profile_owner_id).get("borrowed", []):
+            params_to_use = pm._get_profile_config(profile_owner_id, profile_name, True) or {}
         else:
-            params_source = self.cog.profile_manager._get_profile_config(profile_owner_id, profile_name, False) or {}
             params_to_use = params_source
 
         if not params_source:
-            return []
+            return [], []
 
         ltm_context_size = int(size if size is not None else params_to_use.get(
             "ltm_context_size", params_source.get("ltm_context_size", 3)))
@@ -746,7 +782,9 @@ class MemoryManager:
             "ltm_relevance_threshold", params_source.get("ltm_relevance_threshold", 0.75)))
 
         if ltm_context_size == 0:
-            return []
+            return [], []
+        # Bounded like the search, so the archive block is at most twice its setting.
+        held_ids = held_ids[:ltm_context_size]
 
         # Redirect LTM loads to the borrower's local path if running in a borrowed session
         session_owner_id = None
@@ -768,21 +806,16 @@ class MemoryManager:
         # The early exit is kept so an empty shard still skips the embedding round trip.
         ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, ltm_profile_name)
         if not ltm_data:
-            return []
+            return [], []
         all_profile_ltms = ltm_data.get(context_type, [])
         if not all_profile_ltms:
-            return []
+            return [], []
 
-        prompt_embedding = await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
-        if not prompt_embedding:
-            return []
-
-        # `history` must be the session's log, not a prompt's windowed history: this length
-        # is the turn count the cooldown runs on, and a window's stops growing once it is
-        # full (and steps back, see _build_history_for_participant), so a memory recalled
-        # in a long session never came off cooldown.
-        current_turn = len(history)
-        session_cooldown_history = self.cog.ltm_recall_history.get(session_key, {}) if use_cooldown else {}
+        prompt_embedding = None
+        if search:
+            prompt_embedding = await self._get_embedding(msg_content, guild_id, task_type="RETRIEVAL_QUERY")
+            if not prompt_embedding and not held_ids:
+                return [], []
 
         ltm_cache_key = self._ltm_cache_key(owner_id_str, ltm_profile_name)
 
@@ -794,29 +827,36 @@ class MemoryManager:
                 _build_ltm_vectors, all_profile_ltms,
             )
             if vectors is None:
-                return None
+                return [], []
+
+            # A memory deleted since it was recalled has no row, and is simply not held.
+            held = [all_profile_ltms[vectors.rows[row]]
+                    for row in (vectors.id_to_row.get(i) for i in held_ids) if row is not None]
+            if not prompt_embedding:
+                return held, []
 
             # Guild membership is grouped at build time, so scoping the shard to the
             # one guild that can be recalled here is a dict lookup, and every array
             # below is already only as wide as that guild.
             guild_idx = vectors.guild_rows.get(guild_id_str)
             if guild_idx is None:
-                return None
+                return held, []
 
-            # Cooldown is keyed off session state rather than the file, so it cannot be
+            # Cooldown is read off the session log rather than the file, so it cannot be
             # cached -- but it is only ever as large as the set of memories this session
-            # has already recalled, so it is walked directly instead of scanned for.
+            # has recently recalled, so it is walked directly instead of scanned for.
+            held_set = set(held_ids)
             blocked = []
-            for ltm_id, (last_turn, last_sim) in session_cooldown_history.items():
+            for ltm_id, (back, last_sim) in recalls.items():
                 row = vectors.id_to_row.get(ltm_id)
-                if row is not None and current_turn - last_turn < (5 + (1 - last_sim) * 25):
+                if row is not None and (ltm_id in held_set or back < 5 + (1 - last_sim) * 25):
                     blocked.append(row)
             if blocked:
                 keep = np.ones(vectors.n, dtype=bool)
                 keep[np.array(blocked, dtype=np.intp)] = False
                 guild_idx = guild_idx[keep[guild_idx]]
                 if guild_idx.size == 0:
-                    return None
+                    return held, []
 
             prompt_vec = np.array(prompt_embedding, dtype=np.float32)
             prompt_norm = np.linalg.norm(prompt_vec)
@@ -828,7 +868,7 @@ class MemoryManager:
 
             eligible = np.flatnonzero(similarities >= ltm_relevance_threshold)
             if eligible.size == 0:
-                return None
+                return held, []
 
             cand_rows = guild_idx[eligible]
             # The one gather the MMR loop needs. The version this replaces re-gathered a
@@ -851,43 +891,25 @@ class MemoryManager:
                 scores *= 1.0 - (cand_mat @ cand_mat[best]) * 0.75
                 scores[best] = -np.inf
 
-            return [
-                {
-                    "ltm": all_profile_ltms[vectors.rows[int(cand_rows[p])]],
-                    "original_sim": float(original_sims[p]),
-                }
+            return held, [
+                (all_profile_ltms[vectors.rows[int(cand_rows[p])]], float(original_sims[p]))
                 for p in picked
             ]
 
-        final_memories = await asyncio.to_thread(_thread_search_ltm)
-
-        if not final_memories:
-            return []
-
-        # Written under the same flag that reads it. An explicit recall passes no
-        # session_key -- it does not consult the cooldown -- and recording one anyway
-        # would file every deliberate lookup under the key None and then suppress those
-        # memories from the automatic pass of a session that never showed them.
-        if use_cooldown and session_key not in self.cog.ltm_recall_history:
-            self.cog.ltm_recall_history[session_key] = {}
+        held, found = await asyncio.to_thread(_thread_search_ltm)
 
         # Dated on the character's clock. Undated, "promised him cake" reads the same a
         # week on as three years on, and a character has no other way to tell.
         clock, _ = _resolve_zoneinfo(params_to_use.get("timezone"))
-        recalled_summaries = []
-        for mem_data in final_memories:
-            ltm = mem_data["ltm"]
-            if use_cooldown:
-                self.cog.ltm_recall_history[session_key][ltm['id']] = (current_turn, mem_data["original_sim"])
 
-            decrypted_sum = self.cog.storage_manager._decrypt_data(ltm.get('sum', ''))
+        def dated(ltm) -> str:
+            summary = self.cog.storage_manager._decrypt_data(ltm.get('sum', ''))
             date = entry_date(ltm, clock)
-            recalled_summaries.append(f"[{date}] {decrypted_sum}" if date else decrypted_sum)
+            return f"[{date}] {summary}" if date else summary
 
-        if not recalled_summaries:
-            return []
-
-        return recalled_summaries
+        # Nothing is recorded here: the reply's trace keeps what it recalled
+        # (`_trace_ids`), so a turn that is never written puts nothing on cooldown.
+        return [dated(ltm) for ltm in held], [(ltm.get('id'), sim, dated(ltm)) for ltm, sim in found]
 
     async def recall_for_tool(self, profile_owner_id: int, profile_name: str, query: str,
                               author_dn: str, guild_id: Optional[int],
@@ -900,18 +922,24 @@ class MemoryManager:
         A miss is answered rather than left empty. "I searched and there is nothing"
         and "the search never ran" are the same silence to a model, and the second one
         is what invites it to invent a memory instead.
+
+        `ltm_ids` is for the reply's trace, so what was fetched is held afterwards like
+        any recall; `tool_loop.run` takes it off before the model is answered.
         """
-        summaries = await self._search_ltm(
+        _, found = await self._search_ltm(
             None, [], profile_owner_id, profile_name, query, author_dn, guild_id,
             triggering_user_id, threshold=RECALL_TOOL_THRESHOLD, size=RECALL_TOOL_MAX,
             use_cooldown=False)
-        if not summaries:
+        if not found:
             return {"memories": [],
                     "note": "Nothing in your long-term memories matches that."}
-        return {"memories": summaries}
+        return {"memories": [summary for _, _, summary in found], "ltm_ids": _trace_ids(found)}
 
-    async def _get_relevant_ltm_for_prompt(self, session_key: Any, history: list, profile_owner_id: int, profile_name: str, msg_content: str, author_dn: str, guild_id: Optional[int], triggering_user_id: int, *, threshold: Optional[float] = None) -> Optional[str]:
-        """The automatic pass: what this round retrieves, wrapped for injection.
+    async def _get_relevant_ltm_for_prompt(self, session_key: Any, history: list, profile_owner_id: int, profile_name: str, msg_content: str, author_dn: str, guild_id: Optional[int], triggering_user_id: int, *, threshold: Optional[float] = None) -> LtmRecall:
+        """The automatic pass: what this round retrieves, wrapped for injection in /mod's
+        `ARCHIVE_CONTEXT`, and the ids it newly recalled -- for the reply's trace
+        (`meta["ltm_ids"]`), which the hold and the cooldown are read back from. Held
+        memories lead the block.
 
         `threshold` is raised to `LTM_AUTO_THRESHOLD_WITH_TOOL` by callers whose profile
         also declares `recall`, so the unasked injection narrows to what retrieval is
@@ -923,21 +951,23 @@ class MemoryManager:
         the shard read *and* the query embedding -- a profile with this off pays nothing
         per turn rather than paying for a search whose result is discarded. `recall`
         does not come through here and is deliberately unaffected: pull-only retrieval
-        is its own mode.
+        is its own mode -- and what it fetched is still held with the toggle off, which
+        reads the shard only while something is.
         """
         index = self.cog.profile_manager._get_user_index(profile_owner_id)
         is_borrowed = profile_name in index.get("borrowed", [])
         config = self.cog.profile_manager._get_profile_config(
             profile_owner_id, profile_name, is_borrowed) or {}
-        if not ltm_auto_recall_enabled(config):
-            return None
 
-        summaries = await self._search_ltm(
+        held, found = await self._search_ltm(
             session_key, history, profile_owner_id, profile_name, msg_content,
-            author_dn, guild_id, triggering_user_id, threshold=threshold)
+            author_dn, guild_id, triggering_user_id, threshold=threshold,
+            search=ltm_auto_recall_enabled(config))
+        summaries = held + [summary for _, _, summary in found]
         if not summaries:
-            return None
-        return "<archive_context>\n" + "\n".join(summaries) + "\n</archive_context>"
+            return LtmRecall()
+        template = self.cog.global_prompts.get("ARCHIVE_CONTEXT", DEFAULT_ARCHIVE_CONTEXT)
+        return LtmRecall(template.format(memories="\n".join(summaries)), summaries, _trace_ids(found))
 
     async def _get_relevant_training_examples(self, profile_owner_id: int, profile_name: str, msg_content:str, guild_id: int)->List[str]:
         # [UPDATED] Check context size before disk or API activity

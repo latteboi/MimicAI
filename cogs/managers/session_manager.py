@@ -359,10 +359,14 @@ class SessionManager:
             session["_home"] = home
         return home
 
-    def _get_session_path(self, session_key: Any, session_type: str) -> pathlib.Path:
+    def _get_session_path(self, session_key: Any, session_type: str) -> Optional[pathlib.Path]:
+        """None for a Global Chat whose name resolves to no profile. Soft, a stale name
+        wrote `profiles/<name>/global_chat.json.gz` -- see `_get_shard_path`."""
         if session_type == 'global_chat':
             _, user_id, profile_name = session_key
-            pid = self.cog.profile_manager._get_pid_from_name_any(user_id, profile_name)
+            pid = self.cog.profile_manager._get_pid_from_name(user_id, profile_name)
+            if not pid:
+                return None
             return pathlib.Path(USERS_DIR) / str(user_id) / "profiles" / pid / "global_chat.json.gz"
 
         dir_path = self._get_session_dir_path(session_key, session_type)
@@ -510,6 +514,9 @@ class SessionManager:
 
         try:
             path = self._get_session_path(session_key, session_type)
+            if path is None:
+                print(f"Session save skipped: {session_key} resolves to no profile.")
+                return
             hot_path = self._get_session_hot_path(session_key, session_type)
             data_copy = list(data_to_save) if isinstance(data_to_save, list) else data_to_save.copy()
 
@@ -582,7 +589,7 @@ class SessionManager:
         """
         try:
             path = self._get_session_path(session_key, session_type)
-            if not path.exists():
+            if path is None or not path.exists():
                 return None, 0
             hot_path = self._get_session_hot_path(session_key, session_type)
 
@@ -647,7 +654,8 @@ class SessionManager:
     async def _delete_session_from_disk(self, session_key: Any, session_type: str):
         try:
             path = self._get_session_path(session_key, session_type)
-            await asyncio.to_thread(_delete_file_shard, str(path))
+            if path is not None:
+                await asyncio.to_thread(_delete_file_shard, str(path))
             hot_path = self._get_session_hot_path(session_key, session_type)
             if hot_path is not None:
                 await asyncio.to_thread(_delete_file_shard, str(hot_path))
@@ -683,12 +691,6 @@ class SessionManager:
             return False
 
         for participant in session.get("profiles", []):
-            p_oid = participant.get("owner_id")
-            p_name = participant.get("profile_name")
-            if p_oid and p_name:
-                # Clear the LTM recall penalty history for this profile.
-                self.cog.ltm_recall_history.pop((channel_id, p_oid, p_name), None)
-
             if participant.get("method") == "child_bot":
                 bot_id = participant.get("bot_id")
                 if bot_id:
@@ -925,6 +927,26 @@ class SessionManager:
         pid = participant.get("pid") or self.cog.profile_manager._get_pid_from_name_any(
             owner_id, participant.get("profile_name") or "")
         return (owner_id, pid)
+
+    def turn_speaker(self, turn: Dict) -> Optional[Tuple[int, str]]:
+        """(owner_id, current name) of the profile that spoke `turn`, by its `speaker_pid`.
+
+        None when that profile is gone. The turn's `owner_id`/`profile_name` are a
+        snapshot of the day it was spoken: rebuilt from them, a reply to a profile
+        renamed since spoke under a name that named nothing -- an empty persona -- and,
+        once the name was reused, as somebody else.
+
+        `authored_by` is tried second for `/speak` turns written before it filed a
+        borrow's turn under the borrower: the PID is the borrow's, the owner its source's.
+        """
+        pid = turn.get("speaker_pid")
+        if not pid:
+            return None
+        for owner in dict.fromkeys(o for o in (turn.get("owner_id"), turn.get("authored_by")) if o):
+            name = self.cog.profile_manager._get_name_from_pid(int(owner), pid, include_borrowed=True)
+            if name:
+                return int(owner), name
+        return None
 
     def _repair_participant_identity(self, participants: List[Dict]) -> bool:
         """Stamp a missing PID and re-spell a stale name, in place. True if changed.
@@ -1425,9 +1447,12 @@ class SessionManager:
                 p_owner_id = p["owner_id"]
                 p_name = p["profile_name"]
 
-                # Verify if the profile continues to exist for the owner
+                # By PID where the seat has one: by name, a profile deleted and another
+                # made under its name kept the seat, and spoke as the stranger.
                 p_index = self.cog.profile_manager._get_user_index(p_owner_id)
-                exists = (p_name in p_index.get("personal", {})) or (p_name in p_index.get("borrowed", {})) or (p_name in p_index.get("system", {}))
+                exists = (self.cog.profile_manager._get_name_from_pid(p_owner_id, p["pid"], include_borrowed=True)
+                          is not None if p.get("pid") else
+                          any(p_name in p_index.get(c, {}) for c in ("personal", "borrowed", "system")))
 
                 if exists:
                     valid_profiles.append(p)
@@ -1440,13 +1465,10 @@ class SessionManager:
                         })
 
             if cleaned_any:
+                # An emptied cast stays a session: /suspend ends one. This used to delete
+                # the channel's whole log when its last character was deleted.
                 session["profiles"] = valid_profiles
                 self._save_multi_profile_sessions()
-                if not session["profiles"]:
-                    self.cog.multi_profile_channels.pop(channel_id, None)
-                    dummy_session_key = (channel_id, None, None)
-                    await self._delete_session_from_disk(dummy_session_key, session_type)
-                    return None
 
         if session and session.get("is_hydrated"):
             return session
@@ -1701,10 +1723,6 @@ class SessionManager:
                     session_to_evict.pop('cancelled_reaction_triggers', None)
                     session_to_evict.pop('deleted_unlogged_messages', None)
                     session_to_evict.pop('pending_whispers', None)
-                    # Clean up LTM recall history for participants in this channel to prevent RAM leak
-                    for p in session_to_evict.get("profiles", []):
-                        full_key = (key, p.get("owner_id"), p.get("profile_name"))
-                        self.cog.ltm_recall_history.pop(full_key, None)
 
                     # If it's a completely empty dormant session, pop it entirely to save memory.
                     if not session_to_evict.get("profiles"):
@@ -1718,7 +1736,6 @@ class SessionManager:
                     await self._save_session_to_disk(key, 'global_chat', session_to_save)
 
                 self.cog.global_chat_sessions.pop(key, None)
-                self.cog.ltm_recall_history.pop(key, None)
 
             # Remove from tracking dict after processing
             self.cog.session_last_accessed.pop(key, None)

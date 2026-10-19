@@ -1548,6 +1548,15 @@ RECALL_TOOL_MAX = 5
 #: the retrieval is sure of and the rest is available by asking.
 LTM_AUTO_THRESHOLD_WITH_TOOL = 0.85
 
+#: How many of the character's own replies a recalled memory stays in its archive block
+#: after the reply that recalled it. Shown for that one reply alone, a memory could not
+#: be referred back to: gone from the prompt the turn after, and on cooldown besides.
+LTM_HOLD_REPLIES = 3
+
+#: How far back, in log turns, a recall still counts: the cooldown's longest span
+#: (`5 + (1 - similarity) * 25` at a similarity of 0), so the walk reading both stops here.
+LTM_RECALL_SPAN = 30
+
 #: Memory creation's default mode (`ltm_creation_mode` "flag"; "interval" opts out): the character marks a reply
 #: worth remembering and a capture runs at that round's end, instead of waiting out
 #: `ltm_creation_interval`. Only the *when* moves. The summariser still decides what is
@@ -1580,8 +1589,24 @@ DEFAULT_MEMORY_WRITTEN_NOTE = (
     "</memory_written>"
 )
 
+#: Recalled long-term memories, per turn: `{memories}` is one dated line each. Bare, the
+#: block read as a document to cite ("my records say"), and a held memory
+#: (LTM_HOLD_REPLIES) was free to come up in every reply it sat in. A memory is a
+#: summary of the past, so the conversation in front of it wins.
+DEFAULT_ARCHIVE_CONTEXT = (
+    "<archive_context>\n"
+    "Things you remember, each dated when you learned it. Speak of them as memories, "
+    "never as notes or records.\n"
+    "{memories}\n"
+    "Use one only where it fits, and don't bring up one you have already mentioned. "
+    "Where the conversation says otherwise, the conversation is right.\n"
+    "</archive_context>"
+)
+
+#: Each example is a `User:` line and a `You:` line, and a line addressed to the
+#: character reads as a message to answer -- so this says not to, and not to lift lines.
 DEFAULT_TRAINING_DATA_INJECTION = (
-    "<training_data>\nExamples of your own past speech. They are not part of the current conversation -- match the style, personality and voice they show, not their content.\n\n{examples_block}\n</training_data>"
+    "<training_data>\nExamples of how you speak, from past conversations. They are not part of this one: never answer them or reuse their lines. Match only the style, personality and voice they show.\n\n{examples_block}\n</training_data>"
 )
 
 DEFAULT_TRAINING_ANALYST_PROMPT = (
@@ -2781,21 +2806,28 @@ DEFAULT_NEGATIVE_CONSTRAINTS = (
 # cogs/utils/menu_map.py and substituted for {menu_map} at injection time, because the
 # hand-written copy drifted out of step with the UI it described. An operator override
 # with no {menu_map} placeholder simply keeps whatever it already contains.
+#
+# Conditional, because it is injected on similarity alone (help_service's 0.60): a
+# roleplay line about memories or settings brings the manual in, and a note asserting
+# "you are answering a technical question" pulled the character out of the scene. The
+# path is the map's own wording, not an example: the last one named an action
+# ("Toggle Grounding") that no longer existed, in the line forbidding invented names.
 DEFAULT_HELP_MODE_INJECTION = (
     "<technical_manual>\n"
     "{docs}\n"
     "</technical_manual>\n"
     "<system_note>\n"
-    "You are answering a technical question about MimicAI, the Discord bot you run on.\n"
+    "If the latest message asks how MimicAI, the Discord bot you run on, works or how to "
+    "do something in it, answer from <technical_manual> and the dashboard map below. "
+    "Otherwise ignore this note and the manual, and reply as you normally would.\n"
     "\n"
-    "Answer only from <technical_manual> and the dashboard map below. If neither covers "
-    "the question, say so plainly and suggest the closest dashboard the user could look "
-    "at -- never invent a command, tab, action or setting name.\n"
+    "If neither covers the question, say so plainly and suggest the closest dashboard the "
+    "user could look at -- never invent a command, tab, action or setting name.\n"
     "\n"
-    "When an answer involves changing a setting, state the exact path: the command, then "
-    "the tab, then the action, in that order (for example: `/profile manage` -> Tools -> "
-    "Toggle Grounding (Web Search)). Actions on the `/profile manage` dashboard are "
-    "chosen from the dropdown at the top of the tab, not from separate buttons.\n"
+    "When an answer involves changing a setting, give the path exactly as the dashboard "
+    "map writes it: the command, then the tab, then the action. Actions on the "
+    "`/profile manage` dashboard are chosen from the dropdown at the top of the tab, not "
+    "from separate buttons.\n"
     "\n"
     "Answer as yourself, not as a manual. Answer at the length the question deserves -- a "
     "one-line question takes a one-line answer -- and do not restate the map back to the "
@@ -3036,6 +3068,37 @@ API_ERROR_MAPPINGS = {
     ("403",): "Access Forbidden/Moderated",
     ("413",): "File Too Large",
 }
+
+
+# --- Invites and the permissions they ask for ---------------------------------
+
+#: The official instance's application. Any other instance is self-hosted.
+OFFICIAL_BOT_ID = 1376696185947164854
+
+#: Every permission the bot uses, and all the official invite asks a server for.
+BOT_PERMISSIONS = discord.Permissions(
+    view_channel=True, send_messages=True, send_messages_in_threads=True,
+    read_message_history=True, embed_links=True, attach_files=True, add_reactions=True,
+    use_external_emojis=True, bypass_slowmode=True,
+    manage_webhooks=True,   # a character's own name and face
+    manage_messages=True)   # deleting the messages in a turn that others posted
+#: A child bot speaks as itself and deletes only its own messages.
+CHILD_BOT_PERMISSIONS = BOT_PERMISSIONS & ~discord.Permissions(manage_webhooks=True,
+                                                               manage_messages=True)
+
+
+def invite_url(instance: discord.Client, client_id, permissions: discord.Permissions) -> str:
+    """The link that adds `client_id` to a server, as handed out by `instance`.
+
+    Administrator only from a self-hosted instance, whose owner is inviting their own bot;
+    the official one never asks a server for more than it uses. Decided by the instance
+    handing out the link, not the bot it names: the official instance's child bots are
+    official too.
+    """
+    if instance.user.id != OFFICIAL_BOT_ID:
+        permissions = discord.Permissions(administrator=True)
+    return discord.utils.oauth_url(client_id, permissions=permissions,
+                                   scopes=("bot", "applications.commands"))
 
 
 # --- Command checks -----------------------------------------------------------

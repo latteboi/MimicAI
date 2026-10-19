@@ -1685,13 +1685,6 @@ class ProfileManageView(BlockedGuard, ui.View):
                 await self.original_interaction.edit_original_response(content="Rename failed: Name already exists.", view=None, embed=None); return
             
             if self.cog.profile_manager._rename_profile(self.user_id, old_name, new_name, self.is_borrowed):
-                # Hot-swap live sessions and models to prevent corruption
-                for ch_id, session in self.cog.multi_profile_channels.items():
-                    for p in session.get("profiles", []):
-                        if p["owner_id"] == self.user_id and p["profile_name"] == old_name:
-                            p["profile_name"] = new_name
-                    
-
                 invalidate_model_cache(self.cog, self.user_id, old_name)
                 
                 await self.original_interaction.edit_original_response(content=f"Profile '{old_name}' renamed to '{new_name}'.", view=None, embed=None)
@@ -1796,37 +1789,7 @@ class ProfileManageView(BlockedGuard, ui.View):
     async def _handle_delete(self, interaction):
         async def confirm_delete(i: discord.Interaction):
             await i.response.defer()
-
-            def _sync_delete():
-                user_index = self.cog.profile_manager._get_user_index(self.user_id)
-                list_key = "borrowed" if self.is_borrowed else "personal"
-
-                if self.profile_name not in user_index.get(list_key, {}):
-                    return False
-
-                if isinstance(user_index[list_key], dict):
-                    pid = user_index[list_key].pop(self.profile_name)
-                else:
-                    user_index[list_key].remove(self.profile_name)
-                    pid = self.profile_name
-
-                if not self.is_borrowed:
-                    self.cog.profile_manager._cascade_delete_borrowed_profiles(self.user_id, pid)
-
-                # Shard first, index second -- the same rule creation follows, and for
-                # the same reason. Writing the index first meant a crash before the
-                # rmtree left a shard nothing named, which the next rebuild adopts:
-                # the deleted profile came back. Removing the directory first makes the
-                # worst case an index entry pointing at nothing, which a rebuild drops
-                # -- the delete completes either way.
-                import shutil
-                p_dir = os.path.join(self.cog.USERS_DIR, str(self.user_id), "profiles", pid)
-                shutil.rmtree(p_dir, ignore_errors=True)
-
-                self.cog.profile_manager._save_user_index(self.user_id, user_index)
-                return True
-
-            if await asyncio.to_thread(_sync_delete):
+            if await self.cog.profile_manager.delete_profiles(self.user_id, [self.profile_name]):
                 await self.original_interaction.edit_original_response(content=f"Profile '{self.profile_name}' deleted.", view=None, embed=None)
         confirm_view = build_confirm_view("Confirm Deletion", confirm_delete)
         await interaction.response.send_message(f"Delete profile '{self.profile_name}'?", view=confirm_view, ephemeral=True)
@@ -5532,52 +5495,6 @@ def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[st
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Generation Visual", fields, parser, callback, target_user_id)
 
-def _unlink_profiles(cog, user_id: int, names: List[str]) -> List[str]:
-    """Removes profiles from the index and returns the directories left to remove.
-
-    Split from the removal itself deliberately. `_get_user_index` hands back the dict
-    it caches on the cog, shared with every other handler, so mutating it from a worker
-    thread is a live race -- but `shutil.rmtree` over a hundred profile directories is
-    exactly the kind of blocking work that should not sit on the event loop. The index
-    work stays here; the caller threads the filesystem half.
-
-    Personal profiles cascade to the copies other users borrowed from them; a borrowed
-    entry only unlinks the borrower's own copy.
-    """
-    user_id_str = str(user_id)
-    index = cog.profile_manager._get_user_index(user_id)
-    doomed = []
-
-    for name in names:
-        if name in index.get("borrowed", {}):
-            if isinstance(index["borrowed"], dict):
-                pid = index["borrowed"].pop(name)
-            else:
-                index["borrowed"].remove(name)
-                pid = name
-        elif name in index.get("personal", {}):
-            if isinstance(index["personal"], dict):
-                pid = index["personal"].pop(name)
-            else:
-                index["personal"].remove(name)
-                pid = name
-            cog.profile_manager._cascade_delete_borrowed_profiles(user_id, pid)
-        else:
-            continue
-        doomed.append(os.path.join(cog.USERS_DIR, user_id_str, "profiles", pid))
-
-    if doomed:
-        cog.profile_manager._save_user_index(user_id, index)
-    return doomed
-
-
-def _remove_profile_dirs(paths: List[str]):
-    """The blocking half of a bulk delete. Always called through asyncio.to_thread."""
-    import shutil
-    for path in paths:
-        shutil.rmtree(path, ignore_errors=True)
-
-
 class BulkResetView(_BulkSubView):
     """Wiping long-term memories or training examples across the selected profiles.
 
@@ -5707,11 +5624,10 @@ class BulkDeleteView(_BulkSubView):
             await interaction.edit_original_response(
                 content="No profiles selected.", embed=None, view=None)
             return
-        doomed = _unlink_profiles(self.cog, self.user_id, names)
-        await asyncio.to_thread(_remove_profile_dirs, doomed)
+        deleted = await self.cog.profile_manager.delete_profiles(self.user_id, names)
         await interaction.edit_original_response(
             content=None,
-            embed=discord.Embed(description=f"✅ Deleted {len(doomed)} profile(s).",
+            embed=discord.Embed(description=f"✅ Deleted {deleted} profile(s).",
                                 colour=discord.Colour.green()),
             view=None)
 

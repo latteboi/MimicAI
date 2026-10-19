@@ -995,6 +995,7 @@ MOD_PROMPT_CATEGORIES = [
         ("LTM Summarization", "LTM_SUMMARIZATION_INSTRUCTIONS", DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS),
         # Read by prompt_builder since Memory Search shipped, but never listed here, so
         # the one prompt an operator would most want to retune was unreachable.
+        ("Recalled Memories", "ARCHIVE_CONTEXT", DEFAULT_ARCHIVE_CONTEXT),
         ("Memory Search \u00b7 Character Brief", "RECALL_INSTRUCTION", DEFAULT_RECALL_INSTRUCTION),
         ("Memory Flag \u00b7 Character Brief", "MEMORY_CAPTURE_INSTRUCTION", DEFAULT_MEMORY_CAPTURE_INSTRUCTION),
         ("Memory Flag \u00b7 Written Note", "MEMORY_WRITTEN_NOTE", DEFAULT_MEMORY_WRITTEN_NOTE),
@@ -1023,6 +1024,7 @@ MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
     "TIME_CONTEXT": ({"time_str"}, "format"),
     "BIRTHDAY_CONTEXT": ({"birthdays"}, "format"),
     "MEMORY_WRITTEN_NOTE": ({"when"}, "format"),
+    "ARCHIVE_CONTEXT": ({"memories"}, "format"),
     "NEGATIVE_CONSTRAINTS": ({"constraints"}, "format"),
     "TRAINING_DATA_INJECTION": ({"examples_block"}, "format"),
     "NEURO_ENGINE": ({"d", "c", "o", "a"}, "format"),

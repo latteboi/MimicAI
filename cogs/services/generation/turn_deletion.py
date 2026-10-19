@@ -141,8 +141,6 @@ class TurnDeletionMixin:
             turn.get("type") in ("whisper", "private_response") for turn in session["unified_log"])
         if effectively_empty:
             await self.cog.session_manager._delete_session_from_disk(key, session_type)
-            for p in session.get("profiles", []):
-                self.cog.ltm_recall_history.pop((channel_id, p['owner_id'], p['profile_name']), None)
         else:
             await self.cog.session_manager._save_session_to_disk(key, session_type, session["unified_log"])
         # Deleting turns can strand or reveal a pending whisper -- the one thing a rebuild

@@ -123,20 +123,20 @@ class GameService:
 
     # ------------------------------------------------------------------ roster
 
-    def _temperament_for(self, config: Dict[str, Any], profile_name: str) -> Temperament:
+    def _temperament_for(self, config: Dict[str, Any], seed: str) -> Temperament:
         """The profile's authored temperament, or a stable stand-in.
 
         There is no temperament field on a profile yet -- that arrives with the
-        settings surface in a later phase. Until then the name is hashed to a preset so
+        settings surface in a later phase. Until then the PID is hashed to a preset so
         a table is visibly varied rather than five identical steady players, and so the
-        same profile always plays the same way. Deterministic, and replaced the moment
-        `game_temperament` is authored.
+        same profile always plays the same way -- hashing the name, a rename changed it.
+        Deterministic, and replaced the moment `game_temperament` is authored.
         """
         named = (config or {}).get("game_temperament")
         if named in PRESETS:
             return PRESETS[named]
         pool = ("steady", "steady", "reckless", "anxious", "vindictive", "meek")
-        return PRESETS[pool[sum(map(ord, profile_name)) % len(pool)]]
+        return PRESETS[pool[sum(map(ord, seed)) % len(pool)]]
 
     def _display_for(self, owner_id: int, profile_name: str) -> str:
         """What the table calls this profile.
@@ -163,9 +163,10 @@ class GameService:
     def _build_roster(self, session: Dict[str, Any], limit: int) -> List[Seat]:
         """Snapshot the session's cast into seats.
 
-        Deduplicates by `(owner_id, profile_name)`: the same profile can legitimately
+        Deduplicates by `participant_identity`: the same profile can legitimately
         appear twice in a cast through a borrow, but it cannot sit twice at one table
-        without both seats sharing a neuro state and a ledger line.
+        without both seats sharing a neuro state and a ledger line. A seat is that
+        identity from here on; its name is only what it was called at the deal.
         """
         seats: List[Seat] = []
         if limit <= 0:
@@ -179,7 +180,7 @@ class GameService:
             profile_name = participant.get("profile_name")
             if not owner_id or not profile_name:
                 continue
-            key = (owner_id, profile_name)
+            key = self.cog.session_manager.participant_identity(participant)
             if key in seen:
                 continue
             seen.add(key)
@@ -189,6 +190,7 @@ class GameService:
                 kind="profile",
                 owner_id=owner_id,
                 profile_name=profile_name,
+                pid=key[1],
                 method=participant.get("method", "webhook"),
                 bot_id=participant.get("bot_id"),
             ))
@@ -218,7 +220,7 @@ class GameService:
             for axis in neuro.AXES:
                 if isinstance(stored.get(axis), (int, float)):
                     state[axis] = max(0, min(100, int(stored[axis])))
-        return state, self._temperament_for(config, seat.profile_name or "")
+        return state, self._temperament_for(config, seat.pid or seat.profile_name or "")
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -635,23 +637,25 @@ class GameService:
         character really is rattled for a while after a bad one. It writes through the
         normal profile save path rather than touching anything the game owns.
         """
+        pm = self.cog.profile_manager
         for seat in game.seats:
-            if seat.kind != "profile" or not seat.owner_id or not seat.profile_name:
+            if seat.kind != "profile" or not seat.owner_id or not seat.pid:
                 continue
             state = game.neuro.get(seat.seat_id)
             if not state:
                 continue
             try:
-                index = self.cog.profile_manager._get_user_index(seat.owner_id)
-                borrowed = seat.profile_name in (index.get("borrowed") or [])
-                config = self.cog.profile_manager._get_profile_config(
-                    seat.owner_id, seat.profile_name, borrowed)
+                # The name today, not the deal's: renamed mid-game, the old name named
+                # nothing -- or, reused, somebody else, who was handed this chemistry.
+                name = pm._get_name_from_pid(seat.owner_id, seat.pid, include_borrowed=True)
+                if not name:
+                    continue
+                borrowed = name in (pm._get_user_index(seat.owner_id).get("borrowed") or [])
+                config = pm._get_profile_config(seat.owner_id, name, borrowed)
                 if not config or not config.get("neuro_engine_enabled"):
                     continue
                 config["neuro_state"] = dict(state)
-                await asyncio.to_thread(
-                    self.cog.profile_manager._save_profile_config,
-                    seat.owner_id, seat.profile_name, config, borrowed)
+                await asyncio.to_thread(pm._save_profile_config, seat.owner_id, name, config, borrowed)
             except Exception:
                 continue
 
@@ -846,11 +850,13 @@ class GameService:
         `session['profiles'].index(start_p)` and tests membership with `in`, so handing
         it a freshly built dict that merely looks the same would silently fail both.
         Returns None for a seat whose profile has since left the session -- the roster
-        is a snapshot, so that is a normal state, not an error.
+        is a snapshot, so that is a normal state, not an error. Matched by PID: by name,
+        a profile renamed mid-game had left the session as far as its seat could tell.
         """
+        identity = (int(seat.owner_id), seat.pid)
         for participant in session.get("profiles", []):
-            if (participant.get("owner_id") == seat.owner_id
-                    and participant.get("profile_name") == seat.profile_name):
+            if (participant.get("owner_id")
+                    and self.cog.session_manager.participant_identity(participant) == identity):
                 return participant
         return None
 

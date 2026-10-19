@@ -911,7 +911,8 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
                 "config": new_bot_config
             })
         
-        await interaction.followup.send(f"Success! Child bot '{temp_client.user.name}' has been linked to profile '{profile_name}'.", ephemeral=True)
+        invite = invite_url(self.cog.bot, bot_user_id, CHILD_BOT_PERMISSIONS)
+        await interaction.followup.send(f"Success! Child bot '{temp_client.user.name}' has been linked to profile '{profile_name}'.\n[Invite it to a server](<{invite}>)", ephemeral=True)
         await self.parent_view.update_rebuild(interaction)
 
 class ParentActivityModal(ui.Modal):

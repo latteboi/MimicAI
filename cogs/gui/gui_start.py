@@ -29,13 +29,14 @@ Prose lives in `content.WIZARD_COPY`, and depth is not repeated: each step names
 import asyncio
 import discord
 from discord import ui
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from ..utils.constants import (CAST_POLICY_OPEN, DEFAULT_CAST_POLICY, MODEL_PROVIDERS,
-                               PROVIDER_CHOICES, PROVIDER_NONE, defaultConfig)
+from ..utils.constants import (BOT_PERMISSIONS, CAST_POLICY_OPEN, CHILD_BOT_PERMISSIONS,
+                               DEFAULT_CAST_POLICY, MODEL_PROVIDERS, PROVIDER_CHOICES,
+                               PROVIDER_NONE, defaultConfig)
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
-from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, SERVER_KEY_PITCH, WIZARD_COPY,
-                             WIZARD_TOUR)
+from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, PERMISSION_EFFECTS,
+                             SERVER_KEY_PITCH, WIZARD_COPY, WIZARD_TOUR)
 from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
                               add_select)
 from .gui_settings import (KEY_SLOTS, SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
@@ -150,6 +151,82 @@ WIZARD_STEPS = (
           lambda s: s["has_spoken"], context="guild",
           done_detail=lambda s: "it has spoken here"),
 )
+
+
+def _lacking(perms, wanted: discord.Permissions) -> List[str]:
+    """The flags `wanted` sets that `perms` does not grant, by discord.py's flag names."""
+    return [name for name, on in wanted if on and not getattr(perms, name)]
+
+
+def _missing_permissions(interaction: discord.Interaction) -> List[str]:
+    """What of `BOT_PERMISSIONS` the bot lacks in this channel.
+
+    Read off the gateway cache, so Refresh sees a fix. A channel the cache does not hold
+    falls back to the snapshot sent with the command: a PartialMessageable answers every
+    permission question with none.
+    """
+    guild, channel = interaction.guild, interaction.channel
+    if guild is None:
+        return []
+    if guild.me is not None and channel is not None and not isinstance(
+            channel, discord.PartialMessageable):
+        perms = channel.permissions_for(guild.me)
+    else:
+        perms = interaction.app_permissions
+    return _lacking(perms, BOT_PERMISSIONS)
+
+
+def _child_bot_gaps(cog: "MimicCog", guild, channel_id: int,
+                    profiles: List[Dict]) -> List[Tuple[str, Optional[List[str]]]]:
+    """(bot name, what of `CHILD_BOT_PERMISSIONS` it lacks here) for each seated child bot
+    that falls short, with None for one that is not in this server at all.
+
+    A child bot that is not connected is passed over: nothing can be read off it, and being
+    offline is not something an admin can grant.
+    """
+    if guild is None:
+        return []
+    gaps = []
+    for p in profiles:
+        if p.get("method") != "child_bot":
+            continue
+        child = cog.child_bot_manager.clients.get(str(p.get("bot_id")))
+        if child is None or not child.is_ready():
+            continue
+        child_guild = child.get_guild(guild.id)
+        if child_guild is None:
+            gaps.append((child.user.name, None))
+            continue
+        # Every channel arrives with the guild, so None is a thread it has not cached.
+        channel = child_guild.get_channel_or_thread(channel_id)
+        if channel is None or child_guild.me is None:
+            continue
+        lacking = _lacking(channel.permissions_for(child_guild.me), CHILD_BOT_PERMISSIONS)
+        if lacking:
+            gaps.append((child.user.name, lacking))
+    return gaps
+
+
+def _permission_lines(flags: List[str]) -> str:
+    lines = []
+    for flag in flags:
+        name, effect = PERMISSION_EFFECTS.get(flag, (flag.replace("_", " ").title(), ""))
+        lines.append(f"• **{name}**" + (f": {effect}" if effect else ""))
+    return "\n".join(lines)
+
+
+def _permission_warning(mine: List[str], children: List[Tuple[str, Optional[List[str]]]]) -> str:
+    """The banner's warning: what each bot lacks in this channel, and what that stops."""
+    parts = ["⚠️ **Missing permissions in this channel.** An admin can grant them in the "
+             "channel's **Permissions** settings."]
+    if mine:
+        parts.append("**Me:**\n" + _permission_lines(mine))
+    for name, lacking in children:
+        if lacking is None:
+            parts.append(f"**{name}** (child bot) isn't in this server, so it can't speak here.")
+        else:
+            parts.append(f"**{name}** (child bot):\n" + _permission_lines(lacking))
+    return "\n".join(parts)
 
 
 async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dict[str, Any]:
@@ -279,6 +356,10 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
         "server_key": guild is not None and cog._session_key_block(guild, user_id) is None,
         "guild": guild,
         "channel": interaction.channel,
+        # A self-hosted instance holds Administrator and never lacks one; the official
+        # invite asks for exactly BOT_PERMISSIONS, which a channel's overrides can revoke.
+        "missing_perms": _missing_permissions(interaction),
+        "child_gaps": _child_bot_gaps(cog, guild, channel_id, profiles),
         "has_written": bool(state["written_name"]),
         "seated": (bool(profiles) and cog.session_manager.is_started(session)
                    ) or state["seated_disk"],
@@ -388,6 +469,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
                         "used for server messages — nothing here can generate")
         else:
             key_line = "🔑 **This server** has no API key assigned yet — nothing here can generate"
+        if s["missing_perms"] or s["child_gaps"]:
+            key_line += "\n" + _permission_warning(s["missing_perms"], s["child_gaps"])
 
         if s["is_admin"]:
             # In the banner, not the key step: that field is near Discord's 1024 cap.

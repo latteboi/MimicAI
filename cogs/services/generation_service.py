@@ -622,6 +622,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         """
         bot_id = participant.get('bot_id') if participant.get('method') == 'child_bot' else None
         bot_id = str(bot_id) if bot_id else None
+        if bot_id and bot_id not in self.cog.child_bots:
+            # Unlinked, or its profile deleted: there is nothing left to send through.
+            return "its child bot is no longer linked"
         if bot_id:
             child = self.cog.child_bot_manager.clients.get(bot_id)
             guild = child.get_guild(channel.guild.id) if child else None
@@ -1142,7 +1145,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # there only ever caught the first participant's UnboundLocalError;
                     # from the second onwards they read True and recorded profile A's
                     # recalls, training count and hormone vector onto profile B's turn.
-                    ltm_recall_text = None
+                    ltm_recall = None
                     training_examples_list = []
                     parsed_neuro_state = None
                     parsed_ltm_flag = False
@@ -1152,7 +1155,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     p_name = participant['profile_name']
                     p_index = self.cog.profile_manager._get_user_index(p_owner_id)
                     p_is_b = p_name in p_index.get("borrowed", [])
-                    p_settings = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_b) or {}
+                    p_settings = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_b)
+                    if p_settings is None:
+                        # Deleted since the round began: a turn now is paid for and spoken
+                        # with no persona. The next hydration unseats it.
+                        await self._abandon_state_container(channel, state_container, session=session)
+                        continue
 
                     is_ollama = p_settings.get("primary_model", "").upper().startswith("OLLAMA/")
                     
@@ -1264,9 +1272,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         dynamic_context_for_turn = image_gen_prompt
 
-                        # _get_relevant_ltm_for_prompt uses this only as len(history) for the recall
-                        # cooldown, so unified_log is the direct and more accurate equivalent.
-                        ltm_recall_text = await self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, session.get("unified_log", []), owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id,
+                        # _get_relevant_ltm_for_prompt reads the recall hold and cooldown off
+                        # this, so it is unified_log itself and never a windowed history.
+                        ltm_recall = await self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, session.get("unified_log", []), owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id,
                                                                                                    threshold=ltm_auto_threshold(p_settings))
 
                         # [NEW] Check Image Gen intent vs Profile Toggle
@@ -1336,7 +1344,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if help_task: tasks_to_gather.append(help_task)
                             
                         gathered_results = await asyncio.gather(*tasks_to_gather)
-                        ltm_recall_text = gathered_results[0]
+                        ltm_recall = gathered_results[0]
                         training_examples_list = gathered_results[1]
                         help_context_text = gathered_results[2] if help_task else None
 
@@ -1395,7 +1403,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         full_system_instruction, turn_context, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
                             self._construct_system_instructions,
                             owner_id, profile_name, channel.id, is_multi_profile=True,
-                            training_examples_list=training_examples_list, recalled_ltm=ltm_recall_text,
+                            training_examples_list=training_examples_list, recalled_ltm=ltm_recall.text,
                             critic_constraints=critic_constraints, functions=functions,
                         )
 
@@ -1609,7 +1617,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         }
                     meta = reply_meta(
                         attempt, duration=duration, training_examples=training_examples_list,
-                        ltm_recall_text=ltm_recall_text, sources=turn_grounding_sources,
+                        ltm_recall=ltm_recall, sources=turn_grounding_sources,
                         neuro_state=parsed_neuro_state, critic=critic,
                         ltm_flag=parsed_ltm_flag)
 

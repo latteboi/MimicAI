@@ -1227,7 +1227,6 @@ class ChildBotManager:
         self.cog.channel_models.pop(session_key, None)
         self.cog.channel_model_last_profile_key.pop(session_key, None)
         self.cog.session_last_accessed.pop(session_key, None)
-        self.cog.ltm_recall_history.pop(session_key, None)
 
     async def handle_child_bot_confirmation(self, event_data: Dict):
         correlation_id = event_data.get("correlation_id")

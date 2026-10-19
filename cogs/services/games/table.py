@@ -73,7 +73,9 @@ class Seat:
     display: str
     kind: str = "profile"                 # "profile" | "human"
     owner_id: Optional[int] = None
+    #: The name as of the deal, for display. `pid` is the seat's identity.
     profile_name: Optional[str] = None
+    pid: Optional[str] = None
     method: str = "webhook"               # "webhook" | "child_bot"
     bot_id: Optional[str] = None
 

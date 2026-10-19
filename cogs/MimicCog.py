@@ -12,6 +12,7 @@ from .utils.constants import (
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
     PERSONA_TEXT_INPUT_MAX_LENGTH, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
+    BOT_PERMISSIONS, invite_url,
 )
 from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError, clean_display_name,
                                            draft_from_card, generate_draft, generator_models)
@@ -337,7 +338,6 @@ class MimicCog(EventListeners, commands.Cog):
         self.mention_pointers_sent: LRUCache = LRUCache(max_size=256)
         self.all_bot_ids: Set[int] = set()
         self.image_gen_semaphore = asyncio.Semaphore(3)
-        self.ltm_recall_history: Dict[Any, Dict[str, Tuple[int, float]]] = {}
 
         # Priority Queues for Premium Fast-Lane
         self.image_request_queue = asyncio.PriorityQueue(maxsize=10)
@@ -1530,11 +1530,6 @@ class MimicCog(EventListeners, commands.Cog):
                         "payload": {"action": "stop_typing", "channel_id": ch_id}
                     })
 
-        # [NEW] Reset LTM recall history (penalty system) for this channel
-        for p in session.get("profiles", []):
-            full_session_key = (ch_id, p['owner_id'], p['profile_name'])
-            self.ltm_recall_history.pop(full_session_key, None)
-
         session['is_hydrated'] = True
         session['unified_log'] = []
         # The queue is emptied below without a round, so no reaction it held is waiting.
@@ -2118,7 +2113,6 @@ class MimicCog(EventListeners, commands.Cog):
                 for k in keys_to_del:
                     self.global_chat_sessions.pop(k, None)
                     self.session_last_accessed.pop(k, None)
-                    self.ltm_recall_history.pop(k, None)
 
                 dir_path = pathlib.Path(self.USERS_DIR) / str(user_id) / "profiles"
                 if dir_path.is_dir():
@@ -2142,7 +2136,6 @@ class MimicCog(EventListeners, commands.Cog):
             
             self.global_chat_sessions.pop(session_key, None)
             self.session_last_accessed.pop(session_key, None)
-            self.ltm_recall_history.pop(session_key, None)
 
             await self.session_manager._delete_session_from_disk(session_key, 'global_chat')
             
@@ -2459,9 +2452,6 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.command(name="invite", description="Get the invite link to add MimicAI to your server.")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
     async def invite_slash(self, interaction: discord.Interaction):
-        client_id = self.bot.user.id if self.bot.user else 1376696185947164854
-        invite_url = f"https://discord.com/api/oauth2/authorize?client_id={client_id}&permissions=8&scope=bot%20applications.commands"
-        
         embed = discord.Embed(
             title="Bring Your Personas to Life with MimicAI",
             description="Experience a revolutionary, unified orchestration engine that gives you complete control over your chatbot. MimicAI brings unparalleled customisation and model diversity directly into your Discord servers.",
@@ -2492,7 +2482,7 @@ class MimicCog(EventListeners, commands.Cog):
             inline=False
         )
         
-        view = InviteView(invite_url)
+        view = InviteView(invite_url(self.bot, self.bot.user.id, BOT_PERMISSIONS))
         await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
 
     # Not DM-only: every screen here answers ephemerally, and a key is typed into a

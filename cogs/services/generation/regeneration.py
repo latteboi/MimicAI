@@ -269,7 +269,8 @@ class RegenerationMixin:
                 earlier[-1].get("content", "") if earlier else "")
             help_search = (self.cog.help_service._get_relevant_help_context(trigger_content, channel.guild.id)
                            if p_settings.get("help_mode_enabled", False) else asyncio.sleep(0))
-            ltm_recall_text, training_examples, help_context_text = await asyncio.gather(
+            # `earlier` holds and cools exactly what the turn was first written under.
+            ltm_recall, training_examples, help_context_text = await asyncio.gather(
                 self.cog.memory_manager._get_relevant_ltm_for_prompt(
                     (channel.id, owner_id, profile_name), earlier, owner_id, profile_name,
                     trigger_content, "User", channel.guild.id, payload.user_id,
@@ -288,7 +289,7 @@ class RegenerationMixin:
              primary_model, fallback_model_name) = await asyncio.to_thread(
                 self._construct_system_instructions,
                 owner_id, profile_name, channel.id, is_multi_profile=True,
-                training_examples_list=training_examples, recalled_ltm=ltm_recall_text,
+                training_examples_list=training_examples, recalled_ltm=ltm_recall.text,
                 critic_constraints=(critic or {}).get("text"), functions=functions,
             )
             # In the live round's order: the turn context, then the round's own material.
@@ -375,7 +376,7 @@ class RegenerationMixin:
             final_target_turn["message_ids"] = list(surviving_message_ids)
             final_target_turn["meta"] = reply_meta(
                 attempt, duration=time.monotonic() - t_start, training_examples=training_examples,
-                ltm_recall_text=ltm_recall_text, sources=reply.sources, neuro_state=reply.neuro_state,
+                ltm_recall=ltm_recall, sources=reply.sources, neuro_state=reply.neuro_state,
                 critic=critic)
             # Clean up legacy signatures from the turn if they exist
             final_target_turn.pop('thought_signature', None)
