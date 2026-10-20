@@ -291,6 +291,9 @@ class RegenerationMixin:
                 owner_id, profile_name, channel.id, is_multi_profile=True,
                 training_examples_list=training_examples, recalled_ltm=ltm_recall.text,
                 critic_constraints=(critic or {}).get("text"), functions=functions,
+                # On the turn's own clock, like its history: told it is now, a turn
+                # regenerated half an hour on wrote about half an hour of silence.
+                at=turn_posted_at(target_turn),
             )
             # In the live round's order: the turn context, then the round's own material.
             _add_to_last_user_turn(history, [p for p in (turn_context, recap, help_context_text) if p]

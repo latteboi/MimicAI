@@ -184,7 +184,7 @@ class PromptBuilderMixin:
                 lines.append(line)
         return lines
 
-    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, functions: Sequence[Any] = ()) -> Tuple[str, str, bool, float, float, int, str, str]:
+    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, functions: Sequence[Any] = (), at: Optional[datetime.datetime] = None) -> Tuple[str, str, bool, float, float, int, str, str]:
         """The system instruction for one profile's generation, the turn context, and its
         sampling values.
 
@@ -200,6 +200,10 @@ class PromptBuilderMixin:
         `functions` are the ones the caller's model declares -- the tuple
         `tool_loop.functions_for` gave it, handed to the model factory as well -- and
         each is described here. Empty for a caller that sends this to no model.
+
+        `at` is the moment the turn is written at, when that is not now: a regeneration's
+        original one. Its history stops there, so a `<current_time>` of now reads the
+        time since as silence nobody filled.
         """
         persona_data: Dict[str, List[str]] = {}
         # profile_owner_id is Optional, but profile_data is read unconditionally below.
@@ -360,12 +364,13 @@ class PromptBuilderMixin:
         # answered "midnight" (5/12, and 2/12 last in the turn), against 5-9/12 from the
         # system instruction (prod_tests/prompt_cache_live.py).
         time_template = self.cog.global_prompts.get("TIME_CONTEXT", DEFAULT_CURRENT_TIME)
+        moment = at or datetime.datetime.now(datetime.timezone.utc)
         try:
             tz, _ = _resolve_zoneinfo(timezone_str)
-            now = datetime.datetime.now(tz)
+            now = moment.astimezone(tz)
         except Exception as e:
             print(f"Error processing timezone '{timezone_str}': {e}. Defaulting to UTC.")
-            now = datetime.datetime.now(datetime.timezone.utc)
+            now = moment.astimezone(datetime.timezone.utc)
         turn_parts.insert(0, time_template.format(time_str=now.strftime(TURN_TIME_FORMAT)))
 
         if present_users is None:
