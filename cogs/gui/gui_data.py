@@ -8,6 +8,7 @@ import traceback
 from typing import TYPE_CHECKING, List, Dict, Tuple, Optional
 from ..utils.helpers import _resolve_zoneinfo, suppress_link_previews
 from ..utils import lorebook
+from ..utils.memory_tuning import low_memory
 from ..managers.memory_manager import (EMBEDDING_FAILED_MSG, NO_EMBEDDING_KEY_MSG,
                                        encode_embedding_b64, entry_date)
 
@@ -781,14 +782,25 @@ class ExportPassphraseModal(ui.Modal, title="Self-Hosted Export"):
 class ImportPassphraseModal(ui.Modal, title="Enter Passphrase"):
     passphrase_input = ui.TextInput(label="Passphrase", placeholder="Enter the passphrase used for export", required=True, min_length=8, max_length=100)
 
-    def __init__(self, cog, file_bytes: bytes):
+    def __init__(self, cog, file: discord.Attachment):
         super().__init__()
         self.cog = cog
-        self.file_bytes = file_bytes
+        # The attachment, read again on submit, never its bytes: discord.py keeps a modal with
+        # no timeout until it is submitted, so a dismissed one held its file for good.
+        self.file = file
 
     async def on_submit(self, interaction: discord.Interaction):
+        if low_memory():
+            await interaction.response.send_message(IMPORT_LOW_MEMORY, ephemeral=True)
+            return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.profile_manager._execute_import(interaction, file_bytes=self.file_bytes, passphrase=self.passphrase_input.value)
+        try:
+            file_bytes = await self.file.read()
+        except discord.HTTPException:
+            await interaction.followup.send("❌ The file could not be read back from Discord. Run `/import` again.",
+                                            ephemeral=True)
+            return
+        await self.cog.profile_manager._execute_import(interaction, file_bytes=file_bytes, passphrase=self.passphrase_input.value)
 
 class BulkExportView(BaseBulkProfileView):
     def __init__(self, cog: 'MimicCog', user_id: int):

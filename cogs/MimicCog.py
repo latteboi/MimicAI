@@ -10,14 +10,15 @@ from .utils.constants import (
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
     cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
-    IMPORT_FILE_TOO_LARGE, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
+    IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
     PERSONA_TEXT_INPUT_MAX_LENGTH, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
     BOT_PERMISSIONS, invite_url,
 )
 from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError, clean_display_name,
                                            draft_from_card, generate_draft, generator_models)
-from .utils.character_card import (PNG_SIGNATURE, CardError, prompt_text, profile_name_for, read_card,
+from .utils.character_card import (CardError, card_portrait, prompt_text, profile_name_for, read_card,
                                    read_lorebook)
+from .utils.memory_tuning import low_memory
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import (ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered,
                                   send_status, settle_status, update_status)
@@ -688,24 +689,28 @@ class MimicCog(EventListeners, commands.Cog):
         view = BulkExportView(self, interaction.user.id)
         await interaction.response.send_message("### 📤 Profile Export\nSelect profiles and components to export.\n\n*The file will contain encrypted data. Tampered files cannot be imported.*\n", view=view, ephemeral=True)
 
-    @app_commands.command(name="import", description="Import a MimicAI export, or a character card (PNG or JSON).")
+    @app_commands.command(name="import", description="Import a MimicAI export, or a character card (PNG, CHARX or JSON).")
     @cooldown_unless_refused(1, 30.0, _unregistered)
-    @app_commands.describe(file="A .mimic file from a MimicAI instance, or a character card: a card PNG or its JSON.",
+    @app_commands.describe(file="A .mimic file from a MimicAI instance, or a character card: a PNG, a CHARX or its JSON.",
                            profile_name="Optional: add the file's lorebook to this profile of yours, not import a new one.")
     @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
     async def import_command(self, interaction: discord.Interaction, file: discord.Attachment,
                              profile_name: Optional[str] = None):
         if await refuse_unregistered(self, interaction):
             return
+        # Every kind of import below holds the whole file in memory.
+        if low_memory():
+            await interaction.response.send_message(IMPORT_LOW_MEMORY, ephemeral=True)
+            return
         if profile_name:
             await self._import_lorebook(interaction, file, profile_name)
             return
-        if file.filename.lower().endswith(('.png', '.json')):
+        if file.filename.lower().endswith(('.png', '.json', '.charx')):
             await self._import_card(interaction, file)
             return
         if not file.filename.endswith('.mimic'):
             await interaction.response.send_message(
-                "❌ Invalid file type. Upload a `.mimic` export, or a character card as a PNG or JSON.",
+                "❌ Invalid file type. Upload a `.mimic` export, or a character card as a PNG, CHARX or JSON.",
                 ephemeral=True)
             return
         # On the size Discord states, before read() holds the whole file in memory.
@@ -717,11 +722,12 @@ class MimicCog(EventListeners, commands.Cog):
         
         try:
             file_bytes = await file.read()
-            container = json.loads(file_bytes)
+            # Off the loop: up to 25 MB of JSON, parsed only to see whether it wants a passphrase.
+            container = await asyncio.to_thread(json.loads, file_bytes)
             auth_mode = container.get("auth_mode")
 
             if auth_mode == "passphrase":
-                await interaction.response.send_modal(ImportPassphraseModal(self, file_bytes))
+                await interaction.response.send_modal(ImportPassphraseModal(self, file))
                 return
         except Exception as e:
             await interaction.response.send_message(f"❌ Failed to read or parse file: {suppress_link_previews(str(e))}", ephemeral=True)
@@ -734,10 +740,12 @@ class MimicCog(EventListeners, commands.Cog):
                                profile_name: str):
         """`/import profile_name:`: a lorebook file (SillyTavern World Info), or a card's book,
         added to a profile the user owns. `add_lore_entries` checks the ownership."""
-        limit = discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
-        if not file.filename.lower().endswith(('.png', '.json')) or file.size > limit:
+        is_json = file.filename.lower().endswith('.json')
+        limit = CARD_TEXT_MAX_BYTES if is_json else defaultConfig.LIMIT_ATTACHMENT_BYTES
+        if not (is_json or file.filename.lower().endswith(('.png', '.charx'))) or file.size > limit:
             await interaction.response.send_message(
-                f"❌ A lorebook is a JSON file, or a card PNG carrying one, of at most {limit // (1024 * 1024)} MB.",
+                f"❌ A lorebook is a JSON file of at most {CARD_TEXT_MAX_BYTES // (1024 * 1024)} MB, or a card "
+                f"(PNG or CHARX) carrying one of at most {defaultConfig.LIMIT_ATTACHMENT_BYTES // (1024 * 1024)} MB.",
                 ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -757,15 +765,19 @@ class MimicCog(EventListeners, commands.Cog):
         """`/import` of a character card: read it, sort it into a draft, and show the draft
         (`GeneratedProfileView`) for Save. Nothing is written before Save.
 
-        Capped at what the bot may send back, because a PNG card is re-posted as a plain
+        A card's portrait -- a PNG card itself, a CHARX's main icon -- is re-posted as a plain
         message in the user's DMs, wherever /import ran: the profile's avatar is that
         message's attachment. The one on the command is an interaction's, which Discord
-        deletes after a while."""
-        limit = discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
+        deletes after a while. Only a portrait within CONTENT_CLASSIFY_MAX_IMAGE_BYTES is,
+        well inside what the bot may send, so the file is capped as any import is. A JSON
+        card is all text, refused past CARD_TEXT_MAX_BYTES however it arrives, so that is its
+        cap before the download."""
+        is_json = file.filename.lower().endswith('.json')
+        limit = CARD_TEXT_MAX_BYTES if is_json else defaultConfig.LIMIT_ATTACHMENT_BYTES
         if file.size > limit:
             await interaction.response.send_message(
-                f"❌ That card is {file.size / (1024 * 1024):.1f} MB. A card can be at most "
-                f"{limit // (1024 * 1024)} MB.", ephemeral=True)
+                f"❌ That card is {file.size / (1024 * 1024):.1f} MB. A {'JSON ' if is_json else ''}card "
+                f"can be at most {limit // (1024 * 1024)} MB.", ephemeral=True)
             return
         await send_status(interaction, "Reading the card into a draft...")
         user_id = interaction.user.id
@@ -790,17 +802,22 @@ class MimicCog(EventListeners, commands.Cog):
             appearance["display_name"] = display_name
         # Over the rating's cap the portrait is left off, as `/profile generate` refuses one:
         # the rating would judge the profile by its text alone.
-        is_png = data.startswith(PNG_SIGNATURE)
-        portrait_too_large = is_png and len(data) > defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES
-        if is_png and not portrait_too_large:
+        cap = defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES
+        try:
+            portrait, suffix = await asyncio.to_thread(card_portrait, data, cap)
+        except CardError:
+            # The card read; a damaged icon costs the avatar, not the import.
+            portrait, suffix = None, ""
+        portrait_too_large = portrait is not None and len(portrait) > cap
+        if portrait is not None and not portrait_too_large:
             # Saved without an avatar when DMs are closed; one can be set under Appearance.
             kept = await self._keep_portrait(
-                interaction.user, discord.File(io.BytesIO(data), filename="avatar.png"),
+                interaction.user, discord.File(io.BytesIO(portrait), filename=f"avatar{suffix}"),
                 f"🖼️ **{card['name']}**'s portrait, from the card. If you save the profile, "
                 "this image is its avatar: deleting this message removes it.")
             if kept:
                 appearance["avatar_url"] = kept
-        del data
+        del data, portrait
 
         draft, model_used, unsorted = await draft_from_card(self, user_id, card)
         view = GeneratedProfileView(self, interaction, profile_name, prompt_text(card), draft,

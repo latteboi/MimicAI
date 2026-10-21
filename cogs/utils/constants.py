@@ -3050,6 +3050,7 @@ MEDIA_DESCRIBED_NOTE = (
 )
 
 IMPORT_FILE_TOO_LARGE = "❌ That file is over the {limit} MB import limit."
+IMPORT_LOW_MEMORY = f"❌ Nothing was imported: {ERR_REASON_LOW_MEMORY}."
 
 API_ERROR_MAPPINGS = {
     ("empty response",): "Empty Response (AI failed to output text content)",

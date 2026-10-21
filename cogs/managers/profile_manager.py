@@ -132,6 +132,17 @@ def _passphrase_fernet(passphrase: str, salt: bytes) -> Fernet:
     return Fernet(base64.urlsafe_b64encode(kdf.derive(passphrase.encode('utf-8'))))
 
 
+def _unchecked_declaration() -> Dict[str, Any]:
+    """An 18+ declaration, as a content_rating. No hash, and not checked: it runs nowhere
+    until the classifier has checked it for what Refused catches, and that check stamps the
+    hash it read (_store_content_rating). The caller, or the next resolve_stale_rating,
+    queues it."""
+    return {"verdict": CONTENT_RATING_ADULT, "hash": None, "model": None,
+            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "reason": "Declared 18+ by the profile owner", "source": "owner_declared",
+            "checked": False}
+
+
 def _inflate_export(blob: bytes) -> bytes:
     """A decrypted .mimic payload inflated: zstd, gzip, or neither, as each build wrote it.
 
@@ -3634,19 +3645,8 @@ class ProfileManager:
         if declared:
             if verdict == "adult":
                 return True
-            config["content_rating"] = {
-                "verdict": "adult",
-                # No hash, and not checked: the declaration runs nowhere until the
-                # classifier has checked it for what Refused catches, and that check
-                # stamps the hash it read (_store_content_rating). The caller, or the
-                # next resolve_stale_rating, queues it -- this may run in a thread.
-                "hash": None,
-                "model": None,
-                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "reason": "Declared 18+ by the profile owner",
-                "source": "owner_declared",
-                "checked": False,
-            }
+            # Not queued here: this may run in a thread.
+            config["content_rating"] = _unchecked_declaration()
         else:
             if source != "owner_declared":
                 return False
@@ -4150,7 +4150,7 @@ class ProfileManager:
 
             # Planned on the loop, with no await between the limit check and the last
             # name reserved; the shards are written after, off it, and the index saved last.
-            jobs, skipped, unrated = [], [], []
+            jobs, skipped, unrated, declared = [], [], [], []
             for name, p_data in profiles.items():
                 local_name = self._generate_unique_local_name(user_id, name)
                 valid, reason = self._is_valid_profile_name(local_name)
@@ -4165,13 +4165,19 @@ class ProfileManager:
                 config["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 # Adult and Refused alone cross: dropping either would let the profile run
                 # where it may not, and an export-import round trip must not launder a
-                # refusal. Any other was made about another copy, perhaps on another
-                # instance, and a file can claim any of them. Unrated runs the same and
-                # waits to be submitted before sharing.
+                # refusal. Refused crosses as written, since claiming it gains nothing. Adult
+                # crosses as an unchecked declaration: a passphrase file is anyone's to
+                # write, and a verdict it claimed -- hash and all, which the file's own text
+                # computes -- ran without the check for what Refused catches. Any other was
+                # made about another copy, perhaps on another instance. Unrated runs the
+                # same and waits to be submitted before sharing.
                 rating = config.pop("content_rating", None)
                 verdict = rating.get("verdict") if isinstance(rating, dict) else None
-                if verdict in (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED):
+                if verdict == CONTENT_RATING_REFUSED:
                     config["content_rating"] = rating
+                elif verdict == CONTENT_RATING_ADULT:
+                    config["content_rating"] = _unchecked_declaration()
+                    declared.append(local_name)
                 elif verdict == CONTENT_RATING_GENERAL:
                     unrated.append(local_name)
 
@@ -4199,6 +4205,9 @@ class ProfileManager:
             if unrated:
                 lines.append(f"-# Content ratings other than Adult 18+ do not carry over: submit "
                              f"{', '.join(f'`{n}`' for n in unrated)} again before sharing.")
+            if declared:
+                lines.append(f"-# {', '.join(f'`{n}`' for n in declared)} came in as Adult 18+, and "
+                             "runs once the content check has read it.")
             if skipped:
                 lines.append("**Not imported:**")
                 lines += skipped

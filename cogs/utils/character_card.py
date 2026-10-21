@@ -1,23 +1,29 @@
-"""Character cards (SillyTavern, Chub; spec V1 to V3), read for `/import`.
+"""Character cards (SillyTavern, Chub, RisuAI; spec V1 to V3), read for `/import`.
 
 A card is text someone else wrote, and it becomes only what its importer could have typed:
 persona text, training examples and a lorebook, each through `clean_imported_text` at the
 editor's own caps. Nothing in a card sets a config key or a model, nothing in it is a URL
-the bot fetches (a V3 card's `assets` are ignored), and the only rating it carries is the
-strictest: a card tagged NSFW is declared 18+ on save. `system_prompt` and
-`post_history_instructions` are dropped -- they are written for another engine's prompt
-layout, and are where a card's jailbreak lives.
+the bot fetches (a V3 card's `assets` are ignored, bar the main icon a CHARX carries inside
+itself), and the only rating it carries is the strictest: a card tagged NSFW is declared
+18+ on save. `system_prompt` and `post_history_instructions` are dropped -- they are
+written for another engine's prompt layout, and are where a card's jailbreak lives.
 
 The PNG is walked chunk by chunk and its image is never decoded or copied: only the
 `tEXt` chunk holding the card is read, so a file built to explode when decoded costs the
 walk alone. Compressed text chunks are not read at all, so there is nothing to inflate.
+A CHARX (V3's ZIP: `card.json` at the root, its assets beside it) is opened only once its
+central directory is a card's size, and each entry is read to a cap, never to its stated size.
 
 Pure functions over bytes, run off the event loop by the caller.
 """
 import base64
 import binascii
+import io
+import lzma
 import re
-from typing import Any, Callable, Dict, List, Tuple
+import zipfile
+import zlib
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import orjson
 
@@ -27,12 +33,23 @@ from .constants import (CARD_TEXT_MAX_BYTES, PERSONA_TEXT_INPUT_MAX_LENGTH,
 from .helpers import clean_imported_text
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
-#: A 10 MB image in 8 KB IDAT chunks is ~1,300; past this the file is not a card.
+#: A 25 MB image in 8 KB IDAT chunks is ~3,200; past this the file is not a card.
 _MAX_CHUNKS = 8192
 #: The newest spec first: a V3 card carries a V2 copy under `chara` for older readers.
 _KEYWORDS = (b"ccv3", b"chara")
 #: Base64 of the cap, plus padding.
 _MAX_ENCODED = CARD_TEXT_MAX_BYTES * 4 // 3 + 4
+
+ZIP_SIGNATURE = b"PK\x03\x04"
+#: Bytes of central directory a CHARX may have. Opening a ZIP reads it whole and builds a
+#: ZipInfo of ~480 bytes for every 46-byte entry: a 25 MB file of empty entries kept ~150 MB
+#: and held the GIL for seconds. This is ~5,000 entries at most; a card with every sprite
+#: lists a few hundred.
+_MAX_CHARX_DIRECTORY_BYTES = 256 * 1024
+#: What a damaged or hostile archive raises from zipfile, by codec. RuntimeError covers an
+#: encrypted entry and an unknown compression method.
+_ZIP_ERRORS = (zipfile.BadZipFile, RuntimeError, EOFError, OSError, ValueError,
+               zlib.error, lzma.LZMAError)
 
 #: What a description may bring to the model that sorts it: room to fill every persona
 #: section, and no more.
@@ -87,6 +104,80 @@ def _png_card_text(data: bytes) -> bytes:
         return base64.b64decode(encoded)
     except (binascii.Error, ValueError):
         raise CardError("This card's text is damaged.")
+
+
+def _open_charx(data: bytes) -> zipfile.ZipFile:
+    """A CHARX opened, once its central directory is known to be a card's size."""
+    fp = io.BytesIO(data)
+    try:
+        # ZipFile's own reading of the end record, ZIP64 included, so the size checked is the
+        # size it then reads. Private: a rename fails loudly in tests/test_character_cards.py.
+        end = zipfile._EndRecData(fp)
+    except (OSError, zipfile.BadZipFile):
+        end = None
+    if not end:
+        raise CardError("This CHARX is damaged.")
+    if end[zipfile._ECD_SIZE] > _MAX_CHARX_DIRECTORY_BYTES:
+        raise CardError("This CHARX lists more files than a character card holds.")
+    try:
+        return zipfile.ZipFile(fp)
+    except _ZIP_ERRORS:
+        raise CardError("This CHARX is damaged.")
+
+
+def _charx_member(archive: zipfile.ZipFile, name: str, n: int) -> bytes:
+    """At most `n` bytes of `name`; KeyError when there is none. An entry's stated size is
+    the archive's claim, so the read is what bounds it, inflated or not."""
+    try:
+        with archive.open(name) as f:
+            return f.read(n)
+    except _ZIP_ERRORS:
+        raise CardError("This CHARX is damaged.")
+
+
+def _charx_card_text(data: bytes) -> bytes:
+    """A CHARX's `card.json`, read one byte past the cap so that the cap refuses it."""
+    with _open_charx(data) as archive:
+        try:
+            return _charx_member(archive, "card.json", CARD_TEXT_MAX_BYTES + 1)
+        except KeyError:
+            raise CardError("This CHARX holds no card.json.")
+
+
+def _image_suffix(head: bytes) -> Optional[str]:
+    """The suffix of an image Discord shows, by its first bytes: a name is only a claim."""
+    if head.startswith(PNG_SIGNATURE):
+        return ".png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def card_portrait(data: bytes, max_bytes: int) -> Tuple[Optional[bytes], str]:
+    """The picture a card brings for its avatar and its suffix, or (None, ""). A PNG card is
+    its own; a CHARX's is the main icon it lists as inside the file (`embeded://`, the
+    spec's spelling), and at most `max_bytes` + 1 of that is read, so a caller testing
+    `len(...) > max_bytes` refuses one too large without it ever being read whole."""
+    if data.startswith(PNG_SIGNATURE):
+        return data, ".png"
+    if not data.startswith(ZIP_SIGNATURE):
+        return None, ""
+    assets = _card_object(data, "").get("assets")
+    icons = [a for a in (assets if isinstance(assets, list) else [])
+             if isinstance(a, dict) and a.get("type") == "icon"]
+    icon = next((a for a in icons if a.get("name") == "main"), icons[0] if icons else {})
+    scheme, _, path = str(icon.get("uri") or "").partition("://")
+    if scheme not in ("embeded", "embedded"):
+        return None, ""
+    with _open_charx(data) as archive:
+        try:
+            image = _charx_member(archive, path, max_bytes + 1)
+        except KeyError:
+            return None, ""
+    suffix = _image_suffix(image)
+    return (image, suffix) if suffix else (None, "")
 
 
 def _macros(text: str, name: str) -> str:
@@ -149,14 +240,16 @@ def _lore(book: Any, name: str) -> List[Dict[str, Any]]:
 
 
 def _card_object(data: bytes, filename: str) -> Dict[str, Any]:
-    """The JSON object a card PNG or JSON file holds: V2 and V3 nest the character under
-    `data`, V1 is the character itself, and so is a lorebook file its book."""
+    """The JSON object a card PNG, CHARX or JSON file holds: V2 and V3 nest the character
+    under `data`, V1 is the character itself, and so is a lorebook file its book."""
     if data.startswith(PNG_SIGNATURE):
         raw = _png_card_text(data)
+    elif data.startswith(ZIP_SIGNATURE):
+        raw = _charx_card_text(data)
     elif filename.lower().endswith(".json"):
         raw = data
     else:
-        raise CardError("That is neither a PNG character card nor a card's JSON.")
+        raise CardError("That is not a character card: a card PNG, a CHARX, or a card's JSON.")
     if len(raw) > CARD_TEXT_MAX_BYTES:
         raise CardError("This card holds more text than any character needs.")
     try:
