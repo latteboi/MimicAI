@@ -696,8 +696,89 @@ class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         view = self.parent_view
-        await view.cog.memory_manager._execute_training_analysis(
-            interaction, view.user_id, view.profile_name, count, verbosity)
+        if await view.cog.memory_manager._execute_training_analysis(
+                interaction, view.user_id, view.profile_name, count, verbosity):
+            from .gui_profiles import maybe_prompt_rating_after_edit
+            await maybe_prompt_rating_after_edit(view.cog, interaction, view.user_id, view.profile_name)
+
+class StyleGuideView(BlockedGuard, ui.View):
+    """Training -> Style Guide: what Analyse wrote, shown and never edited -- hand-written
+    style is what AI Instructions is for. Off keeps the guide without sending it. The guide
+    is moderated text and the switch is not, so only a new or cleared guide asks for a rating."""
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str,
+                 parent_manage_view: 'ProfileManageView'):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = interaction
+        # The profile's owner, which is not the invoker when /mod drives this view.
+        self.user_id = parent_manage_view.user_id
+        self.profile_name = profile_name
+        self.parent_manage_view = parent_manage_view
+        self.on = False
+
+    async def start(self):
+        await self._show(self.original_interaction)
+
+    def _write(self, **changes):
+        pm = self.cog.profile_manager
+        prompts = pm._get_profile_prompts(self.user_id, self.profile_name)
+        if prompts is None:
+            return
+        for key, value in changes.items():
+            if value is None:
+                prompts.pop(key, None)
+            else:
+                prompts[key] = value
+        pm._save_profile_prompts(self.user_id, self.profile_name, prompts)
+
+    async def _show(self, interaction: discord.Interaction):
+        prompts = await asyncio.to_thread(
+            self.cog.profile_manager._get_profile_prompts, self.user_id, self.profile_name) or {}
+        guide = self.cog.storage_manager._decrypt_data(prompts.get("style_guide") or "").strip()
+        self.on = bool(prompts.get("style_guide_enabled"))
+        embed = discord.Embed(title=f"Style Guide · {self.profile_name}", color=discord.Color.dark_teal(),
+                              description=guide or "No style guide yet. **Analyse…** writes one from "
+                                                   "this profile's newest training examples.")
+        if guide:
+            embed.set_footer(text="On · sent with AI Instructions" if self.on else "Off · kept, not sent")
+
+        self.clear_items()
+        add_button(self, "Turn Off" if self.on else "Turn On", self._toggle, disabled=not guide,
+                   style=discord.ButtonStyle.secondary if self.on else discord.ButtonStyle.success)
+        add_button(self, "Analyse…", self._analyse, style=discord.ButtonStyle.blurple)
+        add_button(self, "Clear", self._clear, style=discord.ButtonStyle.danger, disabled=not guide)
+        add_button(self, "Back to Dashboard", self._back, row=1, emoji="⬅️")
+        if interaction.response.is_done():
+            await interaction.edit_original_response(embed=embed, view=self)
+        else:
+            await interaction.response.edit_message(embed=embed, view=self)
+
+    async def _toggle(self, i: discord.Interaction):
+        await asyncio.to_thread(self._write, style_guide_enabled=not self.on)
+        await self._show(i)
+
+    async def _clear(self, i: discord.Interaction):
+        await i.response.defer()
+        await asyncio.to_thread(self._write, style_guide=None, style_guide_enabled=None)
+        await self._show(i)
+        from .gui_profiles import maybe_prompt_rating_after_edit
+        await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, self.profile_name)
+
+    async def _analyse(self, i: discord.Interaction):
+        # Imported here: gui_slot_models adopts ModelPickerMixin from gui_profiles, which
+        # imports this module. Its Back returns here through `_show`.
+        from .gui_slot_models import TrainingAnalysisView
+        view = TrainingAnalysisView(self.cog, self)
+        await i.response.edit_message(embed=view.embed(), view=view)
+
+    async def _back(self, i: discord.Interaction):
+        await i.response.defer()
+        embed = await self.cog.profile_manager._build_profile_manage_embed(
+            self.original_interaction, self.profile_name, target_user_id=self.user_id)
+        self.parent_manage_view._build_view()
+        await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
+
 
 class PrivacyDashboardView(BlockedGuard, ui.View):
     # Open to a blocked user. Export and deletion are theirs whatever their standing --

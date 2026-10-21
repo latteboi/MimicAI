@@ -265,9 +265,9 @@ class TrainingAnalysisView(_SlotPairView):
 
     _KEYS = (("training_analysis_model", "Primary"), ("training_analysis_fallback_model", "Fallback"))
     _TITLE = "Analyse Training Examples"
-    _DESCRIPTION = ("Writes a style guide from this profile's newest training examples into AI "
-                    "Instructions slot 4. The models are this profile's Training Analysis models, "
-                    "also under Set Models.")
+    _DESCRIPTION = ("Writes a style guide from this profile's newest training examples, shown "
+                    "under Training \u2192 Style Guide. The models are this profile's Training "
+                    "Analysis models, also under Set Models.")
     _FOOTER = "✏️ chosen for this profile · changes save as you make them"
     _SUBJECT = "Training analysis"
 

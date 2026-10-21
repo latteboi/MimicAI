@@ -2313,11 +2313,12 @@ class ProfileManager:
             return (data.get("prompts") or {}).get("birthday")
         return (self._get_profile_prompts(user_id, profile_name) or {}).get("birthday")
 
-    def lorebook(self, user_id: int, profile_name: str) -> List[Dict[str, Any]]:
-        """The lorebook this name speaks with. A borrow's is its source's, as its persona is:
-        a borrow's own prompts are written empty."""
+    def effective_prompts(self, user_id: int, profile_name: str) -> Dict[str, Any]:
+        """The prompts this name speaks with -- its lorebook, Enhance Awareness, style guide.
+        A borrow's are its source's, as its persona is: a borrow's own prompts are written
+        empty."""
         eff_owner, eff_name = self._resolve_effective_profile(user_id, profile_name)
-        return lorebook.entries((self._get_profile_prompts(eff_owner, eff_name) or {}).get("lorebook"))
+        return self._get_profile_prompts(eff_owner, eff_name) or {}
 
     def put_lore_entry(self, user_id: int, profile_name: str, entry_id: Optional[str],
                        keys: str, content: str) -> Tuple[bool, str]:
@@ -2641,6 +2642,11 @@ class ProfileManager:
         body = "\n\n".join(d for d in decrypted_instr if d)
         if body:
             parts.append(f"instructions:\n{body}")
+        # Judged whether on or off, so turning it on rescans nothing. Enhance Awareness is
+        # shipped text and is never here.
+        guide = prompts.get("style_guide")
+        if isinstance(guide, str) and guide.strip():
+            parts.append(f"style_guide:\n{self.cog.storage_manager._decrypt_data(guide).strip()}")
 
         img_prompt = prompts.get("image_generation_prompt")
         if isinstance(img_prompt, str) and img_prompt.strip():
@@ -4758,7 +4764,7 @@ class ProfileManager:
             self._invalidate_channel_model_cache((channel_id_context, user_id))
         return True
 
-    async def update_user_profile_ai_instructions(self, user_id: int, profile_name: str, instructions: List[str], channel_id_context: int) -> bool:
+    async def update_user_profile_ai_instructions(self, user_id: int, profile_name: str, instructions: List[str], channel_id_context: int, enhance_awareness: Optional[bool] = None) -> bool:
         if not self.cog.has_lock: return False
 
         def _sync_update():
@@ -4766,6 +4772,8 @@ class ProfileManager:
 
             prompts = self._get_profile_prompts(user_id, profile_name) or {}
             prompts["ai_instructions"] = instructions
+            if enhance_awareness is not None:
+                prompts["enhance_awareness_enabled"] = enhance_awareness
             self._save_profile_prompts(user_id, profile_name, prompts)
 
             return self.cog.session_manager._get_active_user_profile_name_for_channel(user_id, channel_id_context) == profile_name

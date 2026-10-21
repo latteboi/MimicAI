@@ -1271,7 +1271,8 @@ class MemoryManager:
 
     async def _execute_training_analysis(self, interaction: discord.Interaction, owner_id: int,
                                          profile_name: str, count: int, verbosity: int):
-        """Writes a style guide from the newest `count` examples into AI Instructions slot 4.
+        """Writes a style guide from the newest `count` examples, and turns it on. True once
+        written, for the caller to offer the rating prompt: the guide is moderated text.
 
         On the profile's own Training Analysis chain. `owner_id` is the profile's owner,
         who is not the invoker under /mod.
@@ -1312,20 +1313,16 @@ class MemoryManager:
 
             if not response_text: raise ValueError("Model returned an empty response.")
 
-            # Save to Slot 4 (Index 3)
             if profile_name in index.get("personal", []):
                 prompts = self.cog.profile_manager._get_profile_prompts(owner_id, profile_name) or {}
-
-                # Ensure ai_instructions is a list of 4
-                if not isinstance(prompts.get("ai_instructions"), list):
-                    prompts["ai_instructions"] = [prompts.get("ai_instructions", ""), "", "", ""]
-                while len(prompts["ai_instructions"]) < 4:
-                    prompts["ai_instructions"].append("")
-
-                prompts["ai_instructions"][3] = self.cog.storage_manager._encrypt_data(response_text[:4000])
+                # Its own key, never an AI Instructions part: those are hand-written, and this
+                # is only ever what the examples said. On, since someone just asked for it.
+                prompts["style_guide"] = self.cog.storage_manager._encrypt_data(response_text[:4000])
+                prompts["style_guide_enabled"] = True
                 self.cog.profile_manager._save_profile_prompts(owner_id, profile_name, prompts)
 
-                await interaction.followup.send(f"\u2705 **Analysis Complete.** Style guide saved to AI Instructions for '{profile_name}'.", ephemeral=True)
+                await interaction.followup.send(f"\u2705 **Analysis Complete.** Style guide saved and turned on for '{profile_name}'. **Training \u2192 Style Guide** shows it.", ephemeral=True)
+                return True
             else:
                 await interaction.followup.send("\u274c Profile not found.", ephemeral=True)
 

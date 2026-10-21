@@ -946,6 +946,8 @@ class ModProfilesView(ModBaseView):
 MOD_PROMPT_CATEGORIES = [
     ("Core Instructions", [
         ("Session Rules", "CONTEXT_RULES", DEFAULT_SESSION_RULES),
+        ("Enhance Awareness", "ENHANCE_AWARENESS", DEFAULT_ENHANCE_AWARENESS),
+        ("Enhance Awareness · Group", "ENHANCE_AWARENESS_GROUP", DEFAULT_ENHANCE_AWARENESS_GROUP),
         ("Current Time", "TIME_CONTEXT", DEFAULT_CURRENT_TIME),
         ("Birthday Context", "BIRTHDAY_CONTEXT", DEFAULT_BIRTHDAY_CONTEXT),
         ("Negative Constraints", "NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS),

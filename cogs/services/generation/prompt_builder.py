@@ -12,6 +12,7 @@ from ...utils.constants import (
     DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_NEURO_DEFINITION,
     DEFAULT_MEMORY_CAPTURE_INSTRUCTION, DEFAULT_MEMORY_WRITTEN_NOTE, LORE_SCAN_TURNS,
     DEFAULT_BOND_DEFINITION, DEFAULT_BOND_INSTRUCTION, BOND_ROSTER_SIZE,
+    DEFAULT_ENHANCE_AWARENESS, DEFAULT_ENHANCE_AWARENESS_GROUP,
 )
 from ...managers.session_manager import _TURN_IDENTITY
 from ...utils import lorebook
@@ -273,6 +274,16 @@ class PromptBuilderMixin:
                 persona_str = "<persona_profile>\n" + "\n\n".join(persona_blocks) + "\n</persona_profile>"
                 stable_parts.append(persona_str)
 
+        # A borrow's are its source's, as its persona is. Read once for everything below.
+        prompts = (self.cog.profile_manager.effective_prompts(profile_owner_id, profile_name_to_use)
+                   if profile_owner_id is not None else {})
+
+        if prompts.get("enhance_awareness_enabled"):
+            stable_parts.append(self.cog.global_prompts.get("ENHANCE_AWARENESS", DEFAULT_ENHANCE_AWARENESS))
+            if len((session or {}).get("profiles") or []) > 1:
+                stable_parts.append(self.cog.global_prompts.get(
+                    "ENHANCE_AWARENESS_GROUP", DEFAULT_ENHANCE_AWARENESS_GROUP))
+
         decrypted_parts = []
         if isinstance(ai_instr_str, list):
             for part in ai_instr_str:
@@ -285,6 +296,11 @@ class PromptBuilderMixin:
             if dec.strip():
                 cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
                 decrypted_parts.append(cleaned_part)
+        # Last, where it sat as Part 4 before it had a key of its own.
+        if prompts.get("style_guide_enabled"):
+            guide = self.cog.storage_manager._decrypt_data(prompts.get("style_guide") or "")
+            if guide.strip():
+                decrypted_parts.append("\n".join(line.strip() for line in guide.split("\n")))
 
         if decrypted_parts:
             # Renamed from the bare <instructions>: it was the one generically-named tag
@@ -298,8 +314,7 @@ class PromptBuilderMixin:
 
         # The lorebook's always-in-mind entries are part of the character, so they sit with
         # its persona; the keyed ones change per turn and ride it, below.
-        lore = (self.cog.profile_manager.lorebook(profile_owner_id, profile_name_to_use)
-                if profile_owner_id is not None else [])
+        lore = lorebook.entries(prompts.get("lorebook"))
         always = lorebook.constant(lore)
         if always:
             stable_parts.append(lorebook.render(always))

@@ -90,7 +90,12 @@ HELP_CATEGORIES = {
             "The Appearance field does double duty: the image generator reads it when the request is for a picture of the character itself.\n\n"
             "**Instructions** answer *how should it write*. Formatting rules, message length, what never to do. It is imperative, and it "
             "takes priority over persona bias during generation. There are four separate instruction blocks so long rulesets do not hit a "
-            "single field's character limit."
+            "single field's character limit.\n\n"
+            "**Enhance Awareness**, the box at the top of Instructions, adds MimicAI's own guidance on how a character thinks -- "
+            "judgement, self-awareness, not caving to insistence -- and, when two or more characters are seated, how to share a "
+            "room without echoing each other. It is off until you tick it, and it is kept up to date for you: the text is never "
+            "copied into your profile. The box's own description shows how many characters and roughly how many tokens it adds "
+            "to the system instruction."
         ),
         "Instruction Style by Model Type": (
             "How much instruction a model wants depends on what kind of model it is.\n\n"
@@ -1184,7 +1189,7 @@ DEFAULT_HELP_DOCS = {
         "Concept: Training Examples are explicit input-output pairs you author by hand to dictate a profile's voice, formatting and tone. Maximum 100 per profile.\n"
         "Retrieval: They are not all injected. Each is embedded, and your current message is matched against the library; only examples clearing the relevance threshold are injected for that turn. A large library therefore stays cheap.\n"
         "Best use: Situational voice -- how the character greets someone, reacts to an insult, or handles a question it cannot answer.\n"
-        "Management: `/profile manage` -> Training -> Manage Training Examples. 'Test match' shows which examples a message would pull in and how closely. 'Analyse' opens the profile's Training Analysis models, which Set Models also holds -- Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.5 Flash-Lite then 3.1 Flash-Lite on Google, until you choose others -- and 'Analyse…' there writes a style guide from the newest examples. Tune matching with 'Set Training Parameters'.\n"
+        "Management: `/profile manage` -> Training -> Manage Training Examples. 'Test match' shows which examples a message would pull in and how closely. 'Analyse' opens the profile's Training Analysis models, which Set Models also holds -- Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.5 Flash-Lite then 3.1 Flash-Lite on Google, until you choose others -- and 'Analyse…' there writes a style guide from the newest examples, which Training -> Style Guide shows, turns on or off, and regenerates. Tune matching with 'Set Training Parameters'.\n"
         "Availability: Training Examples belong to the profile owner. They cannot be edited on a borrowed profile.\n"
         "Reaction capture: `/train` is switched off. It could store other people's messages on your profile where they could neither see nor delete them. Examples are written on the Manage Training Examples screen.\n"
         "Troubleshooting / Symptoms:\n"

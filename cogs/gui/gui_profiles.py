@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
-    _pf, _pi, _ps, _pb, clean_model_name, is_real_model, is_shipped_ltm_prompt,
+    _estimate_text_tokens, _pf, _pi, _ps, _pb, clean_model_name, is_real_model, is_shipped_ltm_prompt,
     image_model_caps,
     openrouter_image_ratios, resolve_critic_settings,
     google_thinking_caps, grounding_mode_display, ltm_auto_recall_enabled, ltm_creation_mode,
@@ -43,7 +43,7 @@ from ..services.api.openrouter_endpoints import option_description, option_label
 from ..services.api.google_rest import voice_id_of
 from ..utils.discord_cdn import is_web_url
 from ..utils.data_policy import may_pick_training_models
-from .gui_data import DataManageView
+from .gui_data import DataManageView, StyleGuideView
 from .gui_hub import HubCloneManagerView, HubShareManagerView
 from .gui_sessions import CustomModelModal
 from .gui_settings import OllamaHostModal
@@ -921,12 +921,12 @@ PROFILE_ACTIONS = (
     _Action("edit_instructions", "persona", "Edit Instructions", "Edit specific AI behavioral instructions.",
             _method("_act_edit_instructions", wants_profile=True),
             bulk=_Bulk(_bulk_method("_bulk_edit_instructions"), scope="personal", destructive=True,
-                       prompt_keys=("ai_instructions",),
-                       description="Overwrite all four AI instruction parts.",
+                       prompt_keys=("ai_instructions", "enhance_awareness_enabled"),
+                       description="Overwrite all four AI instruction parts and Enhance Awareness.",
                        warning="Every selected profile's **AI instructions** are replaced with what you "
-                               "typed, across all four parts. Part 4 is the slot the training analyser "
-                               "writes to, so any generated style guide is overwritten too. The previous "
-                               "text is not recoverable.")),
+                               "typed, across all four parts, and Enhance Awareness is set as you left it. "
+                               "With all four parts blank and the box ticked, only Enhance Awareness is "
+                               "turned on. The previous text is not recoverable.")),
     _Action("edit_appearance", "persona", "Edit Appearance", "Edit the custom Webhook name and avatar.",
             _method("_handle_appearance"), _own),
     # Identity, so it is stored with the persona and a borrow reads the original's. No
@@ -1305,6 +1305,8 @@ PROFILE_ACTIONS = (
     # --- Training (tab hidden entirely for borrowed profiles: every row is owner-only) ---
     _Action("manage_training", "training", "Manage Training Examples", "Add, list, edit, or delete training examples.",
             _method("_act_manage_training", wants_profile=True), _own),
+    _Action("style_guide", "training", "Style Guide", "View, turn on or off, or regenerate the style guide written from training examples.",
+            _method("_act_style_guide", wants_profile=True), _own),
     _Action("manage_lore", "training", "Manage Lorebook", "What the character knows, handed to it when a keyword comes up.",
             _method("_act_manage_lore", wants_profile=True), _own),
     _Action("train_params", "training", "Set Training Parameters", "Set training context size and relevance threshold.",
@@ -1585,7 +1587,8 @@ class ProfileManageView(BlockedGuard, ui.View):
 
     async def _act_edit_instructions(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {}
-        modal = EditUserProfileAIInstructionsModal(self.cog, self.profile_name, prompts.get("ai_instructions", ""), self.user_id)
+        modal = EditUserProfileAIInstructionsModal(self.cog, self.profile_name, prompts.get("ai_instructions", ""), self.user_id,
+                                                   enhance_awareness=bool(prompts.get("enhance_awareness_enabled")))
         await interaction.response.send_modal(modal)
 
     async def _act_models(self, interaction: discord.Interaction, profile: Dict[str, Any]):
@@ -1623,6 +1626,9 @@ class ProfileManageView(BlockedGuard, ui.View):
         view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
                               mode='training', parent_manage_view=self, target_user_id=self.user_id)
         await view.start()
+
+    async def _act_style_guide(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        await StyleGuideView(self.cog, interaction, self.profile_name, self).start()
 
     async def _act_manage_lore(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
@@ -2032,7 +2038,8 @@ class EditUserProfilePersonaModal(ui.Modal):
     async def on_error(self, i:discord.Interaction, e:Exception): print(f"EditUserProfilePersonaModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
 
 class EditUserProfileAIInstructionsModal(ui.Modal):
-    def __init__(self, cog_instance, profile_name: str, current_instr:str, user_id: int, callback=None):
+    def __init__(self, cog_instance, profile_name: str, current_instr:str, user_id: int, callback=None,
+                 enhance_awareness: bool = False):
         self.cog:MimicCog=cog_instance
         self.profile_name = profile_name
         self.user_id = user_id
@@ -2041,37 +2048,43 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
         title = ("Set AI Instructions for Multiple Profiles" if profile_name == "BULK_APPLY"
                  else f"Edit AI Instructions for Profile: '{profile_name}'")[:45]
         super().__init__(title=title)
-        
-        p1, p2, p3, p4 = "", "", "", ""
-        if isinstance(current_instr, list):
-            if len(current_instr) >= 1: p1 = self.cog.storage_manager._decrypt_data(current_instr[0])
-            if len(current_instr) >= 2: p2 = self.cog.storage_manager._decrypt_data(current_instr[1])
-            if len(current_instr) >= 3: p3 = self.cog.storage_manager._decrypt_data(current_instr[2])
-            if len(current_instr) >= 4: p4 = self.cog.storage_manager._decrypt_data(current_instr[3])
 
-        self.add_item(ui.TextInput(label="Part 1",custom_id="ai_p1",style=discord.TextStyle.paragraph,default=p1,required=False,max_length=AI_INSTRUCTIONS_PART_MAX_LENGTH))
-        self.add_item(ui.TextInput(label="Part 2",custom_id="ai_p2",style=discord.TextStyle.paragraph,default=p2,required=False,max_length=AI_INSTRUCTIONS_PART_MAX_LENGTH))
-        self.add_item(ui.TextInput(label="Part 3",custom_id="ai_p3",style=discord.TextStyle.paragraph,default=p3,required=False,max_length=AI_INSTRUCTIONS_PART_MAX_LENGTH))
-        self.add_item(ui.TextInput(label="Style Guide (Reserved For Training)",custom_id="ai_p4",style=discord.TextStyle.paragraph,default=p4,required=False,max_length=AI_INSTRUCTIONS_PART_MAX_LENGTH))
+        current = current_instr if isinstance(current_instr, list) else []
+        # Discord's five components: the tick, then four parts. The style guide has its own
+        # screen under Training, so Part 4 is a part like the others.
+        # Its cost, from the text as resolved (a /mod override counts as itself). Characters
+        # are exact, the 2 being the blank line it is joined by; tokens are an estimate, as
+        # every model's tokeniser counts differently.
+        solo = self.cog.global_prompts.get("ENHANCE_AWARENESS", DEFAULT_ENHANCE_AWARENESS)
+        group = self.cog.global_prompts.get("ENHANCE_AWARENESS_GROUP", DEFAULT_ENHANCE_AWARENESS_GROUP)
+        self.enhance = ui.Checkbox(default=enhance_awareness)
+        self.add_item(ui.Label(text="Enhance Awareness", component=self.enhance, description=(
+            f"Sharper judgement, less echo. Adds {len(solo) + 2:,} chars (~{_estimate_text_tokens(solo):,} "
+            f"tokens), {len(group) + 2:,} (~{_estimate_text_tokens(group):,}) more in groups.")[:100]))
+        self.parts = [ui.TextInput(label=f"Part {n}", style=discord.TextStyle.paragraph,
+                                   default=self.cog.storage_manager._decrypt_data(current[n - 1]) if len(current) >= n else "",
+                                   required=False, max_length=AI_INSTRUCTIONS_PART_MAX_LENGTH)
+                      for n in range(1, 5)]
+        for part in self.parts:
+            self.add_item(part)
 
     async def on_submit(self, i:discord.Interaction):
         await i.response.defer(ephemeral=True,thinking=True)
-        p1=next(c.value for c in self.children if c.custom_id=="ai_p1"); p2=next(c.value for c in self.children if c.custom_id=="ai_p2")
-        p3=next(c.value for c in self.children if c.custom_id=="ai_p3"); p4=next(c.value for c in self.children if c.custom_id=="ai_p4")
-        instr_list = [p1, p2, p3, p4]
+        instr_list = [part.value for part in self.parts]
 
         if self.profile_name == "BULK_APPLY":
             if self.callback:
-                await self.callback(i, instr_list)
+                await self.callback(i, instr_list, self.enhance.value)
             return
 
         success = await self.cog.profile_manager.update_user_profile_ai_instructions(
-            self.user_id, self.profile_name, instr_list, i.channel_id
+            self.user_id, self.profile_name, instr_list, i.channel_id, enhance_awareness=self.enhance.value
         )
         scope=f"your profile '{self.profile_name}'"
         message = f"AI Instructions for {scope} {'updated' if success else 'update failed -- that profile could not be written'}."
 
         await i.followup.send(message,ephemeral=True)
+        # The tick is not moderated text, so a change to it alone leaves the rating current.
         if success:
             await maybe_prompt_rating_after_edit(
                 self.cog, i, self.user_id, self.profile_name)
@@ -6617,12 +6630,20 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
             self.cog, "BULK_APPLY", {}, self.user_id, callback=modal_callback))
 
     async def _bulk_edit_instructions(self, interaction: discord.Interaction):
-        async def modal_callback(i: discord.Interaction, instr_list: List[str]):
+        async def modal_callback(i: discord.Interaction, instr_list: List[str], enhance: bool):
+            # Four blank parts with the tick set means "turn Enhance Awareness on", which is
+            # a likely thing to want across forty profiles; clearing every part is not.
             if not any(part.strip() for part in instr_list):
+                if enhance:
+                    await self._stage_from_modal(i, "edit_instructions", {},
+                                                 {"enhance_awareness_enabled": True})
+                    return
                 await self._modal_reply(
                     i, "Every instruction part was left blank, so nothing was staged.")
                 return
-            await self._stage_from_modal(i, "edit_instructions", {}, {"ai_instructions": instr_list})
+            await self._stage_from_modal(i, "edit_instructions", {},
+                                         {"ai_instructions": instr_list,
+                                          "enhance_awareness_enabled": enhance})
 
         await interaction.response.send_modal(EditUserProfileAIInstructionsModal(
             self.cog, "BULK_APPLY", "", self.user_id, callback=modal_callback))
