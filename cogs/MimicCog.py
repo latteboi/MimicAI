@@ -11,7 +11,7 @@ from .utils.constants import (
     cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
-    PERSONA_TEXT_INPUT_MAX_LENGTH, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
+    PERSONA_TEXT_INPUT_MAX_LENGTH,
     BOT_PERMISSIONS, invite_url,
 )
 from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError, clean_display_name,
@@ -72,7 +72,7 @@ import platform
 from collections import OrderedDict
 import pathlib
 from .utils.helpers import (_resolve_safety_settings, _scrub_response_text, resolve_thinking_params,
-                            suppress_link_previews, voice_sample_mime_type)
+                            suppress_link_previews, voice_sample_mime_type, check_portrait_upload)
 
 class LRUCache(OrderedDict):
     def __init__(self, max_size, *args, **kwargs):
@@ -481,19 +481,9 @@ class MimicCog(EventListeners, commands.Cog):
             await settle_status(interaction, "Give a concept, an image, or both.")
             return
         if image is not None:
-            mime_type = ((image.content_type or "").split(";", 1)[0].strip().lower()
-                         or IMAGE_SUFFIX_MIMES.get(os.path.splitext(image.filename)[1].lower()))
-            if mime_type not in IMAGE_MIME_SUFFIXES:
-                await settle_status(interaction,
-                    "❌ **Not an Image:** Upload a PNG, JPEG or WebP picture.")
-                return
-            # The rating reads an avatar only up to this, and judges a larger one by the
-            # text alone: over it, the picture would be the face of a profile nobody rated.
-            limit = defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES
-            if image.size > limit:
-                await settle_status(interaction,
-                    f"❌ **Image Too Large:** That image is {image.size / (1024 * 1024):.1f} MB. "
-                    f"It can be at most {limit // (1024 * 1024)} MB.")
+            mime_type, refusal = check_portrait_upload(image)
+            if refusal:
+                await settle_status(interaction, refusal)
                 return
 
         index = self.profile_manager._get_user_index(interaction.user.id)

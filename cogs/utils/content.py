@@ -94,8 +94,8 @@ HELP_CATEGORIES = {
             "**Enhance Awareness**, the box at the top of Instructions, adds MimicAI's own guidance on how a character thinks -- "
             "judgement, self-awareness, not caving to insistence -- and, when two or more characters are seated, how to share a "
             "room without echoing each other. It is off until you tick it, and it is kept up to date for you: the text is never "
-            "copied into your profile. The box's own description shows how many characters and roughly how many tokens it adds "
-            "to the system instruction."
+            "copied into your profile. The box's own description shows roughly how many tokens it adds to the system "
+            "instruction; a group chat adds about as many again."
         ),
         "Instruction Style by Model Type": (
             "How much instruction a model wants depends on what kind of model it is.\n\n"

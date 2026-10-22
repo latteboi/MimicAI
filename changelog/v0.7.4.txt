@@ -1,0 +1,23 @@
+v0.7.4 Beta — 2026-10-22 (UTC)
+Characters can refer back to what they just remembered, and Help Mode stays in the scene.
+## **Added**
+- **Enhance Awareness**, a box at the top of `/profile manage` → Edit Instructions: MimicAI's own guidance for sharper judgement and self-awareness, and less echo when two or more characters are seated. Off until ticked; its description shows what it adds to the prompt.
+- **Training → Style Guide.** The style guide Analyse writes now has its own screen, to view, turn on or off, regenerate or clear, instead of filling Part 4 of the instructions. A guide already in Part 4 stays there.
+- **Recalled Memories prompt** in `/mod` → Prompts → Memory & Training, which operators could not edit before.
+- **`/start` flags missing permissions.** In a server, it lists any permission MimicAI or a child bot in the cast is missing in that channel, and what goes wrong without it.
+- **Linking a child bot gives its invite link.**
+- **Upload an avatar in Edit Appearance**, instead of pasting a link. As with `/profile generate`, the image is kept in your DMs: deleting that message removes the avatar.
+
+## **Changed**
+- **The invite no longer asks for Administrator**, only for the permissions MimicAI uses. A self-hosted bot's link still does, and the bot prints it to the console on start.
+- **Recalled memories stay in mind.** A memory recalled by Auto-Recall or Memory Search stays in front of the character for three replies instead of one, so "you said earlier..." gets an answer, then rests before it can come up unprompted again. Characters are told their memories are their own, to bring each up once where it fits, and to trust the conversation over one gone out of date.
+- **Help Mode stays in character.** It answers from the guide only when someone asks how MimicAI works, not when a line in the scene merely sounds like it.
+- **Training examples are taken as voice only**, not as lines to answer or reuse.
+- **Game temperament follows the character, not its name.** In Mimic Eights and Mimic Dice, most characters will play with a new temperament once, from this update on, and then keep it.
+
+## **Fixed**
+- **Memory cooldowns survive a restart**, and deleting or regenerating a reply frees the memories it recalled.
+- **Renaming a profile no longer breaks what was already open.** Until a restart, its child bot, Global Chat card, game seat and replies to its messages could lose its persona or history, and an edit saved from an older screen could leave a stray profile under the old name.
+- **Deleting a profile cleans up after it.** Its child bot goes offline, and a new profile given its name no longer inherits its display name, avatar, rating, Global Chat history or session seat.
+- **Deleting a session's last character no longer erases the channel's history.** The session stays, with an empty cast, until `/suspend` ends it.
+- **No more paid replies that go nowhere**, from a character deleted mid-round or one whose child bot was unlinked.

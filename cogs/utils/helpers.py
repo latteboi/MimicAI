@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Any, Optional, Union
 import orjson as json
 from .constants import (
-    ATTACHMENT_TAG, ATTACHMENT_TAG_DEFAULT, ATTACHMENT_TAG_KINDS,
+    defaultConfig, ATTACHMENT_TAG, ATTACHMENT_TAG_DEFAULT, ATTACHMENT_TAG_KINDS,
     DOCUMENT_MIME_TYPES, TEXT_ATTACHMENT_EXTENSIONS,
     DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_TYPES,
     HARM_CATEGORIES, HarmBlockThreshold, HarmCategory,
@@ -1223,6 +1223,22 @@ def image_suffix_for_mime(mime_type: Optional[str]) -> str:
     """The suffix a generated image is saved under. PNG when the type is missing or unknown,
     which is what every generated image was before a provider could answer in another."""
     return IMAGE_MIME_SUFFIXES.get(str(mime_type or "").split(";", 1)[0].strip().lower(), ".png")
+
+
+def check_portrait_upload(image: Any) -> Tuple[Optional[str], Optional[str]]:
+    """(mime type, None) for an uploaded picture a profile may wear, or (None, the refusal).
+    `/profile generate` and Edit Appearance both ask this, so both refuse alike."""
+    mime_type = ((image.content_type or "").split(";", 1)[0].strip().lower()
+                 or IMAGE_SUFFIX_MIMES.get(os.path.splitext(image.filename)[1].lower()))
+    if mime_type not in IMAGE_MIME_SUFFIXES:
+        return None, "❌ **Not an Image:** Upload a PNG, JPEG or WebP picture."
+    # The rating reads an avatar only up to this, and judges a larger one by the
+    # text alone: over it, the picture would be the face of a profile nobody rated.
+    limit = defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES
+    if image.size > limit:
+        return None, (f"❌ **Image Too Large:** That image is {image.size / (1024 * 1024):.1f} MB. "
+                      f"It can be at most {limit // (1024 * 1024)} MB.")
+    return mime_type, None
 
 
 def generated_image_attachment(path: Optional[str], speaker: str = "", prompt: str = "") -> Tuple[str, str]:

@@ -15,7 +15,7 @@ from ..utils.helpers import (
     _estimate_text_tokens, _pf, _pi, _ps, _pb, clean_model_name, is_real_model, is_shipped_ltm_prompt,
     image_model_caps,
     openrouter_image_ratios, resolve_critic_settings,
-    google_thinking_caps, grounding_mode_display, ltm_auto_recall_enabled, ltm_creation_mode,
+    google_thinking_caps, check_portrait_upload, grounding_mode_display, ltm_auto_recall_enabled, ltm_creation_mode,
     resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model, auto_thinking,
@@ -2052,15 +2052,14 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
         current = current_instr if isinstance(current_instr, list) else []
         # Discord's five components: the tick, then four parts. The style guide has its own
         # screen under Training, so Part 4 is a part like the others.
-        # Its cost, from the text as resolved (a /mod override counts as itself). Characters
-        # are exact, the 2 being the blank line it is joined by; tokens are an estimate, as
-        # every model's tokeniser counts differently.
+        # Its cost, from the text as resolved (a /mod override counts as itself), and an
+        # estimate, as every model's tokeniser counts differently. The group half's cost is
+        # left to the Instructions help page: there is no room for both under 100.
         solo = self.cog.global_prompts.get("ENHANCE_AWARENESS", DEFAULT_ENHANCE_AWARENESS)
-        group = self.cog.global_prompts.get("ENHANCE_AWARENESS_GROUP", DEFAULT_ENHANCE_AWARENESS_GROUP)
         self.enhance = ui.Checkbox(default=enhance_awareness)
         self.add_item(ui.Label(text="Enhance Awareness", component=self.enhance, description=(
-            f"Sharper judgement, less echo. Adds {len(solo) + 2:,} chars (~{_estimate_text_tokens(solo):,} "
-            f"tokens), {len(group) + 2:,} (~{_estimate_text_tokens(group):,}) more in groups.")[:100]))
+            f"Thinks before replying, holds its view, and in groups stops echoing others. "
+            f"~{_estimate_text_tokens(solo):,} tokens.")[:100]))
         self.parts = [ui.TextInput(label=f"Part {n}", style=discord.TextStyle.paragraph,
                                    default=self.cog.storage_manager._decrypt_data(current[n - 1]) if len(current) >= n else "",
                                    required=False, max_length=AI_INSTRUCTIONS_PART_MAX_LENGTH)
@@ -5661,11 +5660,16 @@ class AppearanceModal(ui.Modal):
         self.avatar_url_input = ui.TextInput(label="Avatar URL (Blank to reset)", required=False, default=current_data.get("custom_avatar_url"))
         self.add_item(self.display_name_input)
         self.add_item(self.avatar_url_input)
+        # The URL field is filled with the current avatar, so an upload has to beat it.
+        self.image_input = ui.FileUpload(required=False)
+        self.add_item(ui.Label(text="Avatar Image (optional)", component=self.image_input,
+                               description="Upload a picture instead of a link. It replaces the URL above."))
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer()
         new_display_name = self.display_name_input.value.strip() or None
         new_avatar_url = self.avatar_url_input.value.strip() or None
+        image = self.image_input.values[0] if self.image_input.values else None
         owner_id = self.owner_id
         user_id_str = str(owner_id)
 
@@ -5676,7 +5680,22 @@ class AppearanceModal(ui.Modal):
             if any(r in new_display_name.lower() for r in ["clyde", "@everyone", "@here"]):
                 await interaction.followup.send("❌ **Invalid Display Name:** Contains a reserved keyword or mention.", ephemeral=True)
                 return
-        if new_avatar_url and not is_web_url(new_avatar_url):
+        if image is not None:
+            refusal = check_portrait_upload(image)[1]
+            if refusal:
+                await interaction.followup.send(refusal, ephemeral=True)
+                return
+            # An upload is the interaction's, which Discord deletes after a while. Kept
+            # before anything is written, so closed DMs refuse the whole edit, not half.
+            new_avatar_url = await self.cog._keep_portrait(
+                interaction.user, await image.to_file(),
+                f"🖼️ The avatar of `{self.profile_name}`. Deleting this message removes it.")
+            if not new_avatar_url:
+                await interaction.followup.send(
+                    "❌ **Image Not Kept:** Your DMs are closed, so the image could not be kept as "
+                    "the avatar. Open them, or give an Avatar URL instead.", ephemeral=True)
+                return
+        elif new_avatar_url and not is_web_url(new_avatar_url):
             await interaction.followup.send("❌ **Invalid Avatar URL:** It must be a link starting with https://.", ephemeral=True)
             return
 
