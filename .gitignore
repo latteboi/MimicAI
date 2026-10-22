@@ -11,6 +11,7 @@ __pycache__/
 # Local Data
 cogs/data/
 cogs/mixins/data/
+changelog/releases/
 
 # OS Specific
 .DS_Store
