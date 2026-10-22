@@ -2,8 +2,8 @@
 
 Two provider routes may use what they are sent to train models: Google's free (unpaid)
 Gemini tier, and the OpenRouter hosts whose policy allows training. Both are closed to a
-server's traffic until the bot owner opts that server in, per provider, on the data policy
-screen `/privacy` gives them. See GEMINI_FREE_TIER_BLOCKED in constants for why.
+server's traffic until a self-hosted instance's owner opts that server in, per provider, on
+the data policy screen `/privacy` gives them. See GEMINI_FREE_TIER_BLOCKED in constants for why.
 
 A Global Chat is a conversation wherever its card is opened, so it answers to the same
 policy: the server's when it is opened in one, and closed anywhere else, where there is no
@@ -13,7 +13,8 @@ under their own key, and is not gated.
 The decision is the bot owner's alone. Discord's terms bind the developer operating the
 application, not a server, and Discord's permission -- the only thing that could make
 opening either route compliant -- would be granted to that developer. So a record anyone
-else wrote opens nothing, and nobody else can write one.
+else wrote opens nothing, and nobody else can write one. The official instance's developer
+holds no such permission, so there nobody can, and a record already on disk opens nothing.
 
 The choice lives in the server's plaintext `index.json` under `training_opt_in`, keyed by
 provider. Sparse: an absent entry means "not allowed", and a revoked one is removed rather
@@ -29,13 +30,22 @@ TRAINING_OPT_IN_KEY = "training_opt_in"
 #: The two providers the bot owner can open, in the order the data policy screen lists them.
 TRAINING_PROVIDERS = ("gemini", "openrouter")
 
+#: Whether this is a self-hosted instance, the only kind on which a route can be opened.
+#: Set by on_ready from OFFICIAL_BOT_ID, once the bot knows which application it is;
+#: closed until then, so nothing opens on a guess.
+SELF_HOSTED = False
 
-def may_set_data_policy(user_id: Optional[int]) -> bool:
-    """Whether this user's opt-in counts: the bot owner's, and nobody else's."""
+
+def _is_bot_owner(user_id: Optional[int]) -> bool:
     try:
         return user_id is not None and int(user_id) == int(defaultConfig.DISCORD_OWNER_ID)
     except (TypeError, ValueError):
         return False
+
+
+def may_set_data_policy(user_id: Optional[int]) -> bool:
+    """Whether this user's opt-in counts: a self-hosted instance's owner's, and nobody else's."""
+    return SELF_HOSTED and _is_bot_owner(user_id)
 
 
 def may_pick_training_models(user_id: Optional[int]) -> bool:
@@ -45,7 +55,7 @@ def may_pick_training_models(user_id: Optional[int]) -> bool:
     trains, so to anyone else a model no other host serves is one the data policy refuses
     wherever the bot owner has not opened that route.
     """
-    return may_set_data_policy(user_id)
+    return _is_bot_owner(user_id)
 
 
 def may_save_free_gemini_key(user_id: Optional[int]) -> bool:
@@ -55,7 +65,7 @@ def may_save_free_gemini_key(user_id: Optional[int]) -> bool:
     opens that server to it, and nobody else can. Anyone else's would save, read as set up,
     and never carry a conversation.
     """
-    return may_set_data_policy(user_id)
+    return _is_bot_owner(user_id)
 
 
 def opt_in_record(server_index: Optional[Dict[str, Any]], provider: str) -> Optional[Dict[str, Any]]:

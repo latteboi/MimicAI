@@ -477,7 +477,9 @@ OpenRouter hosts whose policy allows training. Both are closed to a conversation
 bot owner opts its server in, on the screen `/privacy` gives them (`cogs/utils/data_policy.py`,
 stored sparse in the server's `index.json`); everyone else reads the policy there. The terms
 bind the developer, not a server, so no server administrator can: `training_opt_in` ignores
-a record anyone but the bot owner wrote.
+a record anyone but the bot owner wrote. Only a self-hosted instance can open either route
+(`SELF_HOSTED`, set by `on_ready` from `OFFICIAL_BOT_ID`); on the official one the button is
+gone and a record on disk opens nothing.
 
 - **Gemini:** `_get_api_key_for_guild` will not hand out a free-tier (or untiered) key for
   a server that has not opted in. It is the one resolver every server-billed Google call

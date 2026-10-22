@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 from .base_components import (PAGE_NAV_VALUES, BaseBulkProfileView, BlockedGuard, PageJumpModal, add_button,
                               add_select, build_confirm_view, paged_nav_options)
 from .gui_data_policy import DataPolicyView, add_data_policy_fields
+from ..utils import data_policy
 from ..utils.data_policy import may_set_data_policy
 
 class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
@@ -805,7 +806,9 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
         if self.guild is not None:
             e.description += (
                 "\n\n**This server's data policy** decides whether its messages may reach AI "
-                "providers that train on them. Only the bot's owner can change it.")
+                "providers that train on them. "
+                + ("Only the bot's owner can change it." if data_policy.SELF_HOSTED
+                   else "Both stay closed on the official bot, and nobody can open them."))
             add_data_policy_fields(e, self.cog.server_manager._get_server_index(str(self.guild.id)))
             e.set_footer(text=self.guild.name)
         return e

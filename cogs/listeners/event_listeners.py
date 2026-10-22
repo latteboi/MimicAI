@@ -13,7 +13,7 @@ from discord.ext import commands
 
 from ..utils.constants import *
 from ..utils.member_probe import start_member_probe
-from ..utils import mem_probe
+from ..utils import data_policy, mem_probe
 from ..utils.content import (
     MENTION_POINTER_REGISTERED, MENTION_POINTER_UNREGISTERED, WELCOME_MESSAGE,
     WELCOME_CHANNEL_HINTS,
@@ -36,6 +36,7 @@ class EventListeners:
 
     @commands.Cog.listener()
     async def on_ready(self):
+        data_policy.SELF_HOSTED = self.bot.user.id != OFFICIAL_BOT_ID
         if not self.sessions_loaded:
             await self.session_manager._load_multi_profile_sessions()
             self.sessions_loaded = True

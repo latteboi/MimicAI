@@ -59,7 +59,7 @@ HELP_CATEGORIES = {
             "wherever it is opened, and only the bot's owner can save one in `/settings`. OpenRouter requests for either only go "
             "to hosts that do not train on prompts, and a model no "
             "such host is known to serve is offered to the bot's owner alone. A server's administrators cannot change any of "
-            "this; only the bot's owner can, one server at a time, from `/privacy`. Paid tier also escapes the rate limits that "
+            "this; only a self-hosted bot's owner can, one server at a time, from `/privacy` -- never on the official bot. Paid tier also escapes the rate limits that "
             "throttle long-term memory, grounding and the content classifier, and image generation is blocked on free keys entirely.\n\n"
             "**Preferred provider** (`/start`, or `/settings` -> Override Defaults): every model a character uses runs Primary -> Fallback on "
             "this provider. A Fallback you set on the other provider keeps a character speaking through an outage or a spent key on one. "
@@ -966,7 +966,7 @@ DEFAULT_HELP_DOCS = {
     "apis/google_gemini.txt": (
         "Requirements: A Google API key from Google AI Studio, submitted via `/start` or `/settings` -> API Keys.\n"
         "Capabilities: Powers standard text generation. Native Grounding and URL Context on a Gemini model use Google's own Search and URL fetching. Its Gemini image models draw pictures and its Gemini speech models speak, directed by the Director's Desk; OpenRouter offers other image and speech models alongside them.\n"
-        "Free versus paid tier: Google may train its models on what a free-tier key is sent, so `/settings` refuses a free-tier key from anyone but the bot's owner, and one saved before that is not used for a server's messages or for Global Chat. Conversations on Gemini need a billing-enabled (paid) key. A server's administrators cannot change that; only the bot's owner can, one server at a time, from `/privacy`. Free keys also rate-limit hard, and image generation is blocked outright on them.\n"
+        "Free versus paid tier: Google may train its models on what a free-tier key is sent, so `/settings` refuses a free-tier key from anyone but the bot's owner, and one saved before that is not used for a server's messages or for Global Chat. Conversations on Gemini need a billing-enabled (paid) key. A server's administrators cannot change that; only a self-hosted bot's owner can, one server at a time, from `/privacy` -- never on the official bot. Free keys also rate-limit hard, and image generation is blocked outright on them.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The bot isn't responding in the server' or 'Bot is silent'. Fix: Ensure an administrator has assigned a billing-enabled (paid) Google API key to this server via `/settings` -> API Keys, and clicked Save Assignments. A free-tier key is not used in a server.\n"
         "- Symptom: 'Image generation failed' or 'Paid Key Required'. Fix: You are using a free-tier Google API key. You must configure billing in Google AI Studio to unlock image models.\n"
@@ -992,8 +992,8 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'No OpenRouter host is known to serve this model without training on prompts, so it is not offered here.' Fix: Only the bot's owner is offered such models. Pick another."
     ),
     "apis/data_policy.txt": (
-        "Command: `/privacy` shows everyone the data policy of the server it is run in: whether that server's messages may be sent to AI providers that can train on them. Only the bot's owner can change it, with the Change Data Policy button there.\n"
-        "Concept: Two routes can train on what they are sent: Google's free (unpaid) Gemini tier, and OpenRouter hosts whose policy allows training. Both are closed in every server and in every Global Chat. Discord's Developer Policy does not allow message content to be used to train AI models without Discord's permission, and that permission could only be given to the bot's developer, so only the bot's owner can open either route. A server's administrators cannot.\n"
+        "Command: `/privacy` shows everyone the data policy of the server it is run in: whether that server's messages may be sent to AI providers that can train on them. Only a self-hosted bot's owner can change it, with the Change Data Policy button there; on the official bot nobody can, and both routes stay closed.\n"
+        "Concept: Two routes can train on what they are sent: Google's free (unpaid) Gemini tier, and OpenRouter hosts whose policy allows training. Both are closed in every server and in every Global Chat. Discord's Developer Policy does not allow message content to be used to train AI models without Discord's permission, and that permission could only be given to the bot's developer, so only the bot's owner can open either route, and only on a self-hosted bot: the official bot has no such permission, so on it nobody can. A server's administrators cannot.\n"
         "Gemini free tier: While closed, a free-tier Google key is not used for the server's messages -- conversations, memories, web research, images and speech. Billing-enabled (paid) keys are unaffected.\n"
         "OpenRouter: While closed, the server's OpenRouter requests ask OpenRouter to use only hosts that do not train on prompts. A model no such host serves stops working in that server. The model pickers offer such models to the bot's owner alone, and the bot owner's data policy screen says how many models everyone else is offered.\n"
         "Global Chat: A Global Chat is a conversation wherever its card is opened, so it is held to the same rules. Opened in a server, it follows that server's policy; anywhere else -- a DM or a group DM -- both routes stay closed, because there is no server to open.\n"
@@ -1003,7 +1003,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Global Chat says my Google key is on the free tier.' Fix: Assign a billing-enabled (paid) key to Personal in `/settings`, or add an OpenRouter key.\n"
         "- Symptom: 'An OpenRouter model stopped working in our server or in Global Chat.' Fix: No host that avoids training serves it. Pick another model.\n"
         "- Symptom: 'An OpenRouter model is missing from the list' or 'Typing its id is refused.' Fix: No host is known to serve it without training on prompts, so only the bot's owner is offered it.\n"
-        "- Symptom: 'Where is /data_policy?' or 'Our administrator can't allow the free tier.' Fix: The data policy is in `/privacy`. Everyone can read it there; only the bot's owner can change it."
+        "- Symptom: 'Where is /data_policy?' or 'Our administrator can't allow the free tier.' Fix: The data policy is in `/privacy`. Everyone can read it there; only a self-hosted bot's owner can change it, and on the official bot nobody can."
     ),
     "apis/ollama.txt": (
         "Availability: Only this bot's owner -- the person running the instance -- can use Ollama models. An Ollama host receives every message a profile sees, so it has to be the operator's own machine. Everyone else sees Google and OpenRouter only.\n"
@@ -1223,7 +1223,7 @@ DEFAULT_HELP_DOCS = {
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Paid Key Required' or a Gemini image model fails. Fix: Google blocks its image models on free-tier API keys. A valid billing account must be active in Google AI Studio -- or choose an OpenRouter image model instead.\n"
         "- Symptom: '!image does nothing.' Fix: Image generation is disabled for that profile, or its image slot holds something that cannot draw, such as a text model. Choose a Google or OpenRouter image model under Set Models -> Image Generation.\n"
-        "- Symptom: 'No OpenRouter host serves this model without the right to train on prompts.' Fix: The server has not been opened to OpenRouter hosts that may train, and that image model's host is not known to avoid it. Choose another image model; only the bot's owner can change a server's data policy, from `/privacy`.\n"
+        "- Symptom: 'No OpenRouter host serves this model without the right to train on prompts.' Fix: The server has not been opened to OpenRouter hosts that may train, and that image model's host is not known to avoid it. Choose another image model; only a self-hosted bot's owner can change a server's data policy, from `/privacy`.\n"
         "- Symptom: 'My images stopped using web research.' Fix: Images no longer follow the profile's Grounding setting. Set `/profile manage` -> Images -> Set Image Output -> Search grounding to Legacy RAG.\n"
         "- Symptom: 'The aspect ratio I picked was ignored.' Fix: The profile's image model does not carry that ratio. The setting is kept on the profile and left out of the request rather than failing it, so switching back to a model that supports it restores the setting."
     ),
