@@ -792,7 +792,8 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
         super().__init__(timeout=300)
         self.cog = cog
         self.user_id = user_id
-        #: The server /privacy was run in, whose data policy it shows. None in a DM.
+        #: The server /privacy was run in, whose data policy a self-hosted instance shows.
+        #: None in a DM.
         self.guild = guild
         if guild is not None and may_set_data_policy(user_id):
             add_button(self, "Change Data Policy", self.open_data_policy, row=1, emoji="🛡️")
@@ -803,12 +804,12 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
             description="Request a full export of your data or permanently delete your account and all associated profiles, memories, and settings.",
             color=discord.Color.red()
         )
-        if self.guild is not None:
+        # Shown only where someone can change it: on the official bot both routes stay
+        # closed for good, so there is nothing to read.
+        if self.guild is not None and data_policy.SELF_HOSTED:
             e.description += (
                 "\n\n**This server's data policy** decides whether its messages may reach AI "
-                "providers that train on them. "
-                + ("Only the bot's owner can change it." if data_policy.SELF_HOSTED
-                   else "Both stay closed on the official bot, and nobody can open them."))
+                "providers that train on them. Only the bot's owner can change it.")
             add_data_policy_fields(e, self.cog.server_manager._get_server_index(str(self.guild.id)))
             e.set_footer(text=self.guild.name)
         return e

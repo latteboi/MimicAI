@@ -36,7 +36,7 @@ if os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true":
     if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = "MANUAL_MODE_PENDING"
     if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = "MANUAL_MODE_PENDING"
 
-from cogs.utils.constants import defaultConfig
+from cogs.utils.constants import OFFICIAL_BOT_ID, defaultConfig
 from cogs.utils.discord_retry import install_503_retry
 
 # Before any client exists: child bots are built on the same HTTPClient class.
@@ -71,6 +71,9 @@ bot = commands.Bot(command_prefix="!", intents=intents, help_command=None, max_m
 async def on_ready():
     print(f"Bot is online as {bot.user.name} (ID: {bot.user.id})")
     print("Attempting to sync application (slash) commands...")
+    if bot.user.id == OFFICIAL_BOT_ID:
+        # The official bot's /privacy shows no data policy (PrivacyDashboardView.embed).
+        bot.tree.get_command("privacy").description = "Export or delete your data."
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} application commands globally.")
