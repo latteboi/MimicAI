@@ -3972,6 +3972,8 @@ class ThinkingPickerMixin:
         ('critic', 'fallback'): 'critic_fallback_model',
         ('ltm', 'primary'): 'ltm_model',
         ('ltm', 'fallback'): 'ltm_fallback_model',
+        ('training', 'primary'): 'training_analysis_model',
+        ('training', 'fallback'): 'training_analysis_fallback_model',
     }
 
     _LEVEL_LABELS = (

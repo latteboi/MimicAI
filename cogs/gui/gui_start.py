@@ -116,6 +116,7 @@ _GATE_REASONS = {
     "provider": "create your account first",
     "server_key": "needs an API key assigned to this server",
     "can_cast": "needs an administrator, or Open casting (anyone may add characters)",
+    "seated": "add a character to this channel first",
 }
 
 
@@ -148,7 +149,7 @@ WIZARD_STEPS = (
           done_detail=lambda s: f"{s['seated_count']} in the cast"),
     _Step("speak", "Say something to it",
           ("5. Sessions", "Reactivity and Proactivity"),
-          lambda s: s["has_spoken"], context="guild",
+          lambda s: s["has_spoken"], context="guild", requires="seated",
           done_detail=lambda s: "it has spoken here"),
 )
 
@@ -477,6 +478,9 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             pitch = "" if s["server_has_key"] else f"\n\n{SERVER_KEY_PITCH}"
             return f"{where}🛡️ **Your role** Server administrator\n{key_line}{pitch}"
         role = "👤 **Your role** Member (not an administrator)\n"
+        # Who may seat a character, said only on the step that seats one.
+        if self.focus is None or self.focus.key != "seat":
+            return f"{where}{role}{key_line}"
         if s["can_cast"]:
             note = ("This channel is on **Open casting** (anyone may add characters) — you "
                     "can add them here yourself.")
@@ -829,9 +833,10 @@ class NewProfileModal(ui.Modal):
 #: The Create Account form's provider choices, in the step's button order.
 _ACCOUNT_PROVIDERS = (
     ("openrouter", "OpenRouter (recommended)",
-     "One key for Claude, GPT, DeepSeek and hundreds more, some free."),
-    ("gemini", "Google", "Gemini, with Google's image and speech models. Needs billing on."),
-    (PROVIDER_NONE, "None", "No default models: you choose them in /settings."),
+     "One key for replies, images, speech and search, on hundreds of models, some free."),
+    ("gemini", "Google", "Google's own models only. The key needs billing turned on."),
+    (PROVIDER_NONE, "None (choose every model yourself)",
+     "No models set for you. Still needs an OpenRouter or Google key."),
 )
 
 #: What Create Account must have ticked, every one.
@@ -858,10 +863,11 @@ class CreateAccountModal(ui.Modal):
                      for value, label in _CONSENTS.items()])
         self.add_item(ui.Label(text="Tick both to continue", component=self.consent))
         self.provider = ui.RadioGroup(options=[
-            discord.RadioGroupOption(label=label, value=value, description=description)
+            discord.RadioGroupOption(label=label, value=value, description=description,
+                                     default=value == "openrouter")
             for value, label, description in _ACCOUNT_PROVIDERS])
         self.add_item(ui.Label(text="Your provider", component=self.provider,
-                               description="What new characters run on. Change it any time."))
+                               description="Every choice needs an OpenRouter or Google key."))
 
     async def on_submit(self, interaction: discord.Interaction):
         # Discord enforces both, but this is where an account is made, so it is checked here.

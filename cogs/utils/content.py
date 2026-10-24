@@ -657,18 +657,15 @@ SERVER_KEY_PITCH = (
 )
 
 WIZARD_COPY = {
+    # The form's own options say the rest; this says what every one of them still needs.
     "provider": (
-        "Which company's AI models your characters run on.\n\n"
-        "**OpenRouter** is the one to start with. One key reaches Claude, GPT, DeepSeek and a few "
-        "hundred others, some free to run, and it covers replies, images and speech. Only hosts known "
-        "**not to train on your messages** are offered.\n"
-        "**Google** runs Gemini, and adds Gemini's own image and speech models. "
-        "It needs a key with **billing turned on**.\n"
-        "**None** sets no default models: new characters start without one, and you choose in "
-        "`/settings` → Override Defaults.\n\n"
-        "**Create Account** asks you to accept the Terms and choose one: that is how you set MimicAI "
-        "up, and nothing is stored for you before it. New characters start on your choice; a model you "
-        "pick yourself stays picked. Change it any time here or in `/settings` → Override Defaults."
+        "Accept the Terms, then pick where your API key comes from.\n\n"
+        "**OpenRouter** is the one to pick. One key runs replies, images, speech and web search on "
+        "Claude, GPT, Gemini, DeepSeek and hundreds more, some free, through hosts that don't train "
+        "on your messages.\n"
+        "-# **Google** runs only Google's own models and needs a key with billing on. **None** sets no "
+        "models for you, and still needs an OpenRouter or Google key. Change it any time in "
+        "`/settings` → Override Defaults."
     ),
     # The Create Account form's own text, above its two ticks and the provider choice.
     # `{date}` is the Terms' effective date: what is accepted is the version in force.
@@ -686,17 +683,17 @@ WIZARD_COPY = {
     ),
     # Sent once None is chosen: the one choice that leaves something still to do.
     "provider_none": (
-        "**No provider, so no model defaults.** New profiles start with no models. Choose the ones "
-        "they should start on in `/settings` → Override Defaults → Set Models, or per profile in "
+        "**None chosen, so no models are set for you.** You still need an OpenRouter or Google key: "
+        "the next step takes either. New profiles start with no models, so choose the ones they "
+        "should start on in `/settings` → Override Defaults → Set Models, or per profile in "
         "`/profile manage` → Set Models."
     ),
     # One per provider: the step says only what the provider chosen before it needs.
     "key": {
         "openrouter": (
             "**1.** Press **Get a key ↗**, sign in to OpenRouter and create a key. It starts with `sk-or-`.\n"
-            "**2.** Press **Paste key** and paste it into the form. Only you can see it. It becomes your "
-            "**Personal** key, which covers your Global Chat (`/profile global_chat`) and your characters' "
-            "behind-the-scenes work, such as memory.\n"
+            "**2.** Press **Paste key** and paste it into the form. It becomes your **Personal** key, "
+            "and only you can see it.\n"
             "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
             "Free models cost nothing; for the rest you buy credit on OpenRouter. "
             "**Never paste a key into the chat.**"
@@ -704,20 +701,19 @@ WIZARD_COPY = {
         "gemini": (
             "**1.** Press **Get a key ↗**, create a key in Google AI Studio, then turn on **billing** for its "
             "project. Google may train on what a free key sends, so only keys with billing on are accepted.\n"
-            "**2.** Press **Paste key** and paste it into the form. Only you can see it. It becomes your "
-            "**Personal** key, which covers your Global Chat (`/profile global_chat`) and your characters' "
-            "behind-the-scenes work, such as memory.\n"
+            "**2.** Press **Paste key** and paste it into the form. It becomes your **Personal** key, "
+            "and only you can see it.\n"
             "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
             "**Never paste a key into the chat.**"
         ),
         # No provider chosen: either key will do, and both are offered.
         "none": (
-            "With no provider chosen, add whichever key you have — or both.\n"
+            "Characters still need an OpenRouter or Google key: add either, or both. OpenRouter is the one "
+            "to start with.\n"
             "**1.** Press **Get OpenRouter key ↗** (its keys start with `sk-or-`) or **Get Google key ↗** (turn "
             "on **billing** for the key's project: only keys with billing on are accepted).\n"
-            "**2.** Press the matching **Paste** button and paste the key into the form. Only you can see it. "
-            "It becomes your **Personal** key, which covers your Global Chat (`/profile global_chat`) and your "
-            "characters' behind-the-scenes work, such as memory.\n"
+            "**2.** Press the matching **Paste** button and paste the key into the form. It becomes your "
+            "**Personal** key, and only you can see it.\n"
             "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
             "**Never paste a key into the chat.**"
         ),
@@ -837,8 +833,8 @@ DEFAULT_HELP_DOCS = {
         "Second track: Once setup is done, 'Using it' covers talking to characters, `/whisper`, memory commands, images and voice, and what to do when something is wrong. These are not setup steps and have no completion state.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I do not know where to begin.' Fix: Run `/start`.\n"
-        "- Symptom: 'Which API key should I get first?' or 'Do I have to pay to use this?' Fix: OpenRouter. One key reaches a few hundred models and some of them are free to run (DeepSeek V4 0731, and OpenRouter's Free Models Router), and only models some host is known to serve without training on prompts are offered. Add a paid Google Gemini key afterwards for Gemini's speech and image models.\n"
-        "- Symptom: 'The key step is locked.' or 'It says to run /start first.' Fix: Create your account first: press Create Account on step 1, tick the Terms and Privacy Policy, and choose a provider (None is fine). It is how you set MimicAI up: nothing can be created, borrowed or saved for you before it. The key step then asks for that provider's key, or either with None.\n"
+        "- Symptom: 'Which API key should I get first?' or 'Do I have to pay to use this?' Fix: OpenRouter. One key reaches a few hundred models and some of them are free to run (DeepSeek V4 0731, and OpenRouter's Free Models Router), and only models some host is known to serve without training on prompts are offered. It also runs images, speech and web search, so most people never need a second key.\n"
+        "- Symptom: 'The key step is locked.' or 'It says to run /start first.' Fix: Create your account first: press Create Account on step 1, tick the Terms and Privacy Policy, and choose a provider (OpenRouter is the one to start with). It is how you set MimicAI up: nothing can be created, borrowed or saved for you before it. The key step then asks for that provider's key, or either with None: every choice, None included, needs an OpenRouter or Google key.\n"
         "- Symptom: 'Google refused my key.' Fix: Only a billing-enabled (paid) Google key is accepted. Turn billing on for the key's project, or choose OpenRouter instead.\n"
         "- Symptom: 'Add it to this channel is locked: needs an API key assigned to this server.' Fix: An administrator ticks the server in the key step's dropdown, or assigns a key in `/settings` -> API Keys.\n"
         "- Symptom: 'Add it to this channel is locked: needs an administrator.' Fix: Choosing a channel's cast needs server administrator permission, or Open casting. Ask an admin to run `/session config`, or make your own server to test in.\n"

@@ -506,6 +506,9 @@ THINKING_SLOT_KEYS = {
     'ltm':       {'primary':  ('ltm_thinking_level', 'ltm_thinking_budget'),
                   'fallback': ('ltm_fallback_thinking_level',
                                'ltm_fallback_thinking_budget')},
+    'training':  {'primary':  ('training_thinking_level', 'training_thinking_budget'),
+                  'fallback': ('training_fallback_thinking_level',
+                               'training_fallback_thinking_budget')},
 }
 
 #: Every provider counts thinking towards LIMIT_OUTPUT_TOKENS, so a budget at the cap
@@ -523,8 +526,8 @@ THINKING_BUDGET_MAX = defaultConfig.LIMIT_OUTPUT_TOKENS - 4096
 #: memory ever written was billed a full reasoning pass.
 #:
 #: `utility` has no keys in THINKING_SLOT_KEYS and cannot be configured. It is for the
-#: one-shot internal generations with no profile slot to hang a setting off: the rolling
-#: synopsis, the Director's Note. The System Models categories below it are /mod's to set
+#: one-shot internal generations with no slot to hang a setting off. `director` and
+#: `compaction` are a session's (SESSION_THINKING_SLOTS). The System Models categories are /mod's to set
 #: (SYSTEM_THINKING_SLOTS); the classifier's verdict decides who may see a profile, so it
 #: thinks harder than a transcription does.
 THINKING_SLOT_DEFAULTS = {
@@ -532,7 +535,10 @@ THINKING_SLOT_DEFAULTS = {
     'grounding':  {'level': 'low',    'budget': 512},
     'critic':     {'level': 'low',    'budget': 512},
     'ltm':        {'level': 'low',    'budget': 512},
+    'training':   {'level': 'low',    'budget': 512},
     'utility':    {'level': 'low',    'budget': 512},
+    'director':   {'level': 'low',    'budget': 512},
+    'compaction': {'level': 'low',    'budget': 512},
     'describer':  {'level': 'low',    'budget': 512},
     'classifier': {'level': 'medium', 'budget': -1},
     'generator':  {'level': 'low',    'budget': 512},
@@ -543,6 +549,10 @@ THINKING_SLOT_DEFAULTS = {
 #: (`helpers.system_settings`). Not in THINKING_SLOT_KEYS, which is what a profile holds --
 #: and so what Override Defaults may default.
 SYSTEM_THINKING_SLOTS = ('describer', 'classifier', 'generator')
+
+#: A session's AI Director and rolling synopsis, likewise under the response slot's keys, in
+#: `session['proactivity']` and `session['compaction']`: `/session config`'s model screens.
+SESSION_THINKING_SLOTS = ('director', 'compaction')
 
 #: Each profile slot's Primary model key, for the MimicAI Auto tier the slot runs on
 #: (`helpers.auto_thinking`).
@@ -556,6 +566,7 @@ THINKING_SLOT_LABELS = (
     ('grounding', 'Grounding Summariser', 'Summarises web search results in RAG mode.'),
     ('critic',    'Anti-Repetition Critic', 'Screens replies for semantic repetition.'),
     ('ltm',       'LTM Summariser', 'Turns conversations into long-term memories.'),
+    ('training',  'Training Analysis', 'Writes a style guide from training examples.'),
 )
 
 #: Every thinking key the profile-wide picker writes, flattened. Used by the bulk row

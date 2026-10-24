@@ -391,14 +391,13 @@ class SessionCompactionMixin:
 
         async def _attempt(model_name, is_fallback):
             # `{}` here was the same defect the LTM summariser had: not "no thinking"
-            # but "whatever the adapter defaults to", which is high. Compaction is a
-            # session setting rather than a profile one, so it has no configurable slot
-            # and takes the shared `utility` default.
+            # but "whatever the adapter defaults to", which is high.
             model = self.cog.api_service._instantiate_model(
                 model_name, guild_id, session.get("owner_id"),
                 system_instruction=system_instruction,
                 config_owner_id=session.get("owner_id"),
-                thinking_params=resolve_thinking_params(None, "utility"))
+                thinking_params=resolve_thinking_params(
+                    session.get("compaction"), "compaction", "fallback" if is_fallback else "primary"))
             return await model.generate_content_async(
                 [user_prompt], generation_config=dict(GREEDY_SAMPLING))
 

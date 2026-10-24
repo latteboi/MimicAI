@@ -1,5 +1,5 @@
 """Set Models for a model pair that is no profile slot: the AI Director, the session
-synopsis and training analysis.
+synopsis and training analysis -- and the session pairs' Thinking.
 
 Its own module because it adopts `ModelPickerMixin` from `gui_profiles`, which imports
 `gui_sessions` and `gui_data`: each opens its screen lazily, as `/settings` opens its
@@ -11,9 +11,10 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..managers.session_manager import director_enabled, director_model_config
 from ..services.generation.compaction import compaction_model_config
-from ..utils.constants import NO_FALLBACK
+from ..utils.constants import NO_FALLBACK, THINKING_SLOT_KEYS
 from .base_components import BlockedGuard, add_button
-from .gui_profiles import ModelPickerMixin, _keep_wizard_alive
+from .gui_mod import ModThinkingView
+from .gui_profiles import ModelPickerMixin, SingleProfileThinkingView, _keep_wizard_alive
 
 if TYPE_CHECKING:
     from .gui_data import DataManageView
@@ -155,7 +156,14 @@ class _SlotPairView(BlockedGuard, ModelPickerMixin, ui.View):
 
 
 class _SessionPairView(_SlotPairView):
-    """A pair kept in the channel's session, billed to its owner's key."""
+    """A pair kept in the channel's session, billed to its owner's key. Its thinking sits
+    beside its models under the response slot's keys (SESSION_THINKING_SLOTS)."""
+
+    #: Where in the session the pair is kept, its `resolve_thinking_params` slot, and how
+    #: the Thinking screen names it.
+    _SESSION_KEY = ""
+    _THINKING_SLOT = ""
+    _WORDING = ""
 
     def __init__(self, cog, parent: 'SessionConfigView'):
         super().__init__(cog, parent, parent.session.get("owner_id") or parent.original_interaction.user.id)
@@ -174,6 +182,65 @@ class _SessionPairView(_SlotPairView):
         await i.response.defer()
         await self.parent.update_display()
 
+    # --- What ModThinkingView asks of its parent ------------------------------
+
+    def _store(self) -> dict:
+        """The session dict the pair's choices live in, created to be written to."""
+        return self.session.setdefault(self._SESSION_KEY, {})
+
+    def _settings(self) -> dict:
+        return self.session.get(self._SESSION_KEY) or {}
+
+    def _put_settings(self, changes: Dict):
+        """Sparse, as /mod's: None is no key, and no change writes nothing."""
+        store, before = self._store(), dict(self._store())
+        for key, value in changes.items():
+            if value is None:
+                store.pop(key, None)
+            else:
+                store[key] = value
+        if store != before:
+            self.cog.session_manager._save_multi_profile_sessions()
+
+    def _auto_tier(self) -> None:
+        return None
+
+    def _tab_wording(self) -> str:
+        return self._WORDING
+
+    def _tab_footer(self) -> str:
+        return "This session \u00b7 changes save as you make them"
+
+    def _add_buttons(self, row: int):
+        async def think_cb(i: discord.Interaction):
+            view = _SessionThinkingView(self)
+            await i.response.edit_message(**view._render())
+
+        lit = any(self._settings().get(key) is not None
+                  for pair in THINKING_SLOT_KEYS["response"].values() for key in pair)
+        add_button(self, "Thinking\u2026", think_cb, row=row,
+                   style=discord.ButtonStyle.blurple if lit else discord.ButtonStyle.secondary)
+
+
+class _SessionThinkingView(ModThinkingView):
+    """/mod's Thinking screen, on a session pair: the same two efforts and budgets, kept in
+    the session and resolved as its own slot."""
+
+    def __init__(self, parent: _SessionPairView):
+        super().__init__(parent)
+        self.slot = parent._THINKING_SLOT
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Keeps the pair's timer, and its opener's, alive while this occupies their message."""
+        if not await super().interaction_check(interaction):
+            return False
+        _keep_wizard_alive(self.parent)
+        _keep_wizard_alive(self.parent.parent)
+        return True
+
+    def _slot_model(self, _slot: str, role: str = "primary"):
+        return self.parent._value(self.parent._KEYS[role == "fallback"][0])
+
 
 class DirectorModelView(_SessionPairView):
     """`/session config` -> Proactivity -> Director Model. Written to `session['proactivity']`
@@ -185,6 +252,9 @@ class DirectorModelView(_SessionPairView):
                     "you choose one it runs the LTM Summariser's models, which follow the session "
                     "owner's provider. Choosing a model does not turn the Director on.")
     _SUBJECT = "The AI Director"
+    _SESSION_KEY = "proactivity"
+    _THINKING_SLOT = "director"
+    _WORDING = "AI Director"
 
     def _pro(self) -> dict:
         """The session's proactivity settings, with the switch written down first: a session
@@ -193,6 +263,8 @@ class DirectorModelView(_SessionPairView):
         pro = self.session.setdefault("proactivity", {})
         pro.setdefault("director_enabled", director_enabled(pro))
         return pro
+
+    _store = _pro
 
     def _chosen(self, key: str) -> Optional[str]:
         return director_model_config(self.session.get("proactivity"))[
@@ -221,6 +293,7 @@ class DirectorModelView(_SessionPairView):
 
         add_button(self, f"Director: {'ON' if enabled else 'OFF'}", toggle_cb, row=row,
                    style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger)
+        super()._add_buttons(row)
 
 
 class CompactionModelView(_SessionPairView):
@@ -235,6 +308,9 @@ class CompactionModelView(_SessionPairView):
                     "when it fails. Until you choose, they are the synopsis's own defaults for "
                     "the session owner's provider.")
     _SUBJECT = "The session synopsis"
+    _SESSION_KEY = "compaction"
+    _THINKING_SLOT = "compaction"
+    _WORDING = "Session Synopsis"
 
     def _chain(self):
         return self.cog.api_service.model_chain({}, "compaction_model", self.user_id)
@@ -248,7 +324,7 @@ class CompactionModelView(_SessionPairView):
         return compaction_model_config(self.session)[key]
 
     def _write(self, key: str, value: Optional[str]):
-        cfg = self.session.setdefault("compaction", {})
+        cfg = self._store()
         if value is None:
             cfg.pop(self._STORED[key], None)
         else:
@@ -306,6 +382,14 @@ class TrainingAnalysisView(_SlotPairView):
             await i.response.send_modal(AnalyseExamplesModal(self))
 
         add_button(self, "Analyse…", analyse_cb, row=row, style=discord.ButtonStyle.blurple)
+
+        async def think_cb(i: discord.Interaction):
+            view = SingleProfileThinkingView(self.cog, self.original_interaction, self.profile_name,
+                                             slot="training", user_id=self.user_id,
+                                             parent_model_view=self)
+            await i.response.edit_message(**view._render())
+
+        add_button(self, "Thinking\u2026", think_cb, row=row)
 
     async def _back(self, i: discord.Interaction):
         await self.parent._show(i)

@@ -1299,11 +1299,12 @@ class MemoryManager:
             p_is_b = profile_name in index.get("borrowed", [])
             p_cfg = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_b) or {}
 
-            async def _attempt(name, _is_fallback):
-                # `{}` reads as "high" in every adapter; a style guide is a utility job.
+            async def _attempt(name, is_fallback):
+                # `{}` reads as "high" in every adapter, so unset a style guide thinks low.
                 model = self.cog.api_service._instantiate_model(
                     name, interaction.guild_id, owner_id, profile_settings=p_cfg,
-                    config_owner_id=owner_id, thinking_params=resolve_thinking_params(None, "utility"))
+                    config_owner_id=owner_id, thinking_params=resolve_thinking_params(
+                        p_cfg, "training", "fallback" if is_fallback else "primary", cog=self.cog))
                 return await model.generate_content_async([prompt])
 
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(

@@ -34,6 +34,7 @@ from .constants import (
     CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX,
     CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX,
     THINKING_LEVELS, THINKING_SLOT_KEYS, THINKING_SLOT_DEFAULTS, SYSTEM_THINKING_SLOTS,
+    SESSION_THINKING_SLOTS,
     THINKING_SLOT_MODELS,
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     MEDIA_RESOLUTION_VALUES, MEDIA_RESOLUTION_TO_OPENROUTER_DETAIL,
@@ -1327,8 +1328,8 @@ def resolve_thinking_params(config: Optional[Dict[str, Any]],
     thoughts reach no user -- the critic's verdict is parsed, the summariser's output is
     stored -- so asking for them buys billed tokens nobody reads.
 
-    A SYSTEM_THINKING_SLOTS slot is read off its System Models settings under the
-    response slot's keys. Given `cog`, a profile slot on MimicAI Auto takes what the bot
+    A SYSTEM_THINKING_SLOTS slot is read off its System Models settings, and a
+    SESSION_THINKING_SLOTS slot off the session's own, under the response slot's keys. Given `cog`, a profile slot on MimicAI Auto takes what the bot
     owner set for its tier over the profile's own (`auto_thinking`): every call that
     sends a profile's slot passes it.
     """
@@ -1340,10 +1341,11 @@ def resolve_thinking_params(config: Optional[Dict[str, Any]],
     if slot not in THINKING_SLOT_DEFAULTS:
         slot = "response"
     defaults = THINKING_SLOT_DEFAULTS[slot]
-    # A slot with no entry here is one nothing can configure -- `compaction` -- and
+    # A slot with no entry here is one nothing can configure -- `utility` -- and
     # resolves to its default alone.
     roles = THINKING_SLOT_KEYS.get(slot) or (
-        THINKING_SLOT_KEYS["response"] if slot in SYSTEM_THINKING_SLOTS else {})
+        THINKING_SLOT_KEYS["response"]
+        if slot in SYSTEM_THINKING_SLOTS or slot in SESSION_THINKING_SLOTS else {})
 
     def _read(keys) -> Dict[str, Any]:
         """The level and budget stored under one (level, budget) pair, or None each."""

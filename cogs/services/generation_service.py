@@ -554,12 +554,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         request = self.cog.global_prompts.get("DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT).format(
             history=self._director_history(session))
 
-        async def _attempt(model_name, _is_fallback):
+        async def _attempt(model_name, is_fallback):
             # `{}` reads as "high" in every adapter. A Director's note is one short
-            # instruction off ten lines of history; it takes the shared `utility` default.
+            # instruction off ten lines of history, so unset it thinks low.
             model = self.cog.api_service._instantiate_model(
                 model_name, guild_id, owner_id, system_instruction=instructions,
-                config_owner_id=owner_id, thinking_params=resolve_thinking_params(None, "utility"))
+                config_owner_id=owner_id, thinking_params=resolve_thinking_params(
+                    pro, "director", "fallback" if is_fallback else "primary"))
             return await model.generate_content_async([request])
 
         try:
