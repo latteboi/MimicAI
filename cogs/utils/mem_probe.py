@@ -10,7 +10,7 @@ It reports two numbers per phase, and the gap between them is the point:
 - **Python heap**, from `tracemalloc`: what the interpreter allocated, attributable
   to a source line.
 - **RSS**, from the OS: what the process actually holds. Native allocations --
-  OpenSSL buffers, zlib/zstd, a first-time numpy or Pillow import, glibc arenas
+  OpenSSL buffers, zlib/zstd, a first-time numpy import, glibc arenas
   that were freed but not returned -- appear here and nowhere else.
 
 A phase where RSS jumps and the Python heap does not is *not* a Python problem, and

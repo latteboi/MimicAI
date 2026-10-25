@@ -48,14 +48,13 @@ from .helpers import is_real_model
 #: The resolver reads all but the last of these. `original_*` and `pointer` are how
 #: `_resolve_effective_profile` and `_resolve_borrowed_pointer` find the profile a
 #: borrow points at -- overwrite one and the borrow generates with no persona, or
-#: orphans. `profile_id` backs the PID reconciliation in `_get_profile_config`.
-#: `neuro_state` is the one that is not identity: it is the *live* hormone vector,
+#: orphans. `neuro_state` is the one that is not identity: it is the *live* hormone vector,
 #: rewritten as a character reacts, so defaulting it would reset a mood mid-session.
 #: Only `neuro_state` is reachable from the table today (the neuro row declares it);
 #: the rest are here so that adding one to a `_Bulk` later cannot quietly expose it.
 DEFAULT_DENY = frozenset({
     "original_owner_id", "original_pid", "original_profile_name", "original_profile_id",
-    "pointer", "borrowed_at", "profile_id", "created_at", "neuro_state",
+    "pointer", "borrowed_at", "created_at", "neuro_state",
 })
 
 #: Keys forced to new-profile-only even though their row is `scope="all"`.

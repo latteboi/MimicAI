@@ -79,7 +79,7 @@ def setup_mimic():
     #
     # This list is only a fallback for a checkout missing requirements.txt. That file
     # is the source of truth, so any change here has to be mirrored there.
-    deps = ["discord.py", "orjson", "cryptography", "zstandard", "httpx", "numpy", "Pillow", "python-dotenv", "tzdata"]
+    deps = ["discord.py", "orjson", "cryptography", "zstandard", "httpx", "numpy", "python-dotenv", "tzdata"]
     if sys.platform != "win32":
         deps.append("uvloop>=0.18")
     

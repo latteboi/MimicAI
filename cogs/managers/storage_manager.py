@@ -165,8 +165,8 @@ def _get_decompressor() -> "zstd.ZstdDecompressor":
 #
 # What is cached is the *plaintext bytes*, never the parsed object. Every caller
 # still parses its own dict, which is the property that makes this safe to add:
-# profile configs are handed out by reference and mutated in place (see the
-# profile_id reconciliation in _get_profile_config), so caching the object would
+# profile configs are handed out by reference and mutated in place (the
+# update_profile_* methods edit the dict they are given, then save it), so caching the object would
 # alias the cache into whatever the caller did to it next.
 #
 # The stat stamp is the entire invalidation story, and it is exact rather than

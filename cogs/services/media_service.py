@@ -876,7 +876,8 @@ class MediaService:
             placeholder_message = None
             # Check if the finisher is busy. If it is, we are queued.
             if self.cog.image_gen_semaphore.locked():
-                qsize = self.cog.image_request_queue.qsize()
+                # Both queues: generated images wait in the second for the finisher.
+                qsize = self.cog.image_request_queue.qsize() + self.cog.text_request_queue.qsize()
                 await message.reply(f"Your image generation request has been queued. You are #{qsize + 1} in line.", delete_after=10)
             
             used_prefix = image_command_prefix(prompt_content) or IMAGE_COMMAND_PREFIXES[0]

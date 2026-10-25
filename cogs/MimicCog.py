@@ -338,7 +338,10 @@ class MimicCog(EventListeners, commands.Cog):
         # user id -> when an @ of the bot was last answered (`_answer_bot_mention`).
         self.mention_pointers_sent: LRUCache = LRUCache(max_size=256)
         self.all_bot_ids: Set[int] = set()
-        self.image_gen_semaphore = asyncio.Semaphore(3)
+        # One permit per finisher task (there is one), held while it works a request:
+        # `.locked()` is how intake tells a user they are queued. At 3 the lone finisher
+        # could never exhaust it, so it never locked and nobody was ever told.
+        self.image_gen_semaphore = asyncio.Semaphore(1)
 
         # Priority Queues for Premium Fast-Lane
         self.image_request_queue = asyncio.PriorityQueue(maxsize=10)

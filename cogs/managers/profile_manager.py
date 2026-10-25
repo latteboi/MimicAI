@@ -1396,12 +1396,6 @@ class ProfileManager:
             "prompts": source_data.get("prompts", {}).copy(),
             "child_bot": None
         }
-        # The PID assigned above, not a fresh id. This used to mint an unrelated
-        # 8-character value, so a duplicated profile's config disagreed with its own
-        # folder name -- and every other write site (import, clone, convert) sets
-        # config["profile_id"] to the PID. See _get_profile_config for what the
-        # mismatch broke.
-        new_data["config"]["profile_id"] = new_pid
         new_data["config"]["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
         self._save_profile_by_pid(user_id, new_pid, new_data)
@@ -1946,37 +1940,7 @@ class ProfileManager:
     def _get_profile_config(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
         p_data = self._get_profile(user_id, profile_name, is_borrowed)
         if p_data is not None:
-            config = p_data.get("config", {})
-            if not is_borrowed:
-                # config["profile_id"] is meant to equal the PID the profile is
-                # stored under, and import, clone and convert all set it that way.
-                # Two paths did not: a missing value was filled with a fresh
-                # 8-character id, and _duplicate_profile minted one that matched
-                # nothing at all. Either way the config claimed an identity the rest
-                # of the system could not resolve -- _accept_share_request falls back
-                # to this field when it has no PID to work from and stores it as the
-                # borrow's original_pid, so _find_public_entry_id could not link a
-                # public borrow to its listing and _is_profile_public reported every
-                # such borrow as unpublished.
-                #
-                # Reconciled rather than only backfilled, so profiles already
-                # carrying a stray id are repaired on their next read. The write
-                # happens once per affected profile; afterwards the values agree and
-                # this is a string comparison.
-                eff_owner, pid = self._resolve_owner_and_pid(user_id, profile_name, is_borrowed)
-                # A name that does not map -- mid-repair, or one that never mapped --
-                # comes back as the name itself. Leave the field alone in that case
-                # rather than writing an id that would outlive the confusion.
-                #
-                # eff_owner != user_id means a member is reading a System profile.
-                # _save_profile refuses that write, so attempting it would only burn
-                # a resolve on every read; the bot owner's own read repairs it.
-                if (eff_owner == user_id and pid and pid != profile_name
-                        and config.get("profile_id") != pid):
-                    config["profile_id"] = pid
-                    p_data["config"] = config
-                    self._save_profile(user_id, profile_name, p_data, is_borrowed)
-            return config
+            return p_data.get("config", {})
         return None
     def _save_profile_config(self, user_id: int, profile_name: str, data: Dict[str, Any], is_borrowed: bool = False):
         p_data = self._get_profile(user_id, profile_name, is_borrowed)
@@ -4066,6 +4030,7 @@ class ProfileManager:
                 continue
             p_data = self._get_profile_by_pid(user_id, pid) or {}
             config = dict(p_data.get("config") or {})
+            # Retired: older shards still carry it, and a PID is the folder, never config.
             config.pop("profile_id", None)
             entry = {"pid": pid, "config": config, "prompts": p_data.get("prompts") or {},
                      "ltm": [], "training": []}
@@ -4167,7 +4132,6 @@ class ProfileManager:
                 config = p_data.get("config") if isinstance(p_data.get("config"), dict) else {}
                 prompts = p_data.get("prompts") if isinstance(p_data.get("prompts"), dict) else {}
                 new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
-                config["profile_id"] = new_pid
                 config["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 # Adult and Refused alone cross: dropping either would let the profile run
                 # where it may not, and an export-import round trip must not launder a
@@ -4949,12 +4913,12 @@ class ProfileManager:
         def _sync_save():
             # The source PID, resolved rather than defaulted. This used to fall back to
             # the literal "00000000" -- see _UNKNOWN_SOURCE_PID for what that did to the
-            # reverse index. A borrow whose source cannot be named is not a borrow that
+            # reverse index -- and then to a `profile_id` copied into the config, which
+            # was only ever consulted when the index had no PID, and so named nothing.
+            # A borrow whose source cannot be named is not a borrow that
             # should be created: it can never be cascade-deleted, never counts towards
             # the source being distributed, and can never be refreshed.
-            target_original_pid = (target_pid
-                                   or self._get_pid_from_name(sharer_id, current_name)
-                                   or owner_profile_data.get("profile_id"))
+            target_original_pid = target_pid or self._get_pid_from_name(sharer_id, current_name)
             if not target_original_pid or target_original_pid == _UNKNOWN_SOURCE_PID:
                 return False
             source_pointer = self._borrow_pid_key(sharer_id, target_original_pid)
@@ -5167,7 +5131,6 @@ class ProfileManager:
             try:
                 src_data = self._get_profile_by_pid(owner_id, source_pid) or {}
                 config_data = src_data.get("config", {}).copy()
-                config_data["profile_id"] = new_pid
                 config_data["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
                 new_data = {
@@ -5244,7 +5207,6 @@ class ProfileManager:
                 os.makedirs(target_dir, exist_ok=True)
                 src_data = self._get_profile_by_pid(owner_id, source_pid) or {}
                 config_data = src_data.get("config", {}).copy()
-                config_data["profile_id"] = target_pid
                 config_data["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
                 target_data = {

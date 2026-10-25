@@ -1014,7 +1014,7 @@ class ChildBotManager:
                 return
 
             if self.cog.image_gen_semaphore.locked():
-                qsize = self.cog.image_request_queue.qsize()
+                qsize = self.cog.image_request_queue.qsize() + self.cog.text_request_queue.qsize()
                 await send_notification_to_child(f"Your image generation request has been queued. You are #{qsize + 1} in line.")
             else:
                 await self.execute_typing(bot_id, {"channel_id": channel_id})

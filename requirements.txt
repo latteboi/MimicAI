@@ -25,9 +25,6 @@ uvloop>=0.18; sys_platform != "win32"
 # Embedding maths: cosine/MMR retrieval over stacked float16 matrices.
 numpy>=1.24
 
-# Image handling for avatars and generated media.
-Pillow>=10.0
-
 # .env configuration loading. NOTE: the package is python-dotenv; the PyPI
 # package literally named "dotenv" is something else entirely.
 python-dotenv>=1.0
