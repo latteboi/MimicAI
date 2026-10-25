@@ -104,7 +104,10 @@ class DefaultConfigNamespace:
         # Characters of `!image` prompt, after an attached text file is folded in. Stops
         # a novel reaching a model that bills per prompt token and stops reading anyway.
         self.LIMIT_IMAGE_PROMPT_CHARS = 8000
-        self.CHATBOT_MEMORY_LENGTH = 20
+        # Matches COMPACTION_THRESHOLD_DEFAULT, so a profile in a compacted session reads the
+        # synopsis and every turn after it, with no unfolded turns falling between the two.
+        # Seeded at creation: a profile made before this keeps the 20 it was made with.
+        self.CHATBOT_MEMORY_LENGTH = 50
         self.GEMINI_TEMPERATURE = 1.0
         self.GEMINI_TOP_P = 0.95
         self.GEMINI_TOP_K = 0
@@ -2159,7 +2162,7 @@ BLACKLIST_EXEMPT_COMMANDS = frozenset({"privacy", "terms", "settings"})
 
 # --- Sessions: rounds, turns and delivery -------------------------------------
 
-STM_LIMIT_MAX = 50
+STM_LIMIT_MAX = 200
 
 # How much of a session round's own messages may sit outside STM. The turns a round is
 # answering are exempt from the window (see _bound_reserved_tail); past either bound the

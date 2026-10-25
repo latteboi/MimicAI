@@ -406,6 +406,9 @@ every one after. Those are dropped and their turns un-compacted for compaction t
 again. New synopses record `covers_turn_ids`; older ones are found by position. Folded turns
 stay hidden, and the synopsis is sent, only while the session's rolling synopsis is on
 (`compaction_enabled`), so switching it off puts the whole transcript back in the prompt.
+A profile with Always Read Synopsis off (`always_reads_synopsis`) is not sent it in the system
+instruction; `_build_history_for_participant` shows it the newest synopsis as a turn, where it was
+written, only while its STM window still reaches it.
 
 `/compact` and the Compaction tab's buttons run `manual_compaction`: fold every public turn
 but the newest `keep` in passes of at most `COMPACT_PASS_MAX_CHARS`, each chained on the

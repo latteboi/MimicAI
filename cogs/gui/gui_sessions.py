@@ -1072,7 +1072,7 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
         except ValueError:
             await interaction.response.send_message("Invalid chance or cooldown.", ephemeral=True)
 
-class CompactionSettingsModal(ui.Modal, title="Rolling Synopsis"):
+class CompactionSettingsModal(ui.Modal, title="Compaction"):
     threshold_input = ui.TextInput(label=f"Compact after N turns ({COMPACTION_THRESHOLD_MIN}-{COMPACTION_THRESHOLD_MAX})", placeholder=f"Default: {COMPACTION_THRESHOLD_DEFAULT}", required=True, max_length=3)
     chunk_input = ui.TextInput(label="Turns to fold each time", placeholder=f"Default: {COMPACTION_CHUNK_DEFAULT}", required=True, max_length=3)
     length_input = ui.TextInput(label=f"Synopsis length in words ({COMPACTION_SYNOPSIS_WORDS_MIN}-{COMPACTION_SYNOPSIS_WORDS_MAX})", placeholder=f"Default: {COMPACTION_SYNOPSIS_WORDS_DEFAULT}", required=False, max_length=3)
@@ -2422,7 +2422,7 @@ class SessionConfigView(BlockedGuard, ui.View):
                 embed.add_field(name="Latest Synopsis", value=f"```{preview}```", inline=False)
 
         self._add_toggle(
-            "Toggle Rolling Synopsis", enabled,
+            "Toggle Compaction", enabled,
             lambda on: self.session.setdefault("compaction", {}).__setitem__("enabled", on),
             on_off_style=True)
         self._add_modal_button("Edit Settings", CompactionSettingsModal)

@@ -16,6 +16,7 @@ from ..utils.helpers import (
     image_model_caps,
     openrouter_image_ratios, resolve_critic_settings,
     google_thinking_caps, check_portrait_upload, grounding_mode_display, ltm_auto_recall_enabled, ltm_creation_mode,
+    always_reads_synopsis,
     resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model, auto_thinking,
@@ -806,6 +807,14 @@ def _render_memory(ctx):
     ), True
 
 
+def _render_stm(ctx):
+    config = ctx["config"]
+    return "Short-Term Memory", (
+        f"Length: `{config.get('stm_length', defaultConfig.CHATBOT_MEMORY_LENGTH)}` turns\n"
+        f"Always Read Synopsis: {_flag(always_reads_synopsis(config))}"
+    ), True
+
+
 def _ltm_creation_payload(on: bool) -> Dict[str, Any]:
     """Auto-Creation, and Auto-Recall along with it when it goes on.
 
@@ -947,10 +956,10 @@ PROFILE_ACTIONS = (
                              "ltm_model", "ltm_fallback_model",
                              "ollama_host_url", "openrouter_service_tier",
                              "openrouter_endpoints"))),
-    _Action("gen_params", "params", "Set Generation Parameters & STM", "Set Temp, Top P, Top K, and STM Length.",
+    _Action("gen_params", "params", "Set Generation Parameters", "Set Temp, Top P and Top K.",
             _modal("ProfileParamsModal"),
             bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",
-                       keys=("temperature", "top_p", "top_k", "stm_length"))),
+                       keys=("temperature", "top_p", "top_k"))),
     _Action("adv_params", "params", "Set Advanced Parameters (OPENROUTER)", "Set penalties, Min P, and Top A.",
             _modal("ProfileAdvancedParamsModal"), _not_google,
             bulk=_Bulk(_bulk_modal("ProfileAdvancedParamsModal"), scope="all",
@@ -1237,6 +1246,11 @@ PROFILE_ACTIONS = (
     # --- Behaviour (how the profile conducts itself) ---
 
     # --- Memory ---
+    _Action("stm_params", "memory", "Set STM Parameters",
+            "Set STM Length, and whether the session synopsis is always read.",
+            _modal("ProfileSTMParamsModal"), render=_render_stm,
+            bulk=_Bulk(_bulk_modal("ProfileSTMParamsModal"), scope="all",
+                       keys=("stm_length", "always_read_synopsis"))),
     _Action("manage_ltm", "memory", "Manage Long-Term Memories", "Add, list, edit, or delete memories.",
             _method("_act_manage_ltm", wants_profile=True),
             # Editing memories one at a time has no bulk form; wiping them does.
@@ -2094,16 +2108,33 @@ def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], i
         {"label": "Temperature (0.0-2.0)", "custom_id": "temperature", "default": str(current_params.get("temperature", defaultConfig.GEMINI_TEMPERATURE)), "required": False},
         {"label": "Top P (0.0-1.0)", "custom_id": "top_p", "default": str(current_params.get("top_p", defaultConfig.GEMINI_TOP_P)), "required": False},
         {"label": "Top K (integer 0-100)", "custom_id": "top_k", "default": str(current_params.get("top_k", defaultConfig.GEMINI_TOP_K)), "required": False},
-        {"label": f"STM Length (0-{STM_LIMIT_MAX})", "custom_id": "stm_length", "default": str(current_params.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)), "required": False}
     ]
     def parser(v):
         c = {}
         c.update(_ranged(v, "temperature", 0.0, 2.0, "Temperature"))
         c.update(_ranged(v, "top_p", 0.0, 1.0, "Top P"))
         c.update(_ranged(v, "top_k", 0, 100, "Top K", _pi))
-        c.update(_ranged(v, "stm_length", 0, STM_LIMIT_MAX, "STM Length", _pi))
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Set Profile Generation Parameters", fields, parser, callback, target_user_id)
+
+def ProfileSTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id=None):
+    # Override Defaults opens a form on "" for a key it does not hold (`_SparseSeed`).
+    opened_unset = current_params.get("always_read_synopsis") == ""
+    always = ui.Checkbox(custom_id="always_read_synopsis", default=always_reads_synopsis(current_params))
+    fields = [
+        {"label": f"STM Length (0-{STM_LIMIT_MAX})", "custom_id": "stm_length", "default": str(current_params.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)), "required": False},
+        ui.Label(text="Always Read Synopsis", component=always, description=(
+            "⚠️ Off: read only while inside STM. No effect unless STM is below the "
+            "session's Compaction trigger.")),
+    ]
+    def parser(v):
+        c = _ranged(v, "stm_length", 0, STM_LIMIT_MAX, "STM Length", _pi)
+        # Left ticked on a form that opened unset stays unset, as a blank box does:
+        # storing the tick would pin today's default.
+        if not (v["always_read_synopsis"] and opened_unset):
+            c["always_read_synopsis"] = v["always_read_synopsis"]
+        return {"config": c}
+    return ConfigModal(cog, profile_name, is_borrowed, "Set STM Parameters", fields, parser, callback, target_user_id)
 
 def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [

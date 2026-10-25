@@ -348,6 +348,7 @@ def model_slot_labels() -> Dict[str, str]:
 #: slots are not listed -- they come from `model_slot_labels`, which is generated.
 SETTING_LABELS = {
     "stm_length": "Short-Term Memory",
+    "always_read_synopsis": "Always Read Synopsis",
     "ltm_creation_enabled": "LTM Auto-Creation",
     "ltm_recall_enabled": "LTM Auto-Recall",
     "ltm_recall_tool_enabled": "Memory Search",

@@ -498,13 +498,15 @@ class ConfigModal(ui.Modal):
         self.parser = parser
         self.callback = callback
         self.target_user_id = target_user_id
+        # A field is a TextInput's kwargs, or an item already built -- a tick in its Label.
         for f in fields:
-            self.add_item(ui.TextInput(**f))
+            self.add_item(f if isinstance(f, ui.Item) else ui.TextInput(**f))
 
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            raw_values = {c.custom_id: c.value for c in self.children}
+            raw_values = {c.custom_id: c.value for c in self.walk_children()
+                          if isinstance(c, (ui.TextInput, ui.Checkbox))}
             updates = self.parser(raw_values)
             config_updates = updates.get("config", {})
             prompt_updates = updates.get("prompts", {})

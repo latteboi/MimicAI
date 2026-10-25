@@ -19,7 +19,8 @@ from ...utils import lorebook
 from ...utils.bonds import render as render_bonds, take_updates as take_bond_updates
 from ...utils.birthdays import birthday_offset, describe_birthday
 from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash, _resolve_zoneinfo,
-                              default_profile_avatar_url, ltm_flag_enabled, server_context_block)
+                              always_reads_synopsis, default_profile_avatar_url, ltm_flag_enabled,
+                              server_context_block)
 from ._shared import NEURO_BARE_PATTERN, NEURO_TAG_PATTERN
 from .ltm_capture import memory_written_ago
 
@@ -344,7 +345,11 @@ class PromptBuilderMixin:
             # Kept in the instruction although it changes: once per compaction pass, a
             # chunk of turns apart, which costs one cache miss per pass -- and it tells
             # what happened *before* the transcript, so it reads ahead of it.
-            synopsis = self.cog.session_manager.get_latest_synopsis(session)
+            #
+            # Unless the profile reads it only inside its STM: then it is a turn, and
+            # `_build_history_for_participant` places it.
+            synopsis = (self.cog.session_manager.get_latest_synopsis(session)
+                        if always_reads_synopsis(profile_data) else None)
             if synopsis:
                 slow_parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")
 

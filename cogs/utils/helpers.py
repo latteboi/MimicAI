@@ -1979,6 +1979,17 @@ def ltm_auto_recall_enabled(config: Optional[Dict[str, Any]]) -> bool:
     return True if raw is None else bool(raw)
 
 
+def always_reads_synopsis(config: Optional[Dict[str, Any]]) -> bool:
+    """Whether this profile reads the session synopsis as standing context, however far
+    back it is. Off, it reads it only as a turn inside its STM window.
+
+    Absent means on, which is how every profile read it before the setting existed. The
+    two halves -- `_construct_system_instructions` and `_build_history_for_participant`
+    -- both ask this, so the synopsis is sent once or, scrolled out, not at all.
+    """
+    return (config or {}).get("always_read_synopsis") is not False
+
+
 def ltm_creation_mode(config: Optional[Dict[str, Any]]) -> str:
     """"flag" or "interval": when this profile's memories are written.
 

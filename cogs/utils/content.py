@@ -205,14 +205,13 @@ HELP_CATEGORIES = {
             "There is no Save button. A choice is written when you make it."
         ),
         "Core Sampling": (
-            "At `/profile manage` -> **Params** -> Set Generation Parameters & STM.\n\n"
+            "At `/profile manage` -> **Params** -> Set Generation Parameters.\n\n"
             "• **Temperature (0.0 - 2.0):** overall randomness. Around 0.3 is analytical and predictable; around 1.5 is chaotic and inventive. "
             "Most roleplay sits between 0.8 and 1.2.\n"
             "• **Top K:** hard-limits the pool to the K most likely next tokens, cutting off the tail of nonsense.\n"
             "• **Top P (nucleus):** takes tokens in probability order until their combined mass reaches P. The pool shrinks when the model is "
-            "unsure and widens when it is confident.\n"
-            "• **STM Length (0 - 50):** how many previous turns are sent as context. Higher is more coherent and more expensive; very high "
-            "values can dilute the model's adherence to its instructions."
+            "unsure and widens when it is confident.\n\n"
+            "Short-Term Memory is set on the Memory tab -- see *The Three Layers*."
         ),
         "Advanced Sampling and Penalties": (
             "At `/profile manage` -> **Params** -> Set Advanced Parameters. These are honoured by OpenRouter models; Google models ignore them, so the row appears only once the profile's response models can leave Google.\n\n"
@@ -238,8 +237,12 @@ HELP_CATEGORIES = {
     "4. Memory": {
         "The Three Layers": (
             "**Short-Term Memory** is the running conversation. One shared transcript per session; each profile's view is derived from it at "
-            "generation time, so private turns stay private. Depth is the profile's STM Length. `/refresh` clears it for the channel without "
-            "touching anything persistent.\n\n"
+            "generation time, so private turns stay private. Depth is the profile's STM Length (0 - 200, 50 for a new profile), at "
+            "`/profile manage` -> **Memory** -> **Set STM Parameters**. Higher is more coherent and more expensive; very high values can "
+            "dilute the model's adherence to its instructions. `/refresh` clears it for the channel without touching anything persistent.\n\n"
+            "**Always Read Synopsis**, on the same form and on by default, has the profile read a session's rolling synopsis however far "
+            "back it was written. Off, it reads the synopsis only while it is still inside its STM, like any other turn -- which changes "
+            "nothing unless its STM is shorter than the session's Compaction trigger (50 turns unless changed).\n\n"
             "**Long-Term Memory** is a permanent, searchable archive the bot writes for itself.\n\n"
             "**Training Examples** are voice guides you write by hand. See *Writing a Character*.\n\n"
             "The three are independent: clearing STM does not touch LTM, and deleting a memory does not affect training examples."
@@ -1041,7 +1044,7 @@ DEFAULT_HELP_DOCS = {
         "Settle Window: How long a round waits before it reads the channel, so several quick messages -- from one person or several -- get one reply instead of one each. The replying character's placeholder is already up while it waits. Quiet gap (0-10 seconds, default 3) is how long the channel must be quiet after the last message; 0 starts the round at once. Maximum wait (up to 30, default 8) caps the wait while messages keep arriving. Typing wait (0-30, default 15, 0 for off) is how long the first person typing can hold the round so a follow-up still being written makes it in. Who answers is decided by the message that opened the round. Messages sent while a character is replying always go into the next round together. Reset to Defaults clears all three.\n"
         "Seating versus starting: choosing a profile on the Cast tab seats it immediately -- it appears on the Reactivity tab and can have its chance and wakewords set straight away, with no button press in between. It does not make the channel live. Until 'Start / Update Session' is pressed the session is a draft: the footer reads 'Draft', ordinary messages pass through untouched and the AI Director stays quiet. The button, on every tab, starts it -- saving the configuration and loading the transcript. Pressing it again on a live session re-saves it.\n"
         "An empty cast is allowed. A started session with nobody in it keeps its transcript, Master Prompt and settings and simply has no one to answer, which is what 'Clear Cast' leaves behind. `/suspend` is what ends a session outright.\n"
-        "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time and the synopsis length (100-800 words, 220 by default). 'Summariser Model…' opens Set Models for its Primary and Fallback, and there is no third. Until you choose, it runs its own defaults for the session owner's provider: Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.1 Flash-Lite then 3.5 Flash-Lite on Google. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it. To fold now rather than wait, run `/compact` (or press Compact Now): everything but the newest 10 turns (`keep` sets how many) goes into the synopsis, including the pages people linked and the files they pasted, and the Rolling Synopsis is switched on if it was off. `/compact undo:True` (or Uncompact) unfolds every turn and removes the synopsis; while the Rolling Synopsis stays on, it starts folding again once the session is past its trigger.\n"
+        "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory -- except a profile with Always Read Synopsis off (its Memory tab, Set STM Parameters), which reads the synopsis only while it is inside its own STM. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time and the synopsis length (100-800 words, 220 by default). 'Summariser Model…' opens Set Models for its Primary and Fallback, and there is no third. Until you choose, it runs its own defaults for the session owner's provider: Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.1 Flash-Lite then 3.5 Flash-Lite on Google. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it. To fold now rather than wait, run `/compact` (or press Compact Now): everything but the newest 10 turns (`keep` sets how many) goes into the synopsis, including the pages people linked and the files they pasted, and the Rolling Synopsis is switched on if it was off. `/compact undo:True` (or Uncompact) unfolds every turn and removes the synopsis; while the Rolling Synopsis stays on, it starts folding again once the session is past its trigger.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I configured a session but nothing happens.' Fix: Press 'Start / Update Session'. Seating a cast does not start it -- check the footer, which reads 'Draft' until you do.\n"
         "- Symptom: 'Select All did not clear everything.' Fix: The Select All and Unselect All options only affect the source currently shown; 'Clear Cast' empties every source.\n"
@@ -1158,12 +1161,14 @@ DEFAULT_HELP_DOCS = {
     # --- MEMORY ---
     "memory/stm_buffer.txt": (
         "Concept: Short-Term Memory (STM) is the running conversation buffer. The session keeps one shared transcript, and each participant's view is derived from it at generation time, so private turns stay visible only to the profile they involved.\n"
-        "Limits: STM Length defines how many previous conversational turns are appended to the context window (maximum 50). Set it at `/profile manage` -> Params -> Set Generation Parameters & STM.\n"
+        "Limits: STM Length defines how many previous conversational turns are appended to the context window (0-200; a new profile starts at 50). Set it at `/profile manage` -> Memory -> Set STM Parameters.\n"
+        "Synopsis: 'Always Read Synopsis', on the same form and on by default, has the profile read a session's rolling synopsis however far back it is. Off, the synopsis is read only while it is inside the profile's STM, like any other turn. That changes nothing unless the STM is shorter than the session's Compaction trigger (50 turns by default).\n"
         "Tradeoff: A longer buffer is more coherent and more expensive, and a very long one can dilute the model's adherence to its persona and instructions.\n"
         "Command: `/refresh` clears the buffer for the channel without deleting anything persistent.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The profile has stopped following its instructions in a long conversation.' Fix: Lower the STM Length. A very long context crowds out system instructions.\n"
-        "- Symptom: 'In a big cast, profiles do not see what other characters said.' Fix: Raise STM Length so at least one full round fits in the context window."
+        "- Symptom: 'In a big cast, profiles do not see what other characters said.' Fix: Raise STM Length so at least one full round fits in the context window.\n"
+        "- Symptom: 'One profile in a long session has forgotten the early scene the others remember.' Fix: Its Always Read Synopsis is off and its STM no longer reaches the synopsis. Turn it on, or raise STM Length to at least the session's Compaction trigger."
     ),
     "memory/ltm_archive.txt": (
         "Concept: Long-Term Memory (LTM) is a persistent, vector-embedded archive of past conversations. Maximum 5,000 memories per profile.\n"

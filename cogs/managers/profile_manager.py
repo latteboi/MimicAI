@@ -46,7 +46,7 @@ from ..utils.constants import (
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED,
     LIMIT_LORE_ENTRIES, LIMIT_PUBLISHES_PER_DAY, PERSONA_TEXT_INPUT_MAX_LENGTH, )
 from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
-                            ltm_auto_recall_enabled, resolve_critic_settings,
+                            ltm_auto_recall_enabled, always_reads_synopsis, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
                             resolve_auto_models, pick_mood_avatar,
                             resolve_image_tools, resolve_thinking_params,
@@ -4553,12 +4553,10 @@ class ProfileManager:
 
         embed.add_field(name="Models", value="\n".join(model_lines)[:1024], inline=False)
 
-        stm_length = config.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)
         gen_val = (
             f"Temp: `{temp}`\n"
             f"Top P: `{top_p}`\n"
-            f"Top K: `{top_k}`\n"
-            f"STM Length: `{stm_length}`"
+            f"Top K: `{top_k}`"
         )
         embed.add_field(name="\u200bGeneration Parameters", value=gen_val, inline=True)
 
@@ -4600,6 +4598,13 @@ class ProfileManager:
             f"Relevance Threshold: `{train_rel}`"
         )
         embed.add_field(name="Training Examples", value=train_val, inline=True)
+
+        synopsis_status = "**`ON`**" if always_reads_synopsis(config) else "`OFF`"
+        stm_val = (
+            f"Length: `{config.get('stm_length', defaultConfig.CHATBOT_MEMORY_LENGTH)}`\n"
+            f"Always Read Synopsis: {synopsis_status}"
+        )
+        embed.add_field(name="Short-Term Memory", value=stm_val, inline=True)
 
         ltm_ctx = config.get("ltm_context_size", 3)
         ltm_rel = config.get("ltm_relevance_threshold", 0.75)

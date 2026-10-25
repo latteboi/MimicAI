@@ -28,8 +28,9 @@ from ..utils.constants import (
     ROUND_SETTLE_SECONDS, ROUND_SETTLE_MAX_SECONDS, ROUND_SETTLE_TYPING_SECONDS,
 )
 from ..utils.discord_cdn import unsigned_attachment_url
-from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, resolve_grounding_mode,
-                             resolve_url_mode, restamp_turn, turn_posted_at)
+from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, always_reads_synopsis,
+                             resolve_grounding_mode, resolve_url_mode, restamp_turn,
+                             turn_posted_at)
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
 
@@ -1942,17 +1943,33 @@ class SessionManager:
                   and not (hide_folded and t.get("compacted")) and t.get("turn_id"))
         tags = {t["turn_id"]: n for n, t in enumerate(public, 1)}
         find = turn_lookup(full_log)
+        # A profile that does not always read the synopsis reads it here instead, where it
+        # was written, while the window still reaches it. The newest only: each carries
+        # the last forward, and the folded turns between them take no slots, so a window
+        # can reach every one. The newest overall if any is in the slice: it is a suffix.
+        inline_synopsis = None
+        if hide_folded and not always_reads_synopsis(p_settings):
+            inline_synopsis = next((t for t in reversed(log_slice) if t.get("type") == "synopsis"), None)
         for turn in log_slice:
             if turn.get("is_hidden") or (hide_folded and turn.get("compacted")): continue
             content = restamp_turn(turn.get("content") or "", turn_posted_at(turn), clock)
 
             turn_type = turn.get("type")
-            # Not conversation. A synopsis is standing context injected into the system
-            # instruction by _construct_system_instructions, for the same reason
+            # Not conversation. By default a synopsis is standing context injected into
+            # the system instruction by _construct_system_instructions, for the same reason
             # <archive_context> is: it summarises turns that have left the window, so
             # placing it *in* the window means a session with more live turns than
-            # stm_length never sees it -- which is every session compaction is for.
-            if turn_type == "synopsis": continue
+            # stm_length never sees it -- which is every session compaction is for. That
+            # is exactly what a profile with Always Read Synopsis off has asked for.
+            if turn_type == "synopsis":
+                synopsis = (turn.get("content") or "").strip() if turn is inline_synopsis else ""
+                if synopsis:
+                    block = f"<session_synopsis>\n{synopsis}\n</session_synopsis>"
+                    if participant_history and participant_history[-1]['role'] == 'user':
+                        participant_history[-1]['parts'].append(block)
+                    else:
+                        participant_history.append({'role': 'user', 'parts': [block]})
+                continue
             if not turn_type:
                 role = 'model' if turn.get("speaker_pid") == bot_pid else 'user'
                 parts = [with_reply(content, turn, clock, tags, find)]
