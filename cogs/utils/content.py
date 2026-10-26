@@ -630,6 +630,7 @@ HELP_CATEGORIES = {
             "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/purge`, `/compact`\n\n"
             "**Setup and data:** `/settings`, `/export`, `/import`, `/privacy`, `/terms`, `/invite`, `/whoami`, `/viewavatar`\n\n"
             "**Documentation:** `/start` (guided setup), `/guide` (this browser), `/help`, `/news` (what changed in each release)\n\n"
+            "**Support the project:** `/thanks` (Ko-fi, or vote and review on Top.gg)\n\n"
             "**Operator:** `/mod`, `/shutdown`\n\n"
             "`/refresh`, `/cancel`, `/suspend`, `/purge` (bar in a DM), `/memorise`, `/compact`, `/play stop`, `/session config` and `/session swap` require "
             "administrator permission — though an admin can set a channel to **Open casting**, which opens `/session config` "
@@ -760,6 +761,7 @@ PERMISSION_EFFECTS = {
     "bypass_slowmode": ("Bypass Slowmode", "slowmode holds up a reply sent in several parts"),
     "manage_webhooks": ("Manage Webhooks", "characters post under my name and avatar, not their own"),
     "manage_messages": ("Manage Messages", "`/purge` leaves other people's messages behind"),
+    "create_public_threads": ("Create Public Threads", "Branch from Here can't open its thread"),
 }
 
 #: The second track: things worth knowing once setup is finished. Not steps -- none of
@@ -1075,11 +1077,14 @@ DEFAULT_HELP_DOCS = {
         "- Mute Turn (🔇): Hides the targeted message from the bot's memory transcript, making it invisible to the AI while leaving it in the channel.\n"
         "- Skip Participant (❌): Administrators. Suspends a specific profile from responding in the session until the ❌ that skipped it is removed, or the message it is on is deleted. One ❌ per skipped profile: a second, on any of its messages, is removed again. A non-administrator's reaction is removed again rather than applied.\n"
         "- A ▶️ or 🍿 on a message from a profile that has left the cast carries on from whoever spoke last. A reaction that can do nothing -- 🔁, ❌ or ⏯️ on a profile that has left, ⏯️ on a skipped profile, a second ❌ on a profile already skipped, or ▶️, ⏯️ or 🍿 on a draft session -- is removed again.\n"
+        "- Branch from Here (right-click a message -> Apps): Opens a public thread that carries the session up to that message, with its cast and settings, and goes on from there. The channel's own session is unchanged. Anyone who may create threads in the channel can use it, on any message in the session, including one in a branch. Discord's own Create Thread on a session's message does the same; a thread opened from the channel's thread list, off no message, is left alone. The thread is a session of its own: `/purge` there removes only what was said in the thread. The characters are the same characters, so what they remember, how they feel and what they think of people carries between a branch and the channel.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'A reply took the scene in a direction I did not want.' Fix: React with 🔇 to mute that turn. The characters carry on as though it never happened, without deleting the message.\n"
         "- Symptom: 'One character keeps dominating the round.' Fix: React with ❌ on one of its messages to skip it for a while. Administrators only -- if the reaction disappears again, ask one.\n"
         "- Symptom: 'I reacted and my reaction just disappeared.' Fix: It could not do anything. The session is still a draft (press 'Start / Update Session'), nobody is seated, the profile that wrote the message has left the cast, which 🔁 and ❌ need, or that profile is already skipped by an earlier ❌."
         "\n- Symptom: 'A character is still skipped and I cannot unskip it.' Fix: Remove the ❌ that skipped it -- the first one, which the bot copied. Only that one unskips, and someone with Manage Messages can remove another member's. Deleting the message it is on unskips the character too. A skip lasts through a restart; if its message was deleted while the bot was offline, a new ❌ on one of the character's messages takes its place, and removing that one unskips."
+        "\n- Symptom: 'A character remembered something that only happened in a branch.' Fix: That is how branches work. A branch forks the conversation, not the character: long-term memories, mood and bonds belong to the profile, in every channel it is seated in."
+        "\n- Symptom: 'Branch from Here says I can't create threads.' Fix: It needs what Discord asks of anyone opening a thread there, the Create Public Threads permission in that channel. A forum post can't be branched; a thread inside a text channel can."
     ),
     "sessions/response_modes.txt": (
         "Setup: Configured via `/profile manage` -> Tools -> Response Mode.\n"
@@ -1111,6 +1116,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Profiles keep interrupting each other.' Fix: Lower the Chance percentage for those participants.\n"
         "- Symptom: 'My wakeword does not trigger.' Fix: Matching ignores case but wants the whole word ('Al' does not fire on 'Alice'), so one that never fires is misspelt, part of a longer word, or not in the message.\n"
         "- Symptom: 'A character answers whenever someone mentions it, even at 0% Chance.' Fix: Its name is a wakeword. Turn off 'Names as Wakewords' on the Reactivity tab."
+        "\n- Symptom: 'A character greeted someone who just joined, or remarked on a pin.' Fix: That is by design. Discord's own notices in a session's channel -- a member joining, a boost, a pin, a thread started -- reach the cast like any message from that person, tagged as Discord's, and roll Chance and wakewords the same way. A sticker reaches it as its picture, with its name; Discord's own animated default stickers by name alone. Keep a session out of the server's system channel if joins should pass unremarked."
     ),
     "sessions/whisper_and_speak.txt": (
         "Commands: `/whisper` and `/speak`\n"

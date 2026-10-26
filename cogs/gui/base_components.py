@@ -564,9 +564,10 @@ class ActionTextInputModal(ui.Modal):
 class DropdownContentView(BlockedGuard, ui.View):
     def __init__(self, content_dict: dict, title: str, link_button_label: Optional[str] = None,
                  link_button_url: Optional[str] = None, start_category: Optional[str] = None,
-                 start_page: Optional[str] = None):
+                 start_page: Optional[str] = None, footer: Optional[str] = None):
         super().__init__(timeout=600)
         self.content_dict = content_dict
+        self.footer = footer
         self.view_title = title
         self.link_button_label = link_button_label
         self.link_button_url = link_button_url
@@ -608,6 +609,8 @@ class DropdownContentView(BlockedGuard, ui.View):
         content = self.content_dict[self.selected_category][self.selected_page]
         embed = discord.Embed(title=self.selected_page, description=content, color=discord.Color.blurple())
         embed.set_author(name=self.view_title)
+        if self.footer:
+            embed.set_footer(text=self.footer)
         return embed
 
 class InviteView(ui.View):

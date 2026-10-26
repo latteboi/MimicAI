@@ -57,7 +57,7 @@ from .generation.speak import SpeakAsMixin
 from .generation.global_chat import GlobalChatMixin
 from .generation.whisper import WhisperMixin
 from .generation.image_round import ImageRoundMixin
-from .generation.triggers import (TriggerIntakeMixin, batched_message, referenced_message,
+from .generation.triggers import (TriggerIntakeMixin, batched_message, referenced_message, said,
                                   reply_record, wakeword_position)
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
@@ -257,7 +257,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         if isinstance(t, tuple) and len(t) > 1:
             t = t[1]
         if isinstance(t, discord.Message):
-            return t.clean_content.lower()
+            return said(t).lower()
         if isinstance(t, dict) and 'content' in t:
             return t['content'].lower()
         return t.lower() if isinstance(t, str) else ""
@@ -1435,7 +1435,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
                         # This allows participants to see images this round without them persisting in RAM history.
                         all_current_media, media_skipped_note = self._round_media(
-                            new_round_turn_data, links=resolve_url_mode(p_settings) != "off")
+                            new_round_turn_data, links=resolve_url_mode(p_settings) != "off",
+                            emojis=server_context_guild(session, channel) is not None)
                         if media_skipped_note:
                             supplementary_parts.append(media_skipped_note)
                         if urls_skipped and resolve_url_mode(p_settings) == "rag":

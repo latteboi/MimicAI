@@ -944,7 +944,11 @@ def attachment_tag(attachment: Any) -> str:
     The kind is read from the mime rather than assumed. Every attachment was announced as
     an Image, so a character sent a voice message was told it had been sent a picture --
     and on a model that could not hear it, that tag was the whole of what it got.
+
+    A sticker's or an emoji's is empty: what its message says names it already (`triggers.said`).
     """
+    if isinstance(attachment, dict) and attachment.get("named"):
+        return ""
     kind = ATTACHMENT_TAG_KINDS.get(attachment_mime(attachment).split("/", 1)[0], ATTACHMENT_TAG_DEFAULT)
     return ATTACHMENT_TAG.format(kind=kind, filename=attachment_filename(attachment))
 
@@ -969,9 +973,10 @@ def describe_voice_samples(summary: Optional[Tuple[int, int, bool]]) -> Optional
             + f" \u00b7 {filled} of {VOICE_SAMPLE_SLOTS} saved")
 
 
+#: A custom emoji as a message carries it, `<:name:id>` or `<a:name:id>`: name, then id.
+CUSTOM_EMOJI_PATTERN = re.compile(r"<a?:(\w+):(\d+)>")
 #: Discord markup a speech model would read out: custom emoji (the name is kept), links (a
 #: masked link keeps its text), subtext markers, and the emphasis, strike and spoiler characters.
-_CUSTOM_EMOJI = re.compile(r"<a?:(\w+):\d+>")
 #: A mention, channel or timestamp: angle brackets Gemini 3.8 would take for a vocal tag.
 _DISCORD_TOKEN = re.compile(r"<(?:@[!&]?|#|t:)\d+(?::\w)?>")
 _MASKED_LINK = re.compile(r"\[([^\[\]\n]+)\]\(<?https?://[^\s)>]+>?\)")
@@ -1042,7 +1047,7 @@ def speakable_text(text: str, keep_tags: bool = False, vocal_tags: bool = False)
     roleplay action, or -- unless `keep_tags` -- an audio tag. With `vocal_tags`, an action or
     audio tag that is a sound becomes Gemini 3.8's inline tag for it: "*sighs*" is `<sigh>`."""
     replace = _vocal_tag if vocal_tags else (lambda _action: "")
-    text = _CUSTOM_EMOJI.sub(r"\1", text or "")
+    text = CUSTOM_EMOJI_PATTERN.sub(r"\1", text or "")
     text = _DISCORD_TOKEN.sub("", text)
     text = _MASKED_LINK.sub(r"\1", text)
     text = _LINK.sub("", text)

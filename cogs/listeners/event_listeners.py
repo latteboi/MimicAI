@@ -19,10 +19,11 @@ from ..utils.content import (
     WELCOME_CHANNEL_HINTS,
 )
 from ..utils.helpers import (
-    _format_history_entry, _get_user_hash, image_command_prompt, is_media_attachment,
-    is_text_attachment,
+    _format_history_entry, _get_user_hash, CUSTOM_EMOJI_PATTERN, image_command_prompt,
+    is_media_attachment, is_text_attachment,
 )
-from ..services.generation.triggers import mentioned_seat, referenced_message, reply_record
+from ..services.generation.triggers import (emoji_files, mentioned_seat, referenced_message, reply_record,
+                                            said, sticker_files, sticker_tags)
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 
 
@@ -243,6 +244,20 @@ class EventListeners:
         if not message.guild or not self.has_lock or message.author.bot or not self.sessions_loaded:
             return
 
+        # The starter Discord opens a thread made off a message with is that message over
+        # again: in a branch it is already the last turn, and anywhere else nobody listens.
+        # Discord's other notices -- a pin, a join, a boost -- say their own line (`said`).
+        # What says nothing at all, no words, file or sticker, is nobody's turn.
+        if (message.type == discord.MessageType.thread_starter_message
+                or not (message.attachments or said(message))):
+            return
+
+        # In a thread whose branch is still opening (`_branch_opening`), the message waits
+        # for it: passing first, it finds no session and goes unanswered.
+        opening = self.branches_opening.get(message.channel.id)
+        if opening:
+            await opening.wait()
+
         # Sending ends a typing indicator, and Discord says nothing when it does. A round
         # settling on this person's typing learns they stopped from this alone.
         typing = (self.multi_profile_channels.get(message.channel.id) or {}).get('typing')
@@ -358,11 +373,14 @@ class EventListeners:
             is_image_request = image_command_prompt(message.content) is not None
 
             attachments_data = [{"url": a.url, "filename": a.filename, "content_type": a.content_type, "size": a.size}
-                                for a in message.attachments if is_media_attachment(a) or is_text_attachment(a)]
+                                for a in message.attachments if is_media_attachment(a) or is_text_attachment(a)
+                                ] + sticker_files(message) + emoji_files(message)
             
             payload = {
                 "id": message.id,
-                "content": message.content.replace(f"<@{self.bot.user.id}>", "").strip(),
+                "content": "\n".join(part for part in (
+                    CUSTOM_EMOJI_PATTERN.sub(r":\1:", message.content.replace(f"<@{self.bot.user.id}>", "")).strip(),
+                    sticker_tags(message)) if part),
                 "channel_id": message.channel.id, "guild_id": message.guild.id,
                 "author_id": message.author.id, "author_name": message.author.display_name,
                 "timestamp": message.created_at.isoformat(), "attachments": attachments_data,
@@ -1104,7 +1122,7 @@ class EventListeners:
             # message replies to, so a stored `reply_to` stands; a turn written before
             # replies were stored, its quote baked into the text, is given one here.
             new_content = (await self.generation_service._compose_user_turn(
-                msg.clean_content, msg.attachments, edited=True)).content
+                said(msg), msg.attachments, edited=True)).content
             reply_added = False
             if "reply_to" not in turn_object:
                 reply_to, _ = reply_record(session.get("unified_log", []), await referenced_message(msg))
@@ -1137,6 +1155,29 @@ class EventListeners:
             # edit above is already in it. The whisper derivation reads type/target_pid/
             # speaker_pid/is_hidden and never content, so it cannot change either.
             self.session_manager._mark_session_accessed(channel_id)
+
+    @commands.Cog.listener()
+    async def on_thread_create(self, thread: discord.Thread):
+        """A thread someone opens off a session's message with Discord's own Create Thread
+        is a branch, as Branch from Here makes one: a thread opened off a message has that
+        message's id. The bot's own threads are the menu's, which opens their sessions
+        itself, and one opened off no message is left alone, a conversation on the side."""
+        if (not self.has_lock or not self.sessions_loaded or thread.owner_id == self.bot.user.id
+                or thread.owner_id in self.generation_blocked or thread.guild.id in self.quarantined_guilds):
+            return
+        session = self.multi_profile_channels.get(thread.parent_id)
+        if not session:
+            return
+        with self._branch_opening(thread.id):
+            if not session.get("is_hydrated"):
+                session = await self.session_manager._ensure_session_hydrated(thread.parent_id, session.get("type", "multi"))
+            log = (session or {}).get("unified_log") or []
+            through = next((i for i, t in enumerate(log) if thread.id in (t.get("message_ids") or ())), None)
+            if through is None:
+                return
+            blueprint, branch = self.session_manager.branch_of(session, through)
+            jump_url = f"https://discord.com/channels/{thread.guild.id}/{thread.parent_id}/{thread.id}"
+            await self._open_branch(thread, blueprint, branch, jump_url, thread.owner_id)
 
     def _refused_by_blacklist(self, interaction: discord.Interaction) -> bool:
         """True when a block closes this interaction to its user. Nothing is sent.

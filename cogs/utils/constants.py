@@ -1144,6 +1144,9 @@ MEDIA_DESCRIPTION_MAX_CHARS = 3500
 
 # The round's attachments sent with each character's turn. The newest are kept.
 ROUND_MEDIA_MAX = 10
+#: The round's custom emojis shown as pictures, beside ROUND_MEDIA_MAX rather than in it: a
+#: message of emojis would push a photo out. The newest are kept; the rest stay `:name:`.
+ROUND_EMOJI_MAX = 4
 # The messages in one intake whose links URL Context opens. The newest are kept: each
 # opens up to two pages, all at once, so a burst of links was that many fetches together.
 ROUND_URL_MESSAGES_MAX = 3
@@ -1178,6 +1181,12 @@ ATTACHMENT_TAG_KINDS = {'image': "Image", 'audio': "Audio", 'video': "Video"}
 
 ATTACHMENT_TAG_DEFAULT = "File"
 ATTACHMENT_TAG = "[Attached {kind}: {filename}]"
+
+#: A notice Discord posts in someone's name -- a pin, a join, a boost -- as its turn reads
+#: (`triggers.said`). Tagged, or it reads as that person saying it.
+DISCORD_NOTICE_TAG = "[Discord: {text}]"
+#: A sticker, by name. One with a picture is shown as well (`triggers.sticker_files`).
+STICKER_TAG = "[Sticker: {name}]"
 
 #: A reply's `<reply_context>`. A replied-to turn the reader has in view is tagged `[#n]`
 #: in its header for that one prompt and the reply names the tag, with no quote; one it
@@ -3153,6 +3162,10 @@ API_ERROR_MAPPINGS = {
 
 #: The official instance's application. Any other instance is self-hosted.
 OFFICIAL_BOT_ID = 1376696185947164854
+#: `/thanks`. The project's links, so every instance hands out the same ones. The Ko-fi page
+#: is about the software only, never Adult profiles: payment processors drop adult content.
+KOFI_URL = "https://ko-fi.com/latteboi"
+TOPGG_URL = f"https://top.gg/bot/{OFFICIAL_BOT_ID}"
 
 #: Every permission the bot uses, and all the official invite asks a server for.
 BOT_PERMISSIONS = discord.Permissions(
@@ -3160,10 +3173,12 @@ BOT_PERMISSIONS = discord.Permissions(
     read_message_history=True, embed_links=True, attach_files=True, add_reactions=True,
     use_external_emojis=True, bypass_slowmode=True,
     manage_webhooks=True,   # a character's own name and face
-    manage_messages=True)   # deleting the messages in a turn that others posted
-#: A child bot speaks as itself and deletes only its own messages.
+    manage_messages=True,   # deleting the messages in a turn that others posted
+    create_public_threads=True)  # Branch from Here
+#: A child bot speaks as itself, deletes only its own messages and opens no branches.
 CHILD_BOT_PERMISSIONS = BOT_PERMISSIONS & ~discord.Permissions(manage_webhooks=True,
-                                                               manage_messages=True)
+                                                               manage_messages=True,
+                                                               create_public_threads=True)
 
 
 def invite_url(instance: discord.Client, client_id, permissions: discord.Permissions) -> str:

@@ -5,16 +5,83 @@ import unicodedata
 from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 from ...utils.helpers import (
-    _format_history_entry, _get_user_hash, attachment_mime, attachment_tag,
+    _format_history_entry, _get_user_hash, attachment_mime, attachment_tag, CUSTOM_EMOJI_PATTERN,
     image_command_prefix, image_command_prompt, is_media_attachment, URL_FETCH_PATTERN,
 )
 from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
 from ...managers.session_manager import intern_turn, log_user_turn, reply_quote
 from ...utils.constants import (
-    defaultConfig, ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE, ROUND_URL_MESSAGES_MAX,
+    defaultConfig, DISCORD_NOTICE_TAG, ROUND_EMOJI_MAX, ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE,
+    ROUND_URL_MESSAGES_MAX, STICKER_TAG,
 )
 from ...utils.discord_cdn import unsigned_attachment_url
+
+
+def said(message: Any) -> str:
+    """What a message says, as its turn records it and wakewords are looked for in.
+
+    What was typed, with each custom emoji as `:name:` -- what Server Context calls it, and
+    what a character writes to use it -- then the name of any sticker sent with it. A
+    notice Discord posts in
+    someone's name -- a pin, a join, a boost -- has nothing typed: it says Discord's own
+    line for it, tagged as Discord's. Read as typed, it reached the cast as an empty
+    message from that person, replying to nothing they could see.
+    """
+    if message.type in (discord.MessageType.default, discord.MessageType.reply):
+        text = message.clean_content
+    else:
+        try:
+            notice = message.system_content
+        except AttributeError:  # a `guild_stream` notice reads an activity the member may not have
+            notice = None
+        # discord.py words it with the username; the turn's header has the display name.
+        text = DISCORD_NOTICE_TAG.format(
+            text=notice.replace(message.author.name, message.author.display_name)) if notice else ""
+    text = CUSTOM_EMOJI_PATTERN.sub(r":\1:", text)
+    return "\n".join(part for part in (text, sticker_tags(message)) if part)
+
+
+def sticker_tags(message: Any) -> str:
+    """Every sticker a message carries, by name: shown or not, the cast is told of it."""
+    return " ".join(STICKER_TAG.format(name=s.name) for s in getattr(message, "stickers", ()))
+
+
+def sticker_files(message: Any) -> List[Dict[str, Any]]:
+    """A message's stickers as the attachment dicts a round sends a model, for those with
+    a picture. Discord's own default stickers are vector animations its client draws
+    (Lottie), with nothing a model can view, so they stay a name (`sticker_tags`).
+    Marked `named`: the name is in what the message says, so no file tag repeats it.
+    """
+    return [{"url": s.url, "filename": f"{s.name}.{s.format.file_extension}",
+             "content_type": f"image/{s.format.file_extension}", "named": True}
+            for s in getattr(message, "stickers", ()) if s.format is not discord.StickerFormatType.lottie]
+
+
+def emoji_files(message: Any) -> List[Dict[str, Any]]:
+    """A message's custom emojis, once each, as the attachment dicts a round sends a model.
+
+    A still PNG even for an animated one: the CDN serves its first frame, and not every
+    provider takes a GIF. Unicode emojis are text a model reads already. Named in what the
+    message says (`said`), and marked `emoji` for their own allowance (`_round_media`).
+    """
+    files: Dict[str, Dict[str, Any]] = {}
+    for name, emoji_id in CUSTOM_EMOJI_PATTERN.findall(getattr(message, "content", None) or ""):
+        files.setdefault(emoji_id, {"url": f"https://cdn.discordapp.com/emojis/{emoji_id}.png",
+                                    "filename": f"{name}.png", "content_type": "image/png",
+                                    "named": True, "emoji": True})
+    return list(files.values())
+
+
+def media_part(attachment: Any) -> Dict[str, Any]:
+    """The part a model is sent for one attachment, a `discord.Attachment` or a dict."""
+    url = attachment.get("url") if isinstance(attachment, dict) else attachment.url
+    # The bare type, without Discord's `; charset=` parameters: it goes on the wire as a
+    # part's mimeType, and every provider matches it against a fixed table.
+    part = {"url": url, "mime_type": attachment_mime(attachment)}
+    if isinstance(attachment, dict) and attachment.get("emoji"):
+        part["emoji"] = True
+    return part
 
 
 def reply_snapshot(message: Any) -> Dict[str, Any]:
@@ -25,10 +92,10 @@ def reply_snapshot(message: Any) -> Dict[str, Any]:
         "author_id": message.author.id,
         "author_name": message.author.display_name,
         "author_is_bot": bool(getattr(message.author, "bot", False)),
-        "content": message.clean_content,
+        "content": said(message),
         "created_at": message.created_at.isoformat(),
         "attachments": [{"url": a.url, "filename": a.filename, "content_type": a.content_type,
-                         "size": a.size} for a in message.attachments],
+                         "size": a.size} for a in message.attachments] + sticker_files(message) + emoji_files(message),
     }
 
 
@@ -133,7 +200,8 @@ async def batched_message(trigger: Any) -> Optional[BatchedMessage]:
                               p.get('replied_to'))
     if not isinstance(trigger, discord.Message):
         return None
-    return BatchedMessage(trigger.clean_content, trigger.attachments, trigger.author.id,
+    return BatchedMessage(said(trigger), [*trigger.attachments, *sticker_files(trigger), *emoji_files(trigger)],
+                          trigger.author.id,
                           trigger.author.display_name, trigger.guild.id, trigger.id,
                           trigger.created_at, await referenced_message(trigger))
 
@@ -164,8 +232,9 @@ def reply_record(unified_log: List[Dict[str, Any]], ref: Optional[Dict[str, Any]
         if over_attachment_limit(attachment):
             files.append(skipped_attachment_note(attachment))
             continue
-        reply_media.append({"url": attachment["url"], "mime_type": attachment_mime(attachment)})
-        files.append(attachment_tag(attachment))
+        reply_media.append(media_part(attachment))
+        if tag := attachment_tag(attachment):
+            files.append(tag)
     record: Dict[str, Any] = {"files": files} if files else {}
     target = next((t for t in reversed(unified_log) if ref["id"] in (t.get("message_ids") or ())), None)
     if target is not None and not target.get("type") and target.get("turn_id"):
@@ -229,11 +298,9 @@ class TriggerIntakeMixin:
             if over_attachment_limit(attachment):
                 att_tags.append(skipped_attachment_note(attachment))
                 continue
-            url = attachment.get('url') if isinstance(attachment, dict) else attachment.url
-            # The bare type, without Discord's `; charset=` parameters: it goes on the wire
-            # as a part's mimeType, and every provider matches it against a fixed table.
-            media_parts.append({"url": url, "mime_type": attachment_mime(attachment)})
-            att_tags.append(attachment_tag(attachment))
+            media_parts.append(media_part(attachment))
+            if tag := attachment_tag(attachment):
+                att_tags.append(tag)
 
         if att_tags:
             content = f"{' '.join(att_tags)}\n{content}".strip()
@@ -259,7 +326,8 @@ class TriggerIntakeMixin:
         return joined[:defaultConfig.LIMIT_IMAGE_PROMPT_CHARS]
 
     @staticmethod
-    def _round_media(new_round_turn_data, links: bool = True) -> Tuple[List[Dict[str, str]], Optional[str]]:
+    def _round_media(new_round_turn_data, links: bool = True,
+                     emojis: bool = True) -> Tuple[List[Dict[str, str]], Optional[str]]:
         """The round's attachments to send with a character's turn, and a note for any left out.
 
         Every attachment in the round used to go to every character: up to ten a message,
@@ -269,22 +337,28 @@ class TriggerIntakeMixin:
 
         `links` False leaves out images fetched off a posted link -- a profile with URL
         Context off sees nothing a link brought in, as grounding off sees no search.
+
+        Custom emojis have an allowance of their own, the newest ROUND_EMOJI_MAX, so a
+        message full of them pushes no photo out; the rest are left as their `:name:`, with
+        no note. `emojis` False -- Server Context off -- sends none.
         """
         # Once each: a reply to a picture posted in the same round carries it again.
         media, seen = [], set()
         for _text, _url, turn_media in new_round_turn_data:
             for part in turn_media:
-                if not links and part.get("from_link"):
+                if (not links and part.get("from_link")) or (not emojis and part.get("emoji")):
                     continue
                 key = unsigned_attachment_url(part.get("url"))
                 if key and key in seen:
                     continue
                 seen.add(key)
                 media.append(part)
-        if len(media) <= ROUND_MEDIA_MAX:
-            return media, None
-        note = ROUND_MEDIA_SKIPPED_NOTE.format(limit=ROUND_MEDIA_MAX, count=len(media) - ROUND_MEDIA_MAX)
-        return media[-ROUND_MEDIA_MAX:], note
+        files = [part for part in media if not part.get("emoji")]
+        keep = {id(part) for part in files[-ROUND_MEDIA_MAX:]}
+        keep.update(id(part) for part in [p for p in media if p.get("emoji")][-ROUND_EMOJI_MAX:])
+        note = (ROUND_MEDIA_SKIPPED_NOTE.format(limit=ROUND_MEDIA_MAX, count=len(files) - ROUND_MEDIA_MAX)
+                if len(files) > ROUND_MEDIA_MAX else None)
+        return [part for part in media if id(part) in keep], note
 
     @staticmethod
     def _round_links(linked: List[Any]) -> Tuple[List[Any], int]:
@@ -409,7 +483,7 @@ class TriggerIntakeMixin:
             image_prompt_from_this_trigger = False
 
             if (message_trigger or message_payload) and not is_image_gen_round:
-                trigger_content = message_payload['content'] if message_payload else message_trigger.clean_content
+                trigger_content = message_payload['content'] if message_payload else said(message_trigger)
 
                 # Detection is prefix-based only. The round opens on the prefix rather
                 # than on the prompt because a prompt this message does not carry may
@@ -437,9 +511,11 @@ class TriggerIntakeMixin:
                 # in. URL Context reads links from this alone: a link inside an attached file
                 # or someone else's quoted message is not one they asked the profile to
                 # open, and the quote is cut at 150 characters, so its link can be half a URL.
-                typed_text = trigger_obj['content'] if is_child_mention else trigger_obj.clean_content
+                typed_text = trigger_obj['content'] if is_child_mention else said(trigger_obj)
 
-                raw_att_list = trigger_obj['attachments'] if is_child_mention else trigger_obj.attachments
+                raw_att_list = (trigger_obj['attachments'] if is_child_mention
+                                else [*trigger_obj.attachments, *sticker_files(trigger_obj),
+                                      *emoji_files(trigger_obj)])
                 user_turn = await self._compose_user_turn(typed_text, raw_att_list)
                 content, own_media_parts = user_turn.content, user_turn.media_parts
 

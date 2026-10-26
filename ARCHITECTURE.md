@@ -445,6 +445,17 @@ quoted from the log, so deleting or muting it takes it out of every reply too. T
 per-participant history is a multiplicative memory cost for data that is a pure function of
 the log.
 
+### A branch is a copy, not a pointer
+
+Branch from Here opens a thread whose session starts with a copy of the original's log up
+to one message (`SessionManager.branch_of`, `branch_log`), and so does Discord's own Create
+Thread on a session's message (`on_thread_create`). Nothing records the parent: a
+log pointing into another would make every reader of `unified_log` follow it, and a purge or
+trim of the original would rewrite the branch's past. The copy is at most
+`LOG_TRIM_HIGH_WATER` turns, and from then on the thread is an ordinary session. What forks is
+the conversation, not the character: memories, `neuro_state` and bonds are the profile's,
+shared with every channel it sits in.
+
 ---
 
 ## Providers

@@ -544,7 +544,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         focus = self.focus
         if focus is None:
             e.add_field(name="You're set up",
-                        value="Just talk in the channel. **Using it ▸** covers what else there is.",
+                        value="Just talk in the channel. **Using it ▸** covers what else there is.\n"
+                              "-# Enjoying MimicAI? `/thanks` has ways to support it.",
                         inline=False)
         else:
             e.add_field(name=f"Step {WIZARD_STEPS.index(focus) + 1}. {focus.title}",

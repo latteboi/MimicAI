@@ -19,8 +19,10 @@ import time
 from typing import Dict, Iterable, List, Optional, Set
 
 import discord
+import orjson as json
 
 from ...utils.constants import SESSION_BUSY_FLAGS, TURN_DELETE_DEFER_TIMEOUT_SECONDS
+from ...utils.helpers import turn_posted_at
 
 #: Log entries that never appear in the channel, whatever their message_ids hold.
 _INVISIBLE_TURN_TYPES = frozenset({"whisper", "private_response", "synopsis"})
@@ -110,6 +112,28 @@ def remove_turns_from_log(session: Dict, doomed: Iterable[Dict]) -> int:
         _uncompact_uncovered(kept)
     session["unified_log"] = kept
     return len(dropped)
+
+
+def branch_log(log: List[Dict], through: int) -> List[Dict]:
+    """A copy of `log` up to and including `log[through]`, for a branch to start from.
+
+    Deep, as the disk would give it back: compaction, edits and regeneration change turns
+    in place, and a turn two sessions shared would change in both. A synopsis written after
+    the cut is left behind with the turns it followed, so what it alone covered unfolds.
+
+    `message_ids` stay behind too. They name messages in the channel branched from, so
+    `/purge` in the branch would count those turns as its own and delete by them. An id is
+    also a turn's moment, which is written out first, as a regeneration does.
+    """
+    copied = json.loads(json.dumps(log[:through + 1],
+                                   option=json.OPT_SERIALIZE_NUMPY | json.OPT_NON_STR_KEYS))
+    for turn in copied:
+        moment = turn_posted_at(turn)
+        if moment and not turn.get("timestamp"):
+            turn["timestamp"] = moment.isoformat()
+        turn.pop("message_ids", None)
+    _uncompact_uncovered(copied)
+    return copied
 
 
 class TurnDeletionMixin:

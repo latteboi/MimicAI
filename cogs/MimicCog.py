@@ -12,7 +12,7 @@ from .utils.constants import (
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
     PERSONA_TEXT_INPUT_MAX_LENGTH,
-    BOT_PERMISSIONS, invite_url,
+    BOT_PERMISSIONS, invite_url, KOFI_URL, TOPGG_URL,
 )
 from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError, clean_display_name,
                                            draft_from_card, generate_draft, generator_models)
@@ -41,7 +41,7 @@ from .gui.gui_mod import ModStatsView
 from .services.generation.turn_deletion import is_visible_turn
 from .managers.storage_manager import MasterCipher, StorageManager
 from .managers.profile_manager import ProfileManager
-from .managers.session_manager import NEW_SESSION_COMPACTION, SessionManager
+from .managers.session_manager import NEW_SESSION_COMPACTION, SessionManager, session_from_blueprint
 from .managers.memory_manager import MemoryManager
 from .managers.server_manager import ServerManager
 from .managers.child_bot_manager import ChildBotManager
@@ -59,6 +59,7 @@ import discord
 from discord import app_commands, ui
 
 import asyncio
+import contextlib
 import io
 import os
 import orjson as json
@@ -335,6 +336,9 @@ class MimicCog(EventListeners, commands.Cog):
         self.session_manager.evict_inactive_sessions_task.start()
         self.session_manager.flush_dirty_sessions_task.start()
         self.processed_child_messages: LRUCache = LRUCache(max_size=25)
+        # thread id -> set once the branch opening there is open. An entry lives only
+        # while one opens (`_branch_opening`), so a plain dict holds a handful at most.
+        self.branches_opening: Dict[int, asyncio.Event] = {}
         # user id -> when an @ of the bot was last answered (`_answer_bot_mention`).
         self.mention_pointers_sent: LRUCache = LRUCache(max_size=256)
         self.all_bot_ids: Set[int] = set()
@@ -367,6 +371,13 @@ class MimicCog(EventListeners, commands.Cog):
             callback=self.view_generation_trace
         )
         self.bot.tree.add_command(self.trace_ctx_menu)
+        # Discord allows an app five message menus; this is the fourth.
+        self.branch_ctx_menu = app_commands.ContextMenu(
+            name="Branch from Here",
+            callback=self.branch_from_here,
+            allowed_contexts=app_commands.AppCommandContext(guild=True),
+        )
+        self.bot.tree.add_command(self.branch_ctx_menu)
         self.edit_ctx_menu = app_commands.ContextMenu(
             name="Edit Profile Message",
             callback=self.edit_profile_message
@@ -993,27 +1004,9 @@ class MimicCog(EventListeners, commands.Cog):
         session_config = server_index.get("active_sessions", {}).get("regular", {}).get(str(ch_id))
 
         if session_config:
-            # Wake it up as a dehydrated shell
-            session = {
-                # Copies: see _load_multi_profile_sessions.
-                "type": "multi", "profiles": [dict(p) for p in session_config.get("profiles", [])],
-                "unified_log": [], "is_hydrated": False,
-                "owner_id": session_config.get("owner_id", interaction.user.id),
-                "is_running": False, "task_queue": asyncio.Queue(), "worker_task": None,
-                "session_prompt": session_config.get("session_prompt"),
-                "session_mode": session_config.get("session_mode", "sequential"),
-                "proactivity": session_config.get("proactivity", {}),
-                "cast_policy": session_config.get("cast_policy", DEFAULT_CAST_POLICY),
-                # Carried like every other setting. Without it the editor showed the
-                # synopsis off, and the next save wrote that over the blueprint.
-                "compaction": session_config.get("compaction", {}),
-                "started": session_config.get("started", True),
-                "audio_mode": session_config.get("audio_mode", "off"),
-                "max_responses": session_config.get("max_responses", 10),
-                "settle": session_config.get("settle", {}),
-                "name_wakewords": session_config.get("name_wakewords", True),
-                "server_context": session_config.get("server_context", True),
-            }
+            # Wake it up as a dehydrated shell. Copies: see _load_multi_profile_sessions.
+            session = session_from_blueprint({"owner_id": interaction.user.id, **session_config},
+                                             [dict(p) for p in session_config.get("profiles", [])])
         else:
             # Blank session
             session = {
@@ -2039,6 +2032,93 @@ class MimicCog(EventListeners, commands.Cog):
         view = GenerationTraceView(self, interaction, target_turn, prompt_url)
         await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
+    # Not `cooldown_unless_refused`: a context menu has no `binding` for it to hand the
+    # refusal. A refused branch spends a use, as it does in the menus beside it.
+    @app_commands.checks.cooldown(3, 60.0, key=lambda i: i.user.id)
+    async def branch_from_here(self, interaction: discord.Interaction, message: discord.Message):
+        """A public thread that carries this channel's session up to `message` and goes on
+        from there, leaving the original as it is (`SessionManager.branch_of`). What forks
+        is the conversation: the characters in it keep one memory, mood and bond each."""
+        if not self.has_lock or self._refused_by_blacklist(interaction): return
+        await interaction.response.defer(ephemeral=True)
+
+        channel = message.channel
+        parent = channel.parent if isinstance(channel, discord.Thread) else channel
+        if not isinstance(parent, discord.TextChannel):
+            await interaction.followup.send("A branch opens as a thread, and only a text channel holds those.", ephemeral=True)
+            return
+        # The user's own, or the bot opens threads for people Discord wouldn't let.
+        if not interaction.permissions.create_public_threads:
+            await interaction.followup.send("Branching opens a thread, and you can't create threads here.", ephemeral=True)
+            return
+
+        session = self.multi_profile_channels.get(channel.id)
+        if session and not session.get("is_hydrated"):
+            session = await self.session_manager._ensure_session_hydrated(channel.id, session.get("type", "multi"))
+        log = (session or {}).get("unified_log") or []
+        through = next((i for i, t in enumerate(log) if message.id in (t.get("message_ids") or ())), None)
+        if through is None:
+            await interaction.followup.send("Only a message in this channel's session can be branched from.", ephemeral=True)
+            return
+        blueprint, branch = self.session_manager.branch_of(session, through)
+
+        name = " ".join(message.clean_content.split())[:80]
+        name = f"Branch: {name}" if name else "Branch"
+        try:
+            thread = None
+            if channel is parent:
+                try:
+                    thread = await message.create_thread(name=name)
+                except discord.HTTPException as e:
+                    if e.code != 160004:  # the message already has a thread of its own
+                        raise
+            if thread is None:
+                # Without `type`, discord.py opens a private thread.
+                thread = await parent.create_thread(name=name, type=discord.ChannelType.public_thread)
+        except discord.Forbidden:
+            await interaction.followup.send("I need Create Public Threads in this channel to branch.", ephemeral=True)
+            return
+        except discord.HTTPException as e:
+            await interaction.followup.send(f"Discord wouldn't open the thread: {suppress_link_previews(str(e))}", ephemeral=True)
+            return
+
+        with self._branch_opening(thread.id):
+            # The cache learns of a thread from the gateway, not from the request that made it.
+            if self.bot.get_channel(thread.id) is None:
+                try:
+                    await self.bot.wait_for("thread_create", check=lambda t: t.id == thread.id, timeout=10)
+                except asyncio.TimeoutError:
+                    await interaction.followup.send(
+                        f"Discord never confirmed {thread.mention}, so the session didn't start there. Try again.",
+                        ephemeral=True)
+                    return
+            await self._open_branch(thread, blueprint, branch, message.jump_url, interaction.user.id)
+        await interaction.followup.send(f"Branched into {thread.mention}.", ephemeral=True)
+
+    @contextlib.contextmanager
+    def _branch_opening(self, thread_id: int):
+        """Holds messages in `thread_id` (`on_message`) until its branch is open, or turns
+        out not to be one. The thread exists before its session does, and Discord's own
+        Create Thread posts the first message straight after it."""
+        opening = self.branches_opening[thread_id] = asyncio.Event()
+        try:
+            yield
+        finally:
+            del self.branches_opening[thread_id]
+            opening.set()
+
+    async def _open_branch(self, thread, blueprint: Dict[str, Any], log: List[Dict], jump_url: str,
+                           user_id: int) -> None:
+        """Opens `branch_of`'s session in `thread`, and says there where it came from. The
+        menu's way in and Discord's own Create Thread (`on_thread_create`) both end here."""
+        await self.session_manager.open_branch(thread.id, blueprint, log)
+        try:
+            await thread.send(f"-# Branched from {jump_url} by <@{user_id}>. It goes on from that "
+                              "message; the original is unchanged.",
+                              allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            pass  # A note, not the branch: the session is already open.
+
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
     async def edit_profile_message(self, interaction: discord.Interaction, message: discord.Message):
         """Rewrite one message of any profile's reply, in the channel and the session log. Server admins only."""
@@ -2270,8 +2350,30 @@ class MimicCog(EventListeners, commands.Cog):
         if not notes:
             await interaction.response.send_message("No release notes shipped with this instance.", ephemeral=True)
             return
-        view = DropdownContentView(notes, "MimicAI News")
+        view = DropdownContentView(notes, "MimicAI News",
+                                   footer="Enjoying MimicAI? /thanks has ways to support it.")
         await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
+
+    @app_commands.command(name="thanks", description="Support MimicAI: Ko-fi, vote or review on Top.gg.")
+    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
+    async def thanks_slash(self, interaction: discord.Interaction):
+        # A thank-you and nothing more: a tip or a vote unlocks no feature or limit, and
+        # nothing offers this unasked -- it is only pointed at where someone is already looking.
+        embed = discord.Embed(
+            title="Support MimicAI",
+            description=(
+                "Every feature of MimicAI is free, for everyone, on every instance. If it has given "
+                "you something, these help the project keep going:\n\n"
+                "**Ko-fi** — a one-off tip.\n"
+                "**Vote on Top.gg** — helps new people find MimicAI.\n"
+                "**Review** — tell others what you make with it.\n\n"
+                "-# Nothing here unlocks a feature or a limit. Thank you for being here."),
+            color=discord.Color.blurple())
+        view = ui.View(timeout=None)
+        for label, url in (("Ko-fi", KOFI_URL), ("Vote on Top.gg", f"{TOPGG_URL}/vote"),
+                           ("Review", f"{TOPGG_URL}#reviews")):
+            view.add_item(ui.Button(label=label, url=url))
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @app_commands.command(name="help", description="Toggle MimicGuide into this session, or instantly ask a technical question.")
     @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)

@@ -31,6 +31,7 @@ from ..utils.discord_cdn import unsigned_attachment_url
 from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, always_reads_synopsis,
                              resolve_grounding_mode, resolve_url_mode, restamp_turn,
                              turn_posted_at)
+from ..services.generation.turn_deletion import branch_log
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
 
@@ -53,6 +54,43 @@ NEW_SESSION_COMPACTION = {"enabled": True}
 # Repeated verbatim on every turn of a session's log: interning them means one string
 # object per session instead of one per turn.
 _INTERNED_TURN_FIELDS = ("speaker_pid", "target_pid", "profile_name", "role", "type", "speaker_name")
+
+
+def blueprint_settings(blueprint: Dict[str, Any]) -> Dict[str, Any]:
+    """A session's settings as its blueprint stores them, each one absent at its default.
+
+    The one reading of a blueprint. Boot, hydration, the `/session config` shell and a
+    branch each listed these by hand once, and a setting one of them left out saved,
+    showed and worked, then reverted on the next restart.
+    """
+    return {
+        "type": "multi",
+        "owner_id": blueprint.get("owner_id"),
+        "session_prompt": blueprint.get("session_prompt"),
+        "session_mode": blueprint.get("session_mode", "sequential"),
+        "proactivity": blueprint.get("proactivity", {}),
+        "compaction": blueprint.get("compaction", {}),
+        # Absent means CLOSED: a blueprint written before this field existed keeps the
+        # admin-only access it was configured under.
+        "cast_policy": blueprint.get("cast_policy", DEFAULT_CAST_POLICY),
+        "started": blueprint.get("started", True),
+        "audio_mode": blueprint.get("audio_mode", "off"),
+        "max_responses": blueprint.get("max_responses", 10),
+        "settle": blueprint.get("settle", {}),
+        "name_wakewords": blueprint.get("name_wakewords", True),
+        "server_context": blueprint.get("server_context", True),
+    }
+
+
+def session_from_blueprint(blueprint: Dict[str, Any], profiles: List[Dict]) -> Dict[str, Any]:
+    """A dehydrated session restored from `blueprint`, seating `profiles`. Its first
+    trigger loads the log (`_ensure_session_hydrated`)."""
+    return {
+        "profiles": profiles, "unified_log": [], "is_hydrated": False,
+        "last_bot_message_id": None, "is_running": False,
+        "task_queue": asyncio.Queue(), "worker_task": None,
+        **blueprint_settings(blueprint),
+    }
 
 
 def intern_turn(turn: Dict[str, Any]) -> Dict[str, Any]:
@@ -1054,31 +1092,8 @@ class SessionManager:
                     if not owner_id or not (profiles_data or session_data.get("started")):
                         continue
 
-                    self.cog.multi_profile_channels[channel_id] = {
-                        "profiles": profiles_data,
-                        "is_hydrated": False,
-                        "last_bot_message_id": None,
-                        "owner_id": owner_id,
-                        "is_running": False,
-                        "task_queue": asyncio.Queue(),
-                        "worker_task": None,
-                        "session_prompt": session_data.get("session_prompt"),
-                        "session_mode": session_data.get("session_mode", "sequential"),
-                        "type": "multi",
-                        "proactivity": session_data.get("proactivity", {}),
-                        "compaction": session_data.get("compaction", {}),
-                        # Absent means CLOSED: a blueprint written before this field
-                        # existed keeps the admin-only access it was configured under.
-                        "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
-                        "started": session_data.get("started", True),
-                        # Set in /session config like everything above; a blueprint that left
-                        # them out lost the TTS toggle and the response limit on every restart.
-                        "audio_mode": session_data.get("audio_mode", "off"),
-                        "max_responses": session_data.get("max_responses", 10),
-                        "settle": session_data.get("settle", {}),
-                        "name_wakewords": session_data.get("name_wakewords", True),
-                        "server_context": session_data.get("server_context", True),
-                    }
+                    self.cog.multi_profile_channels[channel_id] = session_from_blueprint(
+                        session_data, profiles_data)
                     if channel is None and not guild.unavailable:
                         uncached.append(channel_id)
                 except Exception as e:
@@ -1145,6 +1160,100 @@ class SessionManager:
                         homes.setdefault(ch_id_str, server_id_str)
         return homes
 
+    def _blueprint(self, session_data: Dict) -> Dict[str, Any]:
+        """What a session saves of itself: its settings and its cast. Read back by
+        `blueprint_settings`."""
+        profiles_to_save = []
+        for p in session_data.get("profiles", []):
+            # The stamped PID wins. Re-resolving from the name would overwrite a
+            # good PID with a name-shaped one during the window where a rename
+            # has landed in the index but not yet in this cast entry.
+            pid = p.get("pid") or self.cog.profile_manager._get_pid_from_name_any(
+                p["owner_id"], p["profile_name"])
+            entry = {
+                "pid": pid,
+                "profile_name": p["profile_name"],
+                "owner_id": p["owner_id"],
+                "method": p.get("method", "webhook"),
+                "bot_id": p.get("bot_id"),
+                "ephemeral": p.get("ephemeral", False),
+                "chance": p.get("chance", 100),
+                "wakewords": p.get("wakewords", [])
+            }
+            # The turn its last memory read up to, and that turn's moment
+            # (LtmCaptureMixin). Lost, the next memory reads the newest turns
+            # instead, and can repeat itself.
+            for key in ("ltm_read_through", "ltm_read_through_id"):
+                if p.get(key):
+                    entry[key] = p[key]
+            # Sparse, so an unskipped cast writes exactly what it always has. Kept
+            # across a restart because the ❌ that did it stays on its message.
+            if p.get("is_skipped"):
+                entry["is_skipped"] = True
+                if p.get("skip_reaction"):
+                    entry["skip_reaction"] = list(p["skip_reaction"])
+            profiles_to_save.append(entry)
+
+        return {
+            "owner_id": session_data.get("owner_id"),
+            "profiles": profiles_to_save,
+            "session_prompt": session_data.get("session_prompt"),
+            "session_mode": session_data.get("session_mode", "sequential"),
+            "type": "multi",
+            "proactivity": session_data.get("proactivity", {}),
+            "compaction": session_data.get("compaction", {}),
+            "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
+            "started": bool(session_data.get("started", True)),
+            "audio_mode": session_data.get("audio_mode", "off"),
+            "max_responses": session_data.get("max_responses", 10),
+            "settle": session_data.get("settle", {}),
+            "name_wakewords": bool(session_data.get("name_wakewords", True)),
+            "server_context": bool(session_data.get("server_context", True)),
+        }
+
+    def branch_of(self, session: Dict, through: int) -> Tuple[Dict[str, Any], List[Dict]]:
+        """A branch of `session` at `unified_log[through]`: the blueprint and log it starts
+        from. Taken without an await, so the round still writing the original can't move
+        the cut. `open_branch` starts it.
+
+        Every seat's memory bookmark moves to the cut. Left without one, a seat reads the
+        whole copied past as new and memorises it again; left with the original's, both
+        sessions memorise whatever came between it and the cut. A ❌ skip stays behind:
+        its reaction is on a message the branch doesn't have, so nothing there could undo it.
+        """
+        log = branch_log(session.get("unified_log") or [], through)
+        blueprint = json.loads(json.dumps(self._blueprint(session)))
+        blueprint["started"] = True
+        cut = log[-1]
+        moment = turn_posted_at(cut)
+        for seat in blueprint["profiles"]:
+            seat.pop("is_skipped", None)
+            seat.pop("skip_reaction", None)
+            if moment:
+                seat["ltm_read_through"] = moment.isoformat()
+            if cut.get("turn_id"):
+                seat["ltm_read_through_id"] = cut["turn_id"]
+            else:
+                seat.pop("ltm_read_through_id", None)
+        return blueprint, log
+
+    async def open_branch(self, channel_id: int, blueprint: Dict[str, Any], log: List[Dict]) -> None:
+        """Starts `branch_of`'s session in `channel_id`, a channel the bot has cached --
+        `_save_session_to_disk` skips one it hasn't.
+
+        Live, log and all, before anything is written: Discord's own Create Thread posts
+        its first message straight after the thread, and a session not there yet lets it
+        pass unanswered. Then the log goes to disk before the blueprint, so a crash in
+        between leaves a log nothing restores, never a branch restored with no past.
+        """
+        session = session_from_blueprint(blueprint, blueprint["profiles"])
+        session.update(unified_log=log, is_hydrated=True)
+        self._recompute_pending_whispers(session, force=True)
+        self.cog.multi_profile_channels[channel_id] = session
+        self._mark_session_accessed(channel_id)
+        await self._save_session_to_disk((channel_id, None, None), "multi", log)
+        self._save_multi_profile_sessions()
+
     def _save_multi_profile_sessions(self):
         # This rebuilds every server's map from memory, and until boot has loaded the
         # blueprints memory holds none: a save then -- a command, a listener, the
@@ -1169,57 +1278,7 @@ class SessionManager:
                 if server_id_str is None:
                     continue
 
-                category = "regular"
-
-                profiles_to_save =[]
-                for p in session_data.get("profiles",[]):
-                    # The stamped PID wins. Re-resolving from the name would overwrite a
-                    # good PID with a name-shaped one during the window where a rename
-                    # has landed in the index but not yet in this cast entry.
-                    pid = p.get("pid") or self.cog.profile_manager._get_pid_from_name_any(
-                        p["owner_id"], p["profile_name"])
-                    entry = {
-                        "pid": pid,
-                        "profile_name": p["profile_name"],
-                        "owner_id": p["owner_id"],
-                        "method": p.get("method", "webhook"),
-                        "bot_id": p.get("bot_id"),
-                        "ephemeral": p.get("ephemeral", False),
-                        "chance": p.get("chance", 100),
-                        "wakewords": p.get("wakewords",[])
-                    }
-                    # The turn its last memory read up to, and that turn's moment
-                    # (LtmCaptureMixin). Lost, the next memory reads the newest turns
-                    # instead, and can repeat itself.
-                    for key in ("ltm_read_through", "ltm_read_through_id"):
-                        if p.get(key):
-                            entry[key] = p[key]
-                    # Sparse, so an unskipped cast writes exactly what it always has. Kept
-                    # across a restart because the ❌ that did it stays on its message.
-                    if p.get("is_skipped"):
-                        entry["is_skipped"] = True
-                        if p.get("skip_reaction"):
-                            entry["skip_reaction"] = list(p["skip_reaction"])
-                    profiles_to_save.append(entry)
-
-                blueprint = {
-                    "owner_id": session_data.get("owner_id"),
-                    "profiles": profiles_to_save,
-                    "session_prompt": session_data.get("session_prompt"),
-                    "session_mode": session_data.get("session_mode", "sequential"),
-                    "type": "multi",
-                    "proactivity": session_data.get("proactivity", {}),
-                    "compaction": session_data.get("compaction", {}),
-                    "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
-                    "started": bool(session_data.get("started", True)),
-                    "audio_mode": session_data.get("audio_mode", "off"),
-                    "max_responses": session_data.get("max_responses", 10),
-                    "settle": session_data.get("settle", {}),
-                    "name_wakewords": bool(session_data.get("name_wakewords", True)),
-                    "server_context": bool(session_data.get("server_context", True)),
-                }
-
-                current_server_sessions[server_id_str][category][str(channel_id)] = blueprint
+                current_server_sessions[server_id_str]["regular"][str(channel_id)] = self._blueprint(session_data)
 
             servers_dir = SERVERS_DIR
             if os.path.exists(servers_dir):
@@ -1501,40 +1560,14 @@ class SessionManager:
                     self._repair_participant_identity(profiles)
 
                     if not session:
-                        session = {
-                            "profiles": profiles,
-                            "owner_id": session_config.get("owner_id"),
-                            "session_prompt": session_config.get("session_prompt"),
-                            "session_mode": session_config.get("session_mode", "sequential"),
-                            "type": "multi",
-                            "proactivity": session_config.get("proactivity", {}),
-                            "compaction": session_config.get("compaction", {}),
-                            "cast_policy": session_config.get("cast_policy", DEFAULT_CAST_POLICY),
-                            "task_queue": asyncio.Queue(),
-                            "is_running": False,
-                            "started": session_config.get("started", True),
-                            "audio_mode": session_config.get("audio_mode", "off"),
-                            "max_responses": session_config.get("max_responses", 10),
-                            "settle": session_config.get("settle", {}),
-                            "name_wakewords": session_config.get("name_wakewords", True),
-                            "server_context": session_config.get("server_context", True),
-                        }
+                        session = session_from_blueprint(session_config, profiles)
                         self.cog.multi_profile_channels[channel_id] = session
                     else:
-                        # Update the existing dehydrated shell with index data
-                        session["profiles"] = profiles
-                        session["owner_id"] = session_config.get("owner_id")
-                        session["session_prompt"] = session_config.get("session_prompt")
-                        session["session_mode"] = session_config.get("session_mode", "sequential")
-                        session["type"] = "multi"
-                        session["proactivity"] = session_config.get("proactivity", {})
-                        session["compaction"] = session_config.get("compaction", {})
-                        session["cast_policy"] = session_config.get("cast_policy", DEFAULT_CAST_POLICY)
-                        session["audio_mode"] = session_config.get("audio_mode", "off")
-                        session["max_responses"] = session_config.get("max_responses", 10)
-                        session["settle"] = session_config.get("settle", {})
-                        session["name_wakewords"] = session_config.get("name_wakewords", True)
-                        session["server_context"] = session_config.get("server_context", True)
+                        # Update the existing dehydrated shell with index data. `started`
+                        # stays as the shell has it: only a new session reads it.
+                        settings = blueprint_settings(session_config)
+                        del settings["started"]
+                        session.update(settings, profiles=profiles)
 
         if not session: return None
 

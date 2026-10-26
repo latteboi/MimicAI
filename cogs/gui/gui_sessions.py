@@ -2137,7 +2137,9 @@ class SessionConfigView(BlockedGuard, ui.View):
                    "channel's name and topic, and the server's custom emojis, which it can then "
                    "use in its replies.\n\n"
                    "It changes only when the server does, so providers keep caching it. "
-                   "Emojis limited to certain roles are left out."),
+                   "Emojis limited to certain roles are left out.\n\n"
+                   "While it is on, the characters also see the custom emojis people post, "
+                   "up to 4 a round, each once. Off, they read an emoji by its name alone."),
     }
 
     def _config_summary(self, key: str) -> str:

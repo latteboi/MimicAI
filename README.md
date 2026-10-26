@@ -107,7 +107,8 @@ Alongside the main session loop: `/whisper` for a private, ephemeral exchange wi
 participant, `/speak` to post as one of your profiles — either verbatim, or re-voiced
 in character with a private preview before it goes out — `/trigger` to force a round,
 and `/session audit` for token telemetry and diagnostics. The **View Generation Trace**
-context menu opens the same telemetry for a single reply, and **Edit Profile Message** lets
+context menu opens the same telemetry for a single reply, **Branch from Here** carries the
+session into a thread from any message and goes on from there, and **Edit Profile Message** lets
 a server admin rewrite any profile's reply, marked as edited by them; **Delete Profile
 Message** removes one, every message of it, from the channel and memory.
 
