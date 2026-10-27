@@ -17,11 +17,12 @@ from ..utils.helpers import (
     openrouter_image_ratios, resolve_critic_settings,
     google_thinking_caps, check_portrait_upload, grounding_mode_display, ltm_auto_recall_enabled, ltm_creation_mode,
     always_reads_synopsis,
-    resolve_grounding_mode, resolve_thinking_params, resolve_url_mode,
+    resolve_grounding_mode, resolve_media_resolution, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model, auto_thinking,
     _format_api_error, speaks_verbatim, stored_google_voice, _get_user_hash,
 )
+from ..utils import lorebook
 from ..utils.bonds import describe as describe_bond
 from ..utils.user_defaults import auto_wording, model_provider, setting_label
 from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
@@ -161,6 +162,86 @@ PROFILE_TABS = ("home", "persona", "params", "tools", "images", "audio", "memory
 #: Tab buttons to an action row, for both the dashboard's strip and the bulk wizard's.
 #: Discord's own limit, and the two strips share it so they cannot wrap differently.
 _TAB_BUTTONS_PER_ROW = 5
+
+#: Gemini 3's tokens for one received image at each Input Resolution, per
+#: MEDIA_RESOLUTIONS. "" sends no field, which Gemini 3 reads as HIGH.
+_IMAGE_TOKENS = {"MEDIA_RESOLUTION_LOW": 280, "MEDIA_RESOLUTION_MEDIUM": 560,
+                 "MEDIA_RESOLUTION_HIGH": 1120, "MEDIA_RESOLUTION_ULTRA_HIGH": 2240, "": 1120}
+#: Always-on lore past this earns a tip: about four full entries, on every reply.
+_LORE_TIP_TOKENS = 2000
+
+#: What no profile setting decides, so every profile's tips end on it. Seats and
+#: Proactivity outrank anything a profile can change, and pasted files are the cost
+#: nobody sees: they ride every reply while their message is inside STM.
+_SESSION_TOKEN_TIPS = (
+    "• **Seats multiply everything.** Each character that answers sends its own whole prompt, so "
+    "four answering costs four times one. Reactivity's Chance and wakewords decide how many do.\n"
+    "• **Proactivity** runs rounds with nobody asking. Keep its chance low and its cooldown long.\n"
+    "• **A pasted file or a linked page** is re-sent with every reply while its message is inside "
+    "STM -- a 40,000-character file is about 10,000 tokens each time. `/compact` folds it into the "
+    "synopsis.\n"
+    "• `/session audit` shows what each turn cost, cached tokens included.\n"
+    "-# `/session config` → Reactivity, Proactivity"
+)
+
+
+def token_saving_tips(config: Dict[str, Any], always_on_lore: List[str],
+                      cog=None) -> List[tuple]:
+    """What this profile could spend less on, as (heading, advice), dearest first.
+
+    Only what is true of it: a tip for a setting already at its cheapest is noise. The
+    order is TOKEN_USAGE.md's. `always_on_lore` is the keyless entries' text, or [] for
+    a borrow, whose lorebook is its source's and not its to change.
+    """
+    tips = []
+    level = resolve_thinking_params(config, "response", cog=cog)["thinking_level"]
+    if level in ("max", "xhigh", "high"):
+        tips.append((f"Reasoning Level is {level}",
+                     "Thinking is billed as output, the dearest kind of token, and at this level "
+                     "it can run to thousands a reply. `low` suits most characters.\n"
+                     "-# Params → Set Thinking Parameters"))
+    stm = int(config.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
+    if stm > defaultConfig.CHATBOT_MEMORY_LENGTH:
+        tips.append((f"STM Length is {stm} turns",
+                     f"Every reply re-sends up to {stm + stm // 2 - 1} turns: the window moves in "
+                     "steps so it can be cached. The session's Rolling Synopsis carries what "
+                     f"falls out, so {defaultConfig.CHATBOT_MEMORY_LENGTH} is usually enough.\n"
+                     "-# Memory → Set STM Parameters"))
+    lore_tokens = _estimate_text_tokens("\n".join(always_on_lore))
+    if lore_tokens > _LORE_TIP_TOKENS:
+        tips.append((f"{len(always_on_lore)} always-on lorebook entries, ~{lore_tokens:,} tokens",
+                     "An entry with no keywords goes out with every reply. Given keywords, it is "
+                     "sent only when a recent message mentions one.\n"
+                     "-# Training → Manage Lorebook"))
+    if resolve_url_mode(config) != "off":
+        tips.append(("URL Context is on",
+                     "A linked page (up to ~4,000 tokens, two a message) stays on its message and "
+                     "is re-sent with every reply until that message leaves STM. Off, if this "
+                     "character has no need to read links.\n"
+                     "-# Tools → URL Context Fetching"))
+    resolution = resolve_media_resolution(config)
+    if _IMAGE_TOKENS[resolution] > _IMAGE_TOKENS["MEDIA_RESOLUTION_MEDIUM"]:
+        label = next(l for v, l, _d in MEDIA_RESOLUTIONS if v == resolution)
+        tips.append((f"Images are read at {label}",
+                     f"About {_IMAGE_TOKENS[resolution]:,} tokens an image on Gemini 3, for every "
+                     "character in the round. Low is 280.\n"
+                     "-# Params → Set Media Input Resolution"))
+    if resolve_grounding_mode(config) == "rag":
+        tips.append((f"Grounding is {GROUNDING_MODE_LABELS['rag']}",
+                     "A gate model reads the conversation before every round to decide whether to "
+                     f"search. With {GROUNDING_MODE_LABELS['tool']} the character searches only "
+                     "when it wants to, and costs nothing when it does not.\n"
+                     "-# Tools → Grounding (Web Search)"))
+    if resolve_critic_settings(config)["mode"] == "full":
+        tips.append(("Anti-Repetition Critic is full",
+                     "An extra model call before most replies. `lexical` runs the same loop check "
+                     "locally, for nothing.\n"
+                     "-# Tools → Configure Anti-Repetition Critic"))
+    if config.get("speech_tts_enabled"):
+        tips.append(("Speech TTS is on",
+                     "Every reply is voiced too, billed per second of audio on top of its text.\n"
+                     "-# Audio → Set Speech Settings"))
+    return tips
 
 
 class _Bulk:
@@ -1490,13 +1571,15 @@ class ProfileManageView(BlockedGuard, ui.View):
             btn.callback = self.create_nav_callback(tab)
             self.add_item(btn)
 
+        # Below the strip, never sharing its last row: a full row of tabs plus a button
+        # is six items, and Discord refuses the sixth inside __init__ -- the dashboard
+        # would not open at all for the tab count that happens to land on a boundary.
+        # Row 3 is free; the /mod nav bar sits on row 4.
+        below_strip = min(3, 1 + (len(valid_tabs) + per_row - 1) // per_row)
+        add_button(self, "How To Save Tokens", self._show_token_tips, emoji="💡",
+                   row=below_strip)
         if is_mod:
-            # Below the strip, never sharing its last row: a full row of tabs plus this
-            # button is six items, and Discord refuses the sixth inside __init__ -- the
-            # dashboard would not open at all for the tab count that happens to land on
-            # a boundary. Row 3 is free; the /mod nav bar sits on row 4.
-            self._add_mod_back_button(
-                min(3, 1 + (len(valid_tabs) + per_row - 1) // per_row))
+            self._add_mod_back_button(below_strip)
             ModBaseView.attach_nav(
                 self, "profiles",
                 source=SimpleNamespace(cog=self.cog,
@@ -1520,6 +1603,23 @@ class ProfileManageView(BlockedGuard, ui.View):
             await view.update_display()
         add_button(self, "← Back to Profile List", back_cb, style=discord.ButtonStyle.secondary,
                    row=row)
+
+    async def _show_token_tips(self, interaction: discord.Interaction):
+        lore = ([] if self.is_borrowed else lorebook.constant(lorebook.entries(
+            self.cog.profile_manager.effective_prompts(self.user_id, self.profile_name).get("lorebook"))))
+        tips = token_saving_tips(self.config, lore, cog=self.cog)
+        e = discord.Embed(
+            title=f"How To Save Tokens: {self.profile_name}"[:256],
+            description=("What this profile could spend less on, dearest first. Output -- thinking "
+                         "and the reply -- costs several times what input does."),
+            colour=discord.Colour.blurple())
+        for heading, advice in tips:
+            e.add_field(name=heading[:256], value=advice, inline=False)
+        if not tips:
+            e.add_field(name="This profile", value="Nothing stands out: what it can change is "
+                        "already at or below the shipped defaults.", inline=False)
+        e.add_field(name="In a session", value=_SESSION_TOKEN_TIPS, inline=False)
+        await interaction.response.send_message(embed=e, ephemeral=True)
 
     def create_nav_callback(self, tab_name):
         async def callback(interaction: discord.Interaction):
@@ -4107,7 +4207,8 @@ class ThinkingPickerMixin:
         """One line per slot, resolved rather than read raw.
 
         Resolved so the screen reports what a round will actually run at: an unset
-        utility slot is low/512, not the response slot's high, and an unset fallback is
+        utility slot is its own default (low/512, Training Analysis medium), not the
+        response slot's high, and an unset fallback is
         whatever the primary came out as.
         """
         rows = []

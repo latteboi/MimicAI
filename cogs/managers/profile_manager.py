@@ -2436,6 +2436,10 @@ class ProfileManager:
                 # What happens to an attachment neither of this profile's models can
                 # read. The floor, and free: see UNREADABLE_MEDIA_MODES.
                 "unreadable_media_mode": UNREADABLE_MEDIA_DEFAULT,
+                # Medium, not Model default: Gemini 3 reads that as HIGH, twice the
+                # tokens an image for detail a character rarely needs. Seeded, so a
+                # profile made before keeps what it had.
+                "media_input_resolution": "MEDIA_RESOLUTION_MEDIUM",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
@@ -2526,6 +2530,10 @@ class ProfileManager:
                 # What happens to an attachment neither of this profile's models can
                 # read. The floor, and free: see UNREADABLE_MEDIA_MODES.
                 "unreadable_media_mode": UNREADABLE_MEDIA_DEFAULT,
+                # Medium, not Model default: Gemini 3 reads that as HIGH, twice the
+                # tokens an image for detail a character rarely needs. Seeded, so a
+                # profile made before keeps what it had.
+                "media_input_resolution": "MEDIA_RESOLUTION_MEDIUM",
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,

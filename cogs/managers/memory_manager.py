@@ -1300,7 +1300,8 @@ class MemoryManager:
             p_cfg = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_b) or {}
 
             async def _attempt(name, is_fallback):
-                # `{}` reads as "high" in every adapter, so unset a style guide thinks low.
+                # `{}` reads as "high" in every adapter, so unset a style guide thinks at its
+                # slot's default, medium: it runs once per Analyse, and the guide rides every reply.
                 model = self.cog.api_service._instantiate_model(
                     name, interaction.guild_id, owner_id, profile_settings=p_cfg,
                     config_owner_id=owner_id, thinking_params=resolve_thinking_params(

@@ -555,8 +555,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             history=self._director_history(session))
 
         async def _attempt(model_name, is_fallback):
-            # `{}` reads as "high" in every adapter. A Director's note is one short
-            # instruction off ten lines of history, so unset it thinks low.
+            # `{}` reads as "high" in every adapter. Unset, a Director's note thinks at
+            # its slot's default, medium: it has to read a scene to write a beat for it.
             model = self.cog.api_service._instantiate_model(
                 model_name, guild_id, owner_id, system_instruction=instructions,
                 config_owner_id=owner_id, thinking_params=resolve_thinking_params(
