@@ -947,7 +947,7 @@ def attachment_tag(attachment: Any) -> str:
 
     A sticker's or an emoji's is empty: what its message says names it already (`triggers.said`).
     """
-    if isinstance(attachment, dict) and attachment.get("named"):
+    if isinstance(attachment, dict) and attachment.get("label"):
         return ""
     kind = ATTACHMENT_TAG_KINDS.get(attachment_mime(attachment).split("/", 1)[0], ATTACHMENT_TAG_DEFAULT)
     return ATTACHMENT_TAG.format(kind=kind, filename=attachment_filename(attachment))

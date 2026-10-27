@@ -51,10 +51,11 @@ def sticker_files(message: Any) -> List[Dict[str, Any]]:
     """A message's stickers as the attachment dicts a round sends a model, for those with
     a picture. Discord's own default stickers are vector animations its client draws
     (Lottie), with nothing a model can view, so they stay a name (`sticker_tags`).
-    Marked `named`: the name is in what the message says, so no file tag repeats it.
+    `label` is what the message says to name it: no file tag repeats it (`attachment_tag`),
+    and the picture is sent after it (`labelled`).
     """
     return [{"url": s.url, "filename": f"{s.name}.{s.format.file_extension}",
-             "content_type": f"image/{s.format.file_extension}", "named": True}
+             "content_type": f"image/{s.format.file_extension}", "label": STICKER_TAG.format(name=s.name)}
             for s in getattr(message, "stickers", ()) if s.format is not discord.StickerFormatType.lottie]
 
 
@@ -62,14 +63,14 @@ def emoji_files(message: Any) -> List[Dict[str, Any]]:
     """A message's custom emojis, once each, as the attachment dicts a round sends a model.
 
     A still PNG even for an animated one: the CDN serves its first frame, and not every
-    provider takes a GIF. Unicode emojis are text a model reads already. Named in what the
-    message says (`said`), and marked `emoji` for their own allowance (`_round_media`).
+    provider takes a GIF. Unicode emojis are text a model reads already. Labelled with the
+    `:name:` the message says (`said`), and marked `emoji` for their own allowance (`_round_media`).
     """
     files: Dict[str, Dict[str, Any]] = {}
     for name, emoji_id in CUSTOM_EMOJI_PATTERN.findall(getattr(message, "content", None) or ""):
         files.setdefault(emoji_id, {"url": f"https://cdn.discordapp.com/emojis/{emoji_id}.png",
                                     "filename": f"{name}.png", "content_type": "image/png",
-                                    "named": True, "emoji": True})
+                                    "label": f":{name}:", "emoji": True})
     return list(files.values())
 
 
@@ -79,9 +80,18 @@ def media_part(attachment: Any) -> Dict[str, Any]:
     # The bare type, without Discord's `; charset=` parameters: it goes on the wire as a
     # part's mimeType, and every provider matches it against a fixed table.
     part = {"url": url, "mime_type": attachment_mime(attachment)}
-    if isinstance(attachment, dict) and attachment.get("emoji"):
-        part["emoji"] = True
+    if isinstance(attachment, dict):
+        part.update((key, attachment[key]) for key in ("emoji", "label") if attachment.get(key))
     return part
+
+
+def labelled(media: List[Dict[str, Any]]) -> List[Any]:
+    """Round media as a model is sent it: each sticker and emoji after the text naming it.
+
+    The pictures go at the end of the turn and the names are in the transcript, so a round
+    with two emojis and a sticker was three unnamed pictures to pair with names by order.
+    """
+    return [item for part in media for item in ((part["label"], part) if part.get("label") else (part,))]
 
 
 def reply_snapshot(message: Any) -> Dict[str, Any]:

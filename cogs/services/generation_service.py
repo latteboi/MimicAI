@@ -57,8 +57,8 @@ from .generation.speak import SpeakAsMixin
 from .generation.global_chat import GlobalChatMixin
 from .generation.whisper import WhisperMixin
 from .generation.image_round import ImageRoundMixin
-from .generation.triggers import (TriggerIntakeMixin, batched_message, referenced_message, said,
-                                  reply_record, wakeword_position)
+from .generation.triggers import (TriggerIntakeMixin, batched_message, labelled, referenced_message,
+                                  said, reply_record, wakeword_position)
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
 from .generation.turn_deletion import TurnDeletionMixin
@@ -1443,7 +1443,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             supplementary_parts.append(ROUND_URLS_SKIPPED_NOTE.format(
                                 limit=ROUND_URL_MESSAGES_MAX, count=urls_skipped))
                         if all_current_media:
-                            supplementary_parts.extend(all_current_media)
+                            supplementary_parts.extend(labelled(all_current_media))
                         
                         if is_image_gen_round:
                             if generated_image_path_for_round:

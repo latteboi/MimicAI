@@ -45,8 +45,11 @@ def _file_name(part: Any, n: int) -> str:
 
     Discord's CDN keeps the uploaded name as the url's last segment -- the same name the
     `[Attached Image: cat.png]` tag carries -- so a description headed with it is one the
-    character can match to the tag without counting.
+    character can match to the tag without counting. A sticker or an emoji has its label:
+    its CDN name is an id.
     """
+    if isinstance(part, dict) and part.get("label"):
+        return part["label"]
     url = part.get("url") if isinstance(part, dict) else None
     name = unquote(str(url).split("?", 1)[0].rsplit("/", 1)[-1]) if url else ""
     return name or f"File {n}"
