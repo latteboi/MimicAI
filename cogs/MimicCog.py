@@ -333,6 +333,11 @@ class MimicCog(EventListeners, commands.Cog):
         # session_key -> session_type for logs with unpersisted appends. Bounded by the
         # number of live sessions, and drained every SESSION_FLUSH_INTERVAL_SECONDS.
         self.dirty_sessions: Dict[Any, str] = {}
+        # channel id -> the call_later handle of that session's next proactivity roll
+        # (`SessionManager.arm_proactivity`). One per proactive session, so bounded by
+        # `multi_profile_channels`; a roll that finds its session gone or switched off
+        # removes its own entry.
+        self.proactive_timers: Dict[int, asyncio.TimerHandle] = {}
         self.session_manager.evict_inactive_sessions_task.start()
         self.session_manager.flush_dirty_sessions_task.start()
         self.processed_child_messages: LRUCache = LRUCache(max_size=25)
@@ -799,8 +804,10 @@ class MimicCog(EventListeners, commands.Cog):
 
         profile_name = self.profile_manager._generate_unique_local_name(
             user_id, profile_name_for(card["name"], self.profile_manager._is_valid_profile_name))
-        # Laid over every draft, so Regenerate keeps them: the card's own name, its book, its tag.
-        appearance: Dict[str, Any] = {"lorebook": card["lore"], "adult": card["adult"]}
+        # Laid over every draft, so Regenerate keeps them: the card's own name, its book, its
+        # examples, its tag.
+        appearance: Dict[str, Any] = {"lorebook": card["lore"], "fixed_examples": card["examples"],
+                                      "adult": card["adult"]}
         display_name = clean_display_name(card["name"])
         if display_name:
             appearance["display_name"] = display_name

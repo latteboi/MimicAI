@@ -44,7 +44,7 @@ from ..utils.constants import (
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_MODES, SYSTEM_PROFILE_MODEL,
     SYSTEM_PROFILE_FALLBACK_MODEL,
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED,
-    LIMIT_LORE_ENTRIES, LIMIT_PUBLISHES_PER_DAY, PERSONA_TEXT_INPUT_MAX_LENGTH, )
+    LIMIT_FIXED_EXAMPLES, LIMIT_LORE_ENTRIES, LIMIT_PUBLISHES_PER_DAY, PERSONA_TEXT_INPUT_MAX_LENGTH, )
 from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
                             ltm_auto_recall_enabled, always_reads_synopsis, resolve_critic_settings,
                             grounding_mode_display, resolve_image_output_params,
@@ -55,7 +55,7 @@ from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_m
                             system_settings, resolve_openrouter_endpoint,
                             resolve_openrouter_service_tier,
                             clean_imported_text, _get_user_hash)
-from ..utils import lorebook
+from ..utils import fixed_examples, lorebook
 from ..utils.bonds import apply_updates as apply_bond_updates, describe as describe_bond
 from ..utils.discord_cdn import is_web_url, signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
@@ -113,15 +113,16 @@ def _awaits_review(rating: Dict[str, Any]) -> bool:
 
 def _clean_imported_prompts(value: Any) -> Any:
     """A .mimic profile's prompts as a person could have typed them: every string through
-    `clean_imported_text` at the editor's cap, and the lorebook normalised. A passphrase
-    file is anyone's to write."""
+    `clean_imported_text` at the editor's cap, and the lorebook and fixed examples
+    normalised. A passphrase file is anyone's to write."""
     if isinstance(value, str):
         return clean_imported_text(value, PERSONA_TEXT_INPUT_MAX_LENGTH)
     if isinstance(value, list):
         return [_clean_imported_prompts(v) for v in value]
     if isinstance(value, dict):
-        return {k: lorebook.normalise(v) if k == "lorebook" else _clean_imported_prompts(v)
-                for k, v in value.items()}
+        return {k: lorebook.normalise(v) if k == "lorebook"
+                else fixed_examples.normalise(v) if k == "fixed_examples"
+                else _clean_imported_prompts(v) for k, v in value.items()}
     return value
 
 
@@ -2284,6 +2285,10 @@ class ProfileManager:
         eff_owner, eff_name = self._resolve_effective_profile(user_id, profile_name)
         return self._get_profile_prompts(eff_owner, eff_name) or {}
 
+    def lorebook(self, user_id: int, profile_name: str) -> List[Dict[str, Any]]:
+        """This profile's own lorebook, as its editor shows it. Blocking."""
+        return lorebook.entries((self._get_profile_prompts(user_id, profile_name) or {}).get("lorebook"))
+
     def put_lore_entry(self, user_id: int, profile_name: str, entry_id: Optional[str],
                        keys: str, content: str) -> Tuple[bool, str]:
         """Adds an entry, or with `entry_id` rewrites that one. Blocking: run it in a thread."""
@@ -2325,6 +2330,44 @@ class ProfileManager:
         if len(fresh) > len(added):
             message += f" {len(fresh) - len(added)} did not fit: a lorebook holds {LIMIT_LORE_ENTRIES}."
         return message
+
+    def fixed_examples(self, user_id: int, profile_name: str) -> List[Dict[str, str]]:
+        """This profile's own fixed examples, as their editor shows them. Blocking."""
+        return fixed_examples.entries(
+            (self._get_profile_prompts(user_id, profile_name) or {}).get("fixed_examples"))
+
+    def put_fixed_example(self, user_id: int, profile_name: str, entry_id: Optional[str],
+                          said: str, reply: str) -> Tuple[bool, str]:
+        """Adds an example, or with `entry_id` rewrites that one. Blocking: run it in a thread."""
+        prompts = self._get_profile_prompts(user_id, profile_name)
+        if prompts is None:
+            return False, "That profile could not be found."
+        held = fixed_examples.entries(prompts.get("fixed_examples"))
+        entry = {"id": entry_id or fixed_examples.new_id(), "said": said, "reply": reply}
+        if entry_id:
+            if not any(e.get("id") == entry_id for e in held):
+                return False, "That example no longer exists."
+            held = [entry if e.get("id") == entry_id else e for e in held]
+        elif len(held) >= LIMIT_FIXED_EXAMPLES:
+            return False, f"This profile has {LIMIT_FIXED_EXAMPLES} fixed examples, the most it can hold. Delete one first."
+        else:
+            held.append(entry)
+        prompts["fixed_examples"] = fixed_examples.normalise(held)
+        self._save_profile_prompts(user_id, profile_name, prompts)
+        return True, "Fixed example saved." if entry_id else "Fixed example added."
+
+    def delete_fixed_examples(self, user_id: int, profile_name: str, ids: List[str]) -> int:
+        """Removes the examples with these ids and returns how many went. Blocking."""
+        prompts = self._get_profile_prompts(user_id, profile_name)
+        if prompts is None:
+            return 0
+        held = fixed_examples.entries(prompts.get("fixed_examples"))
+        drop = set(ids)
+        kept = [e for e in held if e.get("id") not in drop]
+        if len(kept) != len(held):
+            prompts["fixed_examples"] = kept
+            self._save_profile_prompts(user_id, profile_name, prompts)
+        return len(held) - len(kept)
 
     def bonds(self, user_id: int, profile_name: str) -> Dict[str, List[int]]:
         """What this profile feels about each person it has scored: ID -> [affection,
@@ -2628,6 +2671,10 @@ class ProfileManager:
         lore = "\n\n".join(e["content"] for e in lorebook.entries(prompts.get("lorebook")))
         if lore:
             parts.append(f"lorebook:\n{lore}")
+        # Sent with every reply, and changed only on an edit, unlike training examples.
+        fixed = fixed_examples.entries(prompts.get("fixed_examples"))
+        if fixed:
+            parts.append(f"fixed_examples:\n{fixed_examples.render(fixed)}")
 
         return "\n\n".join(parts)
 

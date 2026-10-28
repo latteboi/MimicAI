@@ -1,7 +1,7 @@
 """Character cards (SillyTavern, Chub, RisuAI; spec V1 to V3), read for `/import`.
 
 A card is text someone else wrote, and it becomes only what its importer could have typed:
-persona text, training examples and a lorebook, each through `clean_imported_text` at the
+persona text, fixed examples and a lorebook, each through `clean_imported_text` at the
 editor's own caps. Nothing in a card sets a config key or a model, nothing in it is a URL
 the bot fetches (a V3 card's `assets` are ignored, bar the main icon a CHARX carries inside
 itself), and the only rating it carries is the strictest: a card tagged NSFW is declared
@@ -27,8 +27,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import orjson
 
-from . import lorebook
-from .constants import (CARD_TEXT_MAX_BYTES, PERSONA_TEXT_INPUT_MAX_LENGTH,
+from . import fixed_examples, lorebook
+from .constants import (CARD_TEXT_MAX_BYTES, LIMIT_FIXED_EXAMPLES, PERSONA_TEXT_INPUT_MAX_LENGTH,
                         LORE_ENTRY_MAX_CHARS)
 from .helpers import clean_imported_text
 
@@ -54,10 +54,6 @@ _ZIP_ERRORS = (zipfile.BadZipFile, RuntimeError, EOFError, OSError, ValueError,
 #: What a description may bring to the model that sorts it: room to fill every persona
 #: section, and no more.
 DESCRIPTION_MAX_CHARS = 3 * PERSONA_TEXT_INPUT_MAX_LENGTH
-#: Example exchanges kept as training examples. Each costs an embedding call on Save.
-MAX_EXAMPLES = 20
-#: AddTrainingExampleModal's two caps.
-EXAMPLE_INPUT_MAX_CHARS, EXAMPLE_RESPONSE_MAX_CHARS = 1000, 2000
 
 _CHAR_MACRO = re.compile(r"\{\{\s*char\s*\}\}|<bot>", re.IGNORECASE)
 _USER_MACRO = re.compile(r"\{\{\s*user\s*\}\}|<user>", re.IGNORECASE)
@@ -189,11 +185,11 @@ def _text(data: Dict[str, Any], key: str, name: str, limit: int) -> str:
     return clean_imported_text(_macros(value, name), limit) if isinstance(value, str) else ""
 
 
-def _examples(raw: Any, name: str) -> List[Tuple[str, str]]:
-    """`mes_example`'s exchanges as (what someone said, how the character answered): each
-    `{{user}}:` line paired with the `{{char}}:` line straight after it. Lines with no
-    speaker continue the one before. A character line with nothing before it is no
-    exchange, and is skipped."""
+def _examples(raw: Any, name: str) -> List[Dict[str, str]]:
+    """`mes_example` as fixed examples, which SillyTavern sends whole on every reply too:
+    each `{{char}}:` line with the `{{user}}:` line straight before it as what was said,
+    or nothing -- a character line on its own is a sample of the voice. Lines with no
+    speaker continue the one before."""
     if not isinstance(raw, str):
         return []
     pairs = []
@@ -206,15 +202,13 @@ def _examples(raw: Any, name: str) -> List[Tuple[str, str]]:
                 turns.append(["user" if who == "user" else "char", line[m.end():]])
             elif turns:
                 turns[-1][1] += "\n" + line
-        for (first, said), (second, answer) in zip(turns, turns[1:]):
-            if first == "user" and second == "char":
-                said = clean_imported_text(_macros(said, name), EXAMPLE_INPUT_MAX_CHARS)
-                answer = clean_imported_text(_macros(answer, name), EXAMPLE_RESPONSE_MAX_CHARS)
-                if said and answer:
-                    pairs.append((said, answer))
-        if len(pairs) >= MAX_EXAMPLES:
+        for before, (who, answer) in zip([None] + turns, turns):
+            if who == "char":
+                said = before[1] if before and before[0] == "user" else ""
+                pairs.append({"said": _macros(said, name), "reply": _macros(answer, name)})
+        if len(pairs) >= LIMIT_FIXED_EXAMPLES:
             break
-    return pairs[:MAX_EXAMPLES]
+    return fixed_examples.normalise(pairs)
 
 
 def _lore(book: Any, name: str) -> List[Dict[str, Any]]:

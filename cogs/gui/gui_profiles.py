@@ -22,7 +22,8 @@ from ..utils.helpers import (
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model, auto_thinking,
     _format_api_error, speaks_verbatim, stored_google_voice, _get_user_hash,
 )
-from ..utils import lorebook
+from ..utils import fixed_examples, lorebook
+from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, profile_advice, standing_text
 from ..utils.bonds import describe as describe_bond
 from ..utils.user_defaults import auto_wording, model_provider, setting_label
 from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
@@ -162,87 +163,6 @@ PROFILE_TABS = ("home", "persona", "params", "tools", "images", "audio", "memory
 #: Tab buttons to an action row, for both the dashboard's strip and the bulk wizard's.
 #: Discord's own limit, and the two strips share it so they cannot wrap differently.
 _TAB_BUTTONS_PER_ROW = 5
-
-#: Gemini 3's tokens for one received image at each Input Resolution, per
-#: MEDIA_RESOLUTIONS. "" sends no field, which Gemini 3 reads as HIGH.
-_IMAGE_TOKENS = {"MEDIA_RESOLUTION_LOW": 280, "MEDIA_RESOLUTION_MEDIUM": 560,
-                 "MEDIA_RESOLUTION_HIGH": 1120, "MEDIA_RESOLUTION_ULTRA_HIGH": 2240, "": 1120}
-#: Always-on lore past this earns a tip: about four full entries, on every reply.
-_LORE_TIP_TOKENS = 2000
-
-#: What no profile setting decides, so every profile's tips end on it. Seats and
-#: Proactivity outrank anything a profile can change, and pasted files are the cost
-#: nobody sees: they ride every reply while their message is inside STM.
-_SESSION_TOKEN_TIPS = (
-    "• **Seats multiply everything.** Each character that answers sends its own whole prompt, so "
-    "four answering costs four times one. Reactivity's Chance and wakewords decide how many do.\n"
-    "• **Proactivity** runs rounds with nobody asking. Keep its chance low and its cooldown long.\n"
-    "• **A pasted file or a linked page** is re-sent with every reply while its message is inside "
-    "STM -- a 40,000-character file is about 10,000 tokens each time. `/compact` folds it into the "
-    "synopsis.\n"
-    "• `/session audit` shows what each turn cost, cached tokens included.\n"
-    "-# `/session config` → Reactivity, Proactivity"
-)
-
-
-def token_saving_tips(config: Dict[str, Any], always_on_lore: List[str],
-                      cog=None) -> List[tuple]:
-    """What this profile could spend less on, as (heading, advice), dearest first.
-
-    Only what is true of it: a tip for a setting already at its cheapest is noise. The
-    order is TOKEN_USAGE.md's. `always_on_lore` is the keyless entries' text, or [] for
-    a borrow, whose lorebook is its source's and not its to change.
-    """
-    tips = []
-    level = resolve_thinking_params(config, "response", cog=cog)["thinking_level"]
-    if level in ("max", "xhigh", "high"):
-        tips.append((f"Reasoning Level is {level}",
-                     "Thinking is billed as output, the dearest kind of token, and at this level "
-                     "it can run to thousands a reply. `low` suits most characters.\n"
-                     "-# Params → Set Thinking Parameters"))
-    stm = int(config.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-    if stm > defaultConfig.CHATBOT_MEMORY_LENGTH:
-        tips.append((f"STM Length is {stm} turns",
-                     f"Every reply re-sends up to {stm + stm // 2 - 1} turns: the window moves in "
-                     "steps so it can be cached. The session's Rolling Synopsis carries what "
-                     f"falls out, so {defaultConfig.CHATBOT_MEMORY_LENGTH} is usually enough.\n"
-                     "-# Memory → Set STM Parameters"))
-    lore_tokens = _estimate_text_tokens("\n".join(always_on_lore))
-    if lore_tokens > _LORE_TIP_TOKENS:
-        tips.append((f"{len(always_on_lore)} always-on lorebook entries, ~{lore_tokens:,} tokens",
-                     "An entry with no keywords goes out with every reply. Given keywords, it is "
-                     "sent only when a recent message mentions one.\n"
-                     "-# Training → Manage Lorebook"))
-    if resolve_url_mode(config) != "off":
-        tips.append(("URL Context is on",
-                     "A linked page (up to ~4,000 tokens, two a message) stays on its message and "
-                     "is re-sent with every reply until that message leaves STM. Off, if this "
-                     "character has no need to read links.\n"
-                     "-# Tools → URL Context Fetching"))
-    resolution = resolve_media_resolution(config)
-    if _IMAGE_TOKENS[resolution] > _IMAGE_TOKENS["MEDIA_RESOLUTION_MEDIUM"]:
-        label = next(l for v, l, _d in MEDIA_RESOLUTIONS if v == resolution)
-        tips.append((f"Images are read at {label}",
-                     f"About {_IMAGE_TOKENS[resolution]:,} tokens an image on Gemini 3, for every "
-                     "character in the round. Low is 280.\n"
-                     "-# Params → Set Media Input Resolution"))
-    if resolve_grounding_mode(config) == "rag":
-        tips.append((f"Grounding is {GROUNDING_MODE_LABELS['rag']}",
-                     "A gate model reads the conversation before every round to decide whether to "
-                     f"search. With {GROUNDING_MODE_LABELS['tool']} the character searches only "
-                     "when it wants to, and costs nothing when it does not.\n"
-                     "-# Tools → Grounding (Web Search)"))
-    if resolve_critic_settings(config)["mode"] == "full":
-        tips.append(("Anti-Repetition Critic is full",
-                     "An extra model call before most replies. `lexical` runs the same loop check "
-                     "locally, for nothing.\n"
-                     "-# Tools → Configure Anti-Repetition Critic"))
-    if config.get("speech_tts_enabled"):
-        tips.append(("Speech TTS is on",
-                     "Every reply is voiced too, billed per second of audio on top of its text.\n"
-                     "-# Audio → Set Speech Settings"))
-    return tips
-
 
 class _Bulk:
     """How one PROFILE_ACTIONS row behaves in the bulk manager.
@@ -1400,6 +1320,9 @@ PROFILE_ACTIONS = (
     # --- Training (tab hidden entirely for borrowed profiles: every row is owner-only) ---
     _Action("manage_training", "training", "Manage Training Examples", "Add, list, edit, or delete training examples.",
             _method("_act_manage_training", wants_profile=True), _own),
+    _Action("manage_fixed_examples", "training", "Manage Fixed Examples",
+            "Examples of how the character speaks, sent with every reply.",
+            _method("_act_manage_fixed_examples", wants_profile=True), _own),
     _Action("style_guide", "training", "Style Guide", "View, turn on or off, or regenerate the style guide written from training examples.",
             _method("_act_style_guide", wants_profile=True), _own),
     _Action("manage_lore", "training", "Manage Lorebook", "What the character knows, handed to it when a keyword comes up.",
@@ -1576,8 +1499,9 @@ class ProfileManageView(BlockedGuard, ui.View):
         # would not open at all for the tab count that happens to land on a boundary.
         # Row 3 is free; the /mod nav bar sits on row 4.
         below_strip = min(3, 1 + (len(valid_tabs) + per_row - 1) // per_row)
-        add_button(self, "How To Save Tokens", self._show_token_tips, emoji="💡",
-                   row=below_strip)
+        large = sum(item.size == LARGE for item in self._token_advice())
+        add_button(self, f"Token Advice · {large}" if large else "Token Advice", self._show_token_advice,
+                   emoji="💡", row=below_strip)
         if is_mod:
             self._add_mod_back_button(below_strip)
             ModBaseView.attach_nav(
@@ -1604,22 +1528,17 @@ class ProfileManageView(BlockedGuard, ui.View):
         add_button(self, "← Back to Profile List", back_cb, style=discord.ButtonStyle.secondary,
                    row=row)
 
-    async def _show_token_tips(self, interaction: discord.Interaction):
-        lore = ([] if self.is_borrowed else lorebook.constant(lorebook.entries(
-            self.cog.profile_manager.effective_prompts(self.user_id, self.profile_name).get("lorebook"))))
-        tips = token_saving_tips(self.config, lore, cog=self.cog)
-        e = discord.Embed(
-            title=f"How To Save Tokens: {self.profile_name}"[:256],
-            description=("What this profile could spend less on, dearest first. Output -- thinking "
-                         "and the reply -- costs several times what input does."),
-            colour=discord.Colour.blurple())
-        for heading, advice in tips:
-            e.add_field(name=heading[:256], value=advice, inline=False)
-        if not tips:
-            e.add_field(name="This profile", value="Nothing stands out: what it can change is "
-                        "already at or below the shipped defaults.", inline=False)
-        e.add_field(name="In a session", value=_SESSION_TOKEN_TIPS, inline=False)
-        await interaction.response.send_message(embed=e, ephemeral=True)
+    def _token_advice(self):
+        """What this profile's settings cost (`token_advice.profile_advice`). A borrow's lore
+        and fixed examples are its source's, and not its to change, so they are left out."""
+        prompts = ({} if self.is_borrowed
+                   else self.cog.profile_manager.effective_prompts(self.user_id, self.profile_name))
+        return profile_advice(self.config, lorebook.constant(lorebook.entries(prompts.get("lorebook"))),
+                              fixed_examples.entries(prompts.get("fixed_examples")), cog=self.cog)
+
+    async def _show_token_advice(self, interaction: discord.Interaction):
+        view = TokenAdviceView(self)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
 
     def create_nav_callback(self, tab_name):
         async def callback(interaction: discord.Interaction):
@@ -1739,6 +1658,11 @@ class ProfileManageView(BlockedGuard, ui.View):
     async def _act_manage_training(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
                               mode='training', parent_manage_view=self, target_user_id=self.user_id)
+        await view.start()
+
+    async def _act_manage_fixed_examples(self, interaction: discord.Interaction, profile: Dict[str, Any]):
+        view = DataManageView(self.cog, interaction, self.profile_name, self.is_borrowed,
+                              mode='examples', parent_manage_view=self, target_user_id=self.user_id)
         await view.start()
 
     async def _act_style_guide(self, interaction: discord.Interaction, profile: Dict[str, Any]):
@@ -1921,6 +1845,75 @@ class ProfileManageView(BlockedGuard, ui.View):
     async def on_timeout(self):
         try: await self.original_interaction.edit_original_response(content="Manager timed out.", view=None)
         except: pass
+
+class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
+    """Token Advice: what this profile's settings and the text it always sends cost, on
+    the dashboard's own message, with a way to each setting and Back to the tab.
+
+    Its dropdown is the dashboard's own (`dropdown_callback`), so a setting opened from
+    here runs exactly as it does from its tab, and returns to the dashboard as it would.
+    """
+
+    def __init__(self, parent: 'ProfileManageView'):
+        super().__init__(timeout=300)
+        self.parent = parent
+        self.cog = parent.cog
+        self.original_interaction = parent.original_interaction
+        self.items = parent._token_advice()
+        prompts = self.cog.profile_manager.effective_prompts(parent.user_id, parent.profile_name)
+        self.standing = standing_text(prompts, self.cog.storage_manager._decrypt_data,
+                                      self.cog.persona_modal_sections_order)
+        self._build_view()
+
+    def _action(self, value: str) -> Optional['_Action']:
+        action = PROFILE_ACTIONS_BY_VALUE.get(value)
+        return action if action and action.visible(self.parent) else None
+
+    def _where(self, value: str) -> str:
+        action = self._action(value)
+        if action is None:
+            return "Set by the profile it was borrowed from."
+        return f"{action.tab.title()} → {action.option(self.parent).label}"
+
+    def embed(self) -> discord.Embed:
+        e = discord.Embed(title=f"Token Advice · {self.parent.profile_name}"[:256],
+                          description="What this character's settings cost, largest first.",
+                          colour=discord.Colour.blurple())
+        for item in self.items:
+            e.add_field(name=f"{item.size} {item.heading}"[:256],
+                        value=f"{item.text}\n-# {self._where(item.target)}"[:1024], inline=False)
+        if not self.items:
+            e.add_field(name="Its settings", value="Nothing it has on costs more than the shipped "
+                        "defaults.", inline=False)
+        if self.standing:
+            total = sum(tokens for _label, tokens, _target in self.standing)
+            parts = " · ".join(f"{label} {tokens:,}" for label, tokens, _target in self.standing)
+            e.add_field(name=f"Always sent: ~{total:,} tokens",
+                        value=f"{parts}\n-# Cached while unedited, so cheaper after the first reply."
+                        + (" A borrow sends its source's." if self.parent.is_borrowed else ""),
+                        inline=False)
+        e.add_field(name="In a session", value="How many characters answer, and how often, multiplies all "
+                    "of this. `/session config` → Token Advice shows what that session's settings cost.",
+                    inline=False)
+        e.set_footer(text=TOKEN_ADVICE_FOOTER)
+        return e
+
+    def _build_view(self):
+        self.clear_items()
+        targets = list(dict.fromkeys([item.target for item in self.items]
+                                     + [target for _label, _tokens, target in self.standing]))
+        options = [self._action(v).option(self.parent) for v in targets if self._action(v)]
+        if options:
+            add_select(self, options, self.parent.dropdown_callback, placeholder="Go to a setting…", row=0)
+        add_button(self, "Back", self._back_callback, emoji="⬅️", row=1)
+
+    async def _back_callback(self, interaction: discord.Interaction):
+        self.stop()
+        self.parent._build_view()
+        embed = await self.cog.profile_manager._build_profile_manage_embed(
+            interaction, self.parent.profile_name, target_user_id=self.parent.user_id)
+        await interaction.response.edit_message(embed=embed, view=self.parent)
+
 
 class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     """One setting's screen, rendered from its `_Screen` declaration.

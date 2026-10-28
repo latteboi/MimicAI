@@ -15,7 +15,7 @@ from ...utils.constants import (
     DEFAULT_ENHANCE_AWARENESS, DEFAULT_ENHANCE_AWARENESS_GROUP,
 )
 from ...managers.session_manager import _TURN_IDENTITY
-from ...utils import lorebook
+from ...utils import fixed_examples, lorebook
 from ...utils.bonds import render as render_bonds, take_updates as take_bond_updates
 from ...utils.birthdays import birthday_offset, describe_birthday
 from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash, _resolve_zoneinfo,
@@ -319,6 +319,13 @@ class PromptBuilderMixin:
         always = lorebook.constant(lore)
         if always:
             stable_parts.append(lorebook.render(always))
+        # So are the fixed examples, which change only on an edit. The training examples
+        # matched to this turn ride it, in a second block of the same shape.
+        fixed = fixed_examples.entries(prompts.get("fixed_examples"))
+        if fixed:
+            stable_parts.append(
+                self.cog.global_prompts.get("TRAINING_DATA_INJECTION", DEFAULT_TRAINING_DATA_INJECTION)
+                .format(examples_block=fixed_examples.render(fixed)))
 
         # Stable, so they sit with the persona rather than among the per-turn blocks:
         # they never change, and anything volatile placed ahead of them would

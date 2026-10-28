@@ -333,8 +333,8 @@ HELP_CATEGORIES = {
             "gives that character the next turn, even if it has already spoken. Mentioning the main bot does nothing in a session.\n\n"
             "However a character is called on -- a reply, a mention, a reaction or a name -- in a session taking turns in order it keeps the "
             "place it was called to: the speaking order goes on from it, this round and the ones after, until someone else is called.\n\n"
-            "**Proactivity** lets the cast start talking with nobody prompting them. A timer rolls against your configured chance and cooldown; "
-            "when it fires, the **AI Director** -- a separate model -- reads the scene and the recent public conversation and writes a short environmental beat ('a loud noise "
+            "**Proactivity** lets the cast start talking with nobody prompting them. Each time the channel has been quiet for the cooldown, the chance is rolled once, and any message starts "
+            "the wait over; when a roll hits, the **AI Director** -- a separate model -- reads the scene and the recent public conversation and writes a short environmental beat ('a loud noise "
             "outside'), injected as an `<internal_note>` that the cast reacts to.\n\n"
             "Proactivity is the setting most likely to surprise you on the bill: it generates rounds with no user input. Start with a low chance "
             "and a long cooldown."
@@ -1098,7 +1098,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "sessions/proactivity_and_director.txt": (
         "Setup: Enabled via `/session config` -> Proactivity.\n"
-        "Mechanism: When Proactivity is active, an asynchronous system loop monitors the channel. Based on your configured Trigger Chance (0-100%) and Cooldown, the bot can autonomously initiate conversation with no user message at all.\n"
+        "Mechanism: When Proactivity is active, an asynchronous system loop monitors the channel. Each time the channel has been quiet for the Cooldown, the Trigger Chance (0-100%) is rolled once, and any message starts the wait over. When a roll hits, the cast starts talking with no user message at all; in an empty channel it keeps going (10% every 5 minutes is about 29 rounds a day).\n"
         "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Its Primary and Fallback are chosen at `/session config` -> Proactivity -> Director Model, which works like Set Models and has the Director's on/off switch; until you choose, it runs the LTM Summariser's models. It falls back to the next model if the first is busy. Blank instructions (Edit Settings & AI Director) use the default wording.\n"
         "Payload: This scene update is injected as an <internal_note> directly to the cast list, forcing the AI characters to dynamically react to the new situation autonomously.\n"
         "Cost: Proactive rounds consume API quota without anyone prompting them, and the Director is an extra call on top. Start with a low chance and a long cooldown.\n"
@@ -1196,6 +1196,7 @@ DEFAULT_HELP_DOCS = {
         "Concept: Training Examples are explicit input-output pairs you author by hand to dictate a profile's voice, formatting and tone. Maximum 100 per profile.\n"
         "Retrieval: They are not all injected. Each is embedded, and your current message is matched against the library; only examples clearing the relevance threshold are injected for that turn. A large library therefore stays cheap.\n"
         "Best use: Situational voice -- how the character greets someone, reacts to an insult, or handles a question it cannot answer.\n"
+        "Fixed examples: `/profile manage` -> Training -> Manage Fixed Examples holds up to 20 examples that go out with every reply instead of being matched, so they suit the character's everyday voice. What someone says before the reply is optional: a reply on its own is a sample of how the character talks. Each one is paid for on every reply, at the cheaper cached rate once the prompt is cached. A character card's example dialogue is imported as fixed examples. Like the lorebook, they are part of what the content rating judges.\n"
         "Management: `/profile manage` -> Training -> Manage Training Examples. 'Test match' shows which examples a message would pull in and how closely. 'Analyse' opens the profile's Training Analysis models, which Set Models also holds -- Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.5 Flash-Lite then 3.1 Flash-Lite on Google, until you choose others -- and 'Analyse…' there writes a style guide from the newest examples, which Training -> Style Guide shows, turns on or off, and regenerates. Tune matching with 'Set Training Parameters'.\n"
         "Availability: Training Examples belong to the profile owner. They cannot be edited on a borrowed profile.\n"
         "Reaction capture: `/train` is switched off. It could store other people's messages on your profile where they could neither see nor delete them. Examples are written on the Manage Training Examples screen.\n"
@@ -1206,7 +1207,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "memory/context_metadata_and_xml.txt": (
         "Concept: MimicAI uses an XML partitioning protocol to keep background technical context isolated from conversational chat. Models separate tagged system data from user speech far more reliably than they separate prose from prose.\n"
-        "Common tags: `<persona_profile>` and `<character_instructions>` the character itself; `<archive_context>` recalled long-term memories; `<external_context>` web search summaries; `<document_context>` text fetched from URLs; `<current_time>` the profile's local time; `<whisper_context>` and `<private_response>` hidden exchanges; `<internal_note>` system prompts that steer a round; `<scene_prompt>` the session master prompt; `<training_data>` matched style examples; `<content_policy>` the general-audience note.\n"
+        "Common tags: `<persona_profile>` and `<character_instructions>` the character itself; `<archive_context>` recalled long-term memories; `<external_context>` web search summaries; `<document_context>` text fetched from URLs; `<current_time>` the profile's local time; `<whisper_context>` and `<private_response>` hidden exchanges; `<internal_note>` system prompts that steer a round; `<scene_prompt>` the session master prompt; `<training_data>` style examples, fixed and matched; `<content_policy>` the general-audience note.\n"
         "Identity Headers: Every message in history is prefixed `<Name> [ID: PID] [Timestamp]:`. The PID guarantees two characters with the same name are never conflated, and the timestamp gives the model real chronological awareness.\n"
         "Scrubbing: These tags are stripped from model output before delivery, so they never appear in chat.\n"
         "Troubleshooting / Symptoms:\n"

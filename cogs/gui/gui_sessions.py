@@ -20,6 +20,7 @@ from ..services.generation.compaction import compaction_model_config, resolve_co
 from ..managers.session_manager import (director_enabled, director_model_config, rotated_cast,
                                         turn_lookup, with_reply)
 from ..services.generation.global_chat import build_global_chat_embed
+from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, cast_costs, quiet_label, session_advice
 from ..services.generation.tool_loop import functions_for
 
 if TYPE_CHECKING:
@@ -1042,8 +1043,8 @@ class ReactivitySettingsModal(ui.Modal, title="Edit Reactivity"):
 
 
 class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
-    chance_input = ui.TextInput(label="Trigger Chance (0-100%)", placeholder="Default: 10", required=True, max_length=3)
-    cooldown_input = ui.TextInput(label="Cooldown (Seconds)", placeholder="Default: 300", required=True, max_length=5)
+    chance_input = ui.TextInput(label="Chance of a round, each roll (0-100%)", placeholder="Default: 10", required=True, max_length=3)
+    cooldown_input = ui.TextInput(label="Seconds of quiet before each roll (min 60)", placeholder="Default: 300", required=True, max_length=5)
     instructions_input = ui.TextInput(label="Director Instructions (Blank = Default)", style=discord.TextStyle.paragraph, required=False, max_length=1000)
     def __init__(self, view: 'SessionConfigView'):
         super().__init__()
@@ -1057,6 +1058,8 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
             pro = self.view.session.setdefault("proactivity", {})
             pro["chance"] = max(0, min(100, int(self.chance_input.value)))
             pro["cooldown"] = max(60, int(self.cooldown_input.value))
+            self.view.cog.session_manager.arm_proactivity(
+                self.view.original_interaction.channel_id, self.view.session)
 
             # Blank, or the shipped wording left as it was, is "the default": resolved
             # when it runs, so a better wording reaches this session too.
@@ -1384,6 +1387,8 @@ class SessionConfigView(BlockedGuard, ui.View):
         self._seated_cache = None
         #: The Config tab setting whose screen is open, or None for the tab itself.
         self.config_screen = None
+        #: Token Advice is open in place of the tabs.
+        self.advice_open = False
         #: One line for the next render only, e.g. a modal value it could not take. Shown
         #: on this message rather than sent as another one below it.
         self.notice = None
@@ -1757,8 +1762,11 @@ class SessionConfigView(BlockedGuard, ui.View):
         self.clear_items()
         embed = discord.Embed(title=f"Chat Session: #{self.original_interaction.channel.name}", color=discord.Color.gold())
 
+        advice = self._token_advice()
         if self.config_screen:
             self._render_config_screen(embed)
+        elif self.advice_open:
+            self._render_token_advice(embed, advice)
         else:
             self._add_nav_buttons()
             # One method per tab. This was a 573-line `update_display` with the five
@@ -1774,6 +1782,10 @@ class SessionConfigView(BlockedGuard, ui.View):
             if renderer:
                 renderer(embed)
             self._add_commit_button()
+            # Beside Start / Update, on every tab: the cost is worth seeing before committing.
+            large = sum(item.size == LARGE for item in advice)
+            add_button(self, f"Token Advice · {large}" if large else "Token Advice", self._open_token_advice,
+                       emoji="💡", row=3)
 
         if self.notice:
             embed.add_field(name="⚠️ Not saved", value=self.notice[:1024], inline=False)
@@ -1786,7 +1798,7 @@ class SessionConfigView(BlockedGuard, ui.View):
                       else "○ Draft — nothing runs until you press Start / Update Session.")
         if not self._viewer_is_admin():
             state_note += "  ·  Open casting."
-        embed.set_footer(text=state_note)
+        embed.set_footer(text=TOKEN_ADVICE_FOOTER if self.advice_open else state_note)
 
         try:
             await self.original_interaction.edit_original_response(embed=embed, view=self)
@@ -2103,6 +2115,87 @@ class SessionConfigView(BlockedGuard, ui.View):
         policy_sel.callback = policy_cb
         self.add_item(policy_sel)
 
+    def _token_advice(self):
+        """What this session's settings cost (`token_advice.session_advice`), each seat
+        read with its own profile's config."""
+        pm = self.cog.profile_manager
+        seats = []
+        for seat in self.session.get("profiles", []):
+            borrowed = seat["profile_name"] in pm._get_user_index(seat["owner_id"]).get("borrowed", [])
+            seats.append((seat, pm._get_profile_config(seat["owner_id"], seat["profile_name"], borrowed) or {}))
+        guild = getattr(self.original_interaction.channel, "guild", None)
+        return session_advice(self.session, seats,
+                              settle=self.cog.session_manager.settle_window(self.session),
+                              compaction=resolve_compaction_settings(self.session),
+                              director=director_enabled(self.session.get("proactivity")),
+                              custom_emojis=bool(getattr(guild, "emojis", None)))
+
+    async def _open_token_advice(self, i: discord.Interaction):
+        await i.response.defer()
+        # Measured off the log, so it is loaded first, as Start / Update does.
+        if not self.session.get("is_hydrated"):
+            hydrated = await self.cog.session_manager._ensure_session_hydrated(
+                self.original_interaction.channel_id, self.session.get("type", "multi"))
+            if hydrated:
+                self.session = hydrated
+        self.advice_open = True
+        await self.update_display()
+
+    def _advice_where(self, target: str) -> str:
+        tab, _, screen = target.partition(":")
+        return f"Config → {self.CONFIG_SCREENS[screen][0]}" if screen else f"{tab.title()} tab"
+
+    def _render_token_advice(self, embed: discord.Embed, advice):
+        """Token Advice in place of the tabs: what each setting costs, what the cast's replies
+        have cost, and -- for an administrator -- a way to each setting. Back returns to the tab."""
+        embed.title = f"Token Advice · #{self.original_interaction.channel.name}"
+        is_admin = self._viewer_is_admin()
+        embed.description = ("What this session's settings cost, largest first."
+                             + ("" if is_admin else " A server administrator can change them."))
+        for item in advice:
+            embed.add_field(name=f"{item.size} {item.heading}"[:256],
+                            value=f"{item.text}\n-# {self._advice_where(item.target)}"[:1024], inline=False)
+        if not advice:
+            embed.add_field(name="Its settings", value="Nothing here costs more than one reply to each "
+                            "message would.", inline=False)
+
+        costs = cast_costs(self.session.get("unified_log") or [], self.session.get("profiles", []))
+        lines = []
+        for name, cost in costs[:10]:
+            if cost is None:
+                lines.append(f"**{name}**: no replies yet")
+                continue
+            cached = f" ({cost['cached'] * 100 // cost['input']}% cached)" if cost["input"] else ""
+            thinking = f" · ~{cost['thinking']:,} thinking" if cost["thinking"] else ""
+            lines.append(f"**{name}**: ~{cost['input']:,} in{cached} · ~{cost['output']:,} out{thinking}")
+        if len(costs) > 10:
+            lines.append(f"…and {len(costs) - 10} more")
+        if lines:
+            embed.add_field(name="The cast, an average of each one's last 10 replies",
+                            value="\n".join(lines)[:1024], inline=False)
+
+        targets = list(dict.fromkeys(item.target for item in advice))
+        if is_admin and targets:
+            add_select(self, [discord.SelectOption(label=self._advice_where(t)[:100], value=t) for t in targets],
+                       self._advice_go, placeholder="Go to a setting…", row=0)
+
+        async def back(i: discord.Interaction):
+            self.advice_open = False
+            await i.response.defer()
+            await self.update_display()
+        add_button(self, "◀ Back", back, row=1, style=discord.ButtonStyle.secondary)
+
+    async def _advice_go(self, i: discord.Interaction):
+        # Re-tested on the press, as the tab bar is: the view outlives a role.
+        if not self._viewer_is_admin():
+            await i.response.send_message("Only server administrators can change that.", ephemeral=True)
+            return
+        tab, _, screen = i.data['values'][0].partition(":")
+        self.advice_open = False
+        self.current_tab, self.config_screen, self.current_page = tab, screen or None, 0
+        await i.response.defer()
+        await self.update_display()
+
     #: The Config tab's settings: key -> (label, what the screen says it does).
     CONFIG_SCREENS = {
         "execution": ("Execution Mode",
@@ -2350,9 +2443,12 @@ class SessionConfigView(BlockedGuard, ui.View):
         """The timer that lets the cast open a conversation unprompted."""
         pro = self.session.get("proactivity", {})
         enabled = pro.get("enabled", False)
-        embed.description = "Allow the session to start conversations autonomously based on a timer."
+        embed.description = ("Lets the cast start a conversation when the channel goes quiet. Each "
+                             "time it has been quiet for the cooldown, the chance is rolled once; "
+                             "any message starts the wait over.")
         embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
-        embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` every `{pro.get('cooldown', 300)}s`", inline=True)
+        embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` after every "
+                                                        f"`{quiet_label(pro.get('cooldown', 300))}` of quiet", inline=True)
         
         dir_on = director_enabled(pro)
         primary, fallbacks = self.cog.api_service.model_chain(
@@ -2363,10 +2459,10 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="AI Director", value=f"{'**`ON`**' if dir_on else '`OFF`'}\n{models}\n"
                                                   f"Instructions: ```{dir_ins[:200]}```", inline=False)
 
-        self._add_toggle(
-            "Toggle Proactivity", enabled,
-            lambda on: self.session.setdefault("proactivity", {}).__setitem__("enabled", on),
-            on_off_style=True)
+        def set_proactivity(on: bool):
+            self.session.setdefault("proactivity", {})["enabled"] = on
+            self.cog.session_manager.arm_proactivity(self.original_interaction.channel_id, self.session)
+        self._add_toggle("Toggle Proactivity", enabled, set_proactivity, on_off_style=True)
         self._add_modal_button("Edit Settings & AI Director", ProactivitySettingsModal)
 
         async def open_director_models(i: discord.Interaction):
@@ -2530,6 +2626,7 @@ class SessionConfigView(BlockedGuard, ui.View):
                     self.session = hydrated
 
             channel_id = self.original_interaction.channel_id
+            self.cog.session_manager.arm_proactivity(channel_id, self.session)
             for p in self.session.get("profiles", []):
                 if p.get("method") != "child_bot" or not p.get("bot_id"):
                     continue

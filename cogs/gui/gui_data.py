@@ -123,8 +123,8 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
         await i.followup.send("An error occurred with the LTM add form.", ephemeral=True)
 
 class AddTrainingExampleModal(ui.Modal, title="Add Profile Training Example"): 
-    user_input_field=ui.TextInput(label="User Input Example",style=discord.TextStyle.paragraph,required=True,max_length=1000)
-    chatbot_response_field=ui.TextInput(label="Desired Chatbot Response",style=discord.TextStyle.paragraph,required=True,max_length=2000)
+    user_input_field=ui.TextInput(label="User Input Example",style=discord.TextStyle.paragraph,required=True,max_length=EXAMPLE_SAID_MAX_CHARS)
+    chatbot_response_field=ui.TextInput(label="Desired Chatbot Response",style=discord.TextStyle.paragraph,required=True,max_length=EXAMPLE_REPLY_MAX_CHARS)
     def __init__(self, cog, profile_owner_id: int, profile_name: str, guild_id: Optional[int]):
         super().__init__()
         self.cog:MimicCog=cog
@@ -139,8 +139,8 @@ class AddTrainingExampleModal(ui.Modal, title="Add Profile Training Example"):
     async def on_error(self,i:discord.Interaction,e:Exception):print(f"AddTrainExModal err:{e}");traceback.print_exc();await i.followup.send('Oops!',ephemeral=True)
 
 class EditTrainingExampleModal(ui.Modal, title="Edit Profile Training Example"):
-    user_input_field = ui.TextInput(label="User Input Example", style=discord.TextStyle.paragraph, required=True, max_length=1000)
-    chatbot_response_field = ui.TextInput(label="Desired Chatbot Response", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+    user_input_field = ui.TextInput(label="User Input Example", style=discord.TextStyle.paragraph, required=True, max_length=EXAMPLE_SAID_MAX_CHARS)
+    chatbot_response_field = ui.TextInput(label="Desired Chatbot Response", style=discord.TextStyle.paragraph, required=True, max_length=EXAMPLE_REPLY_MAX_CHARS)
 
     def __init__(self, cog, profile_owner_id: int, profile_name: str, example_id: str, current_user_input: str, current_bot_response: str, guild_id: Optional[int]):
         super().__init__()
@@ -194,6 +194,37 @@ class LoreEntryModal(ui.Modal):
         print(f"LoreEntryModal error: {e}"); traceback.print_exc()
         await i.followup.send("An error occurred with the lore entry form.", ephemeral=True)
 
+class FixedExampleModal(ui.Modal):
+    """Adds a fixed example, or with `entry` rewrites it. What was said may be left blank."""
+    said_field = ui.TextInput(label="What someone says (optional)", style=discord.TextStyle.paragraph,
+                              required=False, max_length=EXAMPLE_SAID_MAX_CHARS)
+    reply_field = ui.TextInput(label="How the character answers", style=discord.TextStyle.paragraph,
+                               required=True, max_length=EXAMPLE_REPLY_MAX_CHARS)
+
+    def __init__(self, cog, profile_owner_id: int, profile_name: str, entry: Optional[Dict] = None):
+        super().__init__(title="Edit Fixed Example" if entry else "Add Fixed Example")
+        self.cog: MimicCog = cog
+        self.profile_owner_id = profile_owner_id
+        self.profile_name = profile_name
+        self.entry_id = entry.get("id") if entry else None
+        if entry:
+            self.said_field.default = entry.get("said", "")
+            self.reply_field.default = entry.get("reply", "")
+
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True, thinking=True)
+        _ok, message = await asyncio.to_thread(
+            self.cog.profile_manager.put_fixed_example, self.profile_owner_id, self.profile_name,
+            self.entry_id, self.said_field.value, self.reply_field.value)
+        await i.followup.send(message, ephemeral=True)
+        # Fixed examples are rated text. Deferred: gui_profiles imports this module.
+        from .gui_profiles import maybe_prompt_rating_after_edit
+        await maybe_prompt_rating_after_edit(self.cog, i, self.profile_owner_id, self.profile_name)
+
+    async def on_error(self, i: discord.Interaction, e: Exception):
+        print(f"FixedExampleModal error: {e}"); traceback.print_exc()
+        await i.followup.send("An error occurred with the fixed example form.", ephemeral=True)
+
 class SearchDataModal(ui.Modal, title="Search"):
     search_input = ui.TextInput(label="Search term (leave blank to clear)", required=False, max_length=100)
 
@@ -239,7 +270,8 @@ def _code(text: str) -> str:
     return "```\n" + text.replace("`", "ˋ") + "\n```"
 
 class DataManageView(BlockedGuard, ui.View):
-    """A profile's long-term memories, training examples or lorebook: a page of five, or one opened.
+    """A profile's long-term memories, training examples, fixed examples or lorebook: a page
+    of five, or one opened.
 
     Memories are listed one server at a time, since a memory is only ever recalled in
     the server it formed in -- so a server is chosen before anything is shown, starting
@@ -248,7 +280,7 @@ class DataManageView(BlockedGuard, ui.View):
     LIMIT_LTM entries.
     """
 
-    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm', 'lore']] = None, parent_manage_view: Optional['ProfileManageView'] = None, target_user_id: Optional[int] = None):
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, profile_name: str, is_borrowed: bool, mode: Optional[Literal['training', 'ltm', 'lore', 'examples']] = None, parent_manage_view: Optional['ProfileManageView'] = None, target_user_id: Optional[int] = None):
         super().__init__(timeout=600)
         self.cog = cog
         self.original_interaction = interaction
@@ -259,7 +291,7 @@ class DataManageView(BlockedGuard, ui.View):
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
         self.parent_manage_view = parent_manage_view
-        self.mode: Literal['training', 'ltm', 'lore'] = mode or ('ltm' if is_borrowed else 'training')
+        self.mode: Literal['training', 'ltm', 'lore', 'examples'] = mode or ('ltm' if is_borrowed else 'training')
         self.entries: List[Dict] = []                  # newest first, plain text
         self.servers: List[Tuple[str, str, int]] = []  # (guild id, name, memories), LTM only
         self.server_id: Optional[str] = None
@@ -278,6 +310,9 @@ class DataManageView(BlockedGuard, ui.View):
             return
         if self.mode == 'lore':
             self.entries = await asyncio.to_thread(self.cog.profile_manager.lorebook, self.user_id, self.profile_name)
+            return
+        if self.mode == 'examples':
+            self.entries = await asyncio.to_thread(self.cog.profile_manager.fixed_examples, self.user_id, self.profile_name)
             return
         self.entries = await mm.load_ltms(self.user_id, self.profile_name)
         counts: Dict[str, int] = {}
@@ -298,6 +333,8 @@ class DataManageView(BlockedGuard, ui.View):
     def _text(self, e: Dict) -> str:
         if self.mode == 'lore':
             return f"{', '.join(e.get('keys') or [])} {e.get('content', '')}"
+        if self.mode == 'examples':
+            return f"{e.get('said', '')} {e.get('reply', '')}".strip()
         return e.get("sum", "") if self.mode == 'ltm' else f"{e.get('u_in', '')} {e.get('b_out', '')}"
 
     @staticmethod
@@ -305,7 +342,10 @@ class DataManageView(BlockedGuard, ui.View):
         return ", ".join(e.get("keys") or []) or "Always on"
 
     def _subtitle(self, e: Dict) -> str:
-        """An entry's line under its label: when it was made, or for lore, what wakes it."""
+        """An entry's line under its label: when it was made, for lore what wakes it, and for
+        a fixed example whether anything is said before the reply."""
+        if self.mode == 'examples':
+            return "Exchange" if e.get("said") else "Reply only"
         return self._keys(e) if self.mode == 'lore' else self._date(e)
 
     def _visible(self) -> List[Dict]:
@@ -346,6 +386,7 @@ class DataManageView(BlockedGuard, ui.View):
             'ltm': ("Long-Term Memories", defaultConfig.LIMIT_LTM, "memories across every server"),
             'training': ("Training Examples", defaultConfig.LIMIT_TRAINING, "examples"),
             'lore': ("Lorebook", LIMIT_LORE_ENTRIES, "entries"),
+            'examples': ("Fixed Examples", LIMIT_FIXED_EXAMPLES, "examples"),
         }[self.mode]
         embed = discord.Embed(title=f"{noun} · {self.profile_name}", color=discord.Color.dark_teal())
         embed.set_footer(text=f"{len(self.entries)} / {limit} {unit}")
@@ -368,13 +409,19 @@ class DataManageView(BlockedGuard, ui.View):
                 lines.append(f"**{n}.** {meta}\n{_code(_clip(e.get('sum', ''), MAX_LTM_SUMMARY_CHARACTERS))}")
             elif self.mode == 'lore':
                 lines.append(f"**{n}.** {_clip(self._keys(e), 200)}\n{_code(_clip(e.get('content', ''), 500))}")
+            elif self.mode == 'examples':
+                said = f"User: {_clip(e['said'], 200)}\n" if e.get("said") else ""
+                lines.append(f"**{n}.** {self._subtitle(e)}\n" + _code(
+                    f"{said}{_clip(self.profile_name, 40)}: {_clip(e.get('reply', ''), 400)}"))
             else:
                 lines.append(f"**{n}.** {self._date(e)}\n" + _code(
                     f"User: {_clip(e.get('u_in', ''), 200)}\n"
                     f"{_clip(self.profile_name, 40)}: {_clip(e.get('b_out', ''), 400)}"))
-        empty = ("Nothing here yet. An entry with keywords is handed to the character when one comes "
-                 "up in the conversation; one without is always in mind."
-                 if self.mode == 'lore' else "Nothing here yet.")
+        empty = {'lore': "Nothing here yet. An entry with keywords is handed to the character when one "
+                         "comes up in the conversation; one without is always in mind.",
+                 'examples': "Nothing here yet. A fixed example goes out with every reply, where a "
+                             "training example is sent only when a message resembles it. What someone "
+                             "says before the reply may be left blank."}.get(self.mode, "Nothing here yet.")
         body = "\n\n".join(lines) or ("Nothing matches." if self.search_term else empty)
         embed.description = "\n".join(header + ([""] if header else []) + [body])
         return embed
@@ -394,6 +441,11 @@ class DataManageView(BlockedGuard, ui.View):
                                   color=discord.Color.dark_teal())
             embed.add_field(name="Keywords", value=_clip(self._keys(e), 1000), inline=False)
             return embed
+        elif self.mode == 'examples':
+            said = f"**User**\n{e['said']}\n\n" if e.get("said") else ""
+            return discord.Embed(title=f"Fixed Example `{e.get('id')}`",
+                                 description=f"{said}**{self.profile_name}**\n{e.get('reply', '')}"[:4000],
+                                 color=discord.Color.dark_teal())
         else:
             embed = discord.Embed(title=f"Example `{e.get('id')}`",
                                   description=f"**User**\n{e.get('u_in', '')}\n\n**{self.profile_name}**\n{e.get('b_out', '')}"[:4000],
@@ -448,9 +500,10 @@ class DataManageView(BlockedGuard, ui.View):
         showing = self.mode != 'ltm' or self.server_id
         if showing:
             add_button(self, "Search", self.search_callback, row=3, emoji="\U0001f50d")
-            add_button(self, "Test recall" if self.mode == 'ltm' else "Test match", self.test_callback,
-                       row=3, emoji="\U0001f9e0" if self.mode == 'ltm' else "\U0001f9ea",
-                       disabled=not self.entries)
+            if self.mode != 'examples':   # every fixed example is sent, so there is nothing to match
+                add_button(self, "Test recall" if self.mode == 'ltm' else "Test match", self.test_callback,
+                           row=3, emoji="\U0001f9e0" if self.mode == 'ltm' else "\U0001f9ea",
+                           disabled=not self.entries)
 
         add_button(self, "Add", self.add_callback, style=discord.ButtonStyle.success, row=4, emoji="➕")
         if self.mode == 'training' and not self.is_borrowed and self.entries:
@@ -550,6 +603,8 @@ class DataManageView(BlockedGuard, ui.View):
             modal = AddTrainingExampleModal(self.cog, self.user_id, self.profile_name, self.guild_id)
         elif self.mode == 'lore':
             modal = LoreEntryModal(self.cog, self.user_id, self.profile_name)
+        elif self.mode == 'examples':
+            modal = FixedExampleModal(self.cog, self.user_id, self.profile_name)
         else:
             modal = AddLtmModal(self.cog, self.user_id, self.profile_name, self.guild_id)
 
@@ -575,6 +630,8 @@ class DataManageView(BlockedGuard, ui.View):
                                              item.get("u_in", ""), item.get("b_out", ""), self.guild_id)
         elif self.mode == 'lore':
             modal = LoreEntryModal(self.cog, self.user_id, self.profile_name, item)
+        elif self.mode == 'examples':
+            modal = FixedExampleModal(self.cog, self.user_id, self.profile_name, item)
         else:
             modal = EditLtmModal(self.cog, self.user_id, self.profile_name, item["id"], item.get("sum", ""))
         original_on_submit = modal.on_submit
@@ -590,13 +647,16 @@ class DataManageView(BlockedGuard, ui.View):
             if self.mode == 'lore':
                 gone = await asyncio.to_thread(self.cog.profile_manager.delete_lore_entries,
                                                self.user_id, self.profile_name, ids)
+            elif self.mode == 'examples':
+                gone = await asyncio.to_thread(self.cog.profile_manager.delete_fixed_examples,
+                                               self.user_id, self.profile_name, ids)
             else:
                 delete = mm.delete_ltms if self.mode == 'ltm' else mm.delete_training_examples
                 gone = await delete(self.user_id, self.profile_name, ids)
             await i.response.edit_message(content=f"Deleted {gone} item(s)." if gone else "Nothing was found to delete.",
                                           view=None, embed=None)
             await self._refresh()
-            if self.mode == 'lore' and gone:
+            if self.mode in ('lore', 'examples') and gone:
                 from .gui_profiles import maybe_prompt_rating_after_edit
                 await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, self.profile_name)
         await interaction.response.send_message(prompt, view=build_confirm_view(f"Delete {len(ids)}", confirm),

@@ -2756,6 +2756,12 @@ LORE_KEYS_MAX_CHARS = 200
 LORE_PER_TURN = 5
 LORE_SCAN_TURNS = 4
 
+#: A profile's fixed examples (`prompts["fixed_examples"]`): every one rides every reply,
+#: so the count stays well under the lorebook's. A card's `mes_example` fills up to it.
+#: The two caps are each side of an example, fixed or training.
+LIMIT_FIXED_EXAMPLES = 20
+EXAMPLE_SAID_MAX_CHARS, EXAMPLE_REPLY_MAX_CHARS = 1000, 2000
+
 #: Server context (`/session config` → Server Context): custom emoji names listed, and the
 #: channel topic's length. Both sit in the system instruction on every call.
 LIMIT_SERVER_EMOJIS = 100

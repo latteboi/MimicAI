@@ -57,6 +57,7 @@ from ..utils.helpers import (TURN_TIME_FORMAT, Timeout, _format_api_error, _reso
                             clip_to_sentence, ltm_auto_recall_enabled,
                             resolve_thinking_params, suppress_link_previews)
 from .storage_manager import IOManager
+from ..utils import fixed_examples
 from ..services.api_service import get_embedding_vector
 
 
@@ -1035,7 +1036,7 @@ class MemoryManager:
             out = []
             for row in top:
                 ex = profile_examples[vectors.rows[int(row)]]
-                out.append(f"<example>\nUser: {decrypt(ex['u_in'])}\nYou: {decrypt(ex['b_out'])}\n</example>")
+                out.append(fixed_examples.block(decrypt(ex['u_in']), decrypt(ex['b_out'])))
             return out
 
         return await asyncio.to_thread(_thread_search_training)

@@ -7,7 +7,7 @@ it, Regenerate rolls a fresh one from the same concept, Refine rewrites it to a 
 and Discard -- or simply walking away -- leaves nothing behind.
 
 `/import` of a character card shows its draft here too (`card`): Regenerate sorts the card
-again, and Save also adds its example exchanges as training examples.
+again, and Save also writes its lorebook and example exchanges (as fixed examples).
 """
 import asyncio
 from typing import TYPE_CHECKING, Any, Dict, Optional
@@ -64,7 +64,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.profile_name = profile_name
         self.concept = concept
         #: The display name and avatar the user gave, laid over every draft -- and for a
-        #: card, its lorebook and 18+ tag, which no redraft changes.
+        #: card, its lorebook, fixed examples and 18+ tag, which no redraft changes.
         self.appearance = appearance or {}
         #: The card being imported (`character_card.read_card`), or None for a concept.
         self.card = card
@@ -131,8 +131,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             extras = []
             if draft.get("lorebook"):
                 extras.append(f"**Lorebook:** {len(draft['lorebook'])} entries")
-            if self.card["examples"]:
-                extras.append(f"**Training examples:** {len(self.card['examples'])}, added on Save")
+            if draft.get("fixed_examples"):
+                extras.append(f"**Fixed examples:** {len(draft['fixed_examples'])}")
             if draft.get("adult"):
                 extras.append("**Adult 18+:** the card is tagged NSFW, so it is declared 18+ on Save")
             if extras:
@@ -205,21 +205,6 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await interaction.edit_original_response(embed=self.build_embed(), view=self)
         if failure:
             await interaction.followup.send(f"❌ {failure}", ephemeral=True)
-        elif self.card and self.card["examples"]:
-            await interaction.followup.send(await self._add_card_examples(), ephemeral=True)
-
-    async def _add_card_examples(self) -> str:
-        """The card's example exchanges, as training examples. Each is an embedding call on
-        the owner's key, so the first refusal -- no key, the limit -- ends the run."""
-        examples, added, reason = self.card["examples"], 0, ""
-        for said, answer in examples:
-            ok, reason = await self.cog.memory_manager.add_new_training_example(
-                self.user_id, self.profile_name, said, answer, None)
-            if not ok:
-                break
-            added += 1
-        line = f"Added {added} of {len(examples)} example exchanges as training examples."
-        return line if added == len(examples) else f"{line} {reason}"
 
     async def publish(self, interaction: discord.Interaction):
         """Rates the new profile -- it is Unrated -- and lists it if the verdict allows."""

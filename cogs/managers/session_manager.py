@@ -832,6 +832,10 @@ class SessionManager:
         if existing is not None:
             structural = structural or existing[1]
         self.cog.dirty_sessions[session_key] = (session_type, structural)
+        # Every turn a channel's session logs comes through here, so this is where its
+        # quiet starts over. Global Chat's keys are not a channel's.
+        if isinstance(session_key, tuple) and isinstance(session_key[0], int):
+            self.arm_proactivity(session_key[0])
 
     async def flush_session(self, session_key: Any, session_type: str, structural: bool = False) -> None:
         """Write one session now, preferring the tail sidecar over a full rewrite."""
@@ -1774,36 +1778,54 @@ class SessionManager:
             # Remove from tracking dict after processing
             self.cog.session_last_accessed.pop(key, None)
 
+    def arm_proactivity(self, channel_id: int, session: Optional[Dict] = None) -> None:
+        """Starts this channel's proactivity clock over: one roll of its chance once
+        `cooldown` seconds pass with nothing logged, and another every `cooldown` after.
+
+        The Director exists to break a silence, so anything the session logs restarts the
+        wait (`mark_session_dirty`) -- a round nobody asked for never lands in the middle of
+        a conversation. A timer per session rather than a loop's tick, so a roll comes when
+        the cooldown is up and not up to a tick later. Off, unstarted or gone: no clock.
+        """
+        handle = self.cog.proactive_timers.pop(channel_id, None)
+        if handle is not None:
+            handle.cancel()
+        if session is None:
+            session = self.cog.multi_profile_channels.get(channel_id)
+        pro = (session or {}).get("proactivity") or {}
+        if session is None or not pro.get("enabled") or not self.is_started(session):
+            return
+        self.cog.proactive_timers[channel_id] = self.cog.bot.loop.call_later(
+            max(60.0, float(pro.get("cooldown", 300))), self._proactive_roll, channel_id)
+
+    def _proactive_roll(self, channel_id: int) -> None:
+        """A proactive session's quiet has lasted its cooldown: the next roll is set, and
+        this one queues a round on its chance."""
+        session = self.cog.multi_profile_channels.get(channel_id)
+        self.arm_proactivity(channel_id, session)
+        if channel_id not in self.cog.proactive_timers or not self.cog.has_lock:
+            return
+        # A live game means the channel is anything but silent, and with the cast seated
+        # the round it queues would find nobody to speak -- so it would spend a director
+        # model call to produce nothing. Skip the channel until the table clears.
+        game_service = getattr(self.cog, "game_service", None)
+        if game_service and game_service.has_live_game(channel_id):
+            return
+        if random.random() >= session["proactivity"].get("chance", 10) / 100.0:
+            return
+        session['task_queue'].put_nowait(('proactive_trigger', None))
+        if not session.get('is_running') and (not session.get('worker_task') or session['worker_task'].done()):
+            task = self.cog.bot.loop.create_task(self.cog.generation_service._multi_profile_worker(channel_id))
+            session['worker_task'] = task
+            self.cog.background_tasks.add(task)
+
     @tasks.loop(seconds=60.0)
     async def proactive_session_task(self):
-        if not self.cog.has_lock: return
-        now = time.time()
+        """Arms the clock of a proactive session that has none: every one at boot, and one
+        switched on by a path that does not arm it itself. The rolls are the clocks'."""
         for channel_id, session in list(self.cog.multi_profile_channels.items()):
-            pro = session.get("proactivity", {})
-            if not pro.get("enabled"): continue
-            if not self.is_started(session): continue
-
-            # The Director exists to break a silence. A live game means the channel is
-            # anything but silent, and with the cast seated the round it queues would
-            # find nobody to speak -- so it would spend a director model call to
-            # produce nothing. Skip the channel until the table clears.
-            game_service = getattr(self.cog, "game_service", None)
-            if game_service and game_service.has_live_game(channel_id): continue
-            
-            last_event = session.setdefault("last_proactive_event", 0)
-            cooldown = pro.get("cooldown", 300)
-            if now - last_event < cooldown: continue
-            
-            chance = pro.get("chance", 10) / 100.0
-            if random.random() > chance: continue
-            
-            session["last_proactive_event"] = now
-            
-            await session['task_queue'].put(('proactive_trigger', None))
-            if not session.get('is_running') and (not session.get('worker_task') or session['worker_task'].done()):
-                task = self.cog.bot.loop.create_task(self.cog.generation_service._multi_profile_worker(channel_id))
-                session['worker_task'] = task
-                self.cog.background_tasks.add(task)
+            if channel_id not in self.cog.proactive_timers:
+                self.arm_proactivity(channel_id, session)
 
     @tasks.loop(seconds=60.0)
     async def evict_inactive_sessions_task(self):

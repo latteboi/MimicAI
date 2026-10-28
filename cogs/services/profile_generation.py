@@ -9,7 +9,7 @@ anything is written. A draft lives only on that view: nothing touches disk until
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
-from ..utils import lorebook
+from ..utils import fixed_examples, lorebook
 from ..utils.character_card import prompt_text
 from ..utils.constants import (AI_INSTRUCTIONS_PART_MAX_LENGTH, DEFAULT_CARD_IMPORT_PROMPT,
                                DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
@@ -265,7 +265,8 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
     Blocking file I/O; callers run it through `asyncio.to_thread`. The name and the
     profile limit are checked again because a draft can sit open for minutes. Every field
     is cut to the editor's own cap, which an imported card can run past. A card's
-    lorebook and its 18+ tag (`adult`) are written here too, before anyone can seat it.
+    lorebook, its fixed examples and its 18+ tag (`adult`) are written here too, before
+    anyone can seat it.
     """
     pm = cog.profile_manager
     index = pm._get_user_index(user_id)
@@ -288,6 +289,8 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
     prompts["ai_instructions"][0] = encrypt(draft["ai_instructions"][:AI_INSTRUCTIONS_PART_MAX_LENGTH])
     if draft.get("lorebook"):
         prompts["lorebook"] = lorebook.normalise(draft["lorebook"])
+    if draft.get("fixed_examples"):
+        prompts["fixed_examples"] = fixed_examples.normalise(draft["fixed_examples"])
     pm._save_profile_prompts(user_id, profile_name, prompts)
     if draft.get("adult"):
         pm.set_owner_adult_declaration(user_id, profile_name, True)
