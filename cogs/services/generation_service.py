@@ -25,7 +25,7 @@ from ..utils.constants import (
     LOG_TRIM_TARGET, LOG_TRIM_HIGH_WATER,
     PLACEMENT_REFUSALS,
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE,
-    ROUND_URL_MESSAGES_MAX, ROUND_URLS_SKIPPED_NOTE,
+    ROUND_URL_MESSAGES_MAX, ROUND_URLS_SKIPPED_NOTE, SPEAK_AGAIN_EMOJI,
 )
 from ..utils.helpers import (
     _format_api_error, _format_citation_subtext, _resolve_zoneinfo, _scrub_response_text,
@@ -315,6 +315,18 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if not any(p is seated for p in active_participants):
                     active_participants.insert(0, seated)
 
+        # Likewise the author a ⏯️ asks for by name: a press it lost to Chance handed the turn
+        # to whoever won theirs, or to nobody. ▶️ and 🍿 ask only for the next seat, which
+        # rolls like any. Skipped or gone since the press, it is not brought back.
+        first = triggers[0] if triggers else None
+        is_reaction = isinstance(first, tuple) and first[0] in ('reaction', 'reaction_single')
+        if (is_reaction and first[0] == 'reaction_single'
+                and str(getattr(first[1], 'emoji', '')) == SPEAK_AGAIN_EMOJI
+                and starting_profile_override in session['profiles']
+                and not starting_profile_override.get('is_skipped')
+                and starting_profile_override not in active_participants):
+            active_participants.insert(0, starting_profile_override)
+
         if not active_participants:
             return []
 
@@ -326,7 +338,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         if starting_profile_override:
             start_p = starting_profile_override
             if start_p.get('is_skipped') or start_p not in active_participants:
-                start_p = active_participants[0]
+                # A ▶️ or 🍿 asks for the next turn, not that seat's: lost, it walks on round
+                # the cast to the first seat that won its roll.
+                cast = session['profiles']
+                at = cast.index(start_p) if is_reaction and start_p in cast else None
+                walk = cast[at:] + cast[:at] if at is not None else []
+                start_p = next((p for p in walk if p in active_participants), active_participants[0])
 
             if session_mode == 'sequential':
                 self._turn_cast_to(session, start_p)
