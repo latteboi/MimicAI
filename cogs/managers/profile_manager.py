@@ -103,6 +103,8 @@ _REFUSED_INDEX_LOCK = threading.Lock()
 _VERDICT_LINE = re.compile(r"\W*(GENERAL|ADULT)\b[^\w:]*(?::\W*(\w+))?")
 #: The refusal check's one word, matched the same way.
 _CONFIRM_LINE = re.compile(r"\W*(YES|NO)\b", re.IGNORECASE)
+#: OpenRouter's out-of-credit refusal, as a classifier failure carries it (`openrouter.py`).
+_NO_CREDIT = "API Error 402"
 
 
 def _awaits_review(rating: Dict[str, Any]) -> bool:
@@ -865,7 +867,7 @@ class ProfileManager:
         Returns None for a malformed entry so callers can skip it.
         """
         name = None
-        published_at = 0
+        published_at = updated_at = 0
         status = "active"
 
         if isinstance(p_info, str) and ":" in p_info:
@@ -875,6 +877,7 @@ class ProfileManager:
             pid = p_info.get("original_pid") or p_info.get("original_profile_id")
             name = p_info.get("original_profile_name")
             published_at = p_info.get("published_at") or 0
+            updated_at = p_info.get("updated_at") or 0
             status = p_info.get("status", "active")
         else:
             return None
@@ -898,13 +901,10 @@ class ProfileManager:
         name = resolved or (name if name and name != "Unknown" else None)
 
         if not published_at:
-            # Sorting fallback for entries that predate published_at. The profile
-            # file is the one artefact guaranteed to exist for a live entry.
-            try:
-                published_at = os.path.getmtime(
-                    os.path.join(USERS_DIR, str(owner_id), "profiles", pid, "profile.json.gz"))
-            except OSError:
-                published_at = 0
+            # An "owner_id:pid" entry carries no time. Its profile directory's birth, never
+            # the profile file's mtime: every save rewrites that file, so a profile in use
+            # kept jumping to the top of Newest as if republished.
+            published_at = birth_time(os.path.join(USERS_DIR, str(owner_id), "profiles", pid)) or 0
 
         return {
             "id": entry_id,
@@ -912,6 +912,8 @@ class ProfileManager:
             "original_pid": pid,
             "profile_name": name or "Unknown",
             "published_at": published_at,
+            # A new listing is an update too; a republish with nothing edited is not.
+            "updated_at": max(updated_at, published_at),
             "status": status,
             "orphaned": orphaned,
         }
@@ -1016,17 +1018,27 @@ class ProfileManager:
 
         By PID: an entry's stored name is a snapshot from publishing, so a profile renamed
         since could not be found by name. Existing borrows are untouched. Blocking.
+
+        When it was first published is kept, in About Me's sparse block, for `list_public`:
+        published again, it returns to its place in Newest rather than taking the top.
         """
         pid = self._get_pid_from_name(owner_id, profile_name)
         if not pid:
             return False
-        entry_ids = [d["id"] for d in self._iter_public_entries(owner_id, include_orphaned=True)
-                     if d["original_pid"] == pid]
-        for entry_id in entry_ids:
-            self.cog.public_profiles.pop(entry_id, None)
-        if entry_ids:
+        entries = [d for d in self._iter_public_entries(owner_id, include_orphaned=True)
+                   if d["original_pid"] == pid]
+        for d in entries:
+            self.cog.public_profiles.pop(d["id"], None)
+        if entries:
             self._save_public_index()
-        return bool(entry_ids)
+            about = self.get_user_about(owner_id)
+            # Pruned to profiles the owner still has, so it never outgrows them.
+            first = {p: t for p, t in (about.get("first_published") or {}).items()
+                     if self._get_name_from_pid(owner_id, p) is not None}
+            first[pid] = first.get(pid) or min(int(d["published_at"]) for d in entries)
+            about["first_published"] = first
+            self.save_user_about(owner_id, about)
+        return bool(entries)
 
     def library_search_text(self, owner_id: int, pid: str) -> str:
         """A listing's display name and intro, lower-cased, for the Library's search.
@@ -3249,12 +3261,13 @@ class ProfileManager:
         if answered_by is None:
             # A model replying with no verdict is never General and never Refused: the
             # operator reviews it. Retrying cannot help within the backoff window either
-            # -- a key is not going to appear in fifteen seconds, and a block is not
-            # lifted -- so tell the caller not to bother.
+            # -- a key is not going to appear in fifteen seconds, credit is not bought, and
+            # a block is not lifted -- so tell the caller not to bother.
             self._last_classify_flagged = bool(no_verdicts)
             self._last_classify_failure = "; ".join(failures + no_verdicts) or "unknown"
             self._last_classify_retryable = not no_verdicts and (
-                not all("no usable key" in f for f in failures) if failures else True)
+                not all("no usable key" in f or _NO_CREDIT in f for f in failures)
+                if failures else True)
             return None
 
         match = _VERDICT_LINE.match(raw)
@@ -3475,6 +3488,14 @@ class ProfileManager:
                     current.pop(key, None)
                 IOManager.write_json(current, REFUSED_INDEX_FILE)
         return sorted(live, key=lambda row: row[2])
+
+    @staticmethod
+    def rating_failure_hint(rating: Dict[str, Any]) -> str:
+        """The likeliest fix for a classification that gave up, read off the failure it stored."""
+        if _NO_CREDIT in (rating.get("check_failure") or rating.get("reason") or ""):
+            return ("Your OpenRouter account is out of credit, which the rating models need: "
+                    "top it up at <https://openrouter.ai/settings/credits>.")
+        return "This usually means no API key was available: check `/settings`."
 
     def _record_classification_failure(self, owner_id: int, profile_name: str, reason: str,
                                        flagged: bool = False):
@@ -3771,8 +3792,7 @@ class ProfileManager:
                 return False, "This profile is already awaiting a verdict."
             if time.time() < retry_after:
                 return False, (f"The last attempt failed and it will retry "
-                               f"<t:{int(retry_after)}:R>. This usually means no API key "
-                               f"was available -- check `/settings`.")
+                               f"<t:{int(retry_after)}:R>. {self.rating_failure_hint(rating)}")
         if verdict == CONTENT_RATING_ADULT and await asyncio.to_thread(
                 self._is_owner_declared_adult, owner_id, profile_name):
             return False, ("You have declared this profile 18+. Withdraw the declaration "
@@ -3835,7 +3855,12 @@ class ProfileManager:
             if not ok:
                 return False, message
         await self.await_classification(owner_id, profile_name)
-        return self.content_capability(owner_id, profile_name, capability)
+        allowed, reason = self.content_capability(owner_id, profile_name, capability)
+        rating = (self._get_profile_config(owner_id, profile_name, False) or {}).get("content_rating") or {}
+        if not allowed and rating.get("source") == "failed":
+            # Given up, not still running: "waiting on the verdict" would send them off to wait.
+            return False, f"The content rating could not be reached. {self.rating_failure_hint(rating)}"
+        return allowed, reason
 
     async def publish_profile(self, owner_id: int, profile_name: str) -> Tuple[bool, Optional[str]]:
         """Lists one of the owner's profiles in the Public Library, rating it first if it
@@ -3848,15 +3873,51 @@ class ProfileManager:
         allowed, reason = await self.rate_for_distribution(owner_id, profile_name, "publish")
         if not allowed:
             return False, reason
-        pid = self._get_pid_from_name(owner_id, profile_name)
-        if not pid:
+        if not self.list_public(owner_id, profile_name):
             return False, "Profile not found."
-        self.cog.public_profiles[pid] = f"{owner_id}:{pid}"
         # On the loop: write_json's temp name is fixed, so two threads saving the index at
         # once would trip over each other, and the dict is the loop's to mutate.
         self._save_public_index()
         self.note_publishes(owner_id, 1)
         return True, None
+
+    def list_public(self, owner_id: int, profile_name: str) -> Optional[str]:
+        """Puts one profile in the public index; its PID, or None if it has none. The
+        caller saves the index.
+
+        Newest sorts by when it was first published, which a republish keeps
+        (`unpublish_profile`), so unlisting and listing again buys no place. Recently
+        Updated sorts by when its rating last landed: an edit cannot be listed unrated.
+        """
+        pid = self._get_pid_from_name(owner_id, profile_name)
+        if not pid:
+            return None
+        first = (self.get_user_about(owner_id).get("first_published") or {}).get(pid)
+        self.cog.public_profiles[pid] = {"owner_id": int(owner_id), "original_pid": pid,
+                                         "published_at": first or int(time.time()),
+                                         "updated_at": self._rated_at(owner_id, profile_name)}
+        return pid
+
+    def _rated_at(self, owner_id: int, profile_name: str) -> int:
+        """When the profile's rating landed, in epoch seconds; 0 if it has none."""
+        rating = (self._get_profile_config(owner_id, profile_name, False) or {}).get("content_rating") or {}
+        try:
+            return int(datetime.datetime.fromisoformat(rating["at"]).timestamp())
+        except (KeyError, TypeError, ValueError):
+            return 0
+
+    def _restamp_listing(self, owner_id: int, profile_name: str) -> None:
+        """Moves a listed profile's Recently Updated time to its new rating's. On the loop:
+        the dict is the loop's to mutate."""
+        pid = self._get_pid_from_name(owner_id, profile_name)
+        entry_ids = [d["id"] for d in self._iter_public_entries(owner_id) if d["original_pid"] == pid]
+        for entry_id in entry_ids:
+            entry = self.cog.public_profiles[entry_id]
+            if not isinstance(entry, dict):  # "owner_id:pid"; its Newest falls back as before
+                entry = {"owner_id": int(owner_id), "original_pid": pid}
+            self.cog.public_profiles[entry_id] = {**entry, "updated_at": self._rated_at(owner_id, profile_name)}
+        if entry_ids:
+            self._save_public_index()
 
     # Publishes in the last 24 hours, as epoch seconds, in About Me's sparse block beside
     # the share settings: `published_times` only while it holds one.
@@ -3995,6 +4056,8 @@ class ProfileManager:
 
                 if rating:
                     stored = await asyncio.to_thread(self._store_content_rating, owner_id, profile_name, rating)
+                    if stored:
+                        self._restamp_listing(owner_id, profile_name)
                     if stored and rating.get("confirmed_by"):
                         # Two models agreed; a refusal awaiting review strikes only when
                         # the operator upholds it (`uphold_refusal`). On the loop: the

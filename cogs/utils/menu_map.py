@@ -139,7 +139,7 @@ _STATIC_DASHBOARDS = [
         "`/profile hub`",
         [
             ("Public Library (opens here)", [
-                "Browse and borrow published profiles; Sort switches Newest and Most Borrowed",
+                "Browse and borrow published profiles; Sort steps through Most Borrowed, Newest and Recently Updated",
                 "Search by profile name, creator, display name or intro; Generate",
                 "Publish Yours: list or unlist your profiles (Apply Changes), Edit Intro with one "
                 "selected; a profile not rated yet is rated by the press"]),

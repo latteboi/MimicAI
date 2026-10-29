@@ -1029,6 +1029,7 @@ _MEDIA_READER_CHAINS = {
 #: side, and Gemini 3.8 Flash on both as the last resort: asked only when the Primary is
 #: down or gives no verdict, and to confirm a Primary's refusal. Never at the owner's
 #: request, so it is no second opinion they can shop for. `_classify_profile_content`.
+#: Both OpenRouter models are paid, which Content Safety and its help text tell the owner.
 _CLASSIFIER_CHAINS = {'gemini': ('GOOGLE/gemini-3-flash-preview', 'GOOGLE/gemini-3.8-flash'),
                       'openrouter': (CLAUDE_HAIKU_MODEL, 'OPENROUTER/google/gemini-3.8-flash')}
 #: Each reader's slots, Primary then Fallback.

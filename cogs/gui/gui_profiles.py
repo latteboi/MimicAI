@@ -6989,8 +6989,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
                                   "will review it.")
                     elif rating.get("retry_after") and time.time() < rating["retry_after"]:
                         value += (f"\nThe last check failed and it will retry "
-                                  f"<t:{int(rating['retry_after'])}:R> — check `/settings` "
-                                  f"for an API key.")
+                                  f"<t:{int(rating['retry_after'])}:R>. "
+                                  f"{pm.rating_failure_hint(rating)}")
                 embed.add_field(name="Set by", value=value, inline=False)
             else:
                 reason = CONTENT_RATING_REASON_LABELS.get(
@@ -7024,8 +7024,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
                 embed.add_field(
                     name="Held up",
                     value=(f"The last attempt failed and it will retry "
-                           f"<t:{int(retry_after)}:R>.\nThis usually means no API key was "
-                           f"available — check `/settings`."),
+                           f"<t:{int(retry_after)}:R>.\n{pm.rating_failure_hint(rating)}"),
                     inline=False)
 
         # The capability list, rendered from the table the gates actually read.
@@ -7058,7 +7057,10 @@ class ContentSafetyView(BlockedGuard, ui.View):
             name="What gets checked",
             value=("The profile name, display name, avatar image, persona and AI "
                    "instructions.\nNever your long-term memories, training examples, or "
-                   "any conversation."),
+                   "any conversation."
+                   + ("" if self.is_borrowed else
+                      "\nIt is checked on your own API key; on OpenRouter the rating models "
+                      "are paid ones, so it needs credit.")),
             inline=False)
 
         if self.is_mod_view and self.is_bot_owner:
@@ -7310,8 +7312,9 @@ class PostEditRatingView(BlockedGuard, ui.View):
                 # A failed job leaves a real verdict where it was, so the old rating is
                 # still standing. This used to announce it as the new one.
                 text = ("The re-check did not reach a verdict, usually because no API key was "
-                        "available (check `/settings`). The rating is still out of date. Try "
-                        "again from **Content Safety**.")
+                        "available or its OpenRouter account is out of credit (check "
+                        "`/settings`). The rating is still out of date. Try again from "
+                        "**Content Safety**.")
             else:
                 verdict, _rating = await asyncio.to_thread(
                     pm._content_rating_state, self.user_id, self.profile_name)

@@ -83,13 +83,17 @@ class HubStatsView(HubBaseView):
         embed = await asyncio.to_thread(self.build_embed)
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
 
+#: The Library's orders, in the order Sort steps through them.
+LIBRARY_SORTS = {"borrowed": "Most Borrowed", "new": "Newest", "updated": "Recently Updated"}
+
+
 class HubPublicLibraryView(HubBaseView):
     #: Profiles per dropdown page: 25 options, less the three page controls above them.
     PER_PAGE = 22
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, filtered_list=None):
         super().__init__(cog, interaction, "library")
-        #: "borrowed" (most borrowers first) or "new" (newest first).
+        #: A key of LIBRARY_SORTS.
         self.sort = "borrowed"
         self.all_public = []
         self._load_public_data()
@@ -110,7 +114,10 @@ class HubPublicLibraryView(HubBaseView):
         self.all_public = self._sorted(self.cog.profile_manager._iter_public_entries())
 
     def _sorted(self, entries):
-        """Newest first, or most borrowed first with newest breaking ties."""
+        """Newest first, most recently updated first, or most borrowed first with newest
+        breaking ties."""
+        if self.sort == "updated":
+            return sorted(entries, key=lambda x: x['updated_at'], reverse=True)
         newest = sorted(entries, key=lambda x: x['published_at'], reverse=True)
         if self.sort != "borrowed":
             return newest
@@ -170,8 +177,7 @@ class HubPublicLibraryView(HubBaseView):
         add_button(self, "Search", self.search_cb, row=1)
         add_button(self, "Generate", self.generate_cb, row=1,
                    style=discord.ButtonStyle.blurple, emoji="✨")
-        add_button(self, "Sort: Most Borrowed" if self.sort == "borrowed" else "Sort: Newest",
-                   self.sort_cb, row=2)
+        add_button(self, f"Sort: {LIBRARY_SORTS[self.sort]}", self.sort_cb, row=2)
         add_button(self, "Publish Yours", self.publish_cb, row=2,
                    style=discord.ButtonStyle.green, emoji="🌐")
 
@@ -320,7 +326,8 @@ class HubPublicLibraryView(HubBaseView):
         await i.response.send_modal(modal)
 
     async def sort_cb(self, i: discord.Interaction):
-        self.sort = "new" if self.sort == "borrowed" else "borrowed"
+        order = list(LIBRARY_SORTS)
+        self.sort = order[(order.index(self.sort) + 1) % len(order)]
         searching = self.filtered_list is not self.all_public
         self.all_public = self._sorted(self.all_public)
         self.filtered_list = self._sorted(self.filtered_list) if searching else self.all_public
@@ -896,9 +903,8 @@ class HubShareManagerView(HubBaseView):
         failed_list.update(over_limit)
         published_list = []
         for name in allowed:
-            pid_entry = pm._get_pid_from_name_any(self.user_id, name)
-            self.cog.public_profiles[pid_entry] = f"{self.user_id}:{pid_entry}"
-            published_list.append(name)
+            if pm.list_public(self.user_id, name):
+                published_list.append(name)
         if published_list:
             pm._save_public_index()
             pm.note_publishes(self.user_id, len(published_list))
