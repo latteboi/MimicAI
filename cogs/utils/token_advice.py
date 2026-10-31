@@ -261,10 +261,13 @@ def session_advice(session: Dict[str, Any], seats: Sequence[Tuple[Dict[str, Any]
     # one for somebody, or where its synopsis is a cost of its own.
     if compaction.get("enabled"):
         synopsis = round(compaction.get("max_words", 220) * 4 / 3)
+        # Against the idle mark, the shallower of the two: a window short of it is short of
+        # every fold, where one short only of `threshold` is still shortened by quiet ones.
         unshortened = [str(seat.get("profile_name") or "?") for seat, cfg in seats
-                       if stm_window(cfg)[1] <= compaction["threshold"] - compaction["chunk"]]
+                       if stm_window(cfg)[1] <= compaction["idle_threshold"] - compaction["chunk"]]
         if unshortened or synopsis >= STANDING_ITEM_TOKENS:
-            text = (f"Once {compaction['threshold']} turns are live, a summariser call folds the oldest "
+            text = (f"Once {compaction['threshold']} turns are live, or {compaction['idle_threshold']} and "
+                    f"the channel goes quiet, a summariser call folds the oldest "
                     f"{compaction['chunk']} into the synopsis, up to ~{synopsis:,} tokens, which then goes to "
                     "every character on every call.")
             if unshortened:

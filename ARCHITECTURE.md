@@ -417,6 +417,11 @@ every synopsis. It claims `is_compacting`, which the worker waits on before a ro
 captures its positions, and switches the rolling synopsis on, since a fold made with it
 off would be hidden from nobody and read by no one.
 
+The rolling synopsis folds at a round's end once `threshold` turns are live, and sooner from
+the eviction sweep: a session quiet for five minutes folds at `idle_threshold`
+(`start_idle_compaction`, under `is_compacting`), while nobody waits on the summariser and the
+prompt cache is cold anyway, and is evicted on a later tick.
+
 ### Histories are derived, never maintained
 
 There is exactly one `unified_log` per session. Each participant's view of the conversation

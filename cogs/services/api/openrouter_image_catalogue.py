@@ -50,7 +50,7 @@ class ImageModelInfo(NamedTuple):
     name: str
     author: str
     #: What it accepts, as `image_model_caps` hands it to the pickers and the request path.
-    #: Sizes stop at IMAGE_SIZES_ALL's 2K. "auto" is kept out of ratios and qualities: it is
+    #: Sizes are IMAGE_SIZES_ALL's, up to 4K. "auto" is kept out of ratios and qualities: it is
     #: the absence of a choice, which a blank setting already sends.
     ratios: Tuple[str, ...]
     sizes: Tuple[str, ...]

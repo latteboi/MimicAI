@@ -1707,6 +1707,9 @@ class SessionManager:
         inactive_threshold = 300
 
         keys_to_evict = set()
+        # Popped but not evicted yet: pushed back once the walk is done, so a later tick
+        # looks again. Dropped, the session stayed hydrated until something touched it.
+        deferred = []
 
         # O(1) Heap Peek: Only evaluate sessions that have officially expired
         while self.cog.eviction_heap and now - self.cog.eviction_heap[0][0] > inactive_threshold:
@@ -1722,8 +1725,17 @@ class SessionManager:
                     # profile answer with no history at all.
                     if session and (any(session.get(flag) for flag in SESSION_BUSY_FLAGS)
                                     or session.get('whisper_waiting')):
+                        deferred.append((ts, key))
+                        continue
+                    # Quiet and still in memory: the cheapest moment to fold it. Evicted
+                    # on a later tick, once the fold has released the channel.
+                    if (session and self.cog.has_lock
+                            and self.cog.generation_service.start_idle_compaction(key, session)):
+                        deferred.append((ts, key))
                         continue
                 keys_to_evict.add(key)
+        for entry in deferred:
+            heapq.heappush(self.cog.eviction_heap, entry)
 
         for key in keys_to_evict:
             # Handle multi-profile sessions (key is channel_id int)

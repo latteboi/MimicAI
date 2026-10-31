@@ -19,7 +19,7 @@ from ..utils.constants import (
     VOICE_SAMPLE_GEMINI_ACCEPTED, VOICE_SAMPLE_GEMINI_REFUSED, VOICE_SAMPLE_GEMINI_UNCHECKED,
 )
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor, speaks_verbatim, tighten_line_spacing
-from ..utils.attachment_limits import over_attachment_limit, skipped_attachment_note
+from ..utils.attachment_limits import over_attachment_limit, refuse_oversized_upload, skipped_attachment_note
 from .api.google_rest import GoogleSpeechModel
 from .generation import tool_loop
 from .generation.reply import _merge_sources
@@ -370,6 +370,10 @@ class MediaService:
                                 package['generated_image_path'] = await self.cog.api_service.materialise_inline_data(
                                     response, image_data, image_suffix_for_mime(image_mime))
                                 image_data = None
+                                failure_reason = refuse_oversized_upload(
+                                    package['generated_image_path'], getattr(channel, 'guild', None))
+                                if failure_reason:
+                                    package['generated_image_path'] = None
                             if response is not None:
                                 # Unlinks any blob the package did not take -- what a
                                 # safety block or a fallback attempt leaves behind.
@@ -757,6 +761,11 @@ class MediaService:
                     # carries the type: an OpenRouter model may answer in JPEG.
                     request_data['generated_image_path'] = await self.cog.api_service.materialise_inline_data(
                         response, image_data, image_suffix_for_mime(image_mime))
+                    failure_reason = refuse_oversized_upload(
+                        request_data['generated_image_path'],
+                        getattr(self.cog.bot.get_channel(request_data['channel_id']), 'guild', None))
+                    if failure_reason:
+                        request_data['generated_image_path'] = None
                 # image_data and response are only rebound when the *next* request
                 # arrives, and this worker spends most of its life blocked on the
                 # queue below -- so without dropping them here, whatever the last

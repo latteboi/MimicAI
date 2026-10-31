@@ -2484,7 +2484,8 @@ class SessionConfigView(BlockedGuard, ui.View):
             "them back. Private whispers are never summarised."
         )
         embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
-        embed.add_field(name="Trigger", value=f"Every `{cfg['threshold']}` turns", inline=True)
+        embed.add_field(name="Trigger", value=f"Every `{cfg['threshold']}` turns, or `{cfg['idle_threshold']}` "
+                                              "once the channel goes quiet", inline=True)
         embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
         embed.add_field(name="Length", value=f"About `{cfg['max_words']}` words", inline=True)
         primary, fallbacks = self.cog.api_service.model_chain(

@@ -5,9 +5,11 @@ point where it can: a 500 MB video streamed to disk is safe for memory, and is s
 to the provider and billed by its length. `_stream_to_tempfile` enforces the same limit while
 it downloads, for media that arrives with no stated size.
 """
+import os
 from typing import Any, Optional
 
-from .constants import ATTACHMENT_SKIPPED_NOTE, DOCUMENT_MIME_TYPES, defaultConfig
+from .constants import (ATTACHMENT_SKIPPED_NOTE, DOCUMENT_MIME_TYPES, ERR_REASON_IMAGE_TOO_LARGE,
+                        defaultConfig)
 from .helpers import attachment_mime
 
 _MB = 1024 * 1024
@@ -19,6 +21,22 @@ _DISCORD_DEFAULT_UPLOAD_BYTES = 20 * _MB
 def upload_limit_bytes(guild: Any) -> int:
     """The largest file the bot may post in `guild` -- the outbound limit, not the one above."""
     return max(guild.filesize_limit, _DISCORD_DEFAULT_UPLOAD_BYTES)
+
+
+def refuse_oversized_upload(path: Optional[str], guild: Any) -> Optional[str]:
+    """Deletes a generated image too large to post in `guild` and says why; None if it fits.
+
+    Asked before the character sees the image, so it is told the picture failed instead of
+    presenting one Discord then drops -- after a 20 MB upload -- with only a console line.
+    """
+    if not path:
+        return None
+    size = os.path.getsize(path)
+    limit = upload_limit_bytes(guild) if guild is not None else _DISCORD_DEFAULT_UPLOAD_BYTES
+    if size <= limit:
+        return None
+    os.remove(path)
+    return ERR_REASON_IMAGE_TOO_LARGE.format(size=f"{size / _MB:.1f}", limit=limit // _MB)
 
 
 def attachment_size(attachment: Any) -> Optional[int]:

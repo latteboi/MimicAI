@@ -625,13 +625,10 @@ IMAGE_ASPECT_RATIOS_COMMON = (
     '1:1', '2:3', '3:2', '3:4', '4:3', '4:5', '5:4', '9:16', '16:9', '21:9',
 )
 
-#: Stops at 2K though 3.1 Flash and 3 Pro both draw 4K. Either reason suffices: a 4K PNG
-#: routinely clears Discord's 10 MB limit on an unboosted guild, and the image path holds
-#: ~3.6x the file resident at peak (wire body, base64, decode) -- the largest allocation
-#: this box would ever make, for an image it then fails to upload.
-IMAGE_SIZE_CAP = '2K'
-
-IMAGE_SIZES_ALL = ('512', '1K', '2K')
+#: 4K streams to disk like any other size (cogs/utils/blob_stream), but a 4K PNG lands near
+#: Discord's 20 MiB unboosted limit, so one over it is refused before anything reads it --
+#: `refuse_oversized_upload` -- rather than posted and dropped by Discord.
+IMAGE_SIZES_ALL = ('512', '1K', '2K', '4K')
 
 #: model id -> what it will actually honour, keyed bare because that is what reaches the
 #: API. Empty `sizes` means one fixed resolution and a rejected imageSize; `thinking`
@@ -652,12 +649,12 @@ IMAGE_SIZES_ALL = ('512', '1K', '2K')
 _GOOGLE_IMAGE_CAPS_SHARED = {'quality': (), 'formats': (), 'max_refs': None, 'sampling': True}
 
 IMAGE_MODEL_CAPS = {
-    'gemini-3.1-flash-image':      {'sizes': ('512', '1K', '2K'), 'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': True,  **_GOOGLE_IMAGE_CAPS_SHARED},
+    'gemini-3.1-flash-image':      {'sizes': ('512', '1K', '2K', '4K'), 'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': True,  **_GOOGLE_IMAGE_CAPS_SHARED},
     # 1K and nothing else. It was listed with ('512', '1K') from the 3.1 Flash row; the
     # published table gives the Lite model one resolution, so an empty tuple is the
     # honest encoding -- send no imageSize and let the model use the only one it has.
     'gemini-3.1-flash-lite-image': {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': False, 'image_search': False, **_GOOGLE_IMAGE_CAPS_SHARED},
-    'gemini-3-pro-image':          {'sizes': ('1K', '2K'),        'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': False, **_GOOGLE_IMAGE_CAPS_SHARED},
+    'gemini-3-pro-image':          {'sizes': ('1K', '2K', '4K'),  'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': False, **_GOOGLE_IMAGE_CAPS_SHARED},
     'gemini-2.5-flash-image':      {'sizes': (),                  'ratios': IMAGE_ASPECT_RATIOS_COMMON, 'thinking': False, 'modalities': ('TEXT', 'IMAGE'),   'grounding': False, 'image_search': False, **_GOOGLE_IMAGE_CAPS_SHARED},
 }
 
@@ -693,7 +690,8 @@ IMAGE_ASPECT_RATIO_NOTES = {
 IMAGE_SIZE_NOTES = {
     '512': '0.5K — fastest and cheapest',
     '1K': '1024px on the long edge — the usual choice',
-    '2K': '2048px — the largest that still uploads to Discord',
+    '2K': '2048px — fits any server',
+    '4K': '4096px — can exceed an unboosted server\'s 20 MB upload limit',
 }
 
 IMAGE_THINKING_NOTES = {
@@ -3112,6 +3110,7 @@ VOICE_SAMPLE_SLOTS_FULL = (
 
 ERR_REASON_AUDIO_TOO_LARGE = "{size} MB of audio, over this server's {limit} MB upload limit"
 ERR_REASON_AUDIO_NOT_UPLOADED = "Discord refused the audio file as too large"
+ERR_REASON_IMAGE_TOO_LARGE = "the image came to {size} MB, over this server's {limit} MB upload limit; a lower resolution fits"
 ERR_REASON_LOW_MEMORY = "the server is low on memory right now; try again shortly"
 
 #: Stands in a user's turn for an attachment over LIMIT_ATTACHMENT_BYTES, which is never

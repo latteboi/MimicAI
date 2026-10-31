@@ -1,6 +1,7 @@
 from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, STATUS_IMAGINING_IMAGE
 from ...utils.helpers import (_format_api_error, _resolve_safety_settings, image_suffix_for_mime,
                              resolve_url_mode)
+from ...utils.attachment_limits import refuse_oversized_upload
 from ...utils.memory_tuning import maybe_trim_malloc
 from ...utils import mem_probe
 
@@ -162,6 +163,9 @@ class ImageRoundMixin:
                             generated_image_path_for_round = await self.cog.api_service.materialise_inline_data(
                                 response, img_data, image_suffix_for_mime(image_part.mime_type))
                         img_data = None
+                        image_gen_error_msg = refuse_oversized_upload(generated_image_path_for_round, channel.guild)
+                        if image_gen_error_msg:
+                            generated_image_path_for_round = None
                     else:
                         image_gen_error_msg = "no image data returned"
                     image_part = None

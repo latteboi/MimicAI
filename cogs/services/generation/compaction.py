@@ -1,3 +1,4 @@
+import asyncio
 import time
 import uuid
 import datetime
@@ -77,6 +78,8 @@ def resolve_compaction_settings(session: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "enabled": SessionManager.compaction_enabled(session),
         "threshold": threshold,
+        # Due sooner once the channel is quiet -- see `_plan_compaction`.
+        "idle_threshold": min(threshold, chunk + COMPACT_KEEP_DEFAULT),
         "chunk": chunk,
         "max_words": words,
     }
@@ -124,8 +127,16 @@ class SessionCompactionMixin:
                 return (unified_log[i].get("content") or "").strip() or None
         return None
 
-    def _plan_compaction(self, session: Dict[str, Any]) -> Optional[Tuple[List[int], Dict[str, Any]]]:
+    def _plan_compaction(self, session: Dict[str, Any],
+                         idle: bool = False) -> Optional[Tuple[List[int], Dict[str, Any]]]:
         """The indices to fold this pass, or None if the session is not due.
+
+        Due at `threshold` live turns at a round's end. `idle` -- the eviction sweep, the
+        session quiet for five minutes -- is due sooner, at `idle_threshold` (a chunk plus
+        COMPACT_KEEP_DEFAULT), so a session with pauses folds while nobody waits on the
+        summariser and the provider's prompt cache has gone cold anyway. Never later than
+        `threshold`: the default STM window equals it (`CHATBOT_MEMORY_LENGTH`), and a turn
+        past both the window and the synopsis is read by nobody.
 
         Returns positions rather than turn objects because the synopsis has to be
         inserted at the end of the folded range to keep the transcript chronological.
@@ -139,7 +150,7 @@ class SessionCompactionMixin:
             return None
 
         candidates = self._compactable_indices(unified_log)
-        if len(candidates) < settings["threshold"]:
+        if len(candidates) < settings["idle_threshold" if idle else "threshold"]:
             return None
         # Backing off after a failure. On a server where neither summariser can run,
         # every round end used to spend both attempts again, for the life of the session.
@@ -148,38 +159,66 @@ class SessionCompactionMixin:
 
         return candidates[:settings["chunk"]], settings
 
-    async def _run_session_compaction(self, channel_id: int) -> bool:
+    async def _run_session_compaction(self, channel_id: int, *, idle: bool = False) -> bool:
         """Fold this session's oldest public turns into a synopsis. True if it ran.
 
-        Called at round end, once the round's own flush has landed. Never during a
-        round: inserting a turn shifts every index after it, and `batch_start_index`
-        is captured at round start and read when each participant's prompt is built.
+        Called at round end, once the round's own flush has landed, or `idle` by
+        `start_idle_compaction`. Never during a round: inserting a turn shifts every
+        index after it, and `batch_start_index` is captured at round start and read when
+        each participant's prompt is built.
         """
         session = self.cog.multi_profile_channels.get(channel_id)
         if not session or not session.get("is_hydrated"):
             return False
 
-        # is_running is set by the worker that called us, so it is excluded here; the
-        # rest are the claims that mean another operation is mid-flight on this channel.
-        if any(session.get(flag) for flag in SESSION_BUSY_FLAGS if flag != 'is_running'):
+        # The caller's own claim is excluded -- is_running for the worker at round end,
+        # is_compacting for an idle fold; the rest mean another operation is mid-flight.
+        held = 'is_compacting' if idle else 'is_running'
+        if any(session.get(flag) for flag in SESSION_BUSY_FLAGS if flag != held):
             return False
 
-        plan = self._plan_compaction(session)
+        plan = self._plan_compaction(session, idle)
         if plan is None:
             return False
         indices, settings = plan
 
         folded = await self._fold(channel_id, session, indices, settings)
-        if folded is None:
+        if not folded:
             # Tried again once another fold's worth of public turns has built up. Held in
-            # memory only: a restart is a fair moment to try again.
+            # memory only: a restart is a fair moment to try again. A fold of nothing
+            # waits too, or the idle sweep would retry it every minute and never evict.
             session["_compaction_retry_at"] = (
                 len(self._compactable_indices(session.get("unified_log") or [])) + settings["chunk"])
             return False
-        if not folded:
-            return False
         session.pop("_compaction_retry_at", None)
         await self._flush_folds(channel_id, session)
+        return True
+
+    def start_idle_compaction(self, channel_id: int, session: Dict[str, Any]) -> bool:
+        """Folds a quiet session in the background if it is due. True if started.
+
+        The eviction sweep calls this on a session it found idle and not busy, and the
+        claim is taken before returning, with no await since that check: the worker waits
+        on is_compacting, so no round can capture its positions under the fold.
+        """
+        if not session.get("is_hydrated") or self._plan_compaction(session, idle=True) is None:
+            return False
+        session["is_compacting"] = True
+
+        async def fold():
+            try:
+                await self._run_session_compaction(channel_id, idle=True)
+            except Exception as e:
+                # Raised rather than failed: retried every minute, it would also keep the
+                # session from ever being evicted. Until a restart, as a failure waits.
+                session["_compaction_retry_at"] = float("inf")
+                print(f"[Compaction] Idle fold failed for channel {channel_id}: {e}")
+            finally:
+                session["is_compacting"] = False
+
+        task = asyncio.create_task(fold())
+        self.cog.background_tasks.add(task)
+        task.add_done_callback(self.cog.background_tasks.discard)
         return True
 
     @staticmethod
@@ -369,7 +408,8 @@ class SessionCompactionMixin:
         settings = self._compaction_settings(session)
         if settings["enabled"]:
             message += (f" The rolling synopsis is still on, so it folds {settings['chunk']} again at a "
-                        f"round's end whenever {settings['threshold']} or more turns are live. Turn it off "
+                        f"round's end whenever {settings['threshold']} or more turns are live, or once "
+                        f"{settings['idle_threshold']} are and the channel goes quiet. Turn it off "
                         "on the Compaction tab of `/session config` to keep them.")
         return message
 
