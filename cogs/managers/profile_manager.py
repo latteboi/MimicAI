@@ -2343,6 +2343,30 @@ class ProfileManager:
             message += f" {len(fresh) - len(added)} did not fit: a lorebook holds {LIMIT_LORE_ENTRIES}."
         return message
 
+    def add_fixed_examples(self, user_id: int, profile_name: str, new: List[Dict[str, str]]) -> str:
+        """An imported file's fixed examples, after the profile's own, as `add_lore_entries`
+        adds a book: one it already holds word for word is skipped, and as many as fit. Only on
+        a personal profile -- they live in its prompts, which a borrow never reads. Blocking."""
+        if profile_name not in self._get_user_index(user_id).get("personal", []):
+            return "❌ You can only add fixed examples to a personal profile you own."
+        prompts = self._get_profile_prompts(user_id, profile_name)
+        if prompts is None:
+            return "❌ That profile could not be found."
+        held = fixed_examples.entries(prompts.get("fixed_examples"))
+        have = {(e.get("said", ""), e["reply"]) for e in held}
+        fresh = [e for e in new if (e["said"], e["reply"]) not in have]
+        added = fresh[:max(0, LIMIT_FIXED_EXAMPLES - len(held))]
+        if added:
+            prompts["fixed_examples"] = fixed_examples.normalise(held + added)
+            self._save_profile_prompts(user_id, profile_name, prompts)
+        message = f"Added {len(added)} fixed example{'' if len(added) == 1 else 's'} to **{profile_name}**."
+        if len(new) > len(fresh):
+            message += f" {len(new) - len(fresh)} it already had were skipped."
+        if len(fresh) > len(added):
+            message += (f" {len(fresh) - len(added)} did not fit: a profile holds {LIMIT_FIXED_EXAMPLES} "
+                        "fixed examples. Import the rest as training examples, sent only when a message resembles them.")
+        return message
+
     def fixed_examples(self, user_id: int, profile_name: str) -> List[Dict[str, str]]:
         """This profile's own fixed examples, as their editor shows them. Blocking."""
         return fixed_examples.entries(

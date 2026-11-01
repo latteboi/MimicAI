@@ -10,14 +10,14 @@ from .utils.constants import (
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
     cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
-    IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
+    IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, LIMIT_FIXED_EXAMPLES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
     PERSONA_TEXT_INPUT_MAX_LENGTH,
     BOT_PERMISSIONS, invite_url, KOFI_URL, TOPGG_URL,
 )
 from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError, clean_display_name,
                                            draft_from_card, generate_draft, generator_models)
 from .utils.character_card import (CardError, card_portrait, prompt_text, profile_name_for, read_card,
-                                   read_lorebook)
+                                   read_examples, read_lorebook)
 from .utils.memory_tuning import low_memory
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import (ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered,
@@ -700,11 +700,13 @@ class MimicCog(EventListeners, commands.Cog):
 
     @app_commands.command(name="import", description="Import a MimicAI export, or a character card (PNG, CHARX or JSON).")
     @cooldown_unless_refused(1, 30.0, _unregistered)
-    @app_commands.describe(file="A .mimic file from a MimicAI instance, or a character card: a PNG, a CHARX or its JSON.",
-                           profile_name="Optional: add the file's lorebook to this profile of yours, not import a new one.")
+    @app_commands.describe(file="A .mimic file, a character card (PNG, CHARX or JSON), or examples as TXT or JSON.",
+                           profile_name="Optional: add from the file to this profile of yours (see add), not import a new one.",
+                           add="With profile_name: what to add from the file. The lorebook unless chosen.")
     @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
     async def import_command(self, interaction: discord.Interaction, file: discord.Attachment,
-                             profile_name: Optional[str] = None):
+                             profile_name: Optional[str] = None,
+                             add: Literal['lorebook', 'fixed_examples', 'training_examples'] = 'lorebook'):
         if await refuse_unregistered(self, interaction):
             return
         # Every kind of import below holds the whole file in memory.
@@ -712,7 +714,11 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.response.send_message(IMPORT_LOW_MEMORY, ephemeral=True)
             return
         if profile_name:
-            await self._import_lorebook(interaction, file, profile_name)
+            await self._import_into_profile(interaction, file, profile_name, add)
+            return
+        if add != 'lorebook':
+            await interaction.response.send_message(
+                "❌ Examples are added to a profile of yours: choose it as `profile_name` too.", ephemeral=True)
             return
         if file.filename.lower().endswith(('.png', '.json', '.charx')):
             await self._import_card(interaction, file)
@@ -745,30 +751,48 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.profile_manager._execute_import(interaction, file_bytes)
 
-    async def _import_lorebook(self, interaction: discord.Interaction, file: discord.Attachment,
-                               profile_name: str):
-        """`/import profile_name:`: a lorebook file (SillyTavern World Info), or a card's book,
-        added to a profile the user owns. `add_lore_entries` checks the ownership."""
-        is_json = file.filename.lower().endswith('.json')
-        limit = CARD_TEXT_MAX_BYTES if is_json else defaultConfig.LIMIT_ATTACHMENT_BYTES
-        if not (is_json or file.filename.lower().endswith(('.png', '.charx'))) or file.size > limit:
+    async def _import_into_profile(self, interaction: discord.Interaction, file: discord.Attachment,
+                                   profile_name: str, add: str):
+        """`/import profile_name:`: a file's lorebook (SillyTavern World Info, or a card's book),
+        fixed examples or training examples, added to a profile the user owns. Each `add_*`
+        checks the ownership. Training examples are embedded one by one, so that can take a
+        minute: the status ticks meanwhile."""
+        lower = file.filename.lower()
+        examples = add != 'lorebook'
+        is_text = lower.endswith('.json') or (examples and lower.endswith('.txt'))
+        limit = CARD_TEXT_MAX_BYTES if is_text else defaultConfig.LIMIT_ATTACHMENT_BYTES
+        if not (is_text or lower.endswith(('.png', '.charx'))) or file.size > limit:
+            what = "Examples come as a TXT or JSON file" if examples else "A lorebook is a JSON file"
             await interaction.response.send_message(
-                f"❌ A lorebook is a JSON file of at most {CARD_TEXT_MAX_BYTES // (1024 * 1024)} MB, or a card "
-                f"(PNG or CHARX) carrying one of at most {defaultConfig.LIMIT_ATTACHMENT_BYTES // (1024 * 1024)} MB.",
-                ephemeral=True)
+                f"❌ {what} of at most {CARD_TEXT_MAX_BYTES // (1024 * 1024)} MB, or a card (PNG or CHARX) "
+                f"carrying {'them' if examples else 'one'} of at most "
+                f"{defaultConfig.LIMIT_ATTACHMENT_BYTES // (1024 * 1024)} MB.", ephemeral=True)
             return
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        training = add == 'training_examples'
+        await send_status(interaction, "Embedding the examples..." if training else "Reading the file...")
         user_id = interaction.user.id
         name = self.profile_manager._get_user_appearance(user_id, profile_name).get("custom_display_name") or profile_name
         try:
-            book = await asyncio.to_thread(read_lorebook, await file.read(), file.filename, name)
+            data = await file.read()
+            if examples:
+                cap = defaultConfig.LIMIT_TRAINING if training else LIMIT_FIXED_EXAMPLES
+                found = await asyncio.to_thread(read_examples, data, file.filename, name, cap)
+            else:
+                found = await asyncio.to_thread(read_lorebook, data, file.filename, name)
         except CardError as e:
-            await interaction.followup.send(f"❌ **Import Rejected:** {suppress_link_previews(str(e))}",
-                                            ephemeral=True)
+            await settle_status(interaction, f"❌ **Import Rejected:** {suppress_link_previews(str(e))}")
             return
-        message = await asyncio.to_thread(self.profile_manager.add_lore_entries, user_id, profile_name, book)
-        await interaction.followup.send(message, ephemeral=True)
-        await maybe_prompt_rating_after_edit(self, interaction, user_id, profile_name)
+        del data
+        if training:
+            message = await self.memory_manager.add_training_examples(user_id, profile_name, found,
+                                                                      interaction.guild_id)
+        else:
+            add_to = self.profile_manager.add_fixed_examples if examples else self.profile_manager.add_lore_entries
+            message = await asyncio.to_thread(add_to, user_id, profile_name, found)
+        await settle_status(interaction, message)
+        # Training examples are outside the rated text (`_moderated_surface`).
+        if not training:
+            await maybe_prompt_rating_after_edit(self, interaction, user_id, profile_name)
 
     async def _import_card(self, interaction: discord.Interaction, file: discord.Attachment):
         """`/import` of a character card: read it, sort it into a draft, and show the draft

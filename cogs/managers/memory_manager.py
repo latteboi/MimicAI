@@ -66,6 +66,13 @@ def encode_embedding_b64(embedding: List[float]) -> str:
     return base64.b64encode(np.array(embedding, dtype=np.float16).tobytes()).decode('ascii')
 
 
+def _training_entry(said: str, reply: str, embedding: List[float]) -> Dict[str, str]:
+    """One stored training example: `said` is what retrieval matches, embedded by the caller."""
+    now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return {"id": str(uuid.uuid4())[:8], "created_ts": now_ts, "modified_ts": now_ts,
+            "u_in": said.strip(), "b_out": reply.strip(), "u_emb_b64": encode_embedding_b64(embedding)}
+
+
 #: How a summariser declines, in the forms it actually declines in. The prompt asks for
 #: NO_SUMMARY and nothing else; models add a full stop, bold it, write it with a space,
 #: or answer in plain words. Anchored, and the literal is the first thing required.
@@ -1222,13 +1229,76 @@ class MemoryManager:
         if not emb:
             return False, EMBEDDING_FAILED_MSG
 
-        b64_emb = encode_embedding_b64(emb)
-        now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        entry={"id":str(uuid.uuid4())[:8],"created_ts":now_ts, "modified_ts": now_ts, "u_in":usr_in.strip(),"b_out":bot_out.strip(),"u_emb_b64":b64_emb}
-        training_shard.append(entry)
+        training_shard.append(_training_entry(usr_in, bot_out, emb))
 
         await asyncio.to_thread(self._save_training_shard, owner_id_str, profile_name, training_shard)
         return True,f"Example added for profile '{profile_name}'. Total: {len(training_shard)}/{limit}"
+
+    async def add_training_examples(self, owner_id: int, profile_name: str, pairs: List[Dict[str, str]],
+                                    guild_id: Optional[int]) -> str:
+        """An imported file's examples, after the profile's own, for `/import`. Never
+        `add_new_training_example` per row: that seals the whole shard once an example.
+
+        What is a duplicate, has nothing said to match on, or does not fit is dropped before
+        anything is embedded, so no call is paid for a row that is not kept. The embeddings
+        run one at a time (a burst trips a free key's rate limit) with the shard unread, and
+        it is read again to append, so an edit made meanwhile is kept, not overwritten."""
+        owner = str(owner_id)
+        decrypt = self.cog.storage_manager._decrypt_data
+        limit = defaultConfig.LIMIT_TRAINING
+
+        def _held():
+            if profile_name not in self.cog.profile_manager._get_user_index(owner_id).get("personal", []):
+                return None
+            return self._load_training_shard(owner, profile_name) or []
+
+        held = await asyncio.to_thread(_held)
+        # A borrow's training is its source's (`_resolve_effective_profile`): one written
+        # onto it is never read.
+        if held is None:
+            return "❌ You can only add training examples to a personal profile you own."
+        if not self.cog.storage_manager._embedding_routes(guild_id, owner_id):
+            return f"❌ {NO_EMBEDDING_KEY_MSG}"
+        have = {(decrypt(e.get("u_in") or ""), decrypt(e.get("b_out") or "")) for e in held}
+        said = [p for p in pairs if p["said"]]
+        fresh = [p for p in said if (p["said"], p["reply"]) not in have]
+        todo = fresh[:max(0, limit - len(held))]
+
+        made, failed, in_a_row = [], 0, 0
+        for i, p in enumerate(todo):
+            emb = await self._get_embedding(p["said"], guild_id, task_type="RETRIEVAL_DOCUMENT",
+                                            owner_id=owner_id)
+            if emb:
+                made.append(_training_entry(p["said"], p["reply"], emb))
+                in_a_row = 0
+                continue
+            failed, in_a_row = failed + 1, in_a_row + 1
+            # ponytail: three straight failures read as a dead key or a spent quota; past it,
+            # 100 rows x 5 s x each route outlives the interaction's 15 minutes.
+            if in_a_row >= 3:
+                failed += len(todo) - i - 1
+                break
+
+        def _append() -> int:
+            shard = self._load_training_shard(owner, profile_name) or []
+            kept = made[:max(0, limit - len(shard))]
+            if kept:
+                self._save_training_shard(owner, profile_name, shard + kept)
+            return len(kept)
+
+        added = await asyncio.to_thread(_append) if made else 0
+        late = len(made) - added   # filled by another write while these embedded
+        message = f"Added {added} training example{'' if added == 1 else 's'} to **{profile_name}**."
+        if len(said) > len(fresh):
+            message += f" {len(said) - len(fresh)} it already had were skipped."
+        if len(pairs) > len(said):
+            message += (f" {len(pairs) - len(said)} had nothing said, which a training example is matched "
+                        "on: import those as fixed examples instead.")
+        if len(fresh) - len(todo) + late:
+            message += f" {len(fresh) - len(todo) + late} did not fit: a profile holds {limit} training examples."
+        if failed:
+            message += f" {failed} could not be embedded (the API may be busy or the key rejected); import the file again to add them."
+        return message
 
     async def update_training_example(self, profile_owner_id: int, profile_name: str, example_id: str, new_user_input: str, new_bot_response: str, guild_id: Optional[int]) -> Tuple[bool, str]:
         if not new_user_input.strip() or not new_bot_response.strip():

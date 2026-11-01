@@ -59,11 +59,15 @@ _CHAR_MACRO = re.compile(r"\{\{\s*char\s*\}\}|<bot>", re.IGNORECASE)
 _USER_MACRO = re.compile(r"\{\{\s*user\s*\}\}|<user>", re.IGNORECASE)
 _EXAMPLE_START = re.compile(r"<start>", re.IGNORECASE)
 _EXAMPLE_SPEAKER = re.compile(r"\s*(?:\{\{\s*(user|char)\s*\}\}|<(user|bot)>)\s*:\s*", re.IGNORECASE)
+_EXAMPLE_LABEL = re.compile(r"\s*(said|reply)\s*:\s*", re.IGNORECASE)
 _NSFW_TAGS = {"nsfw", "nsfl"}
 
 
 LOREBOOK_NOT_CARD = ("This is a lorebook, not a character card. To add it to one of your characters, "
                      "run `/import` again with that character as `profile_name`.")
+NO_EXAMPLES = ("This file holds no examples. Write them in a .txt file as `SAID:` and `REPLY:` blocks "
+               "with a `---` line between examples, or as SillyTavern dialogue (`<START>`, `{{user}}:`, "
+               "`{{char}}:`). A .json file can instead hold a list of `{\"said\": ..., \"reply\": ...}`.")
 
 
 class CardError(ValueError):
@@ -185,30 +189,58 @@ def _text(data: Dict[str, Any], key: str, name: str, limit: int) -> str:
     return clean_imported_text(_macros(value, name), limit) if isinstance(value, str) else ""
 
 
-def _examples(raw: Any, name: str) -> List[Dict[str, str]]:
+def _examples(raw: Any, name: str, limit: int = LIMIT_FIXED_EXAMPLES,
+              max_chars: int = DESCRIPTION_MAX_CHARS) -> List[Dict[str, str]]:
     """`mes_example` as fixed examples, which SillyTavern sends whole on every reply too:
     each `{{char}}:` line with the `{{user}}:` line straight before it as what was said,
     or nothing -- a character line on its own is a sample of the voice. Lines with no
-    speaker continue the one before."""
+    speaker continue the one before: gathered and joined once, since `+=` on a list's
+    string copies it every line, quadratic in a file of short lines."""
     if not isinstance(raw, str):
         return []
     pairs = []
-    for block in _EXAMPLE_START.split(raw[:DESCRIPTION_MAX_CHARS]):
-        turns: List[List[str]] = []
+    for block in _EXAMPLE_START.split(raw[:max_chars]):
+        turns: List[Tuple[str, List[str]]] = []
         for line in block.splitlines():
             m = _EXAMPLE_SPEAKER.match(line)
             if m:
                 who = (m.group(1) or m.group(2)).lower()
-                turns.append(["user" if who == "user" else "char", line[m.end():]])
+                turns.append(("user" if who == "user" else "char", [line[m.end():]]))
             elif turns:
-                turns[-1][1] += "\n" + line
-        for before, (who, answer) in zip([None] + turns, turns):
+                turns[-1][1].append(line)
+        for before, (who, lines) in zip([None] + turns, turns):
             if who == "char":
-                said = before[1] if before and before[0] == "user" else ""
-                pairs.append({"said": _macros(said, name), "reply": _macros(answer, name)})
-        if len(pairs) >= LIMIT_FIXED_EXAMPLES:
+                said = "\n".join(before[1]) if before and before[0] == "user" else ""
+                pairs.append({"said": _macros(said, name), "reply": _macros("\n".join(lines), name)})
+        if len(pairs) >= limit:
             break
-    return fixed_examples.normalise(pairs)
+    return fixed_examples.normalise(pairs, limit)
+
+
+def _labelled(raw: str, name: str, limit: int) -> List[Dict[str, str]]:
+    """`SAID:` and `REPLY:` blocks, the example editor's own two fields: a label starts its
+    side, on its own line or ahead of the text, and a reply runs to the next `SAID:` or a
+    rule line (`---`, `===`). A `REPLY:` with no `SAID:` straight before it is a sample of
+    the voice on its own. Anything outside a block -- headings, notes -- is not an example."""
+    pairs: List[Dict[str, List[str]]] = []
+    side = None
+    for line in raw.splitlines():
+        m = _EXAMPLE_LABEL.match(line)
+        if m:
+            label = m.group(1).lower()
+            if label == "said" or side != "said":
+                pairs.append({"said": [], "reply": []})
+            side = label
+            line = line[m.end():]
+            if not line:
+                continue
+        elif len(line.strip()) >= 3 and not line.strip().strip("-="):
+            side = None
+            continue
+        if side:
+            pairs[-1][side].append(line)
+    return fixed_examples.normalise(
+        [{k: _macros("\n".join(v), name) for k, v in p.items()} for p in pairs], limit)
 
 
 def _lore(book: Any, name: str) -> List[Dict[str, Any]]:
@@ -284,6 +316,30 @@ def read_lorebook(data: bytes, filename: str, name: str) -> List[Dict[str, Any]]
     if not book:
         raise CardError("This file holds no lorebook entries.")
     return book
+
+
+def read_examples(data: bytes, filename: str, name: str, limit: int) -> List[Dict[str, str]]:
+    """A file's examples for `/import profile_name: add:`, at most `limit`, `{{char}}` as
+    `name`: a .txt of `SAID:`/`REPLY:` blocks or SillyTavern dialogue, a .json list of
+    `{"said", "reply"}`, or a card's `mes_example`. One file is one destination: which
+    examples are fixed and which are training is the importer's call, not the file's."""
+    lower = filename.lower()
+    if lower.endswith(".txt"):
+        text = data.decode("utf-8-sig", errors="replace")
+        found = _labelled(text, name, limit) or _examples(text, name, limit, len(text))
+    elif lower.endswith(".json") and data.lstrip()[:1] == b"[":
+        try:
+            rows = orjson.loads(data)
+        except orjson.JSONDecodeError:
+            raise CardError("This file's text is not readable JSON.")
+        found = fixed_examples.normalise(
+            [{k: _macros(r[k], name) for k in ("said", "reply") if isinstance(r.get(k), str)}
+             for r in rows if isinstance(r, dict)], limit)
+    else:
+        found = _examples(_card_object(data, filename).get("mes_example"), name, limit, CARD_TEXT_MAX_BYTES)
+    if not found:
+        raise CardError(NO_EXAMPLES)
+    return found
 
 
 def prompt_text(card: Dict[str, Any]) -> str:

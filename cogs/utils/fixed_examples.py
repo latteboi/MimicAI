@@ -20,10 +20,10 @@ def new_id() -> str:
     return "X" + uuid.uuid4().hex[:8].upper()
 
 
-def normalise(raw: Any) -> List[Dict[str, str]]:
+def normalise(raw: Any, limit: int = LIMIT_FIXED_EXAMPLES) -> List[Dict[str, str]]:
     """The examples worth storing out of anything: each side cleaned and cut to the
     editor's caps, any with no reply dropped, ids kept when unique and minted when not, at
-    most LIMIT_FIXED_EXAMPLES."""
+    most `limit`. A training import passes its own: the caps are the training editor's too."""
     out: List[Dict[str, str]] = []
     seen = set()
     for item in raw if isinstance(raw, list) else []:
@@ -39,7 +39,7 @@ def normalise(raw: Any) -> List[Dict[str, str]]:
         out.append({"id": entry_id,
                     "said": clean_imported_text(item.get("said"), EXAMPLE_SAID_MAX_CHARS).strip(),
                     "reply": reply})
-        if len(out) >= LIMIT_FIXED_EXAMPLES:
+        if len(out) >= limit:
             break
     return out
 
