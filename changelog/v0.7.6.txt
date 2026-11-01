@@ -1,0 +1,16 @@
+v0.7.6 Beta — 2026-11-02 (UTC)
+`/refresh` and `/suspend` ask first, and every reply arrives as an embed.
+## **Added**
+- **`/refresh` and `/suspend` ask before deleting anything**, saying what goes and what is kept, then show their progress and result in the same message: **Conversation cleared** or **Session ended**, with which characters saved a memory of it. A channel with nothing to lose -- no session, or one not yet started with nobody seated -- is not asked.
+- **Create from "Did you mean?"**: when `/profile manage` finds no profile by the name you typed, a button creates it as a new, blank profile and opens it, wherever that name is free and you have room for another.
+- **Every confirmation has a Cancel button**, and one left unanswered says nothing was changed instead of leaving a button that does nothing.
+
+## **Changed**
+- **Every reply is an embed**: command answers, refusals and errors alike, instead of a mix of plain text and embeds. An expired `/profile generate` draft stays readable, marked Expired beneath it.
+- **Session Config → Proactivity and Compaction list their models** as the profile dashboard does: the model in bold, each fallback on a line beneath it.
+- **"Did you mean?" catches a typo in one word of a longer name**: `sherlok` finds "sherlock holmes", where it used to suggest nothing.
+- **A "Did you mean?" prompt closes once answered**, saying you may dismiss it, instead of leaving its buttons behind.
+
+## **Fixed**
+- **Choosing a suggestion in `/train`'s "Did you mean?" did nothing.** It now arms training for the profile chosen.
+- **A character removed while a round was running still took its turn**, and showed in `/session swap`'s list as a guest. It now loses its turn, and the list leaves it out of those waiting.

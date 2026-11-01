@@ -24,6 +24,7 @@ from ..utils.attachment_limits import over_attachment_limit
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from .session_manager import NEW_SESSION_COMPACTION
+from ..gui.base_components import text_embed
 
 MAX_EMOJI_SIZE_BYTES = 256 * 1024  # Discord's limit on an uploaded emoji, app or guild.
 # The placeholder to fall back to when a custom one cannot be made to render on a child.
@@ -221,9 +222,9 @@ class ChildBotManager:
             # interaction currently is; a dead one is nothing more we can do about.
             try:
                 if interaction.response.is_done():
-                    await interaction.followup.send(msg, ephemeral=True)
+                    await interaction.followup.send(embed=text_embed(msg), ephemeral=True)
                 else:
-                    await interaction.response.send_message(msg, ephemeral=True)
+                    await interaction.response.send_message(embed=text_embed(msg), ephemeral=True)
             except (discord.NotFound, discord.HTTPException):
                 pass
 
@@ -278,7 +279,7 @@ class ChildBotManager:
                         act = child.activity
                         await child.change_presence(status=status_map[val], activity=act)
                         await self.handle_child_bot_presence({"bot_id": view_self.b_id, "presence": {"status": val}})
-                        await i.response.send_message(f"Status changed to **{val.title()}**.", ephemeral=True)
+                        await i.response.send_message(embed=text_embed(f"Status changed to **{val.title()}**."), ephemeral=True)
 
                     async def act_callback(view_self, i: discord.Interaction):
                         val = view_self.act_select.values[0]
@@ -308,7 +309,7 @@ class ChildBotManager:
                                 stat = child.status
                                 await child.change_presence(status=stat, activity=act)
                                 await self.handle_child_bot_presence({"bot_id": modal_self.b_id, "presence": {"activity_type": modal_self.atype, "activity_text": text, "activity_url": url_val}})
-                                await mi.response.send_message(f"Activity set to **{modal_self.atype.title()} {text}**.", ephemeral=True)
+                                await mi.response.send_message(embed=text_embed(f"Activity set to **{modal_self.atype.title()} {text}**."), ephemeral=True)
 
                         await i.response.send_modal(InProcessActModal(view_self.b_id, val))
 
@@ -316,7 +317,7 @@ class ChildBotManager:
                         stat = child.status
                         await child.change_presence(status=stat, activity=None)
                         await self.handle_child_bot_presence({"bot_id": view_self.b_id, "presence": {"activity_type": None, "activity_text": None, "activity_url": None}})
-                        await i.response.send_message("Activity cleared.", ephemeral=True)
+                        await i.response.send_message(embed=text_embed("Activity cleared."), ephemeral=True)
 
                 await interaction.response.send_message(embed=embed, view=InProcessPresenceView(bot_id), ephemeral=True)
             else:
@@ -329,10 +330,10 @@ class ChildBotManager:
                 try:
                     await interaction.guild.fetch_member(parent_id)
                 except discord.NotFound:
-                    await interaction.response.send_message("You need to invite MimicAI (parent bot) to this server to use child bots.", ephemeral=True)
+                    await interaction.response.send_message(embed=text_embed("You need to invite MimicAI (parent bot) to this server to use child bots."), ephemeral=True)
                     return
                 except Exception:
-                    await interaction.response.send_message("An error occurred while verifying parent bot presence.", ephemeral=True)
+                    await interaction.response.send_message(embed=text_embed("An error occurred while verifying parent bot presence."), ephemeral=True)
                     return
 
             await interaction.response.defer(ephemeral=True)
@@ -348,7 +349,7 @@ class ChildBotManager:
             }
 
             res = await self.handle_child_bot_toggle(toggle_data)
-            await interaction.followup.send(res or "Updated channel participation.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(res or "Updated channel participation."), ephemeral=True)
 
         # Background runner task
         async def runner():

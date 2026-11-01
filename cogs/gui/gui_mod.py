@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 
 from .gui_profiles import (ModelPickerMixin, OpenRouterHostView, ProfileManageView,
                            SingleProfileThinkingView, ThinkingPickerMixin)
+from .base_components import text_embed
 
 class ModBaseView(TabbedView):
     """Base for every /mod tab.
@@ -64,7 +65,7 @@ class ModDocsCreateModal(ui.Modal, title="Create Document"):
         cat = _sanitise_filename(self.category.value.strip().lower())
         name = _sanitise_filename(self.filename.value.strip().lower())
         if not cat or not name:
-            await interaction.followup.send("Invalid category or file name.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Invalid category or file name."), ephemeral=True)
             return
         
         target_dir = os.path.join(DOCS_DIR, cat)
@@ -195,11 +196,11 @@ class ModDocsView(ModBaseView):
 
                 self.selected_file = None
                 self._build_view()
-                await confirm_i.response.edit_message(content="Deleted successfully.", view=None, embed=None)
+                await confirm_i.response.edit_message(content=None, view=None, embed=text_embed("Deleted successfully."))
                 await self.update_display()
 
-            confirm_view = build_confirm_view("Confirm Delete", confirm_action)
-            await i.response.send_message(f"Are you sure you want to delete `{self.selected_file}`?", view=confirm_view, ephemeral=True)
+            confirm_view = build_confirm_view("Confirm Delete", confirm_action, i)
+            await i.response.send_message(embed=text_embed(f"Are you sure you want to delete `{self.selected_file}`?"), view=confirm_view, ephemeral=True)
         add_button(self, "Delete", delete_cb, style=discord.ButtonStyle.danger, row=action_row,
                    disabled=not self.selected_file)
 
@@ -272,14 +273,14 @@ class ModBlockUserModal(ui.Modal):
     async def on_submit(self, i: discord.Interaction):
         uid_str = self.user_id_input.value.strip()
         if not uid_str.isdigit():
-            await i.response.send_message("Invalid ID. Must be numeric.", ephemeral=True)
+            await i.response.send_message(embed=text_embed("Invalid ID. Must be numeric."), ephemeral=True)
             return
 
         uid = int(uid_str)
         if uid == int(defaultConfig.DISCORD_OWNER_ID):
             # Nothing else in the dashboard can be undone from a locked-out account.
             await i.response.send_message(
-                "You cannot block the bot owner — nothing would be left to unblock it with.",
+                embed=text_embed("You cannot block the bot owner — nothing would be left to unblock it with."),
                 ephemeral=True)
             return
 
@@ -307,7 +308,7 @@ class ModBlockGuildModal(ui.Modal):
     async def on_submit(self, i: discord.Interaction):
         gid_str = self.guild_id_input.value.strip()
         if not gid_str.isdigit():
-            await i.response.send_message("Invalid ID. Must be numeric.", ephemeral=True)
+            await i.response.send_message(embed=text_embed("Invalid ID. Must be numeric."), ephemeral=True)
             return
 
         gid = int(gid_str)
@@ -367,7 +368,7 @@ class ModBanEffectsView(BlockedGuard, ui.View):
             applied = await self.cog.server_manager.apply_ban_effects(
                 self.user_id, **self.effects)
             await i.edit_original_response(
-                content="\n".join(applied) if applied else "Nothing selected.", view=None)
+                content=None, embed=text_embed("\n".join(applied) if applied else "Nothing selected."), view=None)
 
         add_button(self, "Apply", apply_cb, row=3, style=discord.ButtonStyle.danger,
                    disabled=not any(self.effects.values()))
@@ -492,8 +493,8 @@ class ModBlacklistView(ModBaseView):
         if is_users:
             async def effects_cb(i: discord.Interaction):
                 await i.response.send_message(
-                    f"Effects to apply for `{self.selected_id}`. None of these is undone "
-                    f"by unblocking them.",
+                    embed=text_embed(f"Effects to apply for `{self.selected_id}`. None of these is undone "
+                    f"by unblocking them."),
                     view=ModBanEffectsView(self.cog, self.selected_id), ephemeral=True)
             add_button(self, "Ban Effects...", effects_cb, row=3,
                        disabled=self.selected_id is None)
@@ -697,11 +698,11 @@ class ModStatsView(ModBaseView):
         async def wipe_cb(i: discord.Interaction):
             async def confirm(confirm_i: discord.Interaction):
                 await confirm_i.response.edit_message(
-                    content=f"Suspending `{live}` session(s) across every server...",
-                    view=None, embed=None)
+                    content=None,
+                    view=None, embed=text_embed(f"Suspending `{live}` session(s) across every server..."))
                 channels, guilds, swept = await self.cog.session_manager.suspend_all_sessions()
                 await confirm_i.edit_original_response(
-                    content=(f"**Global suspend complete.**\n"
+                    content=None, embed=text_embed(f"**Global suspend complete.**\n"
                              f"• Live sessions suspended: `{channels}`\n"
                              f"• Servers affected: `{guilds}`\n"
                              f"• Session log directories removed: `{swept}`\n\n"
@@ -713,13 +714,13 @@ class ModStatsView(ModBaseView):
                 await self.update_display()
 
             await i.response.send_message(
-                f"**Suspend every session on this instance?**\n"
+                embed=text_embed(f"**Suspend every session on this instance?**\n"
                 f"`{live}` live channel session(s) will be torn down exactly as `/suspend` does: "
                 "chat logs deleted, child bots told to drop the channel, Freewill triggers "
                 "disabled. Any session log left on disk for a channel the bot can no longer "
                 "see is swept too. Profiles, memories and settings are untouched.\n\n"
-                "This cannot be undone.",
-                view=build_confirm_view("Wipe Every Session", confirm), ephemeral=True)
+                "This cannot be undone."),
+                view=build_confirm_view("Wipe Every Session", confirm, i), ephemeral=True)
         add_button(self, f"Wipe All Sessions ({live})", wipe_cb, style=discord.ButtonStyle.danger,
                    row=2)
 
@@ -759,7 +760,7 @@ class ModProfilesModal(ui.Modal, title="Enter User ID"):
     async def on_submit(self, i: discord.Interaction):
         uid_str = self.user_id_input.value.strip()
         if not uid_str.isdigit():
-            await i.response.send_message("Invalid ID. Must be numeric.", ephemeral=True)
+            await i.response.send_message(embed=text_embed("Invalid ID. Must be numeric."), ephemeral=True)
             return
         self.parent_view.target_user_id = int(uid_str)
         # Reset the page, or switching from a user with four pages of profiles to one
@@ -810,8 +811,8 @@ class ModProfilesView(ModBaseView):
         async def reset_cb(i: discord.Interaction):
             async def confirm(confirm_i: discord.Interaction):
                 await confirm_i.response.edit_message(
-                    content="Resetting every content rating on this instance...",
-                    view=None, embed=None)
+                    content=None,
+                    view=None, embed=text_embed("Resetting every content rating on this instance..."))
                 counts = await asyncio.to_thread(
                     self.cog.profile_manager.reset_all_content_ratings)
 
@@ -828,17 +829,17 @@ class ModProfilesView(ModBaseView):
                     lines.append(f"• ⚠️ Errors: `{counts['errors']}` (see the console log)")
                 lines.append("\nEvery profile is now Unrated. Owners re-submit from "
                              "`/profile manage` -> Home -> Content Safety.")
-                await confirm_i.edit_original_response(content="\n".join(lines), view=None)
+                await confirm_i.edit_original_response(content=None, embed=text_embed("\n".join(lines)), view=None)
 
             await i.response.send_message(
-                "**Reset every content rating on this instance?**\n"
+                embed=text_embed("**Reset every content rating on this instance?**\n"
                 "Every profile becomes **Unrated** — including Adult and Refused ones — and the "
                 "entire Public Library is delisted, because an Unrated profile cannot be "
                 "published. Existing borrows keep working.\n\n"
                 "Owners re-submit their own profiles afterwards; an 18+ declaration can be "
                 "re-applied in one click with no API call.\n\n"
-                "This cannot be undone.",
-                view=build_confirm_view("Reset Everything", confirm), ephemeral=True)
+                "This cannot be undone."),
+                view=build_confirm_view("Reset Everything", confirm, i), ephemeral=True)
         add_button(self, "Reset All Content Ratings", reset_cb, style=discord.ButtonStyle.danger,
                    row=0)
 
@@ -1170,7 +1171,7 @@ class ModPromptModal(ui.Modal, title="Edit Global Prompt"):
             error = _validate_prompt_placeholders(self.key, val)
             if error:
                 await i.response.send_message(
-                    f"❌ `{self.key}` was **not** saved.\n{error}", ephemeral=True)
+                    embed=text_embed(f"❌ `{self.key}` was **not** saved.\n{error}"), ephemeral=True)
                 return
             self.parent_view.cog.global_prompts[self.key] = val
         else:
@@ -1178,7 +1179,7 @@ class ModPromptModal(ui.Modal, title="Edit Global Prompt"):
 
         self.parent_view.cog.server_manager._save_global_prompts()
         action = "Updated" if val else "Reset to default"
-        await i.response.send_message(f"{action} `{self.key}` successfully.", ephemeral=True)
+        await i.response.send_message(embed=text_embed(f"{action} `{self.key}` successfully."), ephemeral=True)
 
         # Repaint the dashboard so the customised/default markers reflect the save.
         self.parent_view._build_view()
@@ -1237,9 +1238,9 @@ class ModPromptsView(ModBaseView):
             # truncate the tail on save.
             if len(current) > MODAL_PROMPT_CAPACITY:
                 await i.response.send_message(
-                    f"❌ `{key}` is {len(current):,} characters, which exceeds the "
+                    embed=text_embed(f"❌ `{key}` is {len(current):,} characters, which exceeds the "
                     f"{MODAL_PROMPT_CAPACITY:,}-character limit a Discord modal can hold. "
-                    "Shorten it in `mod/system_prompts.json` before editing it here.",
+                    "Shorten it in `mod/system_prompts.json` before editing it here."),
                     ephemeral=True)
                 return
 

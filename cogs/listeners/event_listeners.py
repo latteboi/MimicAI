@@ -25,6 +25,7 @@ from ..utils.helpers import (
 from ..services.generation.triggers import (emoji_files, mentioned_seat, referenced_message, reply_record,
                                             said, sticker_files, sticker_tags)
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
+from ..gui.base_components import text_embed
 
 
 class EventListeners:
@@ -942,7 +943,7 @@ class EventListeners:
             if success and not disarmed:
                 content += "\n\nStill armed -- react to capture another pair."
             try:
-                await interaction.edit_original_response(content=content, embed=None, view=None)
+                await interaction.edit_original_response(content=None, embed=text_embed(content), view=None)
             except discord.HTTPException:
                 pass
 
@@ -1210,7 +1211,7 @@ class EventListeners:
         if (interaction.type is discord.InteractionType.application_command
                 and not self._refused_by_blacklist(interaction)):
             await interaction.response.send_message(
-                "MimicAI is still starting up -- try again in a few seconds.", ephemeral=True)
+                embed=text_embed("MimicAI is still starting up -- try again in a few seconds."), ephemeral=True)
         return False
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1229,9 +1230,9 @@ class EventListeners:
             if seconds_total >= 60:
                 minutes = seconds_total // 60
                 seconds = seconds_total % 60
-                await interaction.response.send_message(f"This command is on cooldown. Please try again in {minutes} minute(s) and {seconds} second(s).", ephemeral=True)
+                await interaction.response.send_message(embed=text_embed(f"This command is on cooldown. Please try again in {minutes} minute(s) and {seconds} second(s)."), ephemeral=True)
             else:
-                await interaction.response.send_message(f"This command is on cooldown. Please try again in {seconds_total} second(s).", ephemeral=True)
+                await interaction.response.send_message(embed=text_embed(f"This command is on cooldown. Please try again in {seconds_total} second(s)."), ephemeral=True)
         elif isinstance(error, app_commands.CheckFailure):
             # Two different refusals arrive here. A blocked user gets nothing: no
             # notice, no reason, and no request spent sending one. Discord shows "This
@@ -1239,7 +1240,7 @@ class EventListeners:
             # Everything else is an ordinary permission check.
             if self._refused_by_blacklist(interaction):
                 return
-            await interaction.response.send_message("You do not have the required permissions (e.g., Server Administrator) to use this command.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("You do not have the required permissions (e.g., Server Administrator) to use this command."), ephemeral=True)
         else:
             error_id = str(uuid.uuid4())[:8]
             print(f"Unhandled command error (ID: {error_id}): {error}")
@@ -1249,9 +1250,9 @@ class EventListeners:
             try:
                 msg = f"An unexpected error occurred. Please report this to the bot owner with the following ID: `{error_id}`"
                 if not interaction.response.is_done():
-                    await interaction.response.send_message(msg, ephemeral=True)
+                    await interaction.response.send_message(embed=text_embed(msg), ephemeral=True)
                 else:
-                    await interaction.followup.send(msg, ephemeral=True)
+                    await interaction.followup.send(embed=text_embed(msg), ephemeral=True)
             except (discord.NotFound, discord.HTTPException):
                 # Interaction is completely dead, nothing more we can do
                 pass

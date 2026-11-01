@@ -1564,7 +1564,7 @@ class ProfileManageView(BlockedGuard, ui.View):
             self.user_id, self.profile_name, self.is_borrowed)
 
         if not profile:
-            await interaction.response.send_message("Profile data not found.", ephemeral=True); return
+            await interaction.response.send_message(embed=text_embed("Profile data not found."), ephemeral=True); return
 
         action = PROFILE_ACTIONS_BY_VALUE.get(choice)
         if action is None:
@@ -1581,7 +1581,7 @@ class ProfileManageView(BlockedGuard, ui.View):
         target_profile = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, is_b)
 
         if not target_profile:
-            await interaction.response.send_message("❌ Error: Profile not found.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("❌ Error: Profile not found."), ephemeral=True)
             return
 
         async def modal_callback(modal_interaction: discord.Interaction, new_val: str):
@@ -1593,9 +1593,9 @@ class ProfileManageView(BlockedGuard, ui.View):
             if target:
                 target["error_response"] = val_to_save
                 self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, target, is_b)
-                await modal_interaction.followup.send(f"✅ Custom error message updated for '{self.profile_name}'.", ephemeral=True)
+                await modal_interaction.followup.send(embed=text_embed(f"✅ Custom error message updated for '{self.profile_name}'."), ephemeral=True)
             else:
-                await modal_interaction.followup.send("❌ Error: Profile not found.", ephemeral=True)
+                await modal_interaction.followup.send(embed=text_embed("❌ Error: Profile not found."), ephemeral=True)
 
         modal = ActionTextInputModal(
             title="Set Custom Error Message",
@@ -1720,18 +1720,18 @@ class ProfileManageView(BlockedGuard, ui.View):
             
             is_valid, err_msg = self.cog.profile_manager._is_valid_profile_name(new_name)
             if not is_valid:
-                await self.original_interaction.edit_original_response(content=f"Rename failed: {err_msg}", view=None, embed=None); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Rename failed: {err_msg}")); return
                 
             if not new_name or new_name.lower() == 'clyde':
-                await self.original_interaction.edit_original_response(content="Rename failed: Invalid name.", view=None, embed=None); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed("Rename failed: Invalid name.")); return
             user_index = self.cog.profile_manager._get_user_index(self.user_id)
             if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
-                await self.original_interaction.edit_original_response(content="Rename failed: Name already exists.", view=None, embed=None); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed("Rename failed: Name already exists.")); return
             
             if self.cog.profile_manager._rename_profile(self.user_id, old_name, new_name, self.is_borrowed):
                 invalidate_model_cache(self.cog, self.user_id, old_name)
                 
-                await self.original_interaction.edit_original_response(content=f"Profile '{old_name}' renamed to '{new_name}'.", view=None, embed=None)
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Profile '{old_name}' renamed to '{new_name}'."))
                 await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, new_name)
         modal.on_submit = rename_submit
         await interaction.response.send_modal(modal)
@@ -1749,21 +1749,21 @@ class ProfileManageView(BlockedGuard, ui.View):
             
             is_valid, err_msg = self.cog.profile_manager._is_valid_profile_name(new_name)
             if not is_valid:
-                await self.original_interaction.edit_original_response(content=f"Duplicate failed: {err_msg}", view=None, embed=None); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Duplicate failed: {err_msg}")); return
                 
             user_index = self.cog.profile_manager._get_user_index(self.user_id)
             if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
-                await self.original_interaction.edit_original_response(content="Duplicate failed: Name already exists.", view=None, embed=None); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed("Duplicate failed: Name already exists.")); return
             
             limit = defaultConfig.LIMIT_PROFILES
             if len(user_index.get("personal", {})) >= limit:
-                await self.original_interaction.edit_original_response(content="Limit reached.", view=None, embed=None); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed("Limit reached.")); return
             
             success, msg = self.cog.profile_manager._duplicate_profile(self.user_id, self.profile_name, new_name)
             if success:
-                await self.original_interaction.edit_original_response(content=f"Duplicated to '{new_name}'.", view=None, embed=None)
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Duplicated to '{new_name}'."))
             else:
-                await self.original_interaction.edit_original_response(content=f"Duplicate failed: {msg}", view=None, embed=None)
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Duplicate failed: {msg}"))
         modal.on_submit = duplicate_submit
         await interaction.response.send_modal(modal)
 
@@ -1790,9 +1790,9 @@ class ProfileManageView(BlockedGuard, ui.View):
             )
             
             if success:
-                await i.followup.send(f"✅ {msg}", ephemeral=True)
+                await i.followup.send(embed=text_embed(f"✅ {msg}"), ephemeral=True)
             else:
-                await i.followup.send(f"❌ **Conversion Failed:** {msg}", ephemeral=True)
+                await i.followup.send(embed=text_embed(f"❌ **Conversion Failed:** {msg}"), ephemeral=True)
 
         modal.on_submit = convert_submit
         await interaction.response.send_modal(modal)
@@ -1826,7 +1826,7 @@ class ProfileManageView(BlockedGuard, ui.View):
             message = (f"🌐 **{self.profile_name}** is in the Public Library. Give it an intro "
                        "from **Library Intro** on this tab." if listed
                        else f"**{self.profile_name}** was not published. {reason or ''}".strip())
-        await interaction.followup.send(message, ephemeral=True)
+        await interaction.followup.send(embed=text_embed(message), ephemeral=True)
         self._build_view()
         await self._refresh_dashboard(interaction)
 
@@ -1834,16 +1834,16 @@ class ProfileManageView(BlockedGuard, ui.View):
         async def confirm_delete(i: discord.Interaction):
             await i.response.defer()
             if await self.cog.profile_manager.delete_profiles(self.user_id, [self.profile_name]):
-                await self.original_interaction.edit_original_response(content=f"Profile '{self.profile_name}' deleted.", view=None, embed=None)
-        confirm_view = build_confirm_view("Confirm Deletion", confirm_delete)
-        await interaction.response.send_message(f"Delete profile '{self.profile_name}'?", view=confirm_view, ephemeral=True)
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Profile '{self.profile_name}' deleted."))
+        confirm_view = build_confirm_view("Confirm Deletion", confirm_delete, interaction)
+        await interaction.response.send_message(embed=text_embed(f"Delete profile '{self.profile_name}'?"), view=confirm_view, ephemeral=True)
 
     async def _handle_timezone(self, interaction, profile, is_borrowed):
         view = SingleProfileTimezoneView(self.cog, self, profile, is_borrowed)
-        await interaction.response.send_message(content=view._get_header_content(), view=view, ephemeral=True)
+        await interaction.response.send_message(embed=text_embed(view._get_header_content()), view=view, ephemeral=True)
 
     async def on_timeout(self):
-        try: await self.original_interaction.edit_original_response(content="Manager timed out.", view=None)
+        try: await self.original_interaction.edit_original_response(content=None, embed=text_embed("Manager timed out."), view=None)
         except: pass
 
 class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
@@ -2080,7 +2080,7 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         print(f"ProfileFunctionView({self.action.value}) error: {error}")
         traceback.print_exc()
         try:
-            await interaction.followup.send("Something went wrong applying that.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Something went wrong applying that."), ephemeral=True)
         except Exception:
             pass
 
@@ -2138,11 +2138,11 @@ class EditUserProfilePersonaModal(ui.Modal):
         scope = f"your profile '{self.profile_name}'"
         message = f"Persona sections for {scope} {'updated' if success else 'update failed -- that profile could not be written'}."
 
-        await i.followup.send(message, ephemeral=True)
+        await i.followup.send(embed=text_embed(message), ephemeral=True)
         if success:
             await maybe_prompt_rating_after_edit(
                 self.cog_instance, i, self.user_id, self.profile_name)
-    async def on_error(self, i:discord.Interaction, e:Exception): print(f"EditUserProfilePersonaModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
+    async def on_error(self, i:discord.Interaction, e:Exception): print(f"EditUserProfilePersonaModal err: {e}"); traceback.print_exc(); await i.followup.send(embed=text_embed('Form error.'),ephemeral=True)
 
 class EditUserProfileAIInstructionsModal(ui.Modal):
     def __init__(self, cog_instance, profile_name: str, current_instr:str, user_id: int, callback=None,
@@ -2189,12 +2189,12 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
         scope=f"your profile '{self.profile_name}'"
         message = f"AI Instructions for {scope} {'updated' if success else 'update failed -- that profile could not be written'}."
 
-        await i.followup.send(message,ephemeral=True)
+        await i.followup.send(embed=text_embed(message),ephemeral=True)
         # The tick is not moderated text, so a change to it alone leaves the rating current.
         if success:
             await maybe_prompt_rating_after_edit(
                 self.cog, i, self.user_id, self.profile_name)
-    async def on_error(self, i:discord.Interaction,e:Exception): print(f"EditUserProfileAIInstrModal err: {e}"); traceback.print_exc(); await i.followup.send('Form error.',ephemeral=True)
+    async def on_error(self, i:discord.Interaction,e:Exception): print(f"EditUserProfileAIInstrModal err: {e}"); traceback.print_exc(); await i.followup.send(embed=text_embed('Form error.'),ephemeral=True)
 
 def ProfileParamsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [
@@ -2940,17 +2940,17 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
             values["gender"] = values.get("gender", "").lower()
             if values["gender"] and values["gender"] not in GOOGLE_VOICE_GENDERS:
                 await modal_interaction.response.send_message(
-                    f"❌ Gender is one of {', '.join(GOOGLE_VOICE_GENDERS)}, or blank.", ephemeral=True)
+                    embed=text_embed(f"❌ Gender is one of {', '.join(GOOGLE_VOICE_GENDERS)}, or blank."), ephemeral=True)
                 return
             if values.get("language") and not _LANGUAGE_TAG.fullmatch(values["language"]):
                 await modal_interaction.response.send_message(
-                    "❌ Language is a code like `en-GB` or `ja-JP`, or blank.", ephemeral=True)
+                    embed=text_embed("❌ Language is a code like `en-GB` or `ja-JP`, or blank."), ephemeral=True)
                 return
-            await modal_interaction.response.edit_message(content=pending, view=None)
+            await modal_interaction.response.edit_message(content=None, embed=text_embed(pending), view=None)
             try:
                 note = await run(self._google_speech_model(modal_interaction), values)
             except Exception as e:
-                note = {"content": f"❌ {_format_api_error(e)}"}
+                note = {"embed": text_embed(f"❌ {_format_api_error(e)}")}
             self._build_view()
             await modal_interaction.edit_original_response(**self._render())
             if note:
@@ -2961,7 +2961,7 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
     async def _search_library(self, interaction: discord.Interaction):
         async def run(model, values):
             self.library_results = await model.list_voices(values["search"], values["language"], values["gender"])
-            return None if self.library_results else {"content": "No voices matched that search."}
+            return None if self.library_results else {"embed": text_embed("No voices matched that search.")}
 
         await self._voice_form(interaction, "Search Voice Library", [
             {"label": "Search", "custom_id": "search", "required": False, "max_length": 100,
@@ -2976,9 +2976,9 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
         async def run(model, values):
             voice_id = values["voice_id"]
             if not _VOICE_ID.fullmatch(voice_id):
-                return {"content": "❌ That is not a voice id: letters, digits, `_`, `-` and `.` only."}
+                return {"embed": text_embed("❌ That is not a voice id: letters, digits, `_`, `-` and `.` only.")}
             if voice_id.lower() not in TTS_VOICE_LOOKUP and await model.get_voice(voice_id) is None:
-                return {"content": "❌ " + GOOGLE_VOICE_NOT_FOUND.format(voice=voice_id)}
+                return {"embed": text_embed("❌ " + GOOGLE_VOICE_NOT_FOUND.format(voice=voice_id))}
             self._apply("speech_voice", stored_google_voice(voice_id))
             return None
 
@@ -3002,7 +3002,7 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
                 file = discord.File(preview, filename="voice_preview.wav")
             finally:
                 os.remove(preview)
-            return {"content": f"A preview of **{self.profile_name}**'s new voice, now selected.",
+            return {"embed": text_embed(f"A preview of **{self.profile_name}**'s new voice, now selected."),
                     "file": file}
 
         await self._voice_form(interaction, "Design a Voice", [
@@ -3194,8 +3194,8 @@ class ModelPickerMixin(ReportErrorMixin):
             if self.values[0] == "ollama_offline":
                 checking = getattr(view, 'ollama_working', None) == "processing"
                 await interaction.response.send_message(
-                    "Still checking the Ollama host -- try again in a moment." if checking
-                    else "Ollama is offline or has no models downloaded.", ephemeral=True)
+                    embed=text_embed("Still checking the Ollama host -- try again in a moment." if checking
+                    else "Ollama is offline or has no models downloaded."), ephemeral=True)
                 return
             if self.values[0] == "custom_option":
                 await interaction.response.send_modal(CustomModelModal(view, self.target_config_key))
@@ -3530,7 +3530,7 @@ class ModelPickerMixin(ReportErrorMixin):
             add_button(self, "Set Host URL", host_cb, style=host_style, row=row)
             
             async def guide_cb(i: discord.Interaction):
-                await i.response.send_message(OLLAMA_GUIDE_TEXT, ephemeral=True)
+                await i.response.send_message(embed=text_embed(OLLAMA_GUIDE_TEXT), ephemeral=True)
             if guide:
                 add_button(self, "Guide", guide_cb, style=discord.ButtonStyle.secondary, row=row)
 
@@ -4254,8 +4254,8 @@ class _SlotThinkingBudgetModal(ui.Modal):
             value = _pi(raw)
             if value is None or value < -1:
                 await interaction.response.send_message(
-                    "Enter -1 for dynamic, 0 to disable thinking, or a token count. "
-                    "Leave a field blank to inherit.", ephemeral=True)
+                    embed=text_embed("Enter -1 for dynamic, 0 to disable thinking, or a token count. "
+                    "Leave a field blank to inherit."), ephemeral=True)
                 return
             pending[budget_key] = min(value, THINKING_BUDGET_MAX)
 
@@ -4686,7 +4686,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
         pending = self._pending()
         if not pending:
             await interaction.response.send_message(
-                "Choose at least one model first.", ephemeral=True)
+                embed=text_embed("Choose at least one model first."), ephemeral=True)
             return
         self.wizard._stage_change("models", config=pending, pins=self._staged_pins())
         await self.wizard.refresh(interaction)
@@ -4852,7 +4852,7 @@ class ThinkingApplyView(ThinkingPickerMixin, _BulkSubView):
     async def _stage_callback(self, interaction: discord.Interaction):
         if not self.staged:
             await interaction.response.send_message(
-                "Choose an effort or a budget first.", ephemeral=True)
+                embed=text_embed("Choose an effort or a budget first."), ephemeral=True)
             return
         self.wizard._stage_change("thinking_params", config=dict(self.staged))
         await self.wizard.refresh(interaction)
@@ -4894,7 +4894,7 @@ class _MediaOptionsApplyView(MediaOptionsMixin, _BulkSubView):
 
     async def _stage_callback(self, interaction: discord.Interaction):
         if not self.staged:
-            await interaction.response.send_message("Choose something first.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Choose something first."), ephemeral=True)
             return
         self.wizard._stage_change(self.ACTION, config=dict(self.staged))
         await self.wizard.refresh(interaction)
@@ -5263,6 +5263,7 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
 
 
 from ..utils.helpers import _resolve_zoneinfo
+from .base_components import text_embed
 
 EXTENSIVE_TIMEZONES = [
     # --- Page 0: Americas (North & Central) ---
@@ -5440,7 +5441,7 @@ class _TimezonePickerView(BlockedGuard, ui.View):
         async def cb(i: discord.Interaction):
             self.current_page = min(TIMEZONE_TOTAL_PAGES - 1, max(0, self.current_page + delta))
             self._build_view()
-            await i.response.edit_message(content=self._get_header_content(), view=self)
+            await i.response.edit_message(content=None, embed=text_embed(self._get_header_content()), view=self)
         return cb
 
     async def select_callback(self, interaction: discord.Interaction):
@@ -5454,7 +5455,7 @@ class _TimezonePickerView(BlockedGuard, ui.View):
             self.current_page = int(choice.split("_")[1])
             self._build_view()
             await interaction.response.edit_message(
-                content=self._get_header_content(), view=self)
+                content=None, embed=text_embed(self._get_header_content()), view=self)
             return
 
         _, canonical_tz = _resolve_zoneinfo(choice)
@@ -5488,7 +5489,7 @@ class UserTimezoneView(_TimezonePickerView):
         self.parent_about_view._build_view()
         await self.parent_about_view.update_display()
         await interaction.response.edit_message(
-            content=f"✅ Your timezone is now **{canonical_tz}**.", view=None)
+            content=None, embed=text_embed(f"✅ Your timezone is now **{canonical_tz}**."), view=None)
 
 
 class SingleProfileTimezoneView(_TimezonePickerView):
@@ -5519,7 +5520,7 @@ class SingleProfileTimezoneView(_TimezonePickerView):
         await self.parent_manage_view.original_interaction.edit_original_response(
             embed=new_embed, view=self.parent_manage_view)
         await interaction.response.edit_message(
-            content=f"✅ Timezone set to **{canonical_tz}**.", view=None)
+            content=None, embed=text_embed(f"✅ Timezone set to **{canonical_tz}**."), view=None)
 
 
 class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
@@ -5590,7 +5591,7 @@ class BulkTimezoneView(_BulkSubView):
 
     async def _stage_callback(self, interaction: discord.Interaction):
         if not self.selected_tz:
-            await interaction.response.send_message("Choose a timezone first.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Choose a timezone first."), ephemeral=True)
             return
         self.wizard._stage_change(
             "time", config={"timezone": self.selected_tz})
@@ -5711,7 +5712,7 @@ class BulkResetView(_BulkSubView):
         targets = self._targets()
         if not self.reset_choice or not targets:
             await interaction.edit_original_response(
-                content="Nothing to reset.", embed=None, view=None)
+                content=None, embed=text_embed("Nothing to reset."), view=None)
             return
 
         if self.reset_choice == "reset_examples":
@@ -5761,7 +5762,7 @@ class BulkDeleteView(_BulkSubView):
         names = sorted(self.wizard.selected_profiles)
         if not names:
             await interaction.edit_original_response(
-                content="No profiles selected.", embed=None, view=None)
+                content=None, embed=text_embed("No profiles selected."), view=None)
             return
         deleted = await self.cog.profile_manager.delete_profiles(self.user_id, names)
         await interaction.edit_original_response(
@@ -5802,15 +5803,15 @@ class AppearanceModal(ui.Modal):
 
         if new_display_name:
             if len(new_display_name) > 32:
-                await interaction.followup.send("❌ **Invalid Display Name:** Must be 32 characters or fewer.", ephemeral=True)
+                await interaction.followup.send(embed=text_embed("❌ **Invalid Display Name:** Must be 32 characters or fewer."), ephemeral=True)
                 return
             if any(r in new_display_name.lower() for r in ["clyde", "@everyone", "@here"]):
-                await interaction.followup.send("❌ **Invalid Display Name:** Contains a reserved keyword or mention.", ephemeral=True)
+                await interaction.followup.send(embed=text_embed("❌ **Invalid Display Name:** Contains a reserved keyword or mention."), ephemeral=True)
                 return
         if image is not None:
             refusal = check_portrait_upload(image)[1]
             if refusal:
-                await interaction.followup.send(refusal, ephemeral=True)
+                await interaction.followup.send(embed=text_embed(refusal), ephemeral=True)
                 return
             # An upload is the interaction's, which Discord deletes after a while. Kept
             # before anything is written, so closed DMs refuse the whole edit, not half.
@@ -5819,11 +5820,11 @@ class AppearanceModal(ui.Modal):
                 f"🖼️ The avatar of `{self.profile_name}`. Deleting this message removes it.")
             if not new_avatar_url:
                 await interaction.followup.send(
-                    "❌ **Image Not Kept:** Your DMs are closed, so the image could not be kept as "
-                    "the avatar. Open them, or give an Avatar URL instead.", ephemeral=True)
+                    embed=text_embed("❌ **Image Not Kept:** Your DMs are closed, so the image could not be kept as "
+                    "the avatar. Open them, or give an Avatar URL instead."), ephemeral=True)
                 return
         elif new_avatar_url and not is_web_url(new_avatar_url):
-            await interaction.followup.send("❌ **Invalid Avatar URL:** It must be a link starting with https://.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("❌ **Invalid Avatar URL:** It must be a link starting with https://."), ephemeral=True)
             return
 
         # The published-profile safety re-check that used to run here is gone with the
@@ -5856,7 +5857,7 @@ class AppearanceModal(ui.Modal):
         new_embed = await self.cog.profile_manager._build_profile_manage_embed(
             self.original_interaction, self.profile_name, target_user_id=owner_id)
         await self.original_interaction.edit_original_response(embed=new_embed)
-        await interaction.followup.send("Appearance updated.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed("Appearance updated."), ephemeral=True)
         # The display name and avatar are part of the classified surface, so an
         # appearance edit invalidates a rating exactly as a persona edit does.
         await maybe_prompt_rating_after_edit(self.cog, interaction, owner_id, self.profile_name)
@@ -5891,7 +5892,7 @@ class MoodAvatarModal(ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         text = self.threshold_input.value.strip()
         if text and not (text.isdigit() and 0 <= int(text) <= 100):
-            await interaction.response.send_message("❌ The level must be a whole number from 0 to 100.",
+            await interaction.response.send_message(embed=text_embed("❌ The level must be a whole number from 0 to 100."),
                                                     ephemeral=True)
             return
         # Sparse, as Edit Appearance is: an unset avatar or level is no key.
@@ -5899,7 +5900,7 @@ class MoodAvatarModal(ui.Modal):
         bad = next((axis for axis, url in avatars.items() if not is_web_url(url)), None)
         if bad:
             await interaction.response.send_message(
-                f"❌ **Invalid Avatar URL:** High {bad.title()} must be a link starting with https://.",
+                embed=text_embed(f"❌ **Invalid Avatar URL:** High {bad.title()} must be a link starting with https://."),
                 ephemeral=True)
             return
         await interaction.response.defer()
@@ -5918,7 +5919,7 @@ class MoodAvatarModal(ui.Modal):
             pm._appearance_entry(config)
 
         await self.on_saved(interaction)
-        await interaction.followup.send("Mood avatars saved.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed("Mood avatars saved."), ephemeral=True)
         # Every mood avatar is judged with the usual one -- see `_fetch_avatar_parts`.
         await maybe_prompt_rating_after_edit(self.cog, interaction, self.owner_id, self.profile_name)
 
@@ -5952,10 +5953,10 @@ class LibraryIntroModal(ui.Modal):
         pm = self.cog.profile_manager
         config = pm._get_profile_config(self.owner_id, self.profile_name, False)
         if config is None:
-            await interaction.followup.send("❌ Profile not found.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("❌ Profile not found."), ephemeral=True)
             return
         if intro == (config.get("library_intro") or ""):
-            await interaction.followup.send("The intro is unchanged.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("The intro is unchanged."), ephemeral=True)
             return
 
         if intro:
@@ -5970,7 +5971,7 @@ class LibraryIntroModal(ui.Modal):
         if self.on_saved:
             await self.on_saved(interaction)
         await interaction.followup.send(
-            "Library intro updated." if intro else "Library intro removed.", ephemeral=True)
+            embed=text_embed("Library intro updated." if intro else "Library intro removed."), ephemeral=True)
         await maybe_prompt_rating_after_edit(self.cog, interaction, self.owner_id, self.profile_name)
 
 def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
@@ -6069,9 +6070,9 @@ class _ActionStagingHost:
 
     async def _modal_reply(self, interaction: discord.Interaction, text: str):
         if interaction.response.is_done():
-            await interaction.followup.send(text, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(text), ephemeral=True)
         else:
-            await interaction.response.send_message(text, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(text), ephemeral=True)
 
     def _open_choice(self, action_value: str, placeholder: str,
                      options: List[discord.SelectOption], on_pick):
@@ -6106,7 +6107,7 @@ class _ActionStagingHost:
                 # minutes the slash command's token lasts. Say so rather than leaving the
                 # change staged on a panel that will never show it again.
                 self.stop()
-                await interaction.followup.send(self._EXPIRED_NOTICE, ephemeral=True)
+                await interaction.followup.send(embed=text_embed(self._EXPIRED_NOTICE), ephemeral=True)
                 return
             try:
                 await interaction.delete_original_response()
@@ -6680,9 +6681,9 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
             return
         if action.bulk.terminal and self.session.has_changes:
             await interaction.response.send_message(
-                f"**{action.bulk_label()}** removes data rather than changing a setting, so it "
+                embed=text_embed(f"**{action.bulk_label()}** removes data rather than changing a setting, so it "
                 f"runs on its own. Apply or clear your {len(self.session.staged)} staged "
-                f"change(s) first.", ephemeral=True)
+                f"change(s) first."), ephemeral=True)
             return
         self.current_action = action
         await action.bulk.run(self, interaction)
@@ -7116,7 +7117,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
         await i.response.defer()
         ok, msg = await self.cog.profile_manager.submit_for_rating(
             self.user_id, self.profile_name)
-        await i.followup.send(msg, ephemeral=True)
+        await i.followup.send(embed=text_embed(msg), ephemeral=True)
         if ok:
             await self._await_verdict(i)
         else:
@@ -7174,8 +7175,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
         await i.response.defer()
         appealed = await asyncio.to_thread(
             self.cog.profile_manager.appeal_refusal, self.user_id, self.profile_name)
-        await i.followup.send("Sent to the bot operator for review." if appealed
-                              else "This refusal cannot be appealed again.", ephemeral=True)
+        await i.followup.send(embed=text_embed("Sent to the bot operator for review." if appealed
+                              else "This refusal cannot be appealed again."), ephemeral=True)
         await self._refresh(i)
 
     async def uphold_cb(self, i: discord.Interaction):
@@ -7202,7 +7203,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
     async def force_cb(self, i: discord.Interaction):
         await i.response.defer()
         self.cog.profile_manager.schedule_content_classification(self.user_id, self.profile_name)
-        await i.followup.send("Re-classification queued.", ephemeral=True)
+        await i.followup.send(embed=text_embed("Re-classification queued."), ephemeral=True)
         await self._await_verdict(i)
 
 
@@ -7331,7 +7332,7 @@ class PostEditRatingView(BlockedGuard, ui.View):
         if self.key in self.cog.pending_classifications:
             # Its verdict would land on top of Unrated and undo this.
             await i.response.send_message(
-                "A re-check of this profile is already running. Wait for it to finish.",
+                embed=text_embed("A re-check of this profile is already running. Wait for it to finish."),
                 ephemeral=True)
             return
         self.stop()

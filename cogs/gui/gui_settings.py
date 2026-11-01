@@ -12,6 +12,7 @@ from .base_components import (
 from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
 from ..utils.helpers import _get_user_hash, _resolve_zoneinfo, suppress_link_previews
 from ..utils.data_policy import is_paid_gemini_slot, may_save_free_gemini_key
+from .base_components import text_embed
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -36,7 +37,7 @@ class OllamaHostModal(ui.Modal, title="Set Ollama Host URL"):
         # below dials it from the bot's own network: the bot owner's call alone.
         if not self.parent_view.cog.profile_manager.may_use_ollama(
                 getattr(self.parent_view, "user_id", interaction.user.id)):
-            await interaction.response.send_message(OLLAMA_OWNER_ONLY, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(OLLAMA_OWNER_ONLY), ephemeral=True)
             return
         url = self.host_input.value.strip()
         if not url:
@@ -72,7 +73,7 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         raw_key = self.key_input.value.strip()
         
         if not raw_key.startswith(("AIzaSy", "AQ.", "sk-or-")):
-            await interaction.followup.send("❌ **Invalid Format.** Keys must start with `AIzaSy`, `AQ.`, or `sk-or-`.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("❌ **Invalid Format.** Keys must start with `AIzaSy`, `AQ.`, or `sk-or-`."), ephemeral=True)
             return
 
         is_valid, err, tier = await self.cog.api_service._validate_api_keys(
@@ -81,13 +82,13 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         )
         
         if not is_valid:
-            await interaction.followup.send(f"❌ **Validation Failed:** {suppress_link_previews(str(err))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"❌ **Validation Failed:** {suppress_link_previews(str(err))}"), ephemeral=True)
             return
 
         # Refused before anything is written -- see may_save_free_gemini_key.
         if (self.provider == "gemini" and not is_paid_gemini_slot({"tier": tier})
                 and not may_save_free_gemini_key(interaction.user.id)):
-            await interaction.followup.send(f"❌ {GEMINI_FREE_TIER_KEY_REFUSED}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"❌ {GEMINI_FREE_TIER_KEY_REFUSED}"), ephemeral=True)
             return
 
         user_data = self.cog.storage_manager._get_user_keys_data(interaction.user.id)
@@ -116,7 +117,7 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         if self.view:
             await self.view._repaint()
 
-        await interaction.followup.send(msg, ephemeral=True)
+        await interaction.followup.send(embed=text_embed(msg), ephemeral=True)
 
 class OverrideConfirmView(BlockedGuard, ui.View):
     """Asks before taking over assignments another key holds, then applies them through
@@ -141,11 +142,11 @@ class OverrideConfirmView(BlockedGuard, ui.View):
         await interaction.response.defer(ephemeral=True)
         self.parent_view._apply_assignments(self.slot_id, self.new_scopes)
         await self.parent_view._repaint()
-        await interaction.edit_original_response(content="✅ Assignments saved successfully.", view=None)
+        await interaction.edit_original_response(content=None, embed=text_embed("✅ Assignments saved successfully."), view=None)
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_override(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.edit_message(content="❌ Assignment update cancelled.", view=None)
+        await interaction.response.edit_message(content=None, embed=text_embed("❌ Assignment update cancelled."), view=None)
 
 def _defaults_view(v):
     # Imported here, not at module scope: gui_defaults adopts ModelPickerMixin from
@@ -339,7 +340,7 @@ class SettingsAboutView(SettingsBaseView):
         # nav_defaults defers gui_defaults.
         from .gui_profiles import UserTimezoneView
         view = UserTimezoneView(self.cog, self)
-        await i.response.send_message(content=view._get_header_content(),
+        await i.response.send_message(embed=text_embed(view._get_header_content()),
                                       view=view, ephemeral=True)
 
     async def _act_clear_timezone(self, i: discord.Interaction):
@@ -388,7 +389,7 @@ class UserBirthdayModal(ui.Modal, title="Your Birthday"):
             birthday = parse_birthday(self.day.value, self.month.value, allow_year=False)
         except ValueError as e:
             await interaction.response.send_message(
-                f"❌ **Invalid Input:** {suppress_link_previews(str(e))}", ephemeral=True)
+                embed=text_embed(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}"), ephemeral=True)
             return
         user_id = self.parent_about_view.user_id
         about = self.cog.profile_manager.get_user_about(user_id)
@@ -727,13 +728,13 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
         self._load_scopes()
         self.setup_items()
         await self.update_display()
-        await interaction.followup.send("✅ Key and all its assignments deleted.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed("✅ Key and all its assignments deleted."), ephemeral=True)
 
     async def save_assignments_callback(self, interaction: discord.Interaction):
         conflicts = self._assignment_conflicts(self.selected_slot, self.selected_scopes)
         if conflicts:
             await interaction.response.send_message(
-                OverrideConfirmView.prompt(conflicts),
+                embed=text_embed(OverrideConfirmView.prompt(conflicts)),
                 view=OverrideConfirmView(self, self.selected_slot, self.selected_scopes),
                 ephemeral=True)
             return
@@ -741,7 +742,7 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
         await interaction.response.defer(ephemeral=True)
         self._apply_assignments(self.selected_slot, self.selected_scopes)
         await self._repaint()
-        await interaction.followup.send("✅ Assignments saved successfully.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed("✅ Assignments saved successfully."), ephemeral=True)
 
 class SettingsChildBotView(SettingsBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
@@ -826,7 +827,7 @@ class SettingsChildBotView(SettingsBaseView):
         self.selected_bot_id = None
         self.setup_items()
         await self.update_display()
-        await i.response.send_message("Bot deleted.", ephemeral=True)
+        await i.response.send_message(embed=text_embed("Bot deleted."), ephemeral=True)
 
 class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
     def __init__(self, cog: 'MimicCog', view: 'SettingsChildBotView'):
@@ -846,7 +847,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         if interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-            await interaction.followup.send("Error: Only the bot owner can create Child Bots.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Error: Only the bot owner can create Child Bots."), ephemeral=True)
             return
             
         token = self.token_input.value.strip()
@@ -854,7 +855,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
         owner_id = interaction.user.id
 
         if not (pid.startswith("A") or pid.startswith("X")):
-            await interaction.followup.send("Error: Child bots can only be linked to Personal Profiles (PIDs starting with 'A') or System Profiles (PIDs starting with 'X'). Borrowed profiles (PIDs starting with 'B' or 'C') cannot be linked -- duplicate one first to get your own Personal Profile.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Error: Child bots can only be linked to Personal Profiles (PIDs starting with 'A') or System Profiles (PIDs starting with 'X'). Borrowed profiles (PIDs starting with 'B' or 'C') cannot be linked -- duplicate one first to get your own Personal Profile."), ephemeral=True)
             return
 
         index = self.cog.profile_manager._get_user_index(owner_id)
@@ -868,7 +869,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
             if profile_name: break
 
         if not profile_name:
-            await interaction.followup.send(f"Error: You do not own a profile with the PID '{pid}'.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Error: You do not own a profile with the PID '{pid}'."), ephemeral=True)
             return
 
         temp_client = discord.Client(intents=discord.Intents.none())
@@ -877,15 +878,15 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
             bot_user_id = str(temp_client.user.id)
             await temp_client.close()
         except discord.LoginFailure:
-            await interaction.followup.send("Error: The provided token is invalid. Please double-check it.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Error: The provided token is invalid. Please double-check it."), ephemeral=True)
             return
         except Exception as e:
             await temp_client.close()
-            await interaction.followup.send(f"Error: An unexpected error occurred while validating the token: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Error: An unexpected error occurred while validating the token: {suppress_link_previews(str(e))}"), ephemeral=True)
             return
 
         if bot_user_id in self.cog.child_bots:
-            await interaction.followup.send("Error: This bot application is already registered as a child bot.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Error: This bot application is already registered as a child bot."), ephemeral=True)
             return
 
         try:
@@ -912,7 +913,7 @@ class ChildBotCreateModal(ui.Modal, title="Create a New Child Bot"):
             })
         
         invite = invite_url(self.cog.bot, bot_user_id, CHILD_BOT_PERMISSIONS)
-        await interaction.followup.send(f"Success! Child bot '{temp_client.user.name}' has been linked to profile '{profile_name}'.\n[Invite it to a server](<{invite}>)", ephemeral=True)
+        await interaction.followup.send(embed=text_embed(f"Success! Child bot '{temp_client.user.name}' has been linked to profile '{profile_name}'.\n[Invite it to a server](<{invite}>)"), ephemeral=True)
         await self.parent_view.update_rebuild(interaction)
 
 class ParentActivityModal(ui.Modal):
@@ -945,7 +946,7 @@ class ParentActivityModal(ui.Modal):
         activity = self.cog.server_manager._build_activity_from_dict(presence)
         await self.cog.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=activity)
         
-        await interaction.response.send_message(f"Activity set to **{self.act_type.title()} {text}**.", ephemeral=True)
+        await interaction.response.send_message(embed=text_embed(f"Activity set to **{self.act_type.title()} {text}**."), ephemeral=True)
 
 class ParentPresenceView(BlockedGuard, ui.View):
     def __init__(self, cog):
@@ -989,7 +990,7 @@ class ParentPresenceView(BlockedGuard, ui.View):
         
         activity = self.cog.server_manager._build_activity_from_dict(presence)
         await self.cog.bot.change_presence(status=status_map[status_val], activity=activity)
-        await interaction.response.send_message(f"Status changed to **{status_val.title()}**.", ephemeral=True)
+        await interaction.response.send_message(embed=text_embed(f"Status changed to **{status_val.title()}**."), ephemeral=True)
 
     async def activity_callback(self, interaction: discord.Interaction):
         act_type = self.activity_select.values[0]
@@ -1005,7 +1006,7 @@ class ParentPresenceView(BlockedGuard, ui.View):
         status_val = presence.get("status", "online")
         status_map = {"online": discord.Status.online, "idle": discord.Status.idle, "dnd": discord.Status.dnd, "invisible": discord.Status.invisible}
         await self.cog.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=None)
-        await interaction.response.send_message("Activity cleared.", ephemeral=True)
+        await interaction.response.send_message(embed=text_embed("Activity cleared."), ephemeral=True)
 
 class ShutdownConfirmView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog'):
@@ -1014,7 +1015,7 @@ class ShutdownConfirmView(BlockedGuard, ui.View):
 
     @ui.button(label="Yes, Shutdown", style=discord.ButtonStyle.danger)
     async def confirm_shutdown(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.edit_message(content="Shutting down child bots and main instance...", view=None)
+        await interaction.response.edit_message(content=None, embed=text_embed("Shutting down child bots and main instance..."), view=None)
         
         # 1. Close child processes first
         for bot_id in list(self.cog.child_bots.keys()):

@@ -213,6 +213,14 @@ def short_model_name(value: Optional[str]) -> str:
     return f"{_SHORT_PREFIXES[model_provider(value)]}/{str(value).rsplit('/', 1)[-1]}"
 
 
+def chain_lines(label: str, primary: str, fallbacks, shown=short_model_name) -> List[str]:
+    """One `model_chain` as the profile dashboard's Models field spells it: the Primary in
+    bold on the label line, each fallback on a subtext line of its own. The session tabs
+    that carry a model pair show theirs the same way."""
+    rest = [m for m in dict.fromkeys(fallbacks) if m != primary]
+    return [f"**{label}** → **`{shown(primary)}`**", *(f"-# ↳ `{shown(m)}`" for m in rest)]
+
+
 def platform_model_defaults() -> Dict[str, str]:
     """Every model slot mapped to the value a fresh profile ships with.
 

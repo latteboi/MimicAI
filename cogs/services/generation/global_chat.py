@@ -17,6 +17,7 @@ from ...utils.helpers import (
 )
 from . import tool_loop
 from .reply import _merge_sources, reply_gen_config
+from ...gui.base_components import text_embed
 
 #: Speakers named on the card before the rest collapse into "+n". Four fits the footer
 #: and the field title at any sensible display-name length.
@@ -174,7 +175,7 @@ class GlobalChatMixin:
         profile_data = self.cog.profile_manager._get_profile_config(source_owner_id, source_profile_name, False)
 
         if not profile_data:
-            await interaction.followup.send(f"The source for '{profile_name}' could not be found.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"The source for '{profile_name}' could not be found."), ephemeral=True)
             return
 
         # The embed goes wherever the command was run, and nothing constrains that
@@ -185,7 +186,7 @@ class GlobalChatMixin:
             host_user_id, profile_name, "global_chat")
         if not allowed:
             await interaction.followup.send(
-                f"**'{profile_name}' cannot be used in Global Chat.**\n{deny_reason}", ephemeral=True)
+                embed=text_embed(f"**'{profile_name}' cannot be used in Global Chat.**\n{deny_reason}"), ephemeral=True)
             return
 
         # The host's own copy from here on, as a session reads a seated borrow's: a borrow
@@ -195,7 +196,7 @@ class GlobalChatMixin:
 
         user_api_key, or_key, block = self.global_chat_keys(host_user_id, interaction.guild_id, profile_data)
         if block:
-            await interaction.followup.send(block, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(block), ephemeral=True)
             return
 
         model_cache_key = ('global', host_user_id, profile_name)
@@ -435,5 +436,5 @@ class GlobalChatMixin:
             await self.cog.session_manager._save_session_to_disk(model_cache_key, 'global_chat', session_data)
 
         except Exception as e:
-            await interaction.followup.send(f"An error occurred during the global chat: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"An error occurred during the global chat: {suppress_link_previews(str(e))}"), ephemeral=True)
             traceback.print_exc()

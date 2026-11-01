@@ -17,11 +17,13 @@ from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PA
                               add_select, build_pagination_controls,
                               bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
+from ..utils.user_defaults import chain_lines
 from ..managers.session_manager import (director_enabled, director_model_config, rotated_cast,
                                         turn_lookup, with_reply)
 from ..services.generation.global_chat import build_global_chat_embed
 from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, cast_costs, quiet_label, session_advice
 from ..services.generation.tool_loop import functions_for
+from .base_components import text_embed
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -46,7 +48,7 @@ class GlobalChatInputModal(ui.Modal, title="Draft Your Reply"):
     async def on_submit(self, interaction: discord.Interaction):
         session_data = self.cog.global_chat_sessions.get(self.parent_view.session_key)
         if not session_data:
-            await interaction.response.send_message("Session expired.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Session expired."), ephemeral=True)
             return
 
         queue = session_data.setdefault("pending_queue", {})
@@ -109,7 +111,7 @@ class GlobalChatQueueView(BlockedGuard, ui.View):
     async def edit_btn(self, interaction: discord.Interaction, button: ui.Button):
         session_data = self.cog.global_chat_sessions.get(self.parent_view.session_key)
         if not session_data or self.user_id not in session_data.get("pending_queue", {}):
-            await interaction.response.send_message("This turn has already been played or removed.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("This turn has already been played or removed."), ephemeral=True)
             return
         
         # Re-add to active typers if they edit, but do NOT extend the absolute 30s deadline
@@ -235,7 +237,7 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
 
     async def lock_callback(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id:
-            await interaction.response.send_message("Only the session owner can lock or unlock this session.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Only the session owner can lock or unlock this session."), ephemeral=True)
             return
         
         session_data = await self._load_current_session()
@@ -247,7 +249,7 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
         session_data = await self._load_current_session()
         
         if session_data.get("is_locked", True) and interaction.user.id != self.user_id:
-            await interaction.response.send_message("This session is currently locked by the host.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("This session is currently locked by the host."), ephemeral=True)
             return
             
         now = time.time()
@@ -290,7 +292,7 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
         if not session_data: return
         
         if session_data.get("is_locked", True) and interaction.user.id != self.user_id:
-            await interaction.response.send_message("This session is currently locked by the host.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("This session is currently locked by the host."), ephemeral=True)
             return
         
         queue = session_data.get("pending_queue", {})
@@ -355,25 +357,25 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
         refuse = getattr(self.parent_view, "refuse_custom_model", None)
         refusal = refuse(self.target_config_key, value) if refuse else None
         if refusal:
-            await interaction.response.send_message(refusal, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(refusal), ephemeral=True)
             return
 
         # Owner first: anyone else who types the prefix is told Ollama is the owner's, not
         # which slots it would or would not fill.
         if value.startswith("OLLAMA/") and not self.parent_view.cog.profile_manager.may_use_ollama(
                 getattr(self.parent_view, "user_id", interaction.user.id)):
-            await interaction.response.send_message(OLLAMA_OWNER_ONLY, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(OLLAMA_OWNER_ONLY), ephemeral=True)
             return
 
         is_image_slot = self.target_config_key in IMAGE_MODEL_KEYS
         is_speech_slot = self.target_config_key in AUDIO_MODEL_KEYS
         if value.startswith("OLLAMA/") and (is_image_slot or is_speech_slot):
             await interaction.response.send_message(
-                IMAGE_MODEL_NO_OLLAMA if is_image_slot else SPEECH_MODEL_NO_OLLAMA, ephemeral=True)
+                embed=text_embed(IMAGE_MODEL_NO_OLLAMA if is_image_slot else SPEECH_MODEL_NO_OLLAMA), ephemeral=True)
             return
         # The API switch skips Ollama here, but a typed prefix does not.
         if value.startswith("OLLAMA/") and self.target_config_key in SEARCH_MODEL_KEYS:
-            await interaction.response.send_message(SEARCH_MODEL_NO_OLLAMA, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(SEARCH_MODEL_NO_OLLAMA), ephemeral=True)
             return
 
         if value.startswith("OPENROUTER/"):
@@ -387,18 +389,18 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
             # purpose. Judged once the catalogue has loaded, not on a fresh install before its sync.
             if (is_image_slot or is_speech_slot) and catalogue.models and model_id not in catalogue.models:
                 await interaction.response.send_message(
-                    OPENROUTER_NOT_IMAGE_MODEL if is_image_slot else OPENROUTER_NOT_SPEECH_MODEL,
+                    embed=text_embed(OPENROUTER_NOT_IMAGE_MODEL if is_image_slot else OPENROUTER_NOT_SPEECH_MODEL),
                     ephemeral=True)
                 return
             # A text slot is held to its list the same way: a model that also makes images or
             # audio is left out of it, since the chat adapter asks for text alone.
             if not (is_image_slot or is_speech_slot) and not catalogue.outputs_text_only(model_id):
-                await interaction.response.send_message(OPENROUTER_NOT_TEXT_MODEL, ephemeral=True)
+                await interaction.response.send_message(embed=text_embed(OPENROUTER_NOT_TEXT_MODEL), ephemeral=True)
                 return
             # A typed id is held to the list the dropdown offers -- see may_pick_training_models.
             if (not may_pick_training_models(getattr(self.parent_view, "user_id", interaction.user.id))
                     and not catalogue.open_to_all(model_id)):
-                await interaction.response.send_message(OPENROUTER_TRAINING_MODEL_HIDDEN, ephemeral=True)
+                await interaction.response.send_message(embed=text_embed(OPENROUTER_TRAINING_MODEL_HIDDEN), ephemeral=True)
                 return
 
         self.parent_view._save_changes(self.target_config_key, value)
@@ -568,7 +570,7 @@ class GlobalChatHistoryView(BlockedGuard, ui.View):
         
         session_data = self.cog.global_chat_sessions.get(self.session_key)
         if not session_data:
-             await interaction.followup.send("Session expired/unloaded.", ephemeral=True)
+             await interaction.followup.send(embed=text_embed("Session expired/unloaded."), ephemeral=True)
              return
 
         original_len = len(session_data['unified_log'])
@@ -588,13 +590,15 @@ class GlobalChatHistoryView(BlockedGuard, ui.View):
                     self.selected_profile = self.available_profiles[0]
                     await self._load_current_session()
                     self._build_view()
-                    await interaction.edit_original_response(content="Round deleted. Switching to next available profile.", embed=self.get_embed(), view=self)
+                    await interaction.edit_original_response(
+                        content=None, embeds=[text_embed("Round deleted. Switching to next available profile."),
+                                              self.get_embed()], view=self)
                 else:
-                    await interaction.edit_original_response(content="History cleared and session deleted.", embed=None, view=None)
+                    await interaction.edit_original_response(content=None, embed=text_embed("History cleared and session deleted."), view=None)
             else:
                 await interaction.edit_original_response(embed=self.get_embed(), view=self)
         else:
-            await interaction.followup.send("Failed to delete round.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Failed to delete round."), ephemeral=True)
 
 class WhisperHistoryView(BlockedGuard, ui.View):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, all_whispers: List[Dict]):
@@ -731,7 +735,7 @@ class WhisperHistoryView(BlockedGuard, ui.View):
 
     async def delete_callback(self, interaction: discord.Interaction):
         if not self.filtered_whispers:
-            await interaction.response.send_message("Nothing to delete.", ephemeral=True, delete_after=5)
+            await interaction.response.send_message(embed=text_embed("Nothing to delete."), ephemeral=True, delete_after=5)
             return
 
         whisper_turn, response_turn = self.filtered_whispers[self.current_page]
@@ -868,7 +872,7 @@ class SpeakPreviewView(BlockedGuard, ui.View):
 
         if not rewritten:
             await interaction.edit_original_response(
-                content=f"That take failed.\n-# {error}", embed=self.build_embed(), view=self)
+                content=None, embeds=[text_embed(f"That take failed.\n-# {error}"), self.build_embed()], view=self)
             return
 
         self.rewritten = rewritten
@@ -889,11 +893,11 @@ class SpeakPreviewView(BlockedGuard, ui.View):
 
         if delivered:
             await interaction.edit_original_response(
-                content=f"Sent, after {self.takes} take(s).", embed=None, view=None)
+                content=None, embed=text_embed(f"Sent, after {self.takes} take(s)."), view=None)
         else:
             await interaction.edit_original_response(
-                content="That profile is no longer seated in this channel's session, so nothing was sent.",
-                embed=None, view=None)
+                content=None,
+                embed=text_embed("That profile is no longer seated in this channel's session, so nothing was sent."), view=None)
         self.stop()
 
     @ui.button(label="Reroll", style=discord.ButtonStyle.primary)
@@ -921,7 +925,7 @@ class SpeakPreviewView(BlockedGuard, ui.View):
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.danger)
     async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.edit_message(content="Discarded.", embed=None, view=None)
+        await interaction.response.edit_message(content=None, embed=text_embed("Discarded."), view=None)
         self.stop()
 
 
@@ -940,14 +944,14 @@ class WhisperActionView(BlockedGuard, ui.View):
     async def delete_button(self, interaction: discord.Interaction, button: ui.Button):
         session = self.cog.multi_profile_channels.get(self.channel_id)
         if not session:
-            await interaction.response.edit_message(content="Session not found or has ended.", view=None, embed=None)
+            await interaction.response.edit_message(content=None, view=None, embed=text_embed("Session not found or has ended."))
             return
 
         if not session.get("is_hydrated"):
             session = await self.cog.session_manager._ensure_session_hydrated(self.channel_id, session.get("type", "multi"))
 
         if not session:
-            await interaction.response.edit_message(content="Failed to load session memory.", view=None, embed=None)
+            await interaction.response.edit_message(content=None, view=None, embed=text_embed("Failed to load session memory."))
             return
 
         turn_ids_to_delete = {self.whisper_turn_id, self.response_turn_id}
@@ -971,12 +975,12 @@ class WhisperActionView(BlockedGuard, ui.View):
             # is_hydrated, which stranded the in-memory log past eviction.
             self.cog.session_manager._recompute_pending_whispers(session)
 
-        await interaction.response.edit_message(content="Whisper has been deleted from the profile's memory.", view=None, embed=None)
+        await interaction.response.edit_message(content=None, view=None, embed=text_embed("Whisper has been deleted from the profile's memory."))
 
     @ui.button(label="Regenerate", style=discord.ButtonStyle.secondary, custom_id="regenerate_whisper")
     async def regenerate_button(self, interaction: discord.Interaction, button: ui.Button):
         if not self.target_participant or not self.whisper_message:
-            await interaction.response.send_message("Regeneration is only available for recent whispers.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Regeneration is only available for recent whispers."), ephemeral=True)
             return
         await self.cog.generation_service._execute_whisper_regeneration(interaction, self.whisper_turn_id, self.response_turn_id, self.target_participant, self.whisper_message)
 
@@ -1021,7 +1025,7 @@ class ReactivitySettingsModal(ui.Modal, title="Edit Reactivity"):
                     raise ValueError()
                 parsed_chance = val
             except ValueError:
-                await interaction.response.send_message("❌ Invalid chance percentage. Must be a number between 0 and 100.", ephemeral=True)
+                await interaction.response.send_message(embed=text_embed("❌ Invalid chance percentage. Must be a number between 0 and 100."), ephemeral=True)
                 return
         
         parsed_keywords = None
@@ -1073,7 +1077,7 @@ class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
             await interaction.response.defer()
             await self.view.update_display()
         except ValueError:
-            await interaction.response.send_message("Invalid chance or cooldown.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Invalid chance or cooldown."), ephemeral=True)
 
 class CompactionSettingsModal(ui.Modal, title="Compaction"):
     threshold_input = ui.TextInput(label=f"Compact after N turns ({COMPACTION_THRESHOLD_MIN}-{COMPACTION_THRESHOLD_MAX})", placeholder=f"Default: {COMPACTION_THRESHOLD_DEFAULT}", required=True, max_length=3)
@@ -1096,7 +1100,7 @@ class CompactionSettingsModal(ui.Modal, title="Compaction"):
             chunk = int(self.chunk_input.value)
             length = int(self.length_input.value) if self.length_input.value.strip() else None
         except ValueError:
-            await interaction.response.send_message("❌ Turn counts and the length must be whole numbers.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("❌ Turn counts and the length must be whole numbers."), ephemeral=True)
             return
 
         cfg = self.view.session.setdefault("compaction", {})
@@ -1134,7 +1138,7 @@ class CompactNowModal(ui.Modal, title="Compact Now"):
         try:
             keep = int(self.keep_input.value)
         except ValueError:
-            await interaction.response.send_message("❌ The number of turns to keep must be a whole number.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("❌ The number of turns to keep must be a whole number."), ephemeral=True)
             return
         await self.view._run_manual_compaction(interaction, keep=max(0, min(COMPACT_KEEP_MAX, keep)))
 
@@ -1236,14 +1240,18 @@ def turn_order(session: Dict) -> List[Tuple[Optional[int], str]]:
         n = seat_of.get((p['owner_id'], p['profile_name']))
         how = "Child Bot" if p.get('method') == 'child_bot' else "Webhook"
         state = "skipped" if p.get('is_skipped') else f"{p.get('chance', 100)}%"
-        slot = f"slot {n + 1}" if n is not None else "guest"
+        slot = f"slot {n + 1}" if n is not None else "guest" if p.get('ephemeral') else "removed"
         return n, f"{lead} `{p['profile_name']}` · {how} · {state} · {slot}"
 
     order, at = session.get('round_order') or ((), 0)
     if session.get('is_running') and order:
+        # A seat removed since the round began is skipped when its turn comes (the worker's
+        # `_may_still_speak`), so it is not listed as waiting -- only as having spoken.
+        shown = [(i, p) for i, p in enumerate(order)
+                 if i <= at or p.get('ephemeral') or (p['owner_id'], p['profile_name']) in seat_of]
         entries = [(None, "**This round**")]
-        entries += [line(p, "✓" if i < at else "▶" if i == at else f"{i + 1}.")
-                    for i, p in enumerate(order)]
+        entries += [line(p, "✓" if i < at else "▶" if i == at else f"{k + 1}.")
+                    for k, (i, p) in enumerate(shown)]
         in_round = {(p['owner_id'], p['profile_name']) for p in order}
         rest = [p for p in profiles if (p['owner_id'], p['profile_name']) not in in_round]
         if rest:
@@ -1726,8 +1734,8 @@ class SessionConfigView(BlockedGuard, ui.View):
                     # when the bar was drawn.
                     if t not in self.MEMBER_TABS and not self._viewer_is_admin():
                         await i.response.send_message(
-                            "Only server administrators can change that. Open casting lets "
-                            "you seat and unseat characters on the **Cast** tab.",
+                            embed=text_embed("Only server administrators can change that. Open casting lets "
+                            "you seat and unseat characters on the **Cast** tab."),
                             ephemeral=True)
                         return
                     self.current_tab = t; self.current_page = 0
@@ -1951,8 +1959,8 @@ class SessionConfigView(BlockedGuard, ui.View):
                 names = ", ".join(f"`{n}`" for n in blocked[:5])
                 more = f" (+{len(blocked) - 5})" if len(blocked) > 5 else ""
                 await i.followup.send(
-                    f"Skipped {names}{more} — already in the cast the other way "
-                    f"(a profile speaks as a child bot **or** a webhook, not both).",
+                    embed=text_embed(f"Skipped {names}{more} — already in the cast the other way "
+                    f"(a profile speaks as a child bot **or** a webhook, not both)."),
                     ephemeral=True)
         add_select(self, options, cast_cb, placeholder=placeholder, min_values=0,
                    max_values=len(options) if page_items else 1, row=0,
@@ -2006,8 +2014,8 @@ class SessionConfigView(BlockedGuard, ui.View):
                 # can go inside one -- so, like the tab bar, it is re-tested here.
                 if not self._viewer_is_admin():
                     await i.response.send_message(
-                        "Only server administrators can clear the whole cast. You can "
-                        "still unseat your own characters from the dropdown.",
+                        embed=text_embed("Only server administrators can clear the whole cast. You can "
+                        "still unseat your own characters from the dropdown."),
                         ephemeral=True)
                     return
                 removed = list(self.session.get('profiles', []))
@@ -2107,7 +2115,7 @@ class SessionConfigView(BlockedGuard, ui.View):
             # outlives the role that rendered it.
             if not self._viewer_is_admin():
                 await i.response.send_message(
-                    "Only a server administrator can change who may edit this session.",
+                    embed=text_embed("Only a server administrator can change who may edit this session."),
                     ephemeral=True)
                 return
             self.session["cast_policy"] = i.data['values'][0]
@@ -2188,7 +2196,7 @@ class SessionConfigView(BlockedGuard, ui.View):
     async def _advice_go(self, i: discord.Interaction):
         # Re-tested on the press, as the tab bar is: the view outlives a role.
         if not self._viewer_is_admin():
-            await i.response.send_message("Only server administrators can change that.", ephemeral=True)
+            await i.response.send_message(embed=text_embed("Only server administrators can change that."), ephemeral=True)
             return
         tab, _, screen = i.data['values'][0].partition(":")
         self.advice_open = False
@@ -2421,7 +2429,7 @@ class SessionConfigView(BlockedGuard, ui.View):
                     targets.append(p)
             
             if not targets:
-                await i.response.send_message("❌ No profiles selected.", ephemeral=True)
+                await i.response.send_message(embed=text_embed("❌ No profiles selected."), ephemeral=True)
                 return
                 
             modal = ReactivitySettingsModal(self, targets)
@@ -2451,13 +2459,11 @@ class SessionConfigView(BlockedGuard, ui.View):
                                                         f"`{quiet_label(pro.get('cooldown', 300))}` of quiet", inline=True)
         
         dir_on = director_enabled(pro)
-        primary, fallbacks = self.cog.api_service.model_chain(
-            director_model_config(pro), "ltm_model", self.session.get("owner_id"))
-        models = f"`{primary}`" + ("\nFallbacks: " + " \u2192 ".join(f"`{m}`" for m in fallbacks)
-                                  if fallbacks else "")
         dir_ins = pro.get("director_instructions", "(Default)") or "(Default)"
-        embed.add_field(name="AI Director", value=f"{'**`ON`**' if dir_on else '`OFF`'}\n{models}\n"
+        embed.add_field(name="AI Director", value=f"{'**`ON`**' if dir_on else '`OFF`'}\n"
                                                   f"Instructions: ```{dir_ins[:200]}```", inline=False)
+        embed.add_field(name="Models", value="\n".join(chain_lines("AI Director", *self.cog.api_service.model_chain(
+            director_model_config(pro), "ltm_model", self.session.get("owner_id")))), inline=False)
 
         def set_proactivity(on: bool):
             self.session.setdefault("proactivity", {})["enabled"] = on
@@ -2488,14 +2494,8 @@ class SessionConfigView(BlockedGuard, ui.View):
                                               "once the channel goes quiet", inline=True)
         embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
         embed.add_field(name="Length", value=f"About `{cfg['max_words']}` words", inline=True)
-        primary, fallbacks = self.cog.api_service.model_chain(
-            compaction_model_config(self.session), "compaction_model", self.session.get("owner_id"))
-        embed.add_field(
-            name="Summariser",
-            value=f"`{primary}`" + ("\nFallbacks: " + " \u2192 ".join(f"`{m}`" for m in fallbacks)
-                                    if fallbacks else ""),
-            inline=False,
-        )
+        embed.add_field(name="Models", value="\n".join(chain_lines("Summariser", *self.cog.api_service.model_chain(
+            compaction_model_config(self.session), "compaction_model", self.session.get("owner_id")))), inline=False)
 
         log = self.session.get("unified_log") or []
         visible = sum(
@@ -2558,7 +2558,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         # Re-tested where it is acted on, as the tab bar is: this spends summariser calls,
         # and the view outlives a role.
         if not self._viewer_is_admin():
-            await i.response.send_message("Only server administrators can compact a session.", ephemeral=True)
+            await i.response.send_message(embed=text_embed("Only server administrators can compact a session."), ephemeral=True)
             return
         undo = kwargs.get("undo")
         await send_status(i, "Unfolding the synopsis..." if undo else "Folding the conversation into its synopsis...")
@@ -2642,7 +2642,7 @@ class SessionConfigView(BlockedGuard, ui.View):
                 note = "Session is live, but the cast is empty — nobody will answer."
             else:
                 note = f"Session is live with {count} participant(s)."
-            await i.followup.send(("▶️ " if not was_started else "🔄 ") + note, ephemeral=True)
+            await i.followup.send(embed=text_embed(("▶️ " if not was_started else "🔄 ") + note), ephemeral=True)
         add_button(self, "▶️ Update Session" if started else "▶️ Start Session", commit,
                    style=discord.ButtonStyle.success, row=3)
 
@@ -2933,7 +2933,7 @@ class GenerationTraceView(BlockedGuard, ui.View):
             # disabled flag is a rendering hint, not a permission.
             if page == "memories" and not self.is_owner:
                 await interaction.response.send_message(
-                    "Only this profile's owner can see the memories it recalled.", ephemeral=True)
+                    embed=text_embed("Only this profile's owner can see the memories it recalled."), ephemeral=True)
                 return
             self.page = page
             self._build_view()

@@ -11,6 +11,7 @@ from .base_components import (BlockedGuard, PageJumpModal, TabbedView, add_butto
                               build_pagination_controls, bulk_select_options,
                               paged_nav_options, refuse_unregistered, resolve_bulk_select)
 from .gui_start import NewProfileModal
+from .base_components import text_embed
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -264,17 +265,17 @@ class HubPublicLibraryView(HubBaseView):
         
         p_info = self.filtered_list[self.selected_index]
         if i.user.id == p_info['owner_id']:
-            await i.response.send_message("You cannot borrow your own profile.", ephemeral=True)
+            await i.response.send_message(embed=text_embed("You cannot borrow your own profile."), ephemeral=True)
             return
         
         if self._has_borrowed(p_info):
-            await i.response.send_message("You already have this profile.", ephemeral=True)
+            await i.response.send_message(embed=text_embed("You already have this profile."), ephemeral=True)
             return
 
         await i.response.defer(ephemeral=True)
         local_name = self.cog.profile_manager._generate_unique_local_name(i.user.id, p_info['profile_name'])
         if await self.cog.profile_manager._accept_share_request(i, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], local_name, is_public_borrow=True):
-            await i.followup.send(f"✅ Borrowed **{p_info['profile_name']}** as **{local_name}**.", ephemeral=True)
+            await i.followup.send(embed=text_embed(f"✅ Borrowed **{p_info['profile_name']}** as **{local_name}**."), ephemeral=True)
 
     async def edit_intro_cb(self, i: discord.Interaction):
         # Deferred: gui_profiles imports this module at load time.
@@ -287,7 +288,7 @@ class HubPublicLibraryView(HubBaseView):
         # published, and the profile may have been renamed since.
         name = self.cog.profile_manager._get_name_from_pid(p_info['owner_id'], p_info.get('original_pid'))
         if not name:
-            await i.response.send_message("That profile no longer exists.", ephemeral=True)
+            await i.response.send_message(embed=text_embed("That profile no longer exists."), ephemeral=True)
             return
 
         async def repaint(_interaction: discord.Interaction):
@@ -500,11 +501,11 @@ class HubIncomingView(HubBaseView):
             return
         blocked = self._about().get("blocked_sharers") or []
         if len(blocked) >= self.BLOCK_LIMIT:
-            await i.followup.send(f"Your block list is full ({self.BLOCK_LIMIT}). Unblock someone "
-                                  "on this tab first.", ephemeral=True)
+            await i.followup.send(embed=text_embed(f"Your block list is full ({self.BLOCK_LIMIT}). Unblock someone "
+                                  "on this tab first."), ephemeral=True)
             return
         self.cog.profile_manager.set_blocked_sharers(self.user_id, [*blocked, self.selected_sharer_id])
-        await i.followup.send("Blocked. Their shares are gone, and they cannot offer you more.",
+        await i.followup.send(embed=text_embed("Blocked. Their shares are gone, and they cannot offer you more."),
                               ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
@@ -524,7 +525,7 @@ class HubIncomingView(HubBaseView):
         for field, count, limit in (("borrowed", len(shares) - clones, defaultConfig.LIMIT_BORROWED),
                                     ("personal", clones, defaultConfig.LIMIT_PROFILES)):
             if count and len(index.get(field, {})) + count > limit:
-                await i.followup.send(f"Limit Reached. Accepting these would exceed your limit of {limit} {field} profiles.", ephemeral=True)
+                await i.followup.send(embed=text_embed(f"Limit Reached. Accepting these would exceed your limit of {limit} {field} profiles."), ephemeral=True)
                 return
 
         accepted, failed = [], []
@@ -555,7 +556,7 @@ class HubIncomingView(HubBaseView):
         msg = f"Accepted: {', '.join(accepted)}" if accepted else "No valid profiles found."
         if failed:
             msg += "\n\n**Not accepted:**\n" + "\n".join(failed)
-        await i.followup.send(msg, ephemeral=True)
+        await i.followup.send(embed=text_embed(msg), ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
         await self.update_display()
@@ -566,7 +567,7 @@ class HubIncomingView(HubBaseView):
         shares =[s for s in self.cog.profile_manager._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
         for s in shares:
             await self.cog.profile_manager._reject_share_request(self.original_interaction, sharer_id, s.get('original_pid'), s['profile_name'], s.get("kind"))
-        await i.followup.send("Rejected shares.", ephemeral=True)
+        await i.followup.send(embed=text_embed("Rejected shares."), ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
         await self.update_display()
@@ -785,8 +786,8 @@ class HubShareManagerView(HubBaseView):
         progress = None
         if unrated:
             progress = await i.followup.send(
-                f"Rating {len(unrated)} profile{'s' if len(unrated) != 1 else ''}, "
-                f"{RATING_CONCURRENCY} at a time. This takes a few seconds each.",
+                embed=text_embed(f"Rating {len(unrated)} profile{'s' if len(unrated) != 1 else ''}, "
+                f"{RATING_CONCURRENCY} at a time. This takes a few seconds each."),
                 ephemeral=True, wait=True)
         gate = asyncio.Semaphore(RATING_CONCURRENCY)
 
@@ -802,8 +803,8 @@ class HubShareManagerView(HubBaseView):
             if progress and name in self.needs_rating:
                 lines.append(f"{'✅' if answer[0] else '⚠️'} **{name}**")
                 try:
-                    await progress.edit(content=f"Rated {len(lines)} of {len(unrated)}\n"
-                                                + "\n".join(lines)[-1800:])
+                    await progress.edit(embed=text_embed(f"Rated {len(lines)} of {len(unrated)}\n"
+                                                         + "\n".join(lines)[-3800:]))
                 except discord.HTTPException:
                     progress = None   # Gone or refused: the report still lands.
         allowed = [name for name in names if answers[name][0]]
@@ -821,7 +822,7 @@ class HubShareManagerView(HubBaseView):
         await i.response.edit_message(view=self)
 
         if not self.selected_profiles or not self.selected_users:
-            await i.followup.send("Select profiles and recipients first.", ephemeral=True)
+            await i.followup.send(embed=text_embed("Select profiles and recipients first."), ephemeral=True)
             self.processing = False
             self.setup_items()
             await self.update_display()
@@ -835,7 +836,7 @@ class HubShareManagerView(HubBaseView):
             await self.update_display()
             lines = "\n".join(f"• **{n}** -- {r}" for n, r in refused.items())
             await i.followup.send(
-                f"None of the selected profiles can be shared yet.\n{lines}", ephemeral=True)
+                embed=text_embed(f"None of the selected profiles can be shared yet.\n{lines}"), ephemeral=True)
             return
 
         pm = self.cog.profile_manager
@@ -875,7 +876,7 @@ class HubShareManagerView(HubBaseView):
         if refused:
             lines = "\n".join(f"• **{n}** -- {r}" for n, r in refused.items())
             report += f"\n\n**Left out:**\n{lines}"
-        await i.followup.send(report, ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
+        await i.followup.send(embed=text_embed(report), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     async def apply_public(self, i: discord.Interaction):
         if self.processing: return
@@ -958,7 +959,7 @@ class BorrowDefaultsView(BlockedGuard, ui.View):
     async def _answer(self, interaction: discord.Interaction, use_mine: bool):
         self.use_mine = use_mine
         await interaction.response.edit_message(
-            content="Using your defaults." if use_mine else "Keeping the original's settings.",
+            content=None, embed=text_embed("Using your defaults." if use_mine else "Keeping the original's settings."),
             view=None)
         self.stop()
 

@@ -34,6 +34,7 @@ from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, always_reads_s
 from ..services.generation.turn_deletion import branch_log
 from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
                               _get_decompressor, seal_blob, unseal_blob)
+from ..gui.base_components import text_embed
 
 # Turns allowed to accumulate in the tail sidecar before the next flush re-seals the
 # whole log into the cold segment. Sized so the common case -- a round appending a
@@ -1447,7 +1448,7 @@ class SessionManager:
         result = await asyncio.to_thread(_sync_switch)
         if result is None:
             if interaction_for_feedback:
-                await interaction_for_feedback.followup.send(f"Your profile '{profile_name}' not found. Cannot activate.", ephemeral=True)
+                await interaction_for_feedback.followup.send(embed=text_embed(f"Your profile '{profile_name}' not found. Cannot activate."), ephemeral=True)
             return False
 
         old_profile_name, active_appearance = result

@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from ..utils.user_defaults import (
-    MODEL_SLOT_PAIRS, apply_defaults, model_chain, model_provider, model_slot_defaults,
+    MODEL_SLOT_PAIRS, apply_defaults, chain_lines, model_chain, model_provider, model_slot_defaults,
     other_provider, platform_model_defaults, sanitise_defaults, setting_label, short_model_name)
 from ..utils.helpers import is_real_model
 from ..utils.constants import (
@@ -64,6 +64,7 @@ from .storage_manager import IOManager, _get_compressor, _get_decompressor
 #: Two searches run in two worker threads, and LRUCache's eviction is several steps.
 _LIBRARY_TEXT_LOCK = threading.Lock()
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
+from ..gui.base_components import text_embed
 
 try:
     import orjson as json
@@ -1940,11 +1941,11 @@ class ProfileManager:
             named += f" and {len(labels) - 6} more"
         view = BorrowDefaultsView(self.cog)
         message = await interaction.followup.send(
-            f"Borrowing `{profile_name}`: your defaults would change {named}. "
-            f"Use yours, or keep what its author chose?", view=view, ephemeral=True, wait=True)
+            embed=text_embed(f"Borrowing `{profile_name}`: your defaults would change {named}. "
+            f"Use yours, or keep what its author chose?"), view=view, ephemeral=True, wait=True)
         if await view.wait():
             try:
-                await message.edit(content="No answer, so the original's settings were kept.",
+                await message.edit(embed=text_embed("No answer, so the original's settings were kept."),
                                    view=None)
             except discord.HTTPException:
                 pass
@@ -4132,9 +4133,9 @@ class ProfileManager:
         limit = discord.utils.DEFAULT_FILE_SIZE_LIMIT_BYTES
         if len(file_data) > limit:
             await interaction.followup.send(
-                f"❌ That export comes to {len(file_data) / (1024 * 1024):.1f} MB, over the "
+                embed=text_embed(f"❌ That export comes to {len(file_data) / (1024 * 1024):.1f} MB, over the "
                 f"{limit // (1024 * 1024)} MB Discord lets me send. Export fewer profiles at a "
-                "time, or leave out Long-Term Memories.", ephemeral=True)
+                "time, or leave out Long-Term Memories."), ephemeral=True)
             return
 
         filename = f"mimic_export_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.mimic"
@@ -4146,7 +4147,7 @@ class ProfileManager:
         else:
             msg += " Your data is encrypted with this instance's master key, so only this instance can import it."
 
-        await interaction.followup.send(msg, file=discord_file, ephemeral=True)
+        await interaction.followup.send(embed=text_embed(msg), file=discord_file, ephemeral=True)
 
     def _build_export(self, user_id: int, pids: Dict[str, Optional[str]], filters: Set[str],
                       passphrase: Optional[str]) -> bytes:
@@ -4323,12 +4324,12 @@ class ProfileManager:
             if skipped:
                 lines.append("**Not imported:**")
                 lines += skipped
-            await interaction.followup.send("\n".join(lines), ephemeral=True)
+            await interaction.followup.send(embed=text_embed("\n".join(lines)), ephemeral=True)
 
         except ValueError as ve:
-            await interaction.followup.send(f"❌ **Import Rejected:** {ve}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"❌ **Import Rejected:** {ve}"), ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"❌ **Import Failed:** An unexpected error occurred: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"❌ **Import Failed:** An unexpected error occurred: {suppress_link_previews(str(e))}"), ephemeral=True)
 
     def _write_imported_profiles(self, user_id: int, jobs: List[Tuple[str, Dict[str, Any], list, list]]):
         """Writes each (pid, profile, ltm, training). Blocking: run it in a thread.
@@ -4356,7 +4357,7 @@ class ProfileManager:
         user_dir = os.path.join(self.cog.USERS_DIR, user_id_str)
         
         if not os.path.exists(user_dir):
-            await interaction.followup.send("No data found for your account.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("No data found for your account."), ephemeral=True)
             return
             
         import tempfile
@@ -4416,9 +4417,9 @@ class ProfileManager:
         
         try:
             file = discord.File(zip_path, filename=f"privacy_export_{user_id_str}.zip")
-            await interaction.followup.send("Here is your complete data export. This archive contains your profiles, API keys and memory data in unencrypted, uncompressed JSON format, and your voice recordings as plain audio (`.bin`). Keep it safe: your API keys are in it unencrypted.", file=file, ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Here is your complete data export. This archive contains your profiles, API keys and memory data in unencrypted, uncompressed JSON format, and your voice recordings as plain audio (`.bin`). Keep it safe: your API keys are in it unencrypted."), file=file, ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"Failed to send export file: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Failed to send export file: {suppress_link_previews(str(e))}"), ephemeral=True)
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -4486,7 +4487,7 @@ class ProfileManager:
             self.cog.global_chat_sessions.pop(k, None)
             self.cog.session_last_accessed.pop(k, None)
 
-        await interaction.followup.send("Account Deleted. All your profiles, memories, and settings have been permanently erased from this instance.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed("Account Deleted. All your profiles, memories, and settings have been permanently erased from this instance."), ephemeral=True)
 
     def _generate_unique_local_name(self, user_id: int, original_name: str) -> str:
         """The source's own name, else the first free `name-2`, `name-3`..., cut to
@@ -4648,14 +4649,12 @@ class ProfileManager:
                            ("Training", "training_analysis_model")):
             primary, fallbacks = model_chain(resolved, key, preferred)
             providers[key] = {model_provider(m) for m in (primary, *fallbacks)}
-            rest = [m for m in dict.fromkeys(fallbacks) if m != primary]
             # A MimicAI Auto slot reads as its tier, with the model it runs on today beside it.
             tiers = {resolved[k]: short_model_name(stored[k])
                      for k in (key, MODEL_SLOT_PAIRS[key]) if auto_tier(stored.get(k))}
             shown = lambda m: (f"{tiers[m]} ({short_model_name(m)})" if m in tiers
                                else short_model_name(m))
-            model_lines.append(f"**{label}** \u2192 **`{shown(primary)}`**")
-            model_lines.extend(f"-# \u21b3 `{shown(m)}`" for m in rest)
+            model_lines.extend(chain_lines(label, primary, fallbacks, shown))
 
         embed.add_field(name="Models", value="\n".join(model_lines)[:1024], inline=False)
 
@@ -4993,12 +4992,12 @@ class ProfileManager:
         """
         recipient_id = interaction.user.id
         if not self.is_registered(recipient_id):
-            await interaction.followup.send(NOT_REGISTERED, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(NOT_REGISTERED), ephemeral=True)
             return False
         if not is_public_borrow and not any(
                 self._is_share_of(s, sharer_id, target_pid, fallback_name)
                 for s in self._pending_shares(recipient_id)):
-            await interaction.followup.send("That share is no longer waiting for you.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("That share is no longer waiting for you."), ephemeral=True)
             return False
         def _sync_prepare():
             current_name = self._get_name_from_pid(sharer_id, target_pid) if target_pid else fallback_name
@@ -5026,20 +5025,20 @@ class ProfileManager:
 
         prep = await asyncio.to_thread(_sync_prepare)
         if prep is None:
-            await interaction.followup.send("The shared profile seems to no longer exist.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("The shared profile seems to no longer exist."), ephemeral=True)
             return False
         if len(prep) == 2:
             refused_name, verdict = prep
             reason = ("Adult profiles cannot be shared." if verdict == CONTENT_RATING_ADULT
                       else "It is not rated for sharing right now. Its owner needs to have it rated first.")
             await interaction.followup.send(
-                f"❌ **'{refused_name}' cannot be borrowed.** {reason}", ephemeral=True)
+                embed=text_embed(f"❌ **'{refused_name}' cannot be borrowed.** {reason}"), ephemeral=True)
             return False
         current_name, owner_profile_data, index, current_borrowed = prep
 
         limit = defaultConfig.LIMIT_BORROWED
         if current_borrowed >= limit:
-            await interaction.followup.send(f"Limit Reached. You have {current_borrowed}/{limit} borrowed profiles.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Limit Reached. You have {current_borrowed}/{limit} borrowed profiles."), ephemeral=True)
             return False
 
         # Asked only where it would change something: defaults are off until the user
@@ -5138,8 +5137,8 @@ class ProfileManager:
 
         if not await asyncio.to_thread(_sync_save):
             await interaction.followup.send(
-                "That profile could not be traced back to its owner, so it cannot be "
-                "borrowed. Ask them to re-share it.", ephemeral=True)
+                embed=text_embed("That profile could not be traced back to its owner, so it cannot be "
+                "borrowed. Ask them to re-share it."), ephemeral=True)
             return False
 
         if not is_public_borrow:
@@ -5174,7 +5173,7 @@ class ProfileManager:
                   f"`/profile manage profile_name:{profile_name}`.")
 
         try:
-            await interaction.followup.send("\n\n".join(lines), ephemeral=True)
+            await interaction.followup.send(embed=text_embed("\n\n".join(lines)), ephemeral=True)
         except Exception:
             # A borrow that succeeded must not be reported as failed because its
             # explanatory note could not be delivered.

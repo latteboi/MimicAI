@@ -3,7 +3,7 @@ from .utils.constants import (
     CAST_POLICY_OPEN, DEFAULT_CAST_POLICY,
     DEFAULT_SYSTEM_INSTRUCTION,
     FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
-    MAX_MULTI_PROFILES, MOD_DATA_DIR, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
+    MAX_MULTI_PROFILES, MOD_DATA_DIR, PLACEHOLDER_EMOJI, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
     GAME_CACHE_MAX_SIZE, MEDIA_DESCRIPTION_CACHE_MAX, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
     PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR, COMPACT_KEEP_DEFAULT, COMPACT_KEEP_MAX,
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
@@ -20,7 +20,8 @@ from .utils.character_card import (CardError, card_portrait, prompt_text, profil
                                    read_examples, read_lorebook)
 from .utils.memory_tuning import low_memory
 from .listeners.event_listeners import EventListeners
-from .gui.base_components import (ActionTextInputModal, DropdownContentView, InviteView, refuse_unregistered,
+from .gui.base_components import (ActionTextInputModal, DropdownContentView, InviteView, build_confirm_view,
+                                  refuse_unregistered, text_embed,
                                   send_status, settle_status, update_status)
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
 from .gui.gui_generate import GeneratedProfileView
@@ -408,7 +409,7 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.response.defer(ephemeral=True)
 
         if system_profile and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-            await interaction.followup.send("❌ **Access Denied:** Creating System Profiles is restricted to the Bot Owner.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("❌ **Access Denied:** Creating System Profiles is restricted to the Bot Owner."), ephemeral=True)
             return
         # A System profile is the bot's, filed under its owner; a personal one is the
         # first thing some users keep, and keeping starts at /start.
@@ -416,43 +417,48 @@ class MimicCog(EventListeners, commands.Cog):
             return
 
         profile_name = profile_name.lower().strip()
-        
-        is_valid, err_msg = self.profile_manager._is_valid_profile_name(profile_name)
-        if not is_valid:
-            await interaction.followup.send(f"❌ **Invalid Name:** {err_msg}", ephemeral=True)
-            return
 
         if system_profile:
+            is_valid, err_msg = self.profile_manager._is_valid_profile_name(profile_name)
+            if not is_valid:
+                await interaction.followup.send(embed=text_embed(f"❌ **Invalid Name:** {err_msg}"), ephemeral=True)
+                return
             owner_id = int(defaultConfig.DISCORD_OWNER_ID)
             owner_index = self.profile_manager._get_user_index(owner_id)
             if profile_name in owner_index.get("system", {}):
-                await interaction.followup.send(f"A system profile with the name '{profile_name}' already exists.", ephemeral=True)
+                await interaction.followup.send(embed=text_embed(f"A system profile with the name '{profile_name}' already exists."), ephemeral=True)
                 return
             new_profile = self.profile_manager._get_or_create_system_profile(profile_name)
-            await interaction.followup.send(f"Successfully created new System Profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Successfully created new System Profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it."), ephemeral=True)
             return
 
-        index = self.profile_manager._get_user_index(interaction.user.id)
-        
+        refusal = self._create_blank_profile(interaction.user.id, profile_name)
+        await interaction.followup.send(embed=text_embed(refusal or f"Successfully created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it."), ephemeral=True)
+
+    def _blank_profile_refusal(self, user_id: int, profile_name: str) -> Optional[str]:
+        """Why `user_id` may not create `profile_name` (already lowercased), or None."""
+        is_valid, err_msg = self.profile_manager._is_valid_profile_name(profile_name)
+        if not is_valid:
+            return f"❌ **Invalid Name:** {err_msg}"
+        index = self.profile_manager._get_user_index(user_id)
         if profile_name in index.get("personal", []) or profile_name in index.get("borrowed", []):
-            await interaction.followup.send(f"A profile with the name '{profile_name}' already exists.", ephemeral=True)
-            return
-
-        current_count = len(index.get("personal", []))
+            return f"A profile with the name '{profile_name}' already exists."
         limit = defaultConfig.LIMIT_PROFILES
+        if len(index.get("personal", [])) >= limit:
+            return f"**Limit Reached.**\n\nYou have reached the maximum of **{limit}** profiles."
+        return None
 
-        if current_count >= limit:
-            await interaction.followup.send(
-                f"**Limit Reached.**\n\nYou have reached the maximum of **{limit}** profiles.", ephemeral=True)
-            return
-
-        new_profile = self.profile_manager._get_or_create_user_profile(interaction.user.id, profile_name)
+    def _create_blank_profile(self, user_id: int, profile_name: str) -> Optional[str]:
+        """The body of /profile create, for a registered user: None once created, or the refusal."""
+        refusal = self._blank_profile_refusal(user_id, profile_name)
+        if refusal:
+            return refusal
+        new_profile = self.profile_manager._get_or_create_user_profile(user_id, profile_name)
         if new_profile:
             config = new_profile.get('config', {})
             config['created_at'] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            self.profile_manager._save_profile_config(interaction.user.id, profile_name, config)
-        
-        await interaction.followup.send(f"Successfully created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it.", ephemeral=True)
+            self.profile_manager._save_profile_config(user_id, profile_name, config)
+        return None
 
     @profile_group.command(name="generate", description="Uses AI to draft a new profile from a concept or an image, for you to review before saving.")
     @cooldown_unless_refused(1, 60.0, _cannot_generate)
@@ -543,8 +549,8 @@ class MimicCog(EventListeners, commands.Cog):
         await settle_status(interaction, embed=view.build_embed(), view=view)
         if image_part and not appearance.get("avatar_url"):
             await interaction.followup.send(
-                "-# Your DMs are closed, so the image could not be kept as the avatar. Set one "
-                "under Appearance after saving.", ephemeral=True)
+                embed=text_embed("-# Your DMs are closed, so the image could not be kept as the avatar. Set one "
+                "under Appearance after saving."), ephemeral=True)
 
     async def _keep_portrait(self, user: discord.abc.User, file: discord.File, caption: str) -> Optional[str]:
         """The link of `file` re-posted in `user`'s DMs, or None when their DMs are closed.
@@ -577,8 +583,23 @@ class MimicCog(EventListeners, commands.Cog):
 
             async def on_pick(pick_interaction: discord.Interaction, picked: str):
                 await self._open_profile_manage(pick_interaction, picked, repaint=True)
+                return True
 
-            await suggest_profile(self, interaction, profile_name, candidates, on_pick)
+            # Offered only where it would succeed, so the button never retires the
+            # suggestions just to say no. Re-checked at the press, which may be minutes on.
+            typed = profile_name.lower().strip()
+
+            async def on_create(create_interaction: discord.Interaction, _typed: str):
+                refusal = self._create_blank_profile(create_interaction.user.id, typed)
+                if refusal:
+                    await create_interaction.followup.send(embed=text_embed(refusal), ephemeral=True)
+                    return False
+                return await on_pick(create_interaction, typed)
+
+            creatable = (self.profile_manager.is_registered(interaction.user.id)
+                         and not self._blank_profile_refusal(interaction.user.id, typed))
+            await suggest_profile(self, interaction, profile_name, candidates, on_pick,
+                                  on_create=on_create if creatable else None)
             return
 
         await self._open_profile_manage(interaction, profile_name)
@@ -655,7 +676,7 @@ class MimicCog(EventListeners, commands.Cog):
             if self.profile_manager._is_system_name(interaction.user.id, n))
 
         if not personal_names and not borrowed_names and not system_names:
-            await interaction.followup.send("You have no saved profiles yet.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("You have no saved profiles yet."), ephemeral=True)
             return
         
         embed = discord.Embed(title="Your Profiles", color=discord.Color.purple())
@@ -696,7 +717,7 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.checks.cooldown(1, 60.0, key=lambda i: i.user.id)
     async def export_command(self, interaction: discord.Interaction):
         view = BulkExportView(self, interaction.user.id)
-        await interaction.response.send_message("### 📤 Profile Export\nSelect profiles and components to export.\n\n*The file will contain encrypted data. Tampered files cannot be imported.*\n", view=view, ephemeral=True)
+        await interaction.response.send_message(embed=text_embed("Select profiles and components to export.\n\n*The file will contain encrypted data. Tampered files cannot be imported.*", title="📤 Profile Export"), view=view, ephemeral=True)
 
     @app_commands.command(name="import", description="Import a MimicAI export, or a character card (PNG, CHARX or JSON).")
     @cooldown_unless_refused(1, 30.0, _unregistered)
@@ -711,27 +732,27 @@ class MimicCog(EventListeners, commands.Cog):
             return
         # Every kind of import below holds the whole file in memory.
         if low_memory():
-            await interaction.response.send_message(IMPORT_LOW_MEMORY, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(IMPORT_LOW_MEMORY), ephemeral=True)
             return
         if profile_name:
             await self._import_into_profile(interaction, file, profile_name, add)
             return
         if add != 'lorebook':
             await interaction.response.send_message(
-                "❌ Examples are added to a profile of yours: choose it as `profile_name` too.", ephemeral=True)
+                embed=text_embed("❌ Examples are added to a profile of yours: choose it as `profile_name` too."), ephemeral=True)
             return
         if file.filename.lower().endswith(('.png', '.json', '.charx')):
             await self._import_card(interaction, file)
             return
         if not file.filename.endswith('.mimic'):
             await interaction.response.send_message(
-                "❌ Invalid file type. Upload a `.mimic` export, or a character card as a PNG, CHARX or JSON.",
+                embed=text_embed("❌ Invalid file type. Upload a `.mimic` export, or a character card as a PNG, CHARX or JSON."),
                 ephemeral=True)
             return
         # On the size Discord states, before read() holds the whole file in memory.
         if file.size > defaultConfig.LIMIT_ATTACHMENT_BYTES:
             await interaction.response.send_message(
-                IMPORT_FILE_TOO_LARGE.format(limit=defaultConfig.LIMIT_ATTACHMENT_BYTES // (1024 * 1024)),
+                embed=text_embed(IMPORT_FILE_TOO_LARGE.format(limit=defaultConfig.LIMIT_ATTACHMENT_BYTES // (1024 * 1024))),
                 ephemeral=True)
             return
         
@@ -745,7 +766,7 @@ class MimicCog(EventListeners, commands.Cog):
                 await interaction.response.send_modal(ImportPassphraseModal(self, file))
                 return
         except Exception as e:
-            await interaction.response.send_message(f"❌ Failed to read or parse file: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(f"❌ Failed to read or parse file: {suppress_link_previews(str(e))}"), ephemeral=True)
             return
         
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -764,9 +785,9 @@ class MimicCog(EventListeners, commands.Cog):
         if not (is_text or lower.endswith(('.png', '.charx'))) or file.size > limit:
             what = "Examples come as a TXT or JSON file" if examples else "A lorebook is a JSON file"
             await interaction.response.send_message(
-                f"❌ {what} of at most {CARD_TEXT_MAX_BYTES // (1024 * 1024)} MB, or a card (PNG or CHARX) "
+                embed=text_embed(f"❌ {what} of at most {CARD_TEXT_MAX_BYTES // (1024 * 1024)} MB, or a card (PNG or CHARX) "
                 f"carrying {'them' if examples else 'one'} of at most "
-                f"{defaultConfig.LIMIT_ATTACHMENT_BYTES // (1024 * 1024)} MB.", ephemeral=True)
+                f"{defaultConfig.LIMIT_ATTACHMENT_BYTES // (1024 * 1024)} MB."), ephemeral=True)
             return
         training = add == 'training_examples'
         await send_status(interaction, "Embedding the examples..." if training else "Reading the file...")
@@ -809,8 +830,8 @@ class MimicCog(EventListeners, commands.Cog):
         limit = CARD_TEXT_MAX_BYTES if is_json else defaultConfig.LIMIT_ATTACHMENT_BYTES
         if file.size > limit:
             await interaction.response.send_message(
-                f"❌ That card is {file.size / (1024 * 1024):.1f} MB. A {'JSON ' if is_json else ''}card "
-                f"can be at most {limit // (1024 * 1024)} MB.", ephemeral=True)
+                embed=text_embed(f"❌ That card is {file.size / (1024 * 1024):.1f} MB. A {'JSON ' if is_json else ''}card "
+                f"can be at most {limit // (1024 * 1024)} MB."), ephemeral=True)
             return
         await send_status(interaction, "Reading the card into a draft...")
         user_id = interaction.user.id
@@ -860,14 +881,14 @@ class MimicCog(EventListeners, commands.Cog):
         await settle_status(interaction, embed=view.build_embed(), view=view)
         if unsorted:
             await interaction.followup.send(
-                f"-# The card was filed as written, not sorted into sections, and each section keeps "
-                f"its first {PERSONA_TEXT_INPUT_MAX_LENGTH:,} characters: {suppress_link_previews(unsorted)}",
+                embed=text_embed(f"-# The card was filed as written, not sorted into sections, and each section keeps "
+                f"its first {PERSONA_TEXT_INPUT_MAX_LENGTH:,} characters: {suppress_link_previews(unsorted)}"),
                 ephemeral=True)
         if portrait_too_large:
             await interaction.followup.send(
-                f"-# The card's image is over {defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES // (1024 * 1024)} MB, "
+                embed=text_embed(f"-# The card's image is over {defaultConfig.CONTENT_CLASSIFY_MAX_IMAGE_BYTES // (1024 * 1024)} MB, "
                 "more than the content rating reads, so it is not the avatar. Set one under "
-                "Appearance after saving.", ephemeral=True)
+                "Appearance after saving."), ephemeral=True)
 
     @app_commands.command(name="privacy", description="Export or delete your data, and see this server's data policy.")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
@@ -885,7 +906,8 @@ class MimicCog(EventListeners, commands.Cog):
         is_owner = interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
         embed = discord.Embed(
             title=f"Bot Identity: {self.bot.user.name}",
-            description="Managed by MimicAI Core.",
+            description=(f"Managed by MimicAI {PLACEHOLDER_EMOJI}.\n"
+                         "*Welcome back, my friends. The show never ends.*"),
             color=discord.Color.blue()
         )
         embed.set_thumbnail(url=self.bot.user.display_avatar.url)
@@ -915,17 +937,17 @@ class MimicCog(EventListeners, commands.Cog):
                                  consent: Optional[discord.Attachment] = None):
         # Checked before the consent screen, so nobody vouches for a file that would be refused.
         if not self.profile_manager.may_set_voice_sample(interaction.user.id, profile_name):
-            await interaction.response.send_message(VOICE_SAMPLE_NOT_OWN, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(VOICE_SAMPLE_NOT_OWN), ephemeral=True)
             return
         mime_type = voice_sample_mime_type(sample.content_type, sample.filename)
         consent_mime_type = consent and voice_sample_mime_type(consent.content_type, consent.filename)
         if mime_type is None or (consent and consent_mime_type is None):
-            await interaction.response.send_message(VOICE_SAMPLE_NOT_AUDIO, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(VOICE_SAMPLE_NOT_AUDIO), ephemeral=True)
             return
         limit = defaultConfig.LIMIT_VOICE_SAMPLE_BYTES
         if sample.size > limit or (consent and consent.size > limit):
             await interaction.response.send_message(
-                VOICE_SAMPLE_TOO_LARGE.format(limit=limit // (1024 * 1024)), ephemeral=True)
+                embed=text_embed(VOICE_SAMPLE_TOO_LARGE.format(limit=limit // (1024 * 1024))), ephemeral=True)
             return
         records = await self.profile_manager.voice_sample_records(interaction.user.id, profile_name)
         if slot is None:
@@ -936,7 +958,7 @@ class MimicCog(EventListeners, commands.Cog):
             slot = selected if selected in empty else (empty[0] if empty else None)
         if slot is None:
             await interaction.response.send_message(
-                VOICE_SAMPLE_SLOTS_FULL.format(slots=VOICE_SAMPLE_SLOTS, profile=profile_name), ephemeral=True)
+                embed=text_embed(VOICE_SAMPLE_SLOTS_FULL.format(slots=VOICE_SAMPLE_SLOTS, profile=profile_name)), ephemeral=True)
             return
         replaces = (records[slot - 1].get("filename") or "recording") if records[slot - 1] else None
         view = VoiceSampleConsentView(self, interaction.user.id, profile_name, sample, mime_type, transcript,
@@ -958,7 +980,7 @@ class MimicCog(EventListeners, commands.Cog):
 
         if removed > 0:
             # Use followup because response was already deferred/used
-            await interaction.followup.send(f"ℹ️ Notice: {removed} borrowed profiles were removed because their original creators deleted them.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"ℹ️ Notice: {removed} borrowed profiles were removed because their original creators deleted them."), ephemeral=True)
 
     session_group = app_commands.Group(name="session", description="Manage chat sessions.", guild_only=True)
 
@@ -982,14 +1004,14 @@ class MimicCog(EventListeners, commands.Cog):
                 interaction.guild_id, interaction.channel_id)
             if policy != CAST_POLICY_OPEN:
                 await interaction.response.send_message(
-                    "You must be a server administrator to configure sessions. An "
+                    embed=text_embed("You must be a server administrator to configure sessions. An "
                     "administrator can set this channel's session to **Open casting** "
-                    "to let anyone edit it.", ephemeral=True)
+                    "to let anyone edit it."), ephemeral=True)
                 return
 
         block = self._session_key_block(interaction.guild, interaction.user.id)
         if block:
-            await interaction.response.send_message(block, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(block), ephemeral=True)
             return
 
         # Invalidate previous session configuration view for this user
@@ -1113,7 +1135,7 @@ class MimicCog(EventListeners, commands.Cog):
 
         self.session_manager._save_multi_profile_sessions()
         await interaction.followup.send(
-            f"Removed `{removed_participant['profile_name']}` from the session.", ephemeral=True)
+            embed=text_embed(f"Removed `{removed_participant['profile_name']}` from the session."), ephemeral=True)
 
     async def _swap_session_impl(self, interaction: discord.Interaction, profile_name: Optional[str],
                                  use_child_bot: Optional[bool], slot: Optional[int]):
@@ -1126,7 +1148,7 @@ class MimicCog(EventListeners, commands.Cog):
         """
         block = self._session_key_block(interaction.guild, interaction.user.id)
         if block:
-            await interaction.followup.send(block, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(block), ephemeral=True)
             return
 
         session = self.multi_profile_channels.get(interaction.channel_id)
@@ -1135,7 +1157,7 @@ class MimicCog(EventListeners, commands.Cog):
             # The live session, not its saved blueprint: slot numbers index this cast, and
             # the turn order is only known here.
             if not session or not session.get("profiles"):
-                await interaction.followup.send("There is no active session in this channel.", ephemeral=True)
+                await interaction.followup.send(embed=text_embed("There is no active session in this channel."), ephemeral=True)
                 return
             
             view = SessionSwapListView(self, interaction, session)
@@ -1144,18 +1166,18 @@ class MimicCog(EventListeners, commands.Cog):
 
         # If no session exists, we must have a profile name to start one
         if not session and not profile_name:
-            await interaction.followup.send("There is no active session to modify. Provide a profile name to start one.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("There is no active session to modify. Provide a profile name to start one."), ephemeral=True)
             return
 
         # If session exists, check ownership
         if session and session.get("owner_id") != interaction.user.id:
-            await interaction.followup.send("You are not the owner of this session and cannot modify its participants.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("You are not the owner of this session and cannot modify its participants."), ephemeral=True)
             return
 
         # Logic for removing a participant by seat number (Session must exist here)
         if not profile_name and slot:
             if slot > len(session["profiles"]):
-                await interaction.followup.send(f"Invalid slot. There are only {len(session['profiles'])} participants.", ephemeral=True)
+                await interaction.followup.send(embed=text_embed(f"Invalid slot. There are only {len(session['profiles'])} participants."), ephemeral=True)
                 return
             await self._remove_session_participant(interaction, session, slot - 1)
             return
@@ -1240,18 +1262,18 @@ class MimicCog(EventListeners, commands.Cog):
             if existing_index is not None:
                 if slot is not None:
                     await interaction.followup.send(
-                        f"`{profile_name}` is already in slot {existing_index + 1}. Run "
+                        embed=text_embed(f"`{profile_name}` is already in slot {existing_index + 1}. Run "
                         f"`/session swap profile_name:{profile_name}` on its own to remove it, "
-                        f"or name a different profile to put in slot {slot}.", ephemeral=True)
+                        f"or name a different profile to put in slot {slot}."), ephemeral=True)
                     return
                 if use_child_bot is not None:
                     seated_as = ("its child bot"
                                  if session["profiles"][existing_index].get("method") == "child_bot"
                                  else "a webhook")
                     await interaction.followup.send(
-                        f"`{profile_name}` is already a participant, speaking through {seated_as}. "
+                        embed=text_embed(f"`{profile_name}` is already a participant, speaking through {seated_as}. "
                         f"Remove it with `/session swap profile_name:{profile_name}` on its own, "
-                        f"then add it back with the `use_child_bot` you want.", ephemeral=True)
+                        f"then add it back with the `use_child_bot` you want."), ephemeral=True)
                     return
                 await self._remove_session_participant(interaction, session, existing_index)
                 return
@@ -1291,9 +1313,9 @@ class MimicCog(EventListeners, commands.Cog):
 
                 self.session_manager._save_multi_profile_sessions()
                 await interaction.followup.send(
-                    f"Session started with `{profile_name}`. Send a message in this channel to talk to it.\n"
+                    embed=text_embed(f"Session started with `{profile_name}`. Send a message in this channel to talk to it.\n"
                     f"Add more with `/session swap`, or open `/session config` to tune reactivity, "
-                    f"mode and prompts.",
+                    f"mode and prompts."),
                     ephemeral=True)
                 return
 
@@ -1308,7 +1330,7 @@ class MimicCog(EventListeners, commands.Cog):
                     old_participant_to_remove = old_participant
                     action_description = f"Swapped session profile to `{profile_name}`."
                 elif len(session["profiles"]) >= MAX_MULTI_PROFILES:
-                    await interaction.followup.send(f"Session is full ({MAX_MULTI_PROFILES} participants). Please specify a slot to replace.", ephemeral=True)
+                    await interaction.followup.send(embed=text_embed(f"Session is full ({MAX_MULTI_PROFILES} participants). Please specify a slot to replace."), ephemeral=True)
                     return
                 else:
                     session["profiles"].append(new_participant)
@@ -1319,7 +1341,7 @@ class MimicCog(EventListeners, commands.Cog):
 
                 if is_insertion:
                     if len(session["profiles"]) >= MAX_MULTI_PROFILES:
-                        await interaction.followup.send(f"Session is full ({MAX_MULTI_PROFILES} participants). Cannot add another.", ephemeral=True)
+                        await interaction.followup.send(embed=text_embed(f"Session is full ({MAX_MULTI_PROFILES} participants). Cannot add another."), ephemeral=True)
                         return
                     session["profiles"].insert(target_index, new_participant)
                     action_description = f"Added `{profile_name}` to session slot {target_index + 1}."
@@ -1351,7 +1373,7 @@ class MimicCog(EventListeners, commands.Cog):
                         })
 
             self.session_manager._save_multi_profile_sessions()
-            await interaction.followup.send(action_description, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(action_description), ephemeral=True)
             return
 
     @session_group.command(name="audit", description="Run a diagnostic and token telemetry audit on the active session.")
@@ -1368,7 +1390,7 @@ class MimicCog(EventListeners, commands.Cog):
             session = await self.session_manager._ensure_session_hydrated(interaction.channel_id, "multi")
 
         if not session:
-            await interaction.response.send_message("There is no active session in this channel to audit.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("There is no active session in this channel to audit."), ephemeral=True)
             return
             
         await interaction.response.defer(ephemeral=True)
@@ -1391,7 +1413,7 @@ class MimicCog(EventListeners, commands.Cog):
                 session = active_sessions.get("regular", {}).get(str(interaction.channel_id))
 
         if not session:
-            await interaction.response.send_message("No active session in this channel.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("No active session in this channel."), ephemeral=True)
             return
 
         view = SessionView(self, interaction, session)
@@ -1462,12 +1484,12 @@ class MimicCog(EventListeners, commands.Cog):
         error = await self.game_service.open_lobby(
             interaction, seats_wanted=seats, join=join, rules=rules, kind=kind)
         if error:
-            await interaction.followup.send(error, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(error), ephemeral=True)
             return
 
         await interaction.followup.send(
-            "Table posted. It is **locked** — press 🔓 on it to let other people sit "
-            "down, then **Start** when everyone is seated. Nothing is on a clock.",
+            embed=text_embed("Table posted. It is **locked** — press 🔓 on it to let other people sit "
+            "down, then **Start** when everyone is seated. Nothing is on a clock."),
             ephemeral=True)
 
     @play_group.command(name="stop", description="End the game running in this channel (Admin Only).")
@@ -1480,7 +1502,7 @@ class MimicCog(EventListeners, commands.Cog):
         lobby = self.game_service.lobby_for(interaction.channel_id)
         if not game and not lobby:
             await interaction.response.send_message(
-                "There is no game running in this channel.", ephemeral=True)
+                embed=text_embed("There is no game running in this channel."), ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True)
@@ -1494,7 +1516,7 @@ class MimicCog(EventListeners, commands.Cog):
         if game:
             await self.game_service.stop_game(interaction.channel_id, reason="stopped early")
         await interaction.followup.send(
-            "Game ended." if game else "Table cleared.", ephemeral=True)
+            embed=text_embed("Game ended." if game else "Table cleared."), ephemeral=True)
 
     # Top level rather than under /session: forcing a round is something a user does
     # mid-conversation, alongside /refresh and /cancel, not something they go into a
@@ -1508,7 +1530,7 @@ class MimicCog(EventListeners, commands.Cog):
 
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session:
-            await interaction.followup.send("No active session found in this channel.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("No active session found in this channel."), ephemeral=True)
             return
 
         # Ungated on purpose. Anyone who can post in the channel already starts a
@@ -1517,17 +1539,17 @@ class MimicCog(EventListeners, commands.Cog):
         # there is no session-owner tier for this to fall into.
         if not self.session_manager.is_started(session):
             await interaction.followup.send(
-                "This session has not been started. Run `/session config` -> **Start / Update Session**.",
+                embed=text_embed("This session has not been started. Run `/session config` -> **Start / Update Session**."),
                 ephemeral=True)
             return
 
         if not session.get("profiles"):
-            await interaction.followup.send("There is nobody in the cast to trigger.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("There is nobody in the cast to trigger."), ephemeral=True)
             return
 
         block = self._session_key_block(interaction.guild, interaction.user.id)
         if block:
-            await interaction.followup.send(block, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(block), ephemeral=True)
             return
 
         # Trigger logic: push a null trigger to simulate automated continuation
@@ -1537,7 +1559,7 @@ class MimicCog(EventListeners, commands.Cog):
             session['worker_task'] = task
             self.background_tasks.add(task)
 
-        await interaction.followup.send("Round triggered.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed("Round triggered."), ephemeral=True)
 
     @app_commands.command(name="refresh", description="Clears the bot's short-term memory for the current context (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -1545,14 +1567,44 @@ class MimicCog(EventListeners, commands.Cog):
     @is_admin_or_owner_check()
     async def refresh_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
-        await interaction.response.defer(ephemeral=True)
+        await self._confirm_teardown(
+            interaction, self._refresh_now, "Refreshing...", "Clear Conversation", text_embed(
+                "The cast forgets everything said in this channel so far, including the synopsis "
+                "and whispers. The cast, session settings and long-term memories are kept, and "
+                "no messages in the channel are deleted.\n\nThis cannot be undone.",
+                title="Clear this channel's conversation?"))
 
+    async def _confirm_teardown(self, interaction: discord.Interaction, run, status: str, label: str,
+                                warning: discord.Embed):
+        """`run(interaction)` behind a confirmation, for /refresh and /suspend: both delete the
+        session from disk. One ephemeral message throughout -- the prompt, then `status`
+        ticking, then the result `run` settles it to. No prompt when there is nothing to
+        lose: no session, or an unstarted draft with nobody seated, which `/suspend` ends."""
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if not session:
+            await interaction.response.send_message(embed=text_embed("There is no session in this channel."),
+                                                    ephemeral=True)
+            return
+
+        async def confirm(i: discord.Interaction):
+            await send_status(i, status)
+            await run(i)
+
+        if not (self.session_manager.is_started(session) or session.get("profiles")):
+            await send_status(interaction, status)
+            await run(interaction)
+            return
+        await interaction.response.send_message(embed=warning, view=build_confirm_view(label, confirm, interaction),
+                                                ephemeral=True)
+
+    async def _refresh_now(self, interaction: discord.Interaction):
+        """The body of /refresh, under `send_status`: it answers by settling the status."""
         ch_id = interaction.channel_id
         held = await self._session_to_memorise(interaction)
         session = self.multi_profile_channels.get(ch_id)
 
         if not session:
-            await interaction.followup.send("There is no active session in this channel to refresh.", ephemeral=True)
+            await settle_status(interaction, "There is no session in this channel.")
             return
 
         for participant in session.get("profiles", []):
@@ -1584,8 +1636,11 @@ class MimicCog(EventListeners, commands.Cog):
         # and a round that delivered during it would flush its log back over the delete.
         await self.session_manager._delete_session_from_disk((ch_id, None, None), session.get("type", "multi"))
 
-        await interaction.followup.send("The session memory for this channel has been cleared. The conversation will start from scratch.", ephemeral=True)
-        await self._memorise_held(interaction, held)
+        note = await self._memorise_held(interaction, held, "Cleared")
+        await settle_status(interaction, embed=text_embed(
+            "The cast won't remember anything said in this channel before now, including the "
+            "synopsis and whispers. The cast, session settings and long-term memories are kept, "
+            "and no messages in the channel are deleted." + note, title="Conversation cleared"))
 
     async def _session_to_memorise(self, interaction: discord.Interaction) -> Optional[Dict]:
         """This channel's session, hydrated, for `_memorise_held` once a teardown has
@@ -1608,20 +1663,26 @@ class MimicCog(EventListeners, commands.Cog):
         # their memory bookmarks still land on the session that keeps them.
         return dict(session) if session else None
 
-    async def _memorise_held(self, interaction: discord.Interaction, held: Optional[Dict]):
+    async def _memorise_held(self, interaction: discord.Interaction, held: Optional[Dict], done: str) -> str:
         """Run after the teardown, never before: the flush is a model call per seat, and
         a session left live meanwhile took every message, command and cast change sent
-        in that window -- and a cast configured then was suspended along with it."""
+        in that window -- and a cast configured then was suspended along with it.
+
+        The line the result ends on: who got a memory, or why nobody did. `done` is what
+        the status says has happened while the save runs."""
         if not held:
-            return
+            if self._session_key_block(interaction.guild, interaction.user.id):
+                return "\n-# No memories were saved: this server has no API key the cast can use."
+            return ""
+        await update_status(interaction, f"{done}. Saving the cast's memories...")
         try:
             saved, _, _ = await self.generation_service.memorise_seats(
                 held, list(held.get("profiles", [])), interaction.guild.id,
                 interaction.user.display_name, interaction.user.id, interaction.channel)
-            if saved:
-                await interaction.followup.send(f"Saved a memory for {', '.join(saved)}.", ephemeral=True)
         except Exception as e:
             print(f"Memory flush after tearing down {interaction.channel_id} failed: {e}")
+            return "\n-# The cast's memories of this conversation could not be saved."
+        return f"\n-# Saved a memory for {', '.join(saved)}." if saved else ""
 
     @app_commands.command(name="cancel", description="Stops the bot's current generation or typing in this channel (Admin Only).")
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
@@ -1659,7 +1720,7 @@ class MimicCog(EventListeners, commands.Cog):
                                   or live_regens)
 
         if not busy:
-            await interaction.response.send_message("Nothing is currently being generated in this channel.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Nothing is currently being generated in this channel."), ephemeral=True)
             return
 
         # Administrators only. A cancel is not private: it aborts the round everybody
@@ -1669,8 +1730,8 @@ class MimicCog(EventListeners, commands.Cog):
         # caller's rank, and it refuses administrators too.
         if self.session_manager.is_delivering(session):
             await interaction.response.send_message(
-                "That response has already been generated and is being sent — cancelling now "
-                "would leave it half-delivered. Wait for it to finish.", ephemeral=True)
+                embed=text_embed("That response has already been generated and is being sent — cancelling now "
+                "would leave it half-delivered. Wait for it to finish."), ephemeral=True)
             return
 
         cancelled = []
@@ -1722,7 +1783,7 @@ class MimicCog(EventListeners, commands.Cog):
         if dropped:
             note += f" {dropped} queued trigger{'s' if dropped != 1 else ''} dropped."
         await interaction.response.send_message(
-            f"Cancelled {summary} for this channel.{note}", ephemeral=True)
+            embed=text_embed(f"Cancelled {summary} for this channel.{note}"), ephemeral=True)
 
     @app_commands.command(name="shutdown", description="Gracefully shuts down this bot instance (Bot Owner Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -1730,11 +1791,11 @@ class MimicCog(EventListeners, commands.Cog):
     @is_owner_in_dm_check()
     async def shutdown_slash(self, interaction: discord.Interaction):
         if interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-            await interaction.response.send_message("This command is restricted to the Bot Owner.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("This command is restricted to the Bot Owner."), ephemeral=True)
             return
 
         view = ShutdownConfirmView(self)
-        await interaction.response.send_message("Are you sure you want to shut down this bot instance?", view=view, ephemeral=True)
+        await interaction.response.send_message(embed=text_embed("Are you sure you want to shut down this bot instance?"), view=view, ephemeral=True)
 
     @app_commands.command(name="suspend", description="Suspends the bot in this channel, clearing the session (Admin Only).")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -1742,18 +1803,28 @@ class MimicCog(EventListeners, commands.Cog):
     @is_admin_or_owner_check()
     async def suspend_slash(self, interaction: discord.Interaction):
         if not self.has_lock: return
-        await interaction.response.defer(ephemeral=True)
-        
+        await self._confirm_teardown(
+            interaction, self._suspend_now, "Suspending...", "End Session", text_embed(
+                "The conversation, its synopsis, the cast and every session setting in this channel "
+                "are deleted, and characters stop replying here. Long-term memories are kept.\n\n"
+                "This cannot be undone.", title="End this channel's session?"))
+
+    async def _suspend_now(self, interaction: discord.Interaction):
+        """The body of /suspend, under `send_status`: it answers by settling the status."""
         ch_id = interaction.channel_id
 
         held = await self._session_to_memorise(interaction)
         if not await self.session_manager.suspend_channel_session(ch_id):
-            await interaction.followup.send("There is no active session in this channel to suspend.", ephemeral=True)
+            await settle_status(interaction, "There is no session in this channel.")
             return
 
         self.session_manager._save_multi_profile_sessions()
-        await interaction.followup.send(f"Session suspended for {interaction.channel.mention}. The bot will be silent until configured again.", ephemeral=True)
-        await self._memorise_held(interaction, held)
+        note = await self._memorise_held(interaction, held, "Ended")
+        await settle_status(interaction, embed=text_embed(
+            f"The conversation, synopsis, cast and session settings in {interaction.channel.mention} "
+            f"are deleted. Characters won't reply here until a session is set up again with "
+            f"{self.command_mention('session swap')} or {self.command_mention('session config')}. "
+            "Long-term memories are kept." + note, title="Session ended"))
 
     @app_commands.command(name="purge", description="Deletes a session's latest turns from channel and memory (Admin Only), or my latest DMs.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -1779,11 +1850,11 @@ class MimicCog(EventListeners, commands.Cog):
             await self._purge_dm(interaction, amount)
             return
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
-            await interaction.followup.send("Purge is not supported in this channel type.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Purge is not supported in this channel type."), ephemeral=True)
             return
         app_perms = interaction.app_permissions
         if not app_perms or not app_perms.manage_messages:
-            await interaction.followup.send("I lack 'Manage Messages' permission.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("I lack 'Manage Messages' permission."), ephemeral=True)
             return
 
         session = self.multi_profile_channels.get(interaction.channel_id)
@@ -1792,14 +1863,14 @@ class MimicCog(EventListeners, commands.Cog):
                 interaction.channel_id, session.get("type", "multi"))
         if not session and not whole_channel:
             await interaction.followup.send(
-                "There is no session in this channel. Set `whole_channel` to delete its messages anyway.",
+                embed=text_embed("There is no session in this channel. Set `whole_channel` to delete its messages anyway."),
                 ephemeral=True)
             return
         # Two rewrites of one log must not overlap, and whichever finished first would
         # release the flag out from under the other.
         if session and session.get('is_purging'):
             await interaction.followup.send(
-                "A purge is already running in this channel. Try again in a moment.", ephemeral=True)
+                embed=text_embed("A purge is already running in this channel. Try again in a moment."), ephemeral=True)
             return
 
         if session:
@@ -1810,14 +1881,14 @@ class MimicCog(EventListeners, commands.Cog):
                     session, tuple(f for f in SESSION_BUSY_FLAGS if f != 'is_purging'),
                     PURGE_BUSY_WAIT_TIMEOUT_SECONDS):
                 await interaction.followup.send(
-                    f"The session is still generating after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
-                    "Nothing was deleted \u2014 try again in a moment.", ephemeral=True)
+                    embed=text_embed(f"The session is still generating after {int(PURGE_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
+                    "Nothing was deleted \u2014 try again in a moment."), ephemeral=True)
                 return
 
             if not whole_channel:
                 doomed = [turn for turn in session.get("unified_log", []) if is_visible_turn(turn)][-amount:]
                 if not doomed:
-                    await interaction.followup.send("There are no turns to delete in this channel.", ephemeral=True)
+                    await interaction.followup.send(embed=text_embed("There are no turns to delete in this channel."), ephemeral=True)
                     return
                 report = await self.generation_service.delete_turns(interaction.channel, session, doomed)
                 summary = f"Deleted {report['turns']} turn(s) and {report['messages']} message(s)."
@@ -1847,9 +1918,9 @@ class MimicCog(EventListeners, commands.Cog):
                     summary += f" {report['messages']} more message(s) belonging to those turns went with them."
             if report["synopses"]:
                 summary += f" Dropped {report['synopses']} session synopsis(es) that still summarised them."
-            await interaction.followup.send(summary, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(summary), ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"An error occurred during purge: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"An error occurred during purge: {suppress_link_previews(str(e))}"), ephemeral=True)
             traceback.print_exc()
         finally:
             if session:
@@ -1871,7 +1942,7 @@ class MimicCog(EventListeners, commands.Cog):
                 deleted += 1
             except discord.HTTPException:
                 pass   # Gone already, or a system message nobody can delete.
-        await interaction.followup.send(f"Deleted {deleted} of my messages from this DM.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed(f"Deleted {deleted} of my messages from this DM."), ephemeral=True)
 
     @app_commands.command(name="memorise", description="Forces long-term memory summarisation for this session's cast, right now (Admin Only).")
     @cooldown_unless_refused(2, 60.0, _no_session_key)
@@ -1986,7 +2057,9 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
     async def train_slash(self, interaction: discord.Interaction, profile: str):
         if not self.has_lock: return
-        await interaction.response.defer(ephemeral=True)
+        # Re-entered by a "Did you mean?" pick, whose interaction is already deferred.
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=True)
 
         candidates = gather_owned_candidates(self, interaction.user.id, only=lambda name, kind: kind == "personal")
         candidate_names = {c.value for c in candidates}
@@ -2017,10 +2090,10 @@ class MimicCog(EventListeners, commands.Cog):
             "interaction": interaction,
         }
         await interaction.followup.send(
-            f"Armed to train **{profile}**. React {TRAIN_INPUT_EMOJI} on the input message and {TRAIN_OUTPUT_EMOJI} on "
+            embed=text_embed(f"Armed to train **{profile}**. React {TRAIN_INPUT_EMOJI} on the input message and {TRAIN_OUTPUT_EMOJI} on "
             "the output message (any two messages, from anyone, in any order). Stays armed for more pairs -- only your "
             "reactions count, and arming expires after 15 minutes of inactivity. Your arming is your own: someone else "
-            "running `/train` in this channel does not disturb it.",
+            "running `/train` in this channel does not disturb it."),
             ephemeral=True)
 
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
@@ -2044,18 +2117,18 @@ class MimicCog(EventListeners, commands.Cog):
                     break
                     
         if not isinstance(unified_log, list) or not unified_log:
-            await interaction.followup.send("Could not find session data for this channel.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Could not find session data for this channel."), ephemeral=True)
             return
 
         idx = next((i for i, t in enumerate(unified_log) if message.id in t.get("message_ids", [])), None)
         target_turn = unified_log[idx] if idx is not None else None
 
         if not target_turn or target_turn.get("is_user") is not False:
-            await interaction.followup.send("This command can only be used on generated bot messages.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("This command can only be used on generated bot messages."), ephemeral=True)
             return
 
         if not target_turn.get("meta"):
-            await interaction.followup.send("No generation trace data is available for this older message.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("No generation trace data is available for this older message."), ephemeral=True)
             return
 
         prompt_id = last_user_message_id(unified_log, idx)
@@ -2076,11 +2149,11 @@ class MimicCog(EventListeners, commands.Cog):
         channel = message.channel
         parent = channel.parent if isinstance(channel, discord.Thread) else channel
         if not isinstance(parent, discord.TextChannel):
-            await interaction.followup.send("A branch opens as a thread, and only a text channel holds those.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("A branch opens as a thread, and only a text channel holds those."), ephemeral=True)
             return
         # The user's own, or the bot opens threads for people Discord wouldn't let.
         if not interaction.permissions.create_public_threads:
-            await interaction.followup.send("Branching opens a thread, and you can't create threads here.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Branching opens a thread, and you can't create threads here."), ephemeral=True)
             return
 
         session = self.multi_profile_channels.get(channel.id)
@@ -2089,7 +2162,7 @@ class MimicCog(EventListeners, commands.Cog):
         log = (session or {}).get("unified_log") or []
         through = next((i for i, t in enumerate(log) if message.id in (t.get("message_ids") or ())), None)
         if through is None:
-            await interaction.followup.send("Only a message in this channel's session can be branched from.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Only a message in this channel's session can be branched from."), ephemeral=True)
             return
         blueprint, branch = self.session_manager.branch_of(session, through)
 
@@ -2107,10 +2180,10 @@ class MimicCog(EventListeners, commands.Cog):
                 # Without `type`, discord.py opens a private thread.
                 thread = await parent.create_thread(name=name, type=discord.ChannelType.public_thread)
         except discord.Forbidden:
-            await interaction.followup.send("I need Create Public Threads in this channel to branch.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("I need Create Public Threads in this channel to branch."), ephemeral=True)
             return
         except discord.HTTPException as e:
-            await interaction.followup.send(f"Discord wouldn't open the thread: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Discord wouldn't open the thread: {suppress_link_previews(str(e))}"), ephemeral=True)
             return
 
         with self._branch_opening(thread.id):
@@ -2120,11 +2193,11 @@ class MimicCog(EventListeners, commands.Cog):
                     await self.bot.wait_for("thread_create", check=lambda t: t.id == thread.id, timeout=10)
                 except asyncio.TimeoutError:
                     await interaction.followup.send(
-                        f"Discord never confirmed {thread.mention}, so the session didn't start there. Try again.",
+                        embed=text_embed(f"Discord never confirmed {thread.mention}, so the session didn't start there. Try again."),
                         ephemeral=True)
                     return
             await self._open_branch(thread, blueprint, branch, message.jump_url, interaction.user.id)
-        await interaction.followup.send(f"Branched into {thread.mention}.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed(f"Branched into {thread.mention}."), ephemeral=True)
 
     @contextlib.contextmanager
     def _branch_opening(self, thread_id: int):
@@ -2157,14 +2230,14 @@ class MimicCog(EventListeners, commands.Cog):
         # Asked here: a context menu is not bound to the cog, so a check decorator's
         # refusal would reach the tree's error handler, not this user.
         if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator):
-            await interaction.response.send_message("Editing profile messages is for server admins.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Editing profile messages is for server admins."), ephemeral=True)
             return
         session = self.multi_profile_channels.get(message.channel.id)
         if session and not session.get("is_hydrated"):
             session = await self.session_manager._ensure_session_hydrated(message.channel.id, session.get("type", "multi"))
         target, refusal = self.generation_service._profile_edit_target(session, message)
         if target is None:
-            await interaction.response.send_message(refusal, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(refusal), ephemeral=True)
             return
 
         async def on_submit(modal_interaction: discord.Interaction, new_text: str):
@@ -2187,17 +2260,17 @@ class MimicCog(EventListeners, commands.Cog):
         if not self.has_lock or self._refused_by_blacklist(interaction): return
         if interaction.guild_id is None:
             if message.author.id != self.bot.user.id:
-                await interaction.response.send_message("Only my own messages can be deleted here.", ephemeral=True)
+                await interaction.response.send_message(embed=text_embed("Only my own messages can be deleted here."), ephemeral=True)
                 return
             try:
                 await message.delete()
             except discord.NotFound:
                 pass
-            await interaction.response.send_message("Message deleted.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Message deleted."), ephemeral=True)
             return
         # Asked here, as Edit Profile Message does: a context menu is not bound to the cog.
         if not (isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator):
-            await interaction.response.send_message("Deleting profile messages is for server admins.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Deleting profile messages is for server admins."), ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         session = self.multi_profile_channels.get(message.channel.id)
@@ -2206,14 +2279,14 @@ class MimicCog(EventListeners, commands.Cog):
         turn = next((t for t in (session or {}).get("unified_log") or ()
                      if message.id in (t.get("message_ids") or ())), None)
         if not turn or turn.get("is_user") is not False:
-            await interaction.followup.send("Only a profile's reply in this channel's session can be deleted.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Only a profile's reply in this channel's session can be deleted."), ephemeral=True)
             return
         # One message is enough: the delete listener takes the rest of the turn, from the
         # channel and the log, once any round still writing it is done (TurnDeletionMixin).
         if not await self.generation_service._delete_own_message(message.channel, message.id):
-            await interaction.followup.send("Could not delete that message.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Could not delete that message."), ephemeral=True)
             return
-        await interaction.followup.send("Deleted, with the rest of that reply.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed("Deleted, with the rest of that reply."), ephemeral=True)
 
     @profile_group.command(name="global_chat", description="Have a persistent, private conversation with a profile.")
     @app_commands.checks.cooldown(5, 60.0, key=lambda i: i.user.id)
@@ -2246,7 +2319,7 @@ class MimicCog(EventListeners, commands.Cog):
             except Exception as e:
                 print(f"Error suspending global chat for {user_id}: {e}")
 
-            await interaction.followup.send("✅ All global conversation histories have been permanently deleted.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("✅ All global conversation histories have been permanently deleted."), ephemeral=True)
             return
 
         profile_name_lower = profile_name.lower().strip() if profile_name else None
@@ -2260,7 +2333,7 @@ class MimicCog(EventListeners, commands.Cog):
 
             await self.session_manager._delete_session_from_disk(session_key, 'global_chat')
             
-            await interaction.followup.send(f"Your global chat history with '{profile_name_lower}' has been cleared.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Your global chat history with '{profile_name_lower}' has been cleared."), ephemeral=True)
             return
 
         if not profile_name_lower:
@@ -2268,7 +2341,7 @@ class MimicCog(EventListeners, commands.Cog):
             view = GlobalChatHistoryView(self, interaction, user_id)
             await view.initialize()
             if not view.available_profiles:
-                await interaction.followup.send("You have no active global chat histories.", ephemeral=True)
+                await interaction.followup.send(embed=text_embed("You have no active global chat histories."), ephemeral=True)
             else:
                 await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
             return
@@ -2311,9 +2384,9 @@ class MimicCog(EventListeners, commands.Cog):
             user_id, profile_name_lower, "global_chat")
         if not allowed:
             await interaction.response.send_message(
-                f"**'{profile_name_lower}' cannot be used in Global Chat.**\n{deny_reason}\n\n"
+                embed=text_embed(f"**'{profile_name_lower}' cannot be used in Global Chat.**\n{deny_reason}\n\n"
                 f"Open `/profile manage profile_name:{profile_name_lower}` and choose "
-                f"**Content Safety** to rate it.",
+                f"**Content Safety** to rate it."),
                 ephemeral=True)
             return
 
@@ -2321,7 +2394,7 @@ class MimicCog(EventListeners, commands.Cog):
             user_id, interaction.guild_id,
             self.profile_manager._get_profile_config(user_id, profile_name_lower, is_borrowed) or {})
         if block:
-            await interaction.response.send_message(block, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(block), ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=False)
@@ -2379,7 +2452,7 @@ class MimicCog(EventListeners, commands.Cog):
         from .utils.news import releases
         notes = releases()
         if not notes:
-            await interaction.response.send_message("No release notes shipped with this instance.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("No release notes shipped with this instance."), ephemeral=True)
             return
         view = DropdownContentView(notes, "MimicAI News",
                                    footer="Enjoying MimicAI? /thanks has ways to support it.")
@@ -2566,13 +2639,13 @@ class MimicCog(EventListeners, commands.Cog):
                         self.multi_profile_channels.pop(interaction.channel_id, None)
                 else:
                     if len(session['profiles']) >= 200:
-                        await interaction.followup.send("The session is full (200 max).", ephemeral=True)
+                        await interaction.followup.send(embed=text_embed("The session is full (200 max)."), ephemeral=True)
                         return
                     session['profiles'].append(participant)
                     result_msg = "MimicGuide joined the Chat Session."
             
             self.session_manager._save_multi_profile_sessions()
-            await interaction.followup.send(result_msg, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(result_msg), ephemeral=True)
 
     @app_commands.command(name="terms", description="View the MimicAI Terms of Service and Privacy Policy.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -2634,7 +2707,7 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def settings_slash(self, interaction: discord.Interaction):
         if not self.fernet:
-            await interaction.response.send_message("Error: The bot's encryption service is not configured.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Error: The bot's encryption service is not configured."), ephemeral=True)
             return
             
         await interaction.response.defer(ephemeral=True)
@@ -2714,7 +2787,7 @@ class MimicCog(EventListeners, commands.Cog):
     async def speak_slash(self, interaction: discord.Interaction, profile_name: str, method: Literal['auto', 'webhook', 'child_bot'] = 'auto', message: Optional[str] = None, style: Literal['verbatim', 'in_character'] = 'verbatim', fidelity: Literal['strict', 'loose'] = 'strict'):
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session:
-            await interaction.response.send_message("There is no active session in this channel. The profile must be active in a session.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("There is no active session in this channel. The profile must be active in a session."), ephemeral=True)
             return
 
         try:
@@ -2753,13 +2826,13 @@ class MimicCog(EventListeners, commands.Cog):
             return
 
         if p_owner_id != interaction.user.id and interaction.user.id != int(defaultConfig.DISCORD_OWNER_ID):
-            await interaction.response.send_message("You can only speak as your own personal or borrowed profiles.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("You can only speak as your own personal or borrowed profiles."), ephemeral=True)
             return
 
         # Verbatim posts the text as written; only in character calls a model.
         block = self._session_key_block(interaction.guild, interaction.user.id) if style == 'in_character' else None
         if block:
-            await interaction.response.send_message(block, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(block), ephemeral=True)
             return
 
         if message:
@@ -2811,7 +2884,7 @@ class MimicCog(EventListeners, commands.Cog):
     async def whisper_slash(self, interaction: discord.Interaction, profile: Optional[str] = None, message: Optional[str] = None):
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session or session.get("type") != "multi":
-            await interaction.response.send_message("This command can only be used in an active multi-profile session.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("This command can only be used in an active multi-profile session."), ephemeral=True)
             return
 
         target_participant = None
@@ -2842,7 +2915,7 @@ class MimicCog(EventListeners, commands.Cog):
 
         block = self._session_key_block(interaction.guild, interaction.user.id) if profile else None
         if block:
-            await interaction.response.send_message(block, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(block), ephemeral=True)
             return
 
         if profile and message:
@@ -2864,12 +2937,12 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.response.defer(ephemeral=True)
             await self._show_whisper_history(interaction)
         else:
-            await interaction.response.send_message("To send a whisper, you must provide both a profile and a message. To view history, provide neither.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("To send a whisper, you must provide both a profile and a message. To view history, provide neither."), ephemeral=True)
 
     async def _show_whisper_history(self, interaction: discord.Interaction):
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session: 
-            await interaction.followup.send("Session not found.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Session not found."), ephemeral=True)
             return
 
         if not session.get("is_hydrated"):
@@ -2892,7 +2965,7 @@ class MimicCog(EventListeners, commands.Cog):
                         break # Found the pair, stop searching for this whisper
 
         if not paired_whispers:
-            await interaction.followup.send("You have no whisper history in this session.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("You have no whisper history in this session."), ephemeral=True)
             return
 
         # Note: History view regeneration is disabled because the target_participant dict 

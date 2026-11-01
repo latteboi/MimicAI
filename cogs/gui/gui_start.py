@@ -41,6 +41,7 @@ from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupM
                               add_select)
 from .gui_settings import (KEY_SLOTS, SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
                            SubmitAPIKeyModal, _fit_list)
+from .base_components import text_embed
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -442,7 +443,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             # Nothing is taken from another key unasked. The ticks fall back to what is
             # saved on the repaint, and the prompt applies them if confirmed.
             await interaction.followup.send(
-                OverrideConfirmView.prompt(conflicts),
+                embed=text_embed(OverrideConfirmView.prompt(conflicts)),
                 view=OverrideConfirmView(self, self.selected_slot, scopes), ephemeral=True)
             return
         self._apply_assignments(self.selected_slot, scopes)
@@ -732,7 +733,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         self.step_key = None
         await self._repaint()
         if provider == PROVIDER_NONE:
-            await interaction.followup.send(WIZARD_COPY["provider_none"], ephemeral=True)
+            await interaction.followup.send(embed=text_embed(WIZARD_COPY["provider_none"]), ephemeral=True)
 
     async def _act_library(self, interaction: discord.Interaction):
         from .gui_hub import HubPublicLibraryView
@@ -751,13 +752,13 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
                     self.state["guild"].id, self.original_interaction.channel_id
                 ) == CAST_POLICY_OPEN):
             await interaction.response.send_message(
-                "You must be a server administrator to configure sessions. An "
+                embed=text_embed("You must be a server administrator to configure sessions. An "
                 "administrator can set this channel's session to **Open casting** to let "
-                "anyone edit it.", ephemeral=True)
+                "anyone edit it."), ephemeral=True)
             return
         block = self.cog._session_key_block(self.state["guild"], interaction.user.id)
         if block:
-            await interaction.response.send_message(block, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(block), ephemeral=True)
             return
         await interaction.response.defer(thinking=True, ephemeral=True)
         await self.cog._open_session_config(interaction)
@@ -781,9 +782,9 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         try:
             message = "Something went wrong there. Press 🔄 Refresh and try again."
             if interaction.response.is_done():
-                await interaction.followup.send(message, ephemeral=True)
+                await interaction.followup.send(embed=text_embed(message), ephemeral=True)
             else:
-                await interaction.response.send_message(message, ephemeral=True)
+                await interaction.response.send_message(embed=text_embed(message), ephemeral=True)
         except Exception:
             pass
 
@@ -874,6 +875,6 @@ class CreateAccountModal(ui.Modal):
         # Discord enforces both, but this is where an account is made, so it is checked here.
         if set(self.consent.values) != set(_CONSENTS) or self.provider.value not in PROVIDER_CHOICES:
             await interaction.response.send_message(
-                "Tick both boxes and choose a provider to create your account.", ephemeral=True)
+                embed=text_embed("Tick both boxes and choose a provider to create your account."), ephemeral=True)
             return
         await self.wizard._choose(interaction, self.provider.value)

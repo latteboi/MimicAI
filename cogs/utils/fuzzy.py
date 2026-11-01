@@ -127,8 +127,12 @@ def score(query: str, candidate: str) -> float:
             return _TOKEN_BASE + 0.14 * coverage
 
     # Only now, for candidates nothing cheaper matched, pay for edit-distance. This is
-    # the tier that catches an actual typo: "Aliec" against "Alice".
-    ratio = SequenceMatcher(None, q_norm or q_fold, c_norm or c_fold).ratio()
+    # the tier that catches an actual typo: "Aliec" against "Alice". Against each word as
+    # well as the whole name: "thron" is one slip from "Dr Aris Thorne"'s last word, and
+    # as a fraction of the whole name it is no match at all.
+    q = q_norm or q_fold
+    ratio = max(SequenceMatcher(None, q, text).ratio()
+                for text in (c_norm or c_fold, *(c_tokens if len(c_tokens) > 1 else ())))
     return min(_DIFFLIB_CEILING, ratio * _DIFFLIB_CEILING)
 
 

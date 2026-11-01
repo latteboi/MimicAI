@@ -23,6 +23,7 @@ from .base_components import (PAGE_NAV_VALUES, BaseBulkProfileView, BlockedGuard
 from .gui_data_policy import DataPolicyView, add_data_policy_fields
 from ..utils import data_policy
 from ..utils.data_policy import may_set_data_policy
+from .base_components import text_embed
 
 class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
@@ -44,25 +45,25 @@ class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
         # assigned -- so in a DM it reliably picked a keyless guild and reported the
         # miss as a broken embedding. The owner's own key is the answer instead.
         if not self.cog.storage_manager._embedding_routes(i.guild_id, self.profile_owner_id):
-            await i.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
+            await i.followup.send(embed=text_embed(NO_EMBEDDING_KEY_MSG), ephemeral=True)
             return
 
         new_embedding = await self.cog.memory_manager._get_embedding(
             new_summary, i.guild_id, task_type="RETRIEVAL_DOCUMENT", owner_id=self.profile_owner_id)
         if not new_embedding:
-            await i.followup.send(EMBEDDING_FAILED_MSG, ephemeral=True)
+            await i.followup.send(embed=text_embed(EMBEDDING_FAILED_MSG), ephemeral=True)
             return
 
         b64_emb = encode_embedding_b64(new_embedding)
         success = await self.cog.memory_manager.update_ltm(self.profile_owner_id, self.profile_name, self.ltm_id, new_summary, b64_emb)
         if success:
-            await i.followup.send(f"LTM entry `{self.ltm_id}` for profile '{self.profile_name}' has been updated.", ephemeral=True)
+            await i.followup.send(embed=text_embed(f"LTM entry `{self.ltm_id}` for profile '{self.profile_name}' has been updated."), ephemeral=True)
         else:
-            await i.followup.send(f"Failed to find and update LTM entry `{self.ltm_id}`.", ephemeral=True)
+            await i.followup.send(embed=text_embed(f"Failed to find and update LTM entry `{self.ltm_id}`."), ephemeral=True)
     
     async def on_error(self, i: discord.Interaction, e: Exception):
         print(f"EditLtmModal error: {e}"); traceback.print_exc()
-        await i.followup.send("An error occurred with the LTM edit form.", ephemeral=True)
+        await i.followup.send(embed=text_embed("An error occurred with the LTM edit form."), ephemeral=True)
 
 class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
@@ -84,9 +85,9 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
         # below (a limit check, an embedding, a shard write) all leads nowhere here.
         if not self.guild_id:
             await i.followup.send(
-                "A memory has to be filed under a server, because that is where it can "
+                embed=text_embed("A memory has to be filed under a server, because that is where it can "
                 "be recalled. Run `/profile manage` in the server this memory belongs to "
-                "and add it there.", ephemeral=True)
+                "and add it there."), ephemeral=True)
             return
 
         # Refused at the limit rather than rolled over: automatic creation drops the
@@ -95,32 +96,32 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
         current_count = len(await self.cog.memory_manager.load_ltms(self.profile_owner_id, self.profile_name))
         if current_count >= limit:
             await i.followup.send(
-                f"**Limit Reached.**\nYou have **{current_count}** memories (Limit: {limit}).\n"
+                embed=text_embed(f"**Limit Reached.**\nYou have **{current_count}** memories (Limit: {limit}).\n"
                 "You cannot manually add more memories while at or above the limit. "
-                "Please delete old memories first.", ephemeral=True)
+                "Please delete old memories first."), ephemeral=True)
             return
 
         summary = self.summary_field.value
         
         if not self.cog.storage_manager._embedding_routes(self.guild_id, self.profile_owner_id):
-            await i.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
+            await i.followup.send(embed=text_embed(NO_EMBEDDING_KEY_MSG), ephemeral=True)
             return
 
         embedding = await self.cog.memory_manager._get_embedding(
             summary, self.guild_id, task_type="RETRIEVAL_DOCUMENT", owner_id=self.profile_owner_id)
         if not embedding:
-            await i.followup.send(EMBEDDING_FAILED_MSG, ephemeral=True)
+            await i.followup.send(embed=text_embed(EMBEDDING_FAILED_MSG), ephemeral=True)
             return
 
         await self.cog.memory_manager._add_ltm(
             self.profile_owner_id, self.profile_name, summary, encode_embedding_b64(embedding),
             self.guild_id, i.user.id, i.user.display_name, source="manual")
-        await i.followup.send(f"Memory added for '{self.profile_name}' "
-                              f"({current_count + 1}/{limit}).", ephemeral=True)
+        await i.followup.send(embed=text_embed(f"Memory added for '{self.profile_name}' "
+                              f"({current_count + 1}/{limit})."), ephemeral=True)
 
     async def on_error(self, i: discord.Interaction, e: Exception):
         print(f"AddLtmModal error: {e}"); traceback.print_exc()
-        await i.followup.send("An error occurred with the LTM add form.", ephemeral=True)
+        await i.followup.send(embed=text_embed("An error occurred with the LTM add form."), ephemeral=True)
 
 class AddTrainingExampleModal(ui.Modal, title="Add Profile Training Example"): 
     user_input_field=ui.TextInput(label="User Input Example",style=discord.TextStyle.paragraph,required=True,max_length=EXAMPLE_SAID_MAX_CHARS)
@@ -135,8 +136,8 @@ class AddTrainingExampleModal(ui.Modal, title="Add Profile Training Example"):
         await i.response.defer(ephemeral=True,thinking=True)
         # add_new_training_example checks the limit itself, before the embedding call.
         s,m=await self.cog.memory_manager.add_new_training_example(self.profile_owner_id, self.profile_name, self.user_input_field.value, self.chatbot_response_field.value, self.guild_id)
-        await i.followup.send(m,ephemeral=True)
-    async def on_error(self,i:discord.Interaction,e:Exception):print(f"AddTrainExModal err:{e}");traceback.print_exc();await i.followup.send('Oops!',ephemeral=True)
+        await i.followup.send(embed=text_embed(m),ephemeral=True)
+    async def on_error(self,i:discord.Interaction,e:Exception):print(f"AddTrainExModal err:{e}");traceback.print_exc();await i.followup.send(embed=text_embed('Oops!'),ephemeral=True)
 
 class EditTrainingExampleModal(ui.Modal, title="Edit Profile Training Example"):
     user_input_field = ui.TextInput(label="User Input Example", style=discord.TextStyle.paragraph, required=True, max_length=EXAMPLE_SAID_MAX_CHARS)
@@ -155,12 +156,12 @@ class EditTrainingExampleModal(ui.Modal, title="Edit Profile Training Example"):
     async def on_submit(self,i:discord.Interaction):
         await i.response.defer(ephemeral=True,thinking=True)
         s,m=await self.cog.memory_manager.update_training_example(self.profile_owner_id, self.profile_name, self.example_id, self.user_input_field.value, self.chatbot_response_field.value, self.guild_id)
-        await i.followup.send(m,ephemeral=True)
+        await i.followup.send(embed=text_embed(m),ephemeral=True)
 
     async def on_error(self, i: discord.Interaction, e: Exception):
         print(f"EditTrainingExampleModal error: {e}")
         traceback.print_exc()
-        await i.followup.send("An error occurred with the edit form.", ephemeral=True)
+        await i.followup.send(embed=text_embed("An error occurred with the edit form."), ephemeral=True)
 
 class LoreEntryModal(ui.Modal):
     """Adds a lore entry, or with `entry` rewrites it. Blank keywords: always in mind."""
@@ -185,14 +186,14 @@ class LoreEntryModal(ui.Modal):
         _ok, message = await asyncio.to_thread(
             self.cog.profile_manager.put_lore_entry, self.profile_owner_id, self.profile_name,
             self.entry_id, self.keys_field.value, self.content_field.value)
-        await i.followup.send(message, ephemeral=True)
+        await i.followup.send(embed=text_embed(message), ephemeral=True)
         # The lorebook is rated text. Deferred: gui_profiles imports this module.
         from .gui_profiles import maybe_prompt_rating_after_edit
         await maybe_prompt_rating_after_edit(self.cog, i, self.profile_owner_id, self.profile_name)
 
     async def on_error(self, i: discord.Interaction, e: Exception):
         print(f"LoreEntryModal error: {e}"); traceback.print_exc()
-        await i.followup.send("An error occurred with the lore entry form.", ephemeral=True)
+        await i.followup.send(embed=text_embed("An error occurred with the lore entry form."), ephemeral=True)
 
 class FixedExampleModal(ui.Modal):
     """Adds a fixed example, or with `entry` rewrites it. What was said may be left blank."""
@@ -216,14 +217,14 @@ class FixedExampleModal(ui.Modal):
         _ok, message = await asyncio.to_thread(
             self.cog.profile_manager.put_fixed_example, self.profile_owner_id, self.profile_name,
             self.entry_id, self.said_field.value, self.reply_field.value)
-        await i.followup.send(message, ephemeral=True)
+        await i.followup.send(embed=text_embed(message), ephemeral=True)
         # Fixed examples are rated text. Deferred: gui_profiles imports this module.
         from .gui_profiles import maybe_prompt_rating_after_edit
         await maybe_prompt_rating_after_edit(self.cog, i, self.profile_owner_id, self.profile_name)
 
     async def on_error(self, i: discord.Interaction, e: Exception):
         print(f"FixedExampleModal error: {e}"); traceback.print_exc()
-        await i.followup.send("An error occurred with the fixed example form.", ephemeral=True)
+        await i.followup.send(embed=text_embed("An error occurred with the fixed example form."), ephemeral=True)
 
 class SearchDataModal(ui.Modal, title="Search"):
     search_input = ui.TextInput(label="Search term (leave blank to clear)", required=False, max_length=100)
@@ -623,7 +624,7 @@ class DataManageView(BlockedGuard, ui.View):
     async def edit_callback(self, interaction: discord.Interaction):
         item = self._opened()
         if not item:
-            await interaction.response.send_message("Could not find the selected item to edit.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Could not find the selected item to edit."), ephemeral=True)
             return
         if self.mode == 'training':
             modal = EditTrainingExampleModal(self.cog, self.user_id, self.profile_name, item["id"],
@@ -653,13 +654,13 @@ class DataManageView(BlockedGuard, ui.View):
             else:
                 delete = mm.delete_ltms if self.mode == 'ltm' else mm.delete_training_examples
                 gone = await delete(self.user_id, self.profile_name, ids)
-            await i.response.edit_message(content=f"Deleted {gone} item(s)." if gone else "Nothing was found to delete.",
-                                          view=None, embed=None)
+            await i.response.edit_message(content=None,
+                                          view=None, embed=text_embed(f"Deleted {gone} item(s)." if gone else "Nothing was found to delete."))
             await self._refresh()
             if self.mode in ('lore', 'examples') and gone:
                 from .gui_profiles import maybe_prompt_rating_after_edit
                 await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, self.profile_name)
-        await interaction.response.send_message(prompt, view=build_confirm_view(f"Delete {len(ids)}", confirm),
+        await interaction.response.send_message(embed=text_embed(prompt), view=build_confirm_view(f"Delete {len(ids)}", confirm, interaction),
                                                 ephemeral=True)
 
     async def delete_callback(self, interaction: discord.Interaction):
@@ -706,7 +707,7 @@ class DataManageView(BlockedGuard, ui.View):
             await interaction.followup.send(embed=embed, ephemeral=True)
             return
         if not self.cog.storage_manager._embedding_routes(interaction.guild_id, self.user_id):
-            await interaction.followup.send(NO_EMBEDDING_KEY_MSG, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(NO_EMBEDDING_KEY_MSG), ephemeral=True)
             return
         mm = self.cog.memory_manager
         cfg = self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, self.is_borrowed) or {}
@@ -724,7 +725,7 @@ class DataManageView(BlockedGuard, ui.View):
             note = f"Threshold {threshold} · up to {size} per turn."
             text = lambda e: self.cog.storage_manager._decrypt_data(e.get("u_in", ""))
         if ranked is None:
-            await interaction.followup.send(EMBEDDING_FAILED_MSG, ephemeral=True)
+            await interaction.followup.send(embed=text_embed(EMBEDDING_FAILED_MSG), ephemeral=True)
             return
         lines = [f"{'✅' if sim >= threshold else '▫️'} `{sim:.2f}` {_clip(text(e), 150)}"
                  for sim, e in ranked]
@@ -753,7 +754,7 @@ class AnalyseExamplesModal(ui.Modal, title="Analyse Training Examples"):
             if not (50 <= verbosity <= 3000): raise ValueError("Verbosity out of range.")
             if count < 1: raise ValueError("Count too low.")
         except ValueError as e:
-            await interaction.response.send_message(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}", ephemeral=True); return
+            await interaction.response.send_message(embed=text_embed(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}"), ephemeral=True); return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
         view = self.parent_view
@@ -877,7 +878,7 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
     async def open_data_policy(self, interaction: discord.Interaction):
         if not may_set_data_policy(interaction.user.id):
             await interaction.response.send_message(
-                "Only this bot's owner can change a server's data policy.", ephemeral=True)
+                embed=text_embed("Only this bot's owner can change a server's data policy."), ephemeral=True)
             return
 
         def back():
@@ -907,7 +908,7 @@ class AccountDeleteModal(ui.Modal, title="Permanently Delete Account"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if self.confirm_input.value != "DELETE":
-            await interaction.response.send_message("❌ Deletion cancelled. You must type 'DELETE' exactly.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("❌ Deletion cancelled. You must type 'DELETE' exactly."), ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.profile_manager._execute_account_deletion(self.user_id, interaction)
@@ -936,13 +937,13 @@ class ImportPassphraseModal(ui.Modal, title="Enter Passphrase"):
 
     async def on_submit(self, interaction: discord.Interaction):
         if low_memory():
-            await interaction.response.send_message(IMPORT_LOW_MEMORY, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(IMPORT_LOW_MEMORY), ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             file_bytes = await self.file.read()
         except discord.HTTPException:
-            await interaction.followup.send("❌ The file could not be read back from Discord. Run `/import` again.",
+            await interaction.followup.send(embed=text_embed("❌ The file could not be read back from Discord. Run `/import` again."),
                                             ephemeral=True)
             return
         await self.cog.profile_manager._execute_import(interaction, file_bytes=file_bytes, passphrase=self.passphrase_input.value)
@@ -979,12 +980,12 @@ class BulkExportView(BaseBulkProfileView):
     async def export_master_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         if not self.selected_profiles:
-            await interaction.followup.send("Select at least one profile to export.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Select at least one profile to export."), ephemeral=True)
             return
         await self.cog.profile_manager._execute_export(interaction, list(self.selected_profiles), self.export_filters)
 
     async def export_selfhost_callback(self, interaction: discord.Interaction):
         if not self.selected_profiles:
-            await interaction.response.send_message("Select at least one profile to export.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Select at least one profile to export."), ephemeral=True)
             return
         await interaction.response.send_modal(ExportPassphraseModal(self))

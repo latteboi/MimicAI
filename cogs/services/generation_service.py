@@ -392,6 +392,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
         return profile_order
 
+    def _may_still_speak(self, session, participant) -> bool:
+        """Whether `participant` may still take its turn this round: it is seated now, or it
+        is the guest a reply or an @ brought in. The order is fixed when the round starts and
+        nothing else tells a running round, so a seat removed since -- `/session swap`, the
+        cast dropdown -- would otherwise speak, and sit in the turn order as a guest."""
+        if participant.get('ephemeral'):
+            return True
+        identity = self.cog.session_manager.participant_identity
+        return identity(participant) in {identity(p) for p in session.get('profiles') or []}
+
     def _turn_cast_to(self, session, seat) -> None:
         """Turns the cast to start at `seat`, and saves it: the place a seat that was called
         on -- replied to, @'d, reacted to, named -- keeps, so the rounds after go on from it
@@ -1167,7 +1177,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     training_examples_list = []
                     parsed_neuro_state = None
                     parsed_ltm_flag = False
-                    
+
+                    if not self._may_still_speak(session, participant):
+                        await self._abandon_state_container(channel, state_container, session=session)
+                        continue
+
                     # Resolve Real-time settings
                     p_owner_id = participant['owner_id']
                     p_name = participant['profile_name']
@@ -2023,6 +2037,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     if not was_blocked and not single_turn_round:
                         self._hand_on(session, channel, profile_order, i, response_text)
 
+                    # Seats removed while this one wrote leave the order before the next
+                    # placeholder goes up in their name. In place: `round_order` is this list,
+                    # and the loop reads on past `i` from it.
+                    profile_order[i + 1:] = [p for p in profile_order[i + 1:]
+                                             if self._may_still_speak(session, p)]
                     is_last_participant = (participant == profile_order[-1])
                     if not is_last_participant:
                         # What arrived while this seat was writing is taken ahead of the next

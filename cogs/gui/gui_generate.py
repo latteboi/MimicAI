@@ -19,6 +19,7 @@ from ..services.profile_generation import (ProfileGenerationError, generate_draf
                                            save_draft)
 from ..utils.helpers import suppress_link_previews
 from .base_components import BlockedGuard, TimeoutCleanupMixin, add_button
+from .base_components import text_embed
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -146,7 +147,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     async def _refuse_while_busy(self, interaction: discord.Interaction) -> bool:
         if not self.busy:
             return False
-        await interaction.response.send_message("Still working on the last one.", ephemeral=True)
+        await interaction.response.send_message(embed=text_embed("Still working on the last one."), ephemeral=True)
         return True
 
     async def redraft(self, interaction: discord.Interaction, request: Optional[str] = None):
@@ -177,7 +178,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         # can outlive the fifteen minutes the original interaction's token lasts.
         await interaction.edit_original_response(embed=self.build_embed(), view=self)
         if failure:
-            await interaction.followup.send(f"❌ **Generation Failed:** {failure}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"❌ **Generation Failed:** {failure}"), ephemeral=True)
 
     async def regenerate(self, interaction: discord.Interaction):
         await self.redraft(interaction)
@@ -204,7 +205,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self._build_view()
         await interaction.edit_original_response(embed=self.build_embed(), view=self)
         if failure:
-            await interaction.followup.send(f"❌ {failure}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"❌ {failure}"), ephemeral=True)
 
     async def publish(self, interaction: discord.Interaction):
         """Rates the new profile -- it is Unrated -- and lists it if the verdict allows."""
@@ -220,12 +221,12 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self._build_view()
         await interaction.edit_original_response(embed=self.build_embed(), view=self)
         if not self.published:
-            await interaction.followup.send(f"Not published. {reason or ''}".strip(), ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Not published. {reason or ''}".strip()), ephemeral=True)
 
     async def discard(self, interaction: discord.Interaction):
         self.stop()
         await interaction.response.edit_message(
-            content="Draft discarded. Nothing was saved.", embed=None, view=None)
+            content=None, embed=text_embed("Draft discarded. Nothing was saved."), view=None)
 
     async def open_dashboard(self, interaction: discord.Interaction):
         self.stop()

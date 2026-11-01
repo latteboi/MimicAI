@@ -15,6 +15,7 @@ from . import tool_loop
 from .reply import ReplyText, reply_gen_config
 from ...gui.gui_sessions import WhisperActionView
 from ...managers.session_manager import intern_turn
+from ...gui.base_components import text_embed
 
 
 class WhisperMixin:
@@ -45,7 +46,7 @@ class WhisperMixin:
             session = await self.cog.session_manager._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi") if session else "multi")
 
         if not session: 
-            await interaction.followup.send("Session not found.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Session not found."), ephemeral=True)
             return
 
         owner_id = target_participant['owner_id']
@@ -58,7 +59,7 @@ class WhisperMixin:
 
         participant_keys = {(p['owner_id'], p['profile_name']) for p in session.get("profiles", [])}
         if participant_key not in participant_keys:
-            await interaction.followup.send("An error occurred: Could not find that participant in this session.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("An error occurred: Could not find that participant in this session."), ephemeral=True)
             return
 
         # Announce the intent before waiting for the channel. The worker checks this
@@ -73,7 +74,7 @@ class WhisperMixin:
             # notice is then edited into the placeholder rather than replaced, so this costs
             # no extra message when the channel was busy and none at all when it was not.
             if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
-                waiting_msg = await interaction.followup.send(WHISPER_WAITING_NOTICE, ephemeral=True, wait=True)
+                waiting_msg = await interaction.followup.send(embed=text_embed(WHISPER_WAITING_NOTICE), ephemeral=True, wait=True)
 
             if not await self.cog.session_manager._wait_for_session_flags(
                 session, SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
@@ -81,9 +82,9 @@ class WhisperMixin:
                 timed_out = (f"The session is still busy after {int(WHISPER_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
                              "Your whisper was not sent \u2014 try again in a moment.")
                 if waiting_msg:
-                    await waiting_msg.edit(content=timed_out)
+                    await waiting_msg.edit(content=None, embed=text_embed(timed_out))
                 else:
-                    await interaction.followup.send(timed_out, ephemeral=True)
+                    await interaction.followup.send(embed=text_embed(timed_out), ephemeral=True)
                 return
 
             # No await between the clear return above and this claim, which is what makes
@@ -320,14 +321,14 @@ class WhisperMixin:
             session = await self.cog.session_manager._ensure_session_hydrated(interaction.channel_id, session.get("type", "multi") if session else "multi")
 
         if not session:
-            await interaction.response.send_message("Session not found.", ephemeral=True)
+            await interaction.response.send_message(embed=text_embed("Session not found."), ephemeral=True)
             return
 
         session['whisper_waiting'] = session.get('whisper_waiting', 0) + 1
         answered = False
         try:
             if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
-                await interaction.response.edit_message(content=WHISPER_WAITING_NOTICE, embed=None, view=None)
+                await interaction.response.edit_message(content=None, embed=text_embed(WHISPER_WAITING_NOTICE), view=None)
                 answered = True
 
             if not await self.cog.session_manager._wait_for_session_flags(
@@ -336,9 +337,9 @@ class WhisperMixin:
                 timed_out = (f"The session is still busy after {int(WHISPER_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
                              "Nothing was regenerated \u2014 try again in a moment.")
                 if answered:
-                    await interaction.edit_original_response(content=timed_out, embed=None, view=None)
+                    await interaction.edit_original_response(content=None, embed=text_embed(timed_out), view=None)
                 else:
-                    await interaction.response.send_message(timed_out, ephemeral=True)
+                    await interaction.response.send_message(embed=text_embed(timed_out), ephemeral=True)
                 return
 
             session['is_whispering'] = True
@@ -374,7 +375,7 @@ class WhisperMixin:
         indices = {t.get("turn_id"): i for i, t in enumerate(log)
                    if t.get("turn_id") in (whisper_turn_id, response_turn_id)}
         if response_turn_id not in indices:
-            await interaction.followup.send("Original response not found in log.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("Original response not found in log."), ephemeral=True)
             return
         # The log as it stood when the whisper was sent, and the whisper as it was logged.
         cut = indices.get(whisper_turn_id, indices[response_turn_id])

@@ -59,6 +59,7 @@ from ..utils.helpers import (TURN_TIME_FORMAT, Timeout, _format_api_error, _reso
 from .storage_manager import IOManager
 from ..utils import fixed_examples
 from ..services.api_service import get_embedding_vector
+from ..gui.base_components import text_embed
 
 
 def encode_embedding_b64(embedding: List[float]) -> str:
@@ -1350,7 +1351,7 @@ class MemoryManager:
         """
         examples = await asyncio.to_thread(self._load_training_shard, str(owner_id), profile_name) or []
         if not examples:
-            await interaction.followup.send("\u274c No training examples found to analyse.", ephemeral=True); return
+            await interaction.followup.send(embed=text_embed("\u274c No training examples found to analyse."), ephemeral=True); return
 
         # Take the N most recent examples
         subset = examples[-count:]
@@ -1394,13 +1395,13 @@ class MemoryManager:
                 prompts["style_guide_enabled"] = True
                 self.cog.profile_manager._save_profile_prompts(owner_id, profile_name, prompts)
 
-                await interaction.followup.send(f"\u2705 **Analysis Complete.** Style guide saved and turned on for '{profile_name}'. **Training \u2192 Style Guide** shows it.", ephemeral=True)
+                await interaction.followup.send(embed=text_embed(f"\u2705 **Analysis Complete.** Style guide saved and turned on for '{profile_name}'. **Training \u2192 Style Guide** shows it."), ephemeral=True)
                 return True
             else:
-                await interaction.followup.send("\u274c Profile not found.", ephemeral=True)
+                await interaction.followup.send(embed=text_embed("\u274c Profile not found."), ephemeral=True)
 
         except Exception as e:
-            await interaction.followup.send(f"\u274c **Analysis Failed:** {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"\u274c **Analysis Failed:** {suppress_link_previews(str(e))}"), ephemeral=True)
 
     async def bulk_reset_examples(self, user_id: int, profile_names: List[str]) -> str:
         user_id_str = str(user_id)

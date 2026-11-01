@@ -15,7 +15,7 @@ import discord
 from discord import ui
 from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Sequence
 
-from .base_components import BlockedGuard, add_button, add_select
+from .base_components import DISMISS, BlockedGuard, add_button, add_select, closed_embed, text_embed
 from ..utils.fuzzy import MAX_CHOICES, best_match, rank_keyed
 
 if TYPE_CHECKING:
@@ -74,8 +74,9 @@ class ProfileSuggestionView(BlockedGuard, ui.View):
 
     def __init__(self, cog: 'MimicCog', user_id: int, typed: str,
                  candidates: Sequence[ProfileCandidate],
-                 on_pick: Callable[[discord.Interaction, str], Awaitable[None]],
-                 *, timeout: float = 180.0, defer_on_pick: bool = True):
+                 on_pick: Callable[[discord.Interaction, str], Awaitable[Optional[bool]]],
+                 *, timeout: float = 180.0, defer_on_pick: bool = True,
+                 on_create: Optional[Callable[[discord.Interaction, str], Awaitable[Optional[bool]]]] = None):
         super().__init__(timeout=timeout)
         self.cog = cog
         self.user_id = user_id
@@ -85,6 +86,8 @@ class ProfileSuggestionView(BlockedGuard, ui.View):
         self.candidates = list(candidates)[:BUTTON_SUGGESTIONS + MAX_CHOICES]
         self.on_pick = on_pick
         self.defer_on_pick = defer_on_pick
+        #: Offered as a "Create" button, handed `typed` as `on_pick` is handed a value.
+        self.on_create = on_create
         # Set by `send`, so on_timeout can strip the controls off the right message.
         self.message: Optional[discord.Message] = None
         # Guards against a second click landing while a slow continuation is still
@@ -105,7 +108,7 @@ class ProfileSuggestionView(BlockedGuard, ui.View):
             return False
         if interaction.user.id != self.user_id:
             await interaction.response.send_message(
-                "This prompt isn't yours to answer.", ephemeral=True)
+                embed=text_embed("This prompt isn't yours to answer."), ephemeral=True)
             return False
         return True
 
@@ -132,6 +135,11 @@ class ProfileSuggestionView(BlockedGuard, ui.View):
             ]
             add_select(self, options, self._select_callback, placeholder="More profiles...", row=1)
 
+        if self.on_create:
+            async def create_cb(interaction: discord.Interaction):
+                await self._dispatch(interaction, self.typed, self.on_create)
+            add_button(self, f"Create '{self.typed[:60]}'", create_cb, emoji="➕",
+                       style=discord.ButtonStyle.primary, row=2)
         add_button(self, "Cancel", self._cancel_callback, style=discord.ButtonStyle.secondary,
                    row=2)
 
@@ -146,68 +154,65 @@ class ProfileSuggestionView(BlockedGuard, ui.View):
             return
         await self._dispatch(interaction, values[0])
 
-    async def _dispatch(self, interaction: discord.Interaction, value: str):
-        """Hand the chosen value to the caller's continuation.
+    async def _dispatch(self, interaction: discord.Interaction, value: str, handler=None):
+        """Hand the chosen value to the caller's continuation (`handler`, else `on_pick`).
 
         Two hand-off modes, because commands need different things from the interaction:
 
         `defer_on_pick=True` (the default) responds with a deferred *update*, giving the
         continuation an interaction whose `edit_original_response` addresses the prompt
-        message -- so the prompt becomes the result in place, with no spent "Did you
-        mean?" card left above it.
+        message, so it can become the result in place. A continuation that does so returns
+        True; any other, the prompt closes as `_retire` draws it, once it has run.
 
         `defer_on_pick=False` hands over an untouched interaction, for continuations that
         cannot work with a deferred one: a modal can only be sent in response to a fresh
         interaction, and a command whose real output is public needs to choose
-        `ephemeral=False` for itself. The prompt is retired separately once the
-        continuation has responded.
+        `ephemeral=False` for itself.
         """
         if self._consumed:
             # A second click that raced the first. discord.py stops dispatching only
             # after the view is evicted from its store, so a slow continuation leaves a
             # real window here.
             await interaction.response.send_message(
-                "That selection is already being handled.", ephemeral=True)
+                embed=text_embed("That selection is already being handled."), ephemeral=True)
             return
         self._consumed = True
         self.stop()
 
-        if self.defer_on_pick:
-            await interaction.response.defer()
-            await self.on_pick(interaction, value)
-            return
-
+        took_over = False
         try:
-            await self.on_pick(interaction, value)
+            if self.defer_on_pick:
+                await interaction.response.defer()
+            took_over = await (handler or self.on_pick)(interaction, value)
         finally:
             # In `finally` because the prompt is already spent -- `_consumed` is set, so
             # its buttons are dead. Leaving the card on screen after a continuation that
             # raised would give the user controls that silently do nothing.
             #
-            # The continuation responds on its own interaction, so this message is ours
-            # alone to clean up: it is addressed through the *original* command's
-            # webhook, not this component's.
-            await self._retire(f"Continuing with `{value}`...")
+            # Addressed through the *original* command's webhook, not this component's,
+            # which the continuation may have answered on.
+            if not took_over:
+                name = next((c.name for c in self.candidates if c.value == value), value)
+                await self._retire(f"Selected '{name[:60]}'")
 
-    async def _retire(self, content: str):
-        """Strip the prompt down to a one-line note. Silent if it is already gone."""
+    async def _retire(self, title: str, description: str = DISMISS):
+        """Close the prompt to `closed_embed`. Silent if it is already gone."""
         if self.message is None:
             return
         try:
-            await self.message.edit(content=content, embed=None, view=None)
+            await self.message.edit(content=None, embed=closed_embed(title, description), view=None)
         except discord.HTTPException:
             pass
 
     async def _cancel_callback(self, interaction: discord.Interaction):
         self._consumed = True
         self.stop()
-        await interaction.response.edit_message(
-            content="Cancelled.", embed=None, view=None)
+        await interaction.response.edit_message(content=None, embed=closed_embed("Cancelled"), view=None)
 
     async def on_timeout(self):
         # Ephemeral messages expire on their own, and a prompt we can no longer edit is
         # exactly the state this is trying to reach -- _retire swallows that.
-        await self._retire("This suggestion prompt has expired. Run the command again.")
+        await self._retire("This prompt has expired", "Run the command again.")
 
     def build_embed(self, *, noun: str = "profile") -> discord.Embed:
         if self.candidates:
@@ -340,8 +345,9 @@ def autocorrect_profile(typed: str, candidates: Sequence[ProfileCandidate]) -> O
 
 async def suggest_profile(cog: 'MimicCog', interaction: discord.Interaction, typed: str,
                           candidates: Sequence[ProfileCandidate],
-                          on_pick: Callable[[discord.Interaction, str], Awaitable[None]],
-                          *, noun: str = "profile", defer_on_pick: bool = True) -> None:
+                          on_pick: Callable[[discord.Interaction, str], Awaitable[Optional[bool]]],
+                          *, noun: str = "profile", defer_on_pick: bool = True,
+                          on_create=None) -> None:
     """Send a "Did you mean?" prompt for `typed` against `candidates`.
 
     Ranks on the profile name, keeps the ordering the scorer produced, and falls back to
@@ -371,5 +377,5 @@ async def suggest_profile(cog: 'MimicCog', interaction: discord.Interaction, typ
         ordered = list(candidates)[:MAX_CHOICES + BUTTON_SUGGESTIONS]
 
     view = ProfileSuggestionView(cog, interaction.user.id, typed, ordered, on_pick,
-                                 defer_on_pick=defer_on_pick)
+                                 defer_on_pick=defer_on_pick, on_create=on_create)
     await view.send(interaction, noun=noun)

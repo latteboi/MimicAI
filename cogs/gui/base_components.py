@@ -53,10 +53,48 @@ def add_select(view: ui.View, options, callback, *, row: int = 0,
     return select
 
 
-def build_confirm_view(button_label: str, on_confirm) -> ui.View:
-    """Builds a single-button (danger-styled) confirmation view wired to on_confirm, timeout=60."""
+def text_embed(text: str, title: Optional[str] = None) -> discord.Embed:
+    """A reply as every answer here is drawn: one embed, the text as its description, cut
+    to an embed's 4096 characters. A plain-text reply is the one thing this replaces."""
+    return discord.Embed(title=title, description=text[:4096], colour=discord.Colour.blurple())
+
+
+DISMISS = "You may dismiss this interface."
+
+
+def closed_embed(title: str, description: str = DISMISS) -> discord.Embed:
+    """What a spent prompt is left showing once it has been answered, cancelled or expired."""
+    return discord.Embed(title=title, description=description, colour=discord.Colour.dark_grey())
+
+
+def build_confirm_view(button_label: str, on_confirm,
+                       interaction: Optional[discord.Interaction] = None) -> ui.View:
+    """A danger-styled confirm button and a Cancel, timeout=60. Given the `interaction` that
+    sent the prompt, an unanswered one closes to say nothing changed rather than leaving a
+    button that silently does nothing."""
     view = ui.View(timeout=60)
-    add_button(view, button_label, on_confirm, style=discord.ButtonStyle.danger)
+
+    async def confirm(i: discord.Interaction):
+        view.stop()
+        await on_confirm(i)
+
+    async def cancel(i: discord.Interaction):
+        view.stop()
+        await i.response.edit_message(content=None, embed=closed_embed("Cancelled", f"Nothing was changed. {DISMISS}"),
+                                      view=None)
+
+    async def expire():
+        if interaction is None:
+            return
+        try:
+            await interaction.edit_original_response(
+                content=None, embed=closed_embed("This prompt has expired", f"Nothing was changed. {DISMISS}"), view=None)
+        except discord.HTTPException:
+            pass
+
+    view.on_timeout = expire
+    add_button(view, button_label, confirm, style=discord.ButtonStyle.danger)
+    add_button(view, "Cancel", cancel)
     return view
 
 async def refuse_unregistered(cog, interaction: discord.Interaction) -> bool:
@@ -68,9 +106,9 @@ async def refuse_unregistered(cog, interaction: discord.Interaction) -> bool:
     if cog.profile_manager.is_registered(interaction.user.id):
         return False
     if interaction.response.is_done():
-        await interaction.followup.send(NOT_REGISTERED, ephemeral=True)
+        await interaction.followup.send(embed=text_embed(NOT_REGISTERED), ephemeral=True)
     else:
-        await interaction.response.send_message(NOT_REGISTERED, ephemeral=True)
+        await interaction.response.send_message(embed=text_embed(NOT_REGISTERED), ephemeral=True)
     return True
 
 
@@ -84,8 +122,14 @@ async def send_status(interaction: discord.Interaction, text: str) -> None:
 
     It ticks as a reply's placeholder does: every ten seconds the embed shows how long the
     command has run, so a slow model call does not look stalled.
+
+    From a button press it takes over that button's message, so a confirm prompt becomes
+    its own progress and then its result.
     """
-    await interaction.response.send_message(embed=_status_embed(text), ephemeral=True)
+    if getattr(interaction, "type", None) is discord.InteractionType.component:
+        await interaction.response.edit_message(content=None, embed=_status_embed(text), view=None)
+    else:
+        await interaction.response.send_message(embed=_status_embed(text), ephemeral=True)
     interaction.extras["status"] = [text, time.monotonic()]
     interaction.extras["status_ticker"] = asyncio.create_task(_tick_status(interaction))
 
@@ -139,7 +183,7 @@ async def settle_status(interaction: discord.Interaction, content: Optional[str]
         # Waited out, so no tick is still being written when the reply is.
         await asyncio.wait((ticker,))
     if content is not None and embed is None:
-        embed, content = discord.Embed(description=content[:4096], colour=discord.Colour.blurple()), None
+        embed, content = text_embed(content), None
     await interaction.edit_original_response(content=content, embed=embed, view=view)
 
 
@@ -197,9 +241,12 @@ class TimeoutCleanupMixin:
         if interaction is None:
             return
         payload = {"view": None}
-        if self.timeout_message:
-            payload["content"] = self.timeout_message
         try:
+            if self.timeout_message:
+                # Below what the panel showed, not over it: an expired draft is still worth
+                # reading, and copying out of.
+                shown = (await interaction.original_response()).embeds[:9]
+                payload.update(content=None, embeds=[*shown, closed_embed("Expired", self.timeout_message)])
             await interaction.edit_original_response(**payload)
         except Exception:
             # Ephemeral responses expire and messages get deleted; a view we can no
@@ -309,9 +356,9 @@ class ReportErrorMixin:
         traceback.print_exc()
         try:
             if interaction.response.is_done():
-                await interaction.followup.send(self.error_message, ephemeral=True)
+                await interaction.followup.send(embed=text_embed(self.error_message), ephemeral=True)
             else:
-                await interaction.response.send_message(self.error_message, ephemeral=True)
+                await interaction.response.send_message(embed=text_embed(self.error_message), ephemeral=True)
         except Exception:
             # The interaction token can be dead by the time we get here; there is
             # nowhere left to report to, and raising out of an error handler is worse.
@@ -443,7 +490,7 @@ class PageJumpModal(ui.Modal):
 
         if page is None or page < 1 or page > self.max_pages:
             await interaction.response.send_message(
-                f"❌ Please enter a valid number between 1 and {self.max_pages}.",
+                embed=text_embed(f"❌ Please enter a valid number between 1 and {self.max_pages}."),
                 ephemeral=True,
             )
             return
@@ -511,10 +558,10 @@ class ConfigModal(ui.Modal):
             config_updates = updates.get("config", {})
             prompt_updates = updates.get("prompts", {})
         except ValueError as e:
-            await interaction.followup.send(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}"), ephemeral=True)
             return
         except Exception:
-            await interaction.followup.send("❌ Error parsing input.", ephemeral=True)
+            await interaction.followup.send(embed=text_embed("❌ Error parsing input."), ephemeral=True)
             return
 
         uid = self.target_user_id or interaction.user.id
@@ -538,7 +585,7 @@ class ConfigModal(ui.Modal):
                 self.cog.profile_manager._save_profile_prompts(uid, self.profile_name, prompts)
                 prompts_saved = True
 
-        await interaction.followup.send(f"✅ Settings updated for '{self.profile_name}'.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed(f"✅ Settings updated for '{self.profile_name}'."), ephemeral=True)
         if self.callback: await self.callback(interaction)
         if prompts_saved:
             # The image prompt is rated text. Deferred: gui_profiles imports this module.
@@ -670,7 +717,7 @@ class BaseBulkProfileView(BlockedGuard, ui.View):
         selection summary.
         """
         await interaction.response.edit_message(
-            content=self._get_selection_feedback_message(), view=self)
+            content=None, embed=text_embed(self._get_selection_feedback_message()), view=self)
 
     def _get_active_list(self):
         return self.personal_profiles if self.view_source == 'personal' else self.borrowed_profiles

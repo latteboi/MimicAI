@@ -52,6 +52,7 @@ from .base_components import BlockedGuard, add_button, add_select
 from ..services.games import dice, eights
 from ..services.games.eights import COLOURS, Card, Move
 from ..services.games.table import NAMES
+from .base_components import text_embed
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -240,7 +241,7 @@ class LobbyView(BlockedGuard, ui.View):
         for item in self.children:
             item.disabled = True
         await interaction.response.edit_message(
-            content="This table is no longer forming.", view=self)
+            content=None, embed=text_embed("This table is no longer forming."), view=self)
 
     @ui.button(label="Start", style=discord.ButtonStyle.primary)
     async def start(self, interaction: discord.Interaction, _button: ui.Button):
@@ -250,7 +251,7 @@ class LobbyView(BlockedGuard, ui.View):
             return
         if interaction.user.id != lobby.host_id:
             await interaction.response.send_message(
-                "Only the host can start this table.", ephemeral=True)
+                embed=text_embed("Only the host can start this table."), ephemeral=True)
             return
 
         # Deal first, then take the lobby message down: if the deal is refused the
@@ -258,7 +259,7 @@ class LobbyView(BlockedGuard, ui.View):
         # reporting the refusal instead of clearing the table.
         error = await self.cog.game_service.start_from_lobby(lobby)
         if error:
-            await interaction.response.send_message(error, ephemeral=True)
+            await interaction.response.send_message(embed=text_embed(error), ephemeral=True)
             return
 
         self.stop()
@@ -286,12 +287,12 @@ class LobbyView(BlockedGuard, ui.View):
 
         if not lobby.open and user_id != lobby.host_id:
             await interaction.response.send_message(
-                "This table is locked. The host can unlock it with 🔒 to let others sit.",
+                embed=text_embed("This table is locked. The host can unlock it with 🔒 to let others sit."),
                 ephemeral=True)
             return
         if len(lobby.humans) >= lobby.limit:
             await interaction.response.send_message(
-                f"Every seat is taken — this table only has {lobby.limit}.",
+                embed=text_embed(f"Every seat is taken — this table only has {lobby.limit}."),
                 ephemeral=True)
             return
 
@@ -306,7 +307,7 @@ class LobbyView(BlockedGuard, ui.View):
             return
         if interaction.user.id != lobby.host_id:
             await interaction.response.send_message(
-                "Only the host can lock or unlock this table.", ephemeral=True)
+                embed=text_embed("Only the host can lock or unlock this table."), ephemeral=True)
             return
         lobby.open = not lobby.open
         await self._repaint(interaction, lobby)
@@ -471,12 +472,13 @@ class HandView(BlockedGuard, ui.View):
         """
         if self.game.state.phase != "playing":
             await interaction.response.edit_message(
-                content="That game has finished.", embed=None, view=None)
+                content=None, embed=text_embed("That game has finished."), view=None)
             return
         view = type(self)(self.cog, self.game, self.seat_id,
                           colour_filter=self.colour_filter)
         embed = view.build_embed()
-        await interaction.response.edit_message(content=note, embed=embed, view=view)
+        await interaction.response.edit_message(
+            content=None, embeds=[*([text_embed(note)] if note else []), embed], view=view)
         self._rebind(interaction, view)
 
     def _not_your_turn(self) -> bool:
@@ -516,7 +518,7 @@ class HandView(BlockedGuard, ui.View):
         if eights.is_wild(card):
             colours = ColourChoiceView(self, card)
             await interaction.response.edit_message(
-                content=f"Playing {card_text(card)} — choose a colour:", view=colours)
+                content=None, embed=text_embed(f"Playing {card_text(card)} — choose a colour:"), view=colours)
             self._rebind(interaction, colours)
             return
         await self.submit(interaction, Move("play", card))
@@ -636,7 +638,7 @@ class DiceView(HandView):
             return
         faces_view = FaceChoiceView(self, quantity, faces)
         await interaction.response.edit_message(
-            content=f"Bid {quantity} of which face?", view=faces_view)
+            content=None, embed=text_embed(f"Bid {quantity} of which face?"), view=faces_view)
         self._rebind(interaction, faces_view)
 
     async def _on_liar(self, interaction: discord.Interaction) -> None:
@@ -671,13 +673,13 @@ class TableView(BlockedGuard, ui.View):
         game = self.cog.active_games.get(self.channel_id)
         if not game or game.state.phase != "playing":
             await interaction.response.send_message(
-                "There is no game running here any more.", ephemeral=True)
+                embed=text_embed("There is no game running here any more."), ephemeral=True)
             return
 
         seat_id = f"user:{interaction.user.id}"
         if game.seat(seat_id) is None:
             await interaction.response.send_message(
-                "You are not seated at this table — you are welcome to watch.",
+                embed=text_embed("You are not seated at this table — you are welcome to watch."),
                 ephemeral=True)
             return
 

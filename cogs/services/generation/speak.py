@@ -17,6 +17,7 @@ from ...utils.helpers import (
 )
 from ...managers.session_manager import intern_turn
 from . import tool_loop
+from ...gui.base_components import text_embed
 
 
 #: What the channel shows around a message's share of a reply but the log does not keep:
@@ -41,16 +42,16 @@ class SpeakAsMixin:
 
         if style != 'in_character':
             if await self._deliver_speak_as(interaction_to_respond, ctx, message):
-                await interaction_to_respond.followup.send("Message sent.", ephemeral=True)
+                await interaction_to_respond.followup.send(embed=text_embed("Message sent."), ephemeral=True)
             else:
                 await interaction_to_respond.followup.send(
-                    "That profile is no longer seated in this channel's session.", ephemeral=True)
+                    embed=text_embed("That profile is no longer seated in this channel's session."), ephemeral=True)
             return
 
         if len(message) > SPEAK_REWRITE_MAX_INPUT_CHARS:
             await interaction_to_respond.followup.send(
-                f"That line is {len(message):,} characters. In-character delivery takes at most "
-                f"{SPEAK_REWRITE_MAX_INPUT_CHARS:,} — shorten it, or send it verbatim.",
+                embed=text_embed(f"That line is {len(message):,} characters. In-character delivery takes at most "
+                f"{SPEAK_REWRITE_MAX_INPUT_CHARS:,} — shorten it, or send it verbatim."),
                 ephemeral=True)
             return
 
@@ -71,8 +72,7 @@ class SpeakAsMixin:
             # character's voice, and delivering their own words under the character's
             # face is a different message than the one they approved.
             await placeholder.edit(
-                content=f"{ctx['speaker_display_name']} could not deliver that line.\n-# {error}",
-                embed=None)
+                embed=text_embed(f"{ctx['speaker_display_name']} could not deliver that line.\n-# {error}"))
             return
 
         view = SpeakPreviewView(self.cog, interaction_to_respond, ctx, message, rewritten, fidelity)
@@ -94,12 +94,12 @@ class SpeakAsMixin:
         is_personal = profile_name in index.get("personal", [])
 
         if not is_borrowed and not is_personal:
-            await interaction_to_respond.followup.send(f"You do not have a profile named '{profile_name}'.", ephemeral=True)
+            await interaction_to_respond.followup.send(embed=text_embed(f"You do not have a profile named '{profile_name}'."), ephemeral=True)
             return None
 
         if isinstance(channel, (discord.TextChannel, discord.Thread)):
             if not channel.permissions_for(channel.guild.me).send_messages:
-                await interaction_to_respond.followup.send("I do not have permission to send messages in that channel.", ephemeral=True)
+                await interaction_to_respond.followup.send(embed=text_embed("I do not have permission to send messages in that channel."), ephemeral=True)
                 return None
 
         effective_owner_id = user_id
@@ -118,7 +118,7 @@ class SpeakAsMixin:
 
         refusal = self.cog.profile_manager.placement_refusal(effective_owner_id, effective_profile_name, channel)
         if refusal:
-            await interaction_to_respond.followup.send(f"**{effective_profile_name}** {refusal}", ephemeral=True)
+            await interaction_to_respond.followup.send(embed=text_embed(f"**{effective_profile_name}** {refusal}"), ephemeral=True)
             return None
 
         delivery_method = 'webhook'
@@ -133,7 +133,7 @@ class SpeakAsMixin:
         if session:
             participant_data = next((p for p in session.get("profiles", []) if p.get("owner_id") == user_id and p.get("profile_name") == profile_name), None)
             if not participant_data:
-                await interaction_to_respond.followup.send(f"The profile '{profile_name}' is not an active participant in this channel's multi-profile session.", ephemeral=True)
+                await interaction_to_respond.followup.send(embed=text_embed(f"The profile '{profile_name}' is not an active participant in this channel's multi-profile session."), ephemeral=True)
                 return None
 
             session_method = participant_data.get("method", "webhook")
@@ -145,7 +145,7 @@ class SpeakAsMixin:
                 if session_method == 'child_bot' and child_bot_id:
                     delivery_method = 'child_bot'
                 else:
-                    await interaction_to_respond.followup.send(f"This profile is not configured to use a Child Bot in this session. Cannot use 'child_bot' method.", ephemeral=True)
+                    await interaction_to_respond.followup.send(embed=text_embed(f"This profile is not configured to use a Child Bot in this session. Cannot use 'child_bot' method."), ephemeral=True)
                     return None
         else:
             linked_bot_id = next((bot_id for bot_id, data in self.cog.child_bots.items() if data.get("owner_id") == effective_owner_id and data.get("profile_name") == effective_profile_name), None)
@@ -159,7 +159,7 @@ class SpeakAsMixin:
                 if child_bot_id:
                     delivery_method = 'child_bot'
                 else:
-                    await interaction_to_respond.followup.send(f"The profile '{effective_profile_name}' is not linked to a Child Bot, or that bot is not present in this server. Cannot use 'child_bot' method.", ephemeral=True)
+                    await interaction_to_respond.followup.send(embed=text_embed(f"The profile '{effective_profile_name}' is not linked to a Child Bot, or that bot is not present in this server. Cannot use 'child_bot' method."), ephemeral=True)
                     return None
 
         speaker_display_name = effective_profile_name
@@ -485,8 +485,8 @@ class SpeakAsMixin:
         if message is None or target is None:
             # With their text: a modal cannot be reopened from its own submit.
             await interaction.followup.send(
-                refusal, ephemeral=True,
-                embed=discord.Embed(description=text[:4096]) if text else discord.utils.MISSING)
+                ephemeral=True,
+                embeds=[text_embed(refusal), *([discord.Embed(description=text[:4096])] if text else [])])
             return
 
         display = target["prefix"] + text + edit_attribution(interaction.user.id)
@@ -503,7 +503,7 @@ class SpeakAsMixin:
             else:
                 raise RuntimeError("it was not sent by this bot")
         except (discord.HTTPException, RuntimeError) as e:
-            await interaction.followup.send(f"Could not edit that message: {suppress_link_previews(str(e))}", ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Could not edit that message: {suppress_link_previews(str(e))}"), ephemeral=True)
             return
 
         turn = target["turn"]
@@ -517,4 +517,4 @@ class SpeakAsMixin:
         await self.cog.session_manager.flush_session(
             (channel.id, None, None), session.get("type", "multi"),
             structural=index < session.get("_log_cold_len", 0))
-        await interaction.followup.send("Message edited.", ephemeral=True)
+        await interaction.followup.send(embed=text_embed("Message edited."), ephemeral=True)
