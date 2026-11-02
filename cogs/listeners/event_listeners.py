@@ -1379,7 +1379,7 @@ class EventListeners:
         pending: List[Tuple[str, str]] = []
         meta: Dict[str, Any] = {}
 
-        if cmd_name in ["speak", "whisper", "memorise"]:
+        if cmd_name in ["speak", "whisper", "memorise", "trigger", "purge"]:
             server_id_str = str(interaction.guild_id) if interaction.guild_id else "dm"
             server_index = self.server_manager._get_server_index(server_id_str)
             channel_str = str(interaction.channel_id)

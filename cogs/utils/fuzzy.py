@@ -10,12 +10,11 @@ path, so it only ever touches strings the caller already has in memory -- resolv
 display names, PIDs, or appearance data for a candidate is the caller's job, and should
 be done *after* ranking so it only happens for the survivors.
 
-Cost: the cheap tiers are a casefold plus a substring test. `difflib` is consulted only
-for candidates that no cheaper tier matched, which is the case that was previously
-returning nothing at all.
+Cost: the cheap tiers are a casefold plus a substring test. Edit distance is paid only
+for candidates that no cheaper tier matched, and only over the diagonal band its budget
+allows, so it costs a few cells per query character whatever the name's length.
 """
 
-from difflib import SequenceMatcher
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 # Scores are banded rather than continuous so that a weaker tier can never outrank a
@@ -27,7 +26,11 @@ _NORMALISED = 0.95
 _PREFIX_BASE = 0.85
 _SUBSTRING_BASE = 0.70
 _TOKEN_BASE = 0.55
-_DIFFLIB_CEILING = 0.54
+# A typo: within the edit budget of the whole name, or else of its start or one of its
+# words. Each further edit costs a step, and the weakest still clears DEFAULT_CUTOFF.
+_TYPO_WHOLE = 0.54
+_TYPO_PARTIAL = 0.47
+_TYPO_STEP = 0.02
 
 #: Below this, a suggestion is more confusing than helpful and is dropped.
 DEFAULT_CUTOFF = 0.40
@@ -69,6 +72,42 @@ def _length_bonus(query_len: int, candidate_len: int) -> float:
     if candidate_len <= 0:
         return 0.0
     return 0.09 * min(1.0, query_len / candidate_len)
+
+
+def _typo_budget(query_len: int) -> int:
+    """How many edits a query of this length may carry and still mean a name.
+
+    Counted, not a ratio: one slip in "mrf" is a third of it, and a ratio cut-off long
+    enough to be safe on "sherlok" refused every three-letter name a single typo.
+    """
+    return 0 if query_len < 3 else 1 if query_len < 6 else 2 if query_len < 12 else 3
+
+
+def _typo_distance(q: str, c: str, k: int) -> Tuple[int, int]:
+    """Edits from `q` to `c`, and to the closest start of `c` -- each capped at k + 1.
+
+    Optimal string alignment: a swap of neighbours ("aliec") is one edit. Only cells
+    within k of the diagonal are filled, as every cell outside it is over the cap already.
+    The start counts because autocomplete is typed left to right: "mrf" is one slip from
+    "mr. grizz" begun, though nowhere near all of it.
+    """
+    n, m = len(q), len(c)
+    over = k + 1
+    if n - m > k:
+        return over, over
+    prev2: List[int] = []
+    prev = [j if j <= k else over for j in range(m + 1)]
+    for i in range(1, n + 1):
+        row = [over] * (m + 1)
+        if i <= k:
+            row[0] = i
+        for j in range(max(1, i - k), min(m, i + k) + 1):
+            d = min(prev[j] + 1, row[j - 1] + 1, prev[j - 1] + (q[i - 1] != c[j - 1]))
+            if i > 1 and j > 1 and q[i - 1] == c[j - 2] and q[i - 2] == c[j - 1]:
+                d = min(d, prev2[j - 2] + 1)
+            row[j] = min(d, over)
+        prev2, prev = prev, row
+    return prev[m], min(prev[max(0, n - k):m + 1])
 
 
 def score(query: str, candidate: str) -> float:
@@ -126,14 +165,22 @@ def score(query: str, candidate: str) -> float:
             # Spans 0.55 to 0.69 -- above the difflib ceiling, below the substring band.
             return _TOKEN_BASE + 0.14 * coverage
 
-    # Only now, for candidates nothing cheaper matched, pay for edit-distance. This is
+    # Only now, for candidates nothing cheaper matched, pay for edit distance. This is
     # the tier that catches an actual typo: "Aliec" against "Alice". Against each word as
     # well as the whole name: "thron" is one slip from "Dr Aris Thorne"'s last word, and
-    # as a fraction of the whole name it is no match at all.
-    q = q_norm or q_fold
-    ratio = max(SequenceMatcher(None, q, text).ratio()
-                for text in (c_norm or c_fold, *(c_tokens if len(c_tokens) > 1 else ())))
-    return min(_DIFFLIB_CEILING, ratio * _DIFFLIB_CEILING)
+    # as a fraction of the whole name it is no match at all. A whole-name slip outranks a
+    # partial one, so "mrf" offers "mrc" before "mr. grizz".
+    k = _typo_budget(len(q_norm))
+    if not k:
+        return 0.0
+    whole, start = _typo_distance(q_norm, c_norm or c_fold, k)
+    if whole <= k:
+        return _TYPO_WHOLE - _TYPO_STEP * max(0, whole - 1)
+    partial = min([start, *(d for token in (c_tokens if len(c_tokens) > 1 else ())
+                            for d in _typo_distance(q_norm, token, k))])
+    if partial <= k:
+        return _TYPO_PARTIAL - _TYPO_STEP * max(0, partial - 1)
+    return 0.0
 
 
 def rank(

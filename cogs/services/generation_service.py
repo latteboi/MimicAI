@@ -158,7 +158,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         return surviving, beat_participant, beat_cast
 
     #: Trigger kinds that name the participant who answers first, at index 2.
-    SPEAKER_NAMING_TRIGGERS = ('reply', 'reaction', 'reaction_single', 'child_mention', 'game_beat')
+    #: A `cue` is `/trigger` with arguments: `('cue', note_or_None, seat_or_None)`.
+    SPEAKER_NAMING_TRIGGERS = ('reply', 'reaction', 'reaction_single', 'child_mention', 'game_beat', 'cue')
 
     @classmethod
     def _starting_override(cls, triggers):
@@ -237,7 +238,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
     @staticmethod
     def _is_single_turn_round(initial_trigger, triggers, game_beat_participant, game_beat_cast) -> bool:
         """Whether the round is one character's turn and nobody else's."""
-        if isinstance(initial_trigger, tuple) and initial_trigger[0] == 'reaction_single':
+        if isinstance(initial_trigger, tuple) and (initial_trigger[0] == 'reaction_single' or (
+                initial_trigger[0] == 'cue' and initial_trigger[2] is not None)):
             return True
         # A beat on its own is one character's moment, not a cue for the
         # whole cast -- five profiles all reacting to one Draw Four is the
@@ -315,13 +317,14 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if not any(p is seated for p in active_participants):
                     active_participants.insert(0, seated)
 
-        # Likewise the author a ⏯️ asks for by name: a press it lost to Chance handed the turn
-        # to whoever won theirs, or to nobody. ▶️ and 🍿 ask only for the next seat, which
-        # rolls like any. Skipped or gone since the press, it is not brought back.
+        # Likewise the author a ⏯️ or a `/trigger profile:` asks for by name: a press it lost
+        # to Chance handed the turn to whoever won theirs, or to nobody. ▶️ and 🍿 ask only
+        # for the next seat, which rolls like any. Skipped or gone since, it is not brought back.
         first = triggers[0] if triggers else None
         is_reaction = isinstance(first, tuple) and first[0] in ('reaction', 'reaction_single')
-        if (is_reaction and first[0] == 'reaction_single'
-                and str(getattr(first[1], 'emoji', '')) == SPEAK_AGAIN_EMOJI
+        named = isinstance(first, tuple) and (first[0] == 'cue' or (
+            first[0] == 'reaction_single' and str(getattr(first[1], 'emoji', '')) == SPEAK_AGAIN_EMOJI))
+        if (named and starting_profile_override is not None
                 and starting_profile_override in session['profiles']
                 and not starting_profile_override.get('is_skipped')
                 and starting_profile_override not in active_participants):

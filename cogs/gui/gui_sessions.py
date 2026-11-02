@@ -1963,17 +1963,18 @@ class SessionConfigView(BlockedGuard, ui.View):
                     f"(a profile speaks as a child bot **or** a webhook, not both)."),
                     ephemeral=True)
         add_select(self, options, cast_cb, placeholder=placeholder, min_values=0,
-                   max_values=len(options) if page_items else 1, row=0,
+                   max_values=len(options) if page_items else 1, row=1,
                    disabled=not page_items)
 
-        # Row 1, directly under the profile dropdown. A select rather than the
+        # Row 0, above the profile dropdown it filters, read top-down as the whisper
+        # viewer's filter is. A select rather than the
         # button that cycled: five sources meant up to four presses to reach one,
         # with no way to see what the others were, and `session` has to be able to
         # disappear for a non-admin rather than be cycled past.
         source_opts = self._available_sources()
         src_sel = ui.Select(
             placeholder=f"Source: {self.SOURCE_LABELS[self.view_source][0]}",
-            min_values=1, max_values=1, row=1,
+            min_values=1, max_values=1, row=0,
             options=[discord.SelectOption(
                 label=self.SOURCE_LABELS[src][0], value=src,
                 description=self.SOURCE_LABELS[src][1],
@@ -2642,6 +2643,12 @@ class SessionConfigView(BlockedGuard, ui.View):
                 note = "Session is live, but the cast is empty — nobody will answer."
             else:
                 note = f"Session is live with {count} participant(s)."
+            # The moment an admin is here and able to fix it; nothing else tells them.
+            from .gui_start import _child_bot_gaps, _missing_permissions, _permission_warning
+            mine = _missing_permissions(i)
+            children = _child_bot_gaps(self.cog, i.guild, channel_id, self.session.get("profiles", []))
+            if mine or children:
+                note += "\n\n" + _permission_warning(mine, children)
             await i.followup.send(embed=text_embed(("▶️ " if not was_started else "🔄 ") + note), ephemeral=True)
         add_button(self, "▶️ Update Session" if started else "▶️ Start Session", commit,
                    style=discord.ButtonStyle.success, row=3)

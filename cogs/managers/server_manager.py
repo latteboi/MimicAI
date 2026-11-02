@@ -614,7 +614,16 @@ class ServerManager:
                             # than creating a second webhook against a transient failure.
                             return cached_wh
 
-            # No usable cache entry: fetch or create, which does cost a round trip.
+            # No usable cache entry: fetch or create, which does cost a round trip. Asked
+            # locally first, after the cache (a stored webhook needs no permission): without
+            # it every send in a channel lacking Manage Webhooks paid a REST call that could
+            # only 403, and every 403 counts toward Discord's invalid-request IP ban. Not
+            # logged: it is the server's setting, which the operator cannot change. The
+            # admin is told on Start / Update Session and in /start.
+            me = parent_channel.guild.me
+            if me is not None and not parent_channel.permissions_for(me).manage_webhooks:
+                return None
+
             webhooks = await parent_channel.webhooks()
             bot_webhook = next((wh for wh in webhooks if wh.user and wh.user.id == self.cog.bot.user.id), None)
             if not bot_webhook:
@@ -626,9 +635,7 @@ class ServerManager:
             self._save_channel_webhooks(only_servers={parent_channel.guild.id})
             return bot_webhook
         except discord.Forbidden:
-            # The usual cause of a whole server delivering under the bot's own name.
-            print(f"Missing Manage Webhooks in #{getattr(parent_channel, 'name', '?')}; "
-                  f"profiles will speak as the bot there.")
+            pass  # The local check above passed on a stale cache; same outcome.
         except Exception as e:
             print(f"Failed to get/create webhook for {parent_channel.name}: {e}")
         return None

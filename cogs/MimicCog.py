@@ -6,7 +6,7 @@ from .utils.constants import (
     MAX_MULTI_PROFILES, MOD_DATA_DIR, PLACEHOLDER_EMOJI, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
     GAME_CACHE_MAX_SIZE, MEDIA_DESCRIPTION_CACHE_MAX, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
     PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR, COMPACT_KEEP_DEFAULT, COMPACT_KEEP_MAX,
-    SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
+    SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, SKIP_PARTICIPANT_EMOJI, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
     cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
@@ -906,7 +906,7 @@ class MimicCog(EventListeners, commands.Cog):
         is_owner = interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
         embed = discord.Embed(
             title=f"Bot Identity: {self.bot.user.name}",
-            description=(f"Managed by MimicAI {PLACEHOLDER_EMOJI}.\n"
+            description=(f"{PLACEHOLDER_EMOJI}\n\n"
                          "*Welcome back, my friends. The show never ends.*"),
             color=discord.Color.blue()
         )
@@ -1518,13 +1518,29 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.followup.send(
             embed=text_embed("Game ended." if game else "Table cleared."), ephemeral=True)
 
+    @staticmethod
+    def _cast_seat(session: Dict, value: str) -> Optional[Dict]:
+        """The seat an autocomplete value (`owner_id:name`), or a bare typed name, names in this cast."""
+        try:
+            owner_str, name = value.split(":", 1)
+            owner_id = int(owner_str)
+        except ValueError:
+            owner_id, name = None, value
+        return next((p for p in session.get("profiles", [])
+                     if p.get("profile_name") == name and (owner_id is None or p.get("owner_id") == owner_id)),
+                    None)
+
     # Top level rather than under /session: forcing a round is something a user does
     # mid-conversation, alongside /refresh and /cancel, not something they go into a
     # configuration group to find.
     @app_commands.command(name="trigger", description="Manually triggers a new round of the session in this channel.")
-    @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
+    @cooldown_unless_refused(2, 10.0, _no_session_key)
     @app_commands.guild_only()
-    async def trigger_session_slash(self, interaction: discord.Interaction):
+    @app_commands.describe(profile="Optional: this cast member answers, and only them, whatever their chance.",
+                           note="Optional (Admin Only): a note the cast reads this round, as they read the AI Director's.")
+    @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
+    async def trigger_session_slash(self, interaction: discord.Interaction, profile: Optional[str] = None,
+                                    note: Optional[app_commands.Range[str, 1, 1000]] = None):
         if not self.has_lock: return
         await interaction.response.defer(ephemeral=True)
 
@@ -1552,8 +1568,34 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.followup.send(embed=text_embed(block), ephemeral=True)
             return
 
-        # Trigger logic: push a null trigger to simulate automated continuation
-        await session['task_queue'].put(None)
+        # The note is the one gated part: the cast reads it as a system note, above anything
+        # a member could say, and nothing in the channel shows who wrote it.
+        if note and not interaction.permissions.administrator:
+            await interaction.followup.send(
+                embed=text_embed("Only server administrators can add a note."), ephemeral=True)
+            return
+        seat = None
+        if profile:
+            seat = self._cast_seat(session, profile)
+            if not seat:
+                await interaction.followup.send(
+                    embed=text_embed("That character is not in this session's cast."), ephemeral=True)
+                return
+            # A skip is a member's call, made with a reaction; this does not overrule it.
+            if seat.get("is_skipped"):
+                await interaction.followup.send(embed=text_embed(
+                    f"`{seat['profile_name']}` is skipped in this session. Remove the "
+                    f"{SKIP_PARTICIPANT_EMOJI} reaction from their message to bring them back."), ephemeral=True)
+                return
+        # A round in progress takes whatever is queued mid-round as messages, and a cue is
+        # not one: it would be spent with nobody answering it.
+        if (seat or note) and session.get("is_running"):
+            await interaction.followup.send(
+                embed=text_embed("A round is in progress. Try again once it finishes."), ephemeral=True)
+            return
+
+        # No arguments: a null trigger, the round continuing as if by itself.
+        await session['task_queue'].put(('cue', note, seat) if (seat or note) else None)
         if not session.get('worker_task') or session['worker_task'].done():
             task = self.bot.loop.create_task(self.generation_service._multi_profile_worker(interaction.channel_id))
             session['worker_task'] = task
@@ -1832,9 +1874,13 @@ class MimicCog(EventListeners, commands.Cog):
     # Anyone in their own DM with the bot: only the bot's messages go, and only theirs to see.
     @app_commands.check(lambda i: i.guild_id is None or i.permissions.administrator)
     @app_commands.describe(amount="Turns to delete, newest first (1-100). Messages, with whole_channel or in a DM.",
-                           whole_channel="Count every message in the channel, not only the session's turns.")
+                           whole_channel="Count every message in the channel, not only the session's turns.",
+                           profile="Optional: only this cast member's turns. Turns folded into the synopsis are kept.",
+                           user="Optional: only this person's. With whole_channel, from before the session too.")
+    @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
     async def purge_slash(self, interaction: discord.Interaction, amount: app_commands.Range[int, 1, 100],
-                          whole_channel: bool = False):
+                          whole_channel: bool = False, profile: Optional[str] = None,
+                          user: Optional[discord.User] = None):
         """Counts turns, as the channel shows them; `whole_channel` counts raw messages.
 
         A turn is one line of the conversation however many messages carried it -- the
@@ -1842,12 +1888,27 @@ class MimicCog(EventListeners, commands.Cog):
         count: whispers, private responses and synopses are skipped and left in place.
         `whole_channel` reaches what no turn owns -- other bots, chat from before the
         session -- and a turn its window clips goes whole.
+
+        `profile` or `user` counts only that speaker's turns, and never a folded one: a
+        quiet speaker's last few can sit deep in the log, and deleting a folded turn drops
+        the synopsis that covered it -- everyone's history, not just theirs.
         """
         if not self.has_lock: return
         await interaction.response.defer(ephemeral=True)
 
+        refusal = None
         if isinstance(interaction.channel, discord.DMChannel):
-            await self._purge_dm(interaction, amount)
+            if not (profile or user):
+                await self._purge_dm(interaction, amount)
+                return
+            refusal = "In a DM only my own messages go. Leave `profile` and `user` empty."
+        elif profile and user:
+            refusal = "Choose a `profile` or a `user`, not both."
+        elif profile and whole_channel:
+            # A webhook character's messages have no author to tell them apart by.
+            refusal = "`whole_channel` counts raw messages, which a character's cannot be picked out of. Leave one empty."
+        if refusal:
+            await interaction.followup.send(embed=text_embed(refusal), ephemeral=True)
             return
         if not isinstance(interaction.channel, (discord.TextChannel, discord.Thread)):
             await interaction.followup.send(embed=text_embed("Purge is not supported in this channel type."), ephemeral=True)
@@ -1866,6 +1927,18 @@ class MimicCog(EventListeners, commands.Cog):
                 embed=text_embed("There is no session in this channel. Set `whole_channel` to delete its messages anyway."),
                 ephemeral=True)
             return
+        # Whose turns count, by the id each turn was logged under: a character's PID, a person's user id.
+        theirs = None
+        if profile:
+            seat = self._cast_seat(session, profile)
+            if not seat:
+                await interaction.followup.send(
+                    embed=text_embed("That character is not in this session's cast."), ephemeral=True)
+                return
+            pid = self.profile_manager._get_pid_from_name_any(seat["owner_id"], seat["profile_name"])
+            theirs = lambda t: not t.get("is_user") and t.get("speaker_pid") == pid
+        elif user:
+            theirs = lambda t: bool(t.get("is_user")) and t.get("speaker_pid") == str(user.id)
         # Two rewrites of one log must not overlap, and whichever finished first would
         # release the flag out from under the other.
         if session and session.get('is_purging'):
@@ -1886,9 +1959,13 @@ class MimicCog(EventListeners, commands.Cog):
                 return
 
             if not whole_channel:
-                doomed = [turn for turn in session.get("unified_log", []) if is_visible_turn(turn)][-amount:]
+                doomed = [turn for turn in session.get("unified_log", []) if is_visible_turn(turn) and (
+                    theirs is None or (theirs(turn) and not turn.get("compacted")))][-amount:]
                 if not doomed:
-                    await interaction.followup.send(embed=text_embed("There are no turns to delete in this channel."), ephemeral=True)
+                    await interaction.followup.send(embed=text_embed(
+                        "There are no turns to delete in this channel." if theirs is None else
+                        "There are no turns of theirs to delete here. Turns folded into the synopsis are kept."),
+                        ephemeral=True)
                     return
                 report = await self.generation_service.delete_turns(interaction.channel, session, doomed)
                 summary = f"Deleted {report['turns']} turn(s) and {report['messages']} message(s)."
@@ -1897,12 +1974,24 @@ class MimicCog(EventListeners, commands.Cog):
                 # independent of the session, so the game is torn down here.
                 self.game_service.teardown_channel(interaction.channel_id)
 
+                # `limit` is how many messages purge reads, not how many it deletes. With a
+                # `user`, `amount` counts their messages, so it reads further and stops taking
+                # once it has them.
+                left = amount
+
                 def track(m):
+                    nonlocal left
+                    if user:
+                        if m.author.id != user.id or not left:
+                            return False
+                        left -= 1
                     self.purged_message_ids[m.id] = True
                     return True
 
+                # ponytail: a `user` is looked for in the newest 1,000 messages, as in a DM;
+                # someone quieter than that keeps what lies deeper.
                 purged = await interaction.channel.purge(
-                    limit=amount, check=track, before=interaction.created_at,
+                    limit=1000 if user else amount, check=track, before=interaction.created_at,
                     reason=f"Purge by {interaction.user}")
                 report = {"turns": 0, "messages": 0, "synopses": 0}
                 if session:
@@ -1966,22 +2055,10 @@ class MimicCog(EventListeners, commands.Cog):
 
         target_participant = None
         if profile:
-            try:
-                p_owner_id_str, p_name = profile.split(":", 1)
-                p_owner_id = int(p_owner_id_str)
-            except ValueError:
-                p_owner_id = None
-                p_name = profile
-
-            target_participant = next(
-                (p for p in session.get("profiles", [])
-                 if p.get("profile_name") == p_name and (p_owner_id is None or p.get("owner_id") == p_owner_id)),
-                None,
-            )
+            target_participant = self._cast_seat(session, profile)
             if not target_participant:
-                await settle_status(interaction, f"Could not find participant '{p_name}' in this session.")
+                await settle_status(interaction, "That character is not in this session's cast.")
                 return
-
 
         session_type = session.get("type", "multi")
         if not session.get("is_hydrated"):

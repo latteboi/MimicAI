@@ -195,6 +195,21 @@ class BatchedMessage(NamedTuple):
     reply_ref: Optional[Dict[str, Any]]
 
 
+def log_system_note(session: Dict[str, Any], content: str, new_round_turn_data: list) -> None:
+    """A note nobody said -- the AI Director's, or `/trigger note:` -- as a SYSTEM turn
+    the round reads. No name or timestamp header: it is not a line of the conversation."""
+    system_content = f"<system_note>\n{content}\n</system_note>"
+    session.setdefault("unified_log", []).append(intern_turn({
+        "turn_id": str(uuid.uuid4()),
+        "is_user": False,
+        "speaker_pid": "SYSTEM",
+        "message_ids": [],
+        "content": system_content,
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }))
+    new_round_turn_data.append((system_content, None, []))
+
+
 async def batched_message(trigger: Any) -> Optional[BatchedMessage]:
     """The message a trigger batched mid-round carries, or None for one that carries none.
 
@@ -424,6 +439,15 @@ class TriggerIntakeMixin:
                     new_round_turn_data.append((content, None, []))
                 continue
 
+            # `/trigger`'s arguments. Its note is read wherever it lands in the batch -- a
+            # bare string is read at index 0 alone, and someone typing first would drop it.
+            if isinstance(trigger, tuple) and trigger[0] == 'cue':
+                if i == 0 and trigger[2] is not None:
+                    starting_profile_override = trigger[2]
+                if trigger[1]:
+                    log_system_note(session, trigger[1], new_round_turn_data)
+                continue
+
             if i == 0:
                 if isinstance(trigger, tuple):
                     if trigger[0] == 'reply':
@@ -445,26 +469,7 @@ class TriggerIntakeMixin:
                     elif trigger[0] == 'child_mention': _, message_payload, starting_profile_override = trigger
                 elif isinstance(trigger, discord.RawReactionActionEvent): reaction_trigger = trigger
                 elif isinstance(trigger, str):
-                    # Handle string prompts
-                    content = trigger
-                    turn_id = str(uuid.uuid4())
-
-                    # XML-standardised system turn without Name/Timestamp header
-                    system_content = f"<system_note>\n{content}\n</system_note>"
-
-                    turn_object = {
-                        "turn_id": turn_id,
-                        "is_user": False,
-                        "speaker_pid": "SYSTEM",
-                        "message_ids": [],
-                        "content": system_content,
-                        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                    }
-                    session.setdefault("unified_log", []).append(intern_turn(turn_object))
-
-                    new_round_turn_data.append((system_content, None, []))
-
-                    message_trigger = None
+                    log_system_note(session, trigger, new_round_turn_data)
                 else: message_trigger = trigger
             else:
                 # [UPDATED] Unpack structured tuples in batches to prevent lost replies/mentions/child bots
