@@ -65,7 +65,9 @@ def get_config_value(key_name: str, default: str = None) -> str | None:
             resource_name = f"projects/{_gcp_project_id}/secrets/{name}/versions/latest"
             try:
                 response = client.access_secret_version(request={"name": resource_name}, timeout=3.0)
-                return response.payload.data.decode("UTF-8")
+                # Stripped: `echo value | gcloud secrets create` stores a trailing newline,
+                # which breaks a URL silently (.env values arrive stripped already).
+                return response.payload.data.decode("UTF-8").strip()
             except (NotFound, GoogleAPICallError): continue
     return default
 
