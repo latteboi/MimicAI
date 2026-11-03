@@ -1,6 +1,9 @@
 v0.7.6 Beta — 2026-11-02 (UTC)
 `/refresh` and `/suspend` ask first, and every reply arrives as an embed.
 ## **Added**
+- **Sign in with OpenRouter** on `/start`'s key step: approve MimicAI on OpenRouter and your key arrives by itself as your Personal key, with nothing to copy or paste. **Paste key** still takes a key you already have.
+- **Still Editing** on the Rating Out of Date prompt: each edit to a rated profile then waits ten minutes instead of three before its rating is settled, so several edits are rated once, after the last.
+- **The Public Library's dropdown shows each profile's display name** beside its creator, where it differs from the profile's name, matching the card it opens.
 - **`/refresh` and `/suspend` ask before deleting anything**, saying what goes and what is kept, then show their progress and result in the same message: **Conversation cleared** or **Session ended**, with which characters saved a memory of it. A channel with nothing to lose -- no session, or one not yet started with nobody seated -- is not asked.
 - **Create from "Did you mean?"**: when `/profile manage` finds no profile by the name you typed, a button creates it as a new, blank profile and opens it, wherever that name is free and you have room for another.
 - **Every confirmation has a Cancel button**, and one left unanswered says nothing was changed instead of leaving a button that does nothing.
@@ -9,11 +12,14 @@ v0.7.6 Beta — 2026-11-02 (UTC)
 
 ## **Changed**
 - **Every reply is an embed**: command answers, refusals and errors alike, instead of a mix of plain text and embeds. An expired `/profile generate` draft stays readable, marked Expired beneath it.
+- **A content rating that gets lighter needs a second model to agree**: out of Refused, or from Adult to General. Until it does, the stricter rating stands, and a refusal goes to the bot operator to review, with no new strike.
+- **A borrowed profile starts with the plain error message**, not its author's, since no content rating checks that text. Set your own under `/profile manage` -> Misc -> Custom Error Message.
 - **Session Config → Proactivity and Compaction list their models** as the profile dashboard does: the model in bold, each fallback on a line beneath it.
 - **"Did you mean?" and profile autocomplete catch a typo in one word of a longer name, or in a short one**: `sherlok` finds "sherlock holmes", and `mrf` offers "mrc" ahead of "mr. grizz", where they used to suggest nothing.
 - **Session Config → Cast puts the Source dropdown above the profiles it lists**, so you pick where to look first.
 - **A "Did you mean?" prompt closes once answered**, saying you may dismiss it, instead of leaving its buttons behind.
 
 ## **Fixed**
+- **Content ratings read only the first 6,000 characters of a profile**, so behind a long persona the instructions, lorebook and fixed examples went unchecked. The whole profile is read now.
 - **Choosing a suggestion in `/train`'s "Did you mean?" did nothing.** It now arms training for the profile chosen.
 - **A character removed while a round was running still took its turn**, and showed in `/session swap`'s list as a guest. It now loses its turn, and the list leaves it out of those waiting.

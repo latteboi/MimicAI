@@ -613,6 +613,16 @@ stored as `GOOGLE/<id>` so no OpenRouter voice is mistaken for one. A designed v
 one Google project, so a key from another gets "no such voice": that key and voice are
 remembered (`_TTS_MISSING_VOICES`) and speak the default from then on, without a second 400.
 
+### Sign in with OpenRouter
+
+`/start` can fetch a user's OpenRouter key through OpenRouter's OAuth (PKCE) instead of a paste.
+The callback is a Cloudflare Worker (`cloudflare/openrouter_signin.js`), not this process,
+which serves no HTTP: it posts the code through a webhook into a private channel, and the
+wizard that drew the link takes it off the gateway with `wait_for`, matched on the webhook id
+and the link's `state`. The verifier stays in that wait, so a code seen in the channel is
+useless. An instance without `OPENROUTER_SIGNIN_URL` and `OPENROUTER_RELAY_WEBHOOK_ID` keeps
+the paste. `cogs/utils/openrouter_signin.py`.
+
 ### No vendor SDKs
 
 `google-genai` was removed and replaced with the REST adapter. This dropped roughly 70 MB

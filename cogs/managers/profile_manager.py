@@ -114,6 +114,31 @@ def _awaits_review(rating: Dict[str, Any]) -> bool:
     return rating.get("verdict") == CONTENT_RATING_REFUSED and bool(rating.get("review"))
 
 
+#: Verdicts by what they keep in, for telling a re-rating that loosens one.
+_STRICTNESS = {CONTENT_RATING_GENERAL: 0, CONTENT_RATING_ADULT: 1, CONTENT_RATING_REFUSED: 2}
+
+
+def _rating_floor(rating: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """(verdict, reason) a re-rating may not go below on one model's word (`_hold_floor`).
+
+    A standing Refused, or an Adult the classifier or the operator gave -- a declaration is
+    its owner's to withdraw -- or the Adult an Unrated or Pending record carries as `was`, so
+    dropping to Unrated and submitting again is no way round it.
+    """
+    verdict = rating.get("verdict")
+    if verdict == CONTENT_RATING_REFUSED or (
+            verdict == CONTENT_RATING_ADULT and rating.get("source") != "owner_declared"):
+        return verdict, rating.get("reason")
+    if rating.get("was") == CONTENT_RATING_ADULT:
+        return CONTENT_RATING_ADULT, None
+    return None, None
+
+
+def _carried_floor(rating: Dict[str, Any]) -> Dict[str, str]:
+    """`was`, for an Unrated or Pending record replacing `rating`. Refused never is one."""
+    return {"was": CONTENT_RATING_ADULT} if _rating_floor(rating)[0] == CONTENT_RATING_ADULT else {}
+
+
 def _clean_imported_prompts(value: Any) -> Any:
     """A .mimic profile's prompts as a person could have typed them: every string through
     `clean_imported_text` at the editor's cap, and the lorebook and fixed examples
@@ -1041,12 +1066,12 @@ class ProfileManager:
             self.save_user_about(owner_id, about)
         return bool(entries)
 
-    def library_search_text(self, owner_id: int, pid: str) -> str:
-        """A listing's display name and intro, lower-cased, for the Library's search.
+    def _library_fields(self, owner_id: int, pid: str) -> Tuple[str, str]:
+        """A listing's (display name, intro), for the Library's search and its dropdown.
 
         Read uncached -- a search touches every listing, which is no reason to fill the
         shard cache -- and kept per version of the file, keyed by its mtime, so an edit is
-        picked up without a hook in every config write.
+        picked up without a hook in every config write. Blocking: call it off the loop.
         """
         # ponytail: one stat per listing per search, and a decrypt per listing the first
         # time; copy the text into the public index if the Library outgrows that.
@@ -1054,16 +1079,23 @@ class ProfileManager:
         try:
             version = os.path.getmtime(path)
         except OSError:
-            return ""
+            return "", ""
         cached = self.cog.library_text.get(pid)
         if cached and cached[0] == version:
             return cached[1]
         config = (IOManager.read_json_gzip(path, self.cog.fernet) or {}).get("config") or {}
-        text = "\n".join(filter(None, (config.get("custom_display_name"),
-                                       config.get("library_intro")))).lower()
+        fields = (str(config.get("custom_display_name") or ""), str(config.get("library_intro") or ""))
         with _LIBRARY_TEXT_LOCK:
-            self.cog.library_text[pid] = (version, text)
-        return text
+            self.cog.library_text[pid] = (version, fields)
+        return fields
+
+    def library_search_text(self, owner_id: int, pid: str) -> str:
+        """A listing's display name and intro, lower-cased, for the Library's search."""
+        return "\n".join(filter(None, self._library_fields(owner_id, pid))).lower()
+
+    def library_display_name(self, owner_id: int, pid: str) -> str:
+        """A listing's display name, or "" for none. Blocking, as `_library_fields` is."""
+        return self._library_fields(owner_id, pid)[0]
 
     def distribution_of(self, owner_id: int, profile_name: str) -> Tuple[bool, int]:
         """(listed in the Public Library, number of users borrowing it), for copy that
@@ -3251,20 +3283,25 @@ class ProfileManager:
         asked whether it holds, in that code's words (`REFUSAL_CONFIRMERS`). Agreed, the
         refusal is `confirmed_by` that model and settles itself. Disputed, or with no
         answer, it is still Refused but waits on the operator's `review`, with no strike.
+
+        A verdict lighter than the one the profile stands on (`_rating_floor`) holds only
+        once a second model agrees (`_hold_floor`).
         """
         self._last_classify_flagged = False  # a raise before any answer flags nothing
         surface = await asyncio.to_thread(self._moderated_surface, owner_id, profile_name)
         surface_hash = self._surface_hash(surface)
-
-        max_chars = defaultConfig.CONTENT_CLASSIFY_MAX_CHARS
-        truncated = surface[:max_chars]
-        if len(surface) > max_chars:
-            truncated += "\n[...truncated]"
+        floor, floor_reason = await asyncio.to_thread(
+            lambda: _rating_floor((self._get_profile_config(owner_id, profile_name, False) or {})
+                                  .get("content_rating") or {}))
 
         prompt_text = self.cog.global_prompts.get(
             "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT)
 
-        parts = [f"<target_profile>\n{truncated}\n</target_profile>"]
+        # All of it. It was cut at 6,000 characters, so behind a full persona the
+        # instructions, lorebook and fixed examples went unread -- and the hash covers them,
+        # so an edit there was "re-checked" unseen too. The editors bound it (~200,000
+        # characters at every cap), well inside a classifier's context.
+        parts = [f"<target_profile>\n{surface}\n</target_profile>"]
         parts.extend(await self._fetch_avatar_parts(owner_id, profile_name))
 
         payload = [{"role": "user", "parts": parts}]
@@ -3329,7 +3366,47 @@ class ProfileManager:
                 record["confirmed_by"] = other[1]
             else:
                 record["review"] = "disputed" if confirmed else "unconfirmed"
+        elif floor and _STRICTNESS[verdict] < _STRICTNESS[floor]:
+            record = await self._hold_floor(owner_id, record, floor, floor_reason, settings,
+                                            attempts, answered_by, prompt_text, payload)
         return record
+
+    async def _hold_floor(self, owner_id: int, record: Dict[str, Any], floor: str,
+                          floor_reason: Optional[str], settings: Dict[str, Any], attempts: List[tuple],
+                          answered_by: int, prompt_text: str, payload: list) -> Dict[str, Any]:
+        """`record`, if a second model agrees it may go below `floor`; else the stricter answer.
+
+        One answer is one draw -- each model judges at its own sampling defaults -- so small
+        edits resubmitted could walk a refusal or an Adult rating down until a draw came back
+        lighter. Tightening needs no second opinion. Asked of the other model, or of the same
+        one again when the chain has only one: a refusal its own confirmer's question, anything
+        else the classifier's. Held Refused, it waits on the operator with no strike.
+        """
+        second = next((a for i, a in enumerate(attempts) if i != answered_by), attempts[answered_by])
+        if floor == CONTENT_RATING_REFUSED and floor_reason in REFUSAL_CONFIRMERS:
+            status, text, _why = await self._ask_classifier(
+                owner_id, second, settings, self.cog.global_prompts.get(*REFUSAL_CONFIRMERS[floor_reason]),
+                payload, _CONFIRM_LINE)
+            answer = _CONFIRM_LINE.match(text) if status == "success" else None
+            if answer and answer.group(1).upper() == "NO":
+                return record
+            held, reason = CONTENT_RATING_REFUSED, floor_reason
+        else:
+            status, text, _why = await self._ask_classifier(
+                owner_id, second, settings, prompt_text, payload, _VERDICT_LINE)
+            answer = _VERDICT_LINE.match(text) if status == "success" else None
+            held, reason = floor, floor_reason  # no answer: the stricter stands
+            if answer:
+                code = (answer.group(2) or "").upper()
+                held = CONTENT_RATING_REFUSED if code in REFUSAL_CONFIRMERS else answer.group(1).lower()
+                reason = code if code in CONTENT_RATING_REASON_LABELS else None
+                if _STRICTNESS[held] <= _STRICTNESS[record["verdict"]]:
+                    return record
+        if held == CONTENT_RATING_REFUSED:
+            return {**record, "verdict": held, "reason": reason, "underlying": record["verdict"],
+                    "review": "disputed" if answer else "unconfirmed"}
+        return {**record, "verdict": held, "reason": reason,
+                **({"model": second[1]} if answer else {})}
 
     def _store_content_rating(self, owner_id: int, profile_name: str, rating: Dict[str, Any]) -> bool:
         """Persists a verdict, unless a moderator override is pinned for this content."""
@@ -3566,6 +3643,7 @@ class ProfileManager:
                 "source": "failed",
                 "retry_after": time.time() + defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER,
                 **flag,
+                **_carried_floor(rating),
             }
             self._save_profile_config(owner_id, profile_name, config, False)
             self._invalidate_content_rating(owner_id, profile_name)
@@ -3828,7 +3906,8 @@ class ProfileManager:
             return False, "Profile not found."
 
         # A flag stays until a verdict lands: submitting again is not a review.
-        flagged = (config.get("content_rating") or {}).get("flagged")
+        previous = config.get("content_rating") or {}
+        flagged = previous.get("flagged")
         config["content_rating"] = {
             "verdict": CONTENT_RATING_PENDING,
             "hash": None,
@@ -3837,6 +3916,7 @@ class ProfileManager:
             "reason": None,
             "source": "submitted",
             **({"flagged": flagged} if flagged else {}),
+            **_carried_floor(previous),
         }
         await asyncio.to_thread(self._save_profile_config, owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
@@ -3988,6 +4068,7 @@ class ProfileManager:
             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "reason": None,
             "source": "edited",
+            **_carried_floor(rating),
         }
         self._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
@@ -5006,6 +5087,10 @@ class ProfileManager:
             owner_profile_data = self._get_profile_config(sharer_id, current_name, False)
             if not owner_profile_data:
                 return None
+            # Not the author's error message: it is posted under the character's name and no
+            # rating reads it (`_moderated_surface`), so a listing carried unrated text into
+            # every borrower's servers. The borrower writes their own under Misc.
+            owner_profile_data.pop("error_response", None)
 
             # Checked here, when the borrow is made, as well as where the share was
             # offered: a request or code can wait while the rating changes under it,

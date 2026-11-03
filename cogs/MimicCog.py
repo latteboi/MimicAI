@@ -241,7 +241,7 @@ class MimicCog(EventListeners, commands.Cog):
         self.profile_manager._load_profile_shares()
         self.public_profiles: Dict[str, Dict[str, Any]] = {}
         self.profile_manager._load_public_profiles()
-        # PID -> (profile file mtime, its listing's searchable text): `library_search_text`.
+        # PID -> (profile file mtime, (display name, intro)): `_library_fields`.
         self.library_text: LRUCache = LRUCache(max_size=2000)
         # Reverse index: "<owner_id>:<pid>" -> {borrower_id: [local names]}, with the
         # borrower-side inverse derived in memory. Bounded by the number of borrows

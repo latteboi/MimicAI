@@ -551,11 +551,14 @@ HELP_CATEGORIES = {
             "the profile to age-restricted channels and out of sharing. Withdraw it whenever you like -- that returns the "
             "profile to Unrated.\n\n"
             "**What gets checked:** the profile name, display name, avatar images, library intro, persona, AI instructions, "
-            "image prompt and lorebook. Never your long-term memories, training examples, or any conversation.\n\n"
+            "image prompt, lorebook, style guide and fixed examples, all of it however long. Never your long-term memories, "
+            "training examples, or any conversation. A rating lighter than the one before -- out of Refused, or Adult to "
+            "General -- stands only once a second model agrees.\n\n"
             "**If you edit a rated profile,** its rating no longer describes it, and you will be asked whether to re-check "
             "it or set it back to Unrated. Unrated also takes it out of the Public Library. If you do not choose within "
             "three minutes, a listed or borrowed profile is re-checked automatically and any other is set to Unrated. "
-            "A bulk edit applies that rule at once rather than asking per profile.\n\n"
+            "Making several edits? Press **Still Editing**: each edit then waits ten minutes instead, so the rating is "
+            "settled once, after the last. A bulk edit applies that rule at once rather than asking per profile.\n\n"
             "**Disputes.** A classifier Adult verdict can only be cleared by the bot operator. Editing the persona lets you "
             "submit again, which is usually faster."
         ),
@@ -704,6 +707,15 @@ WIZARD_COPY = {
             "Free models cost nothing; for the rest you buy credit on OpenRouter. "
             "**Never paste a key into the chat.**"
         ),
+        # Where the instance offers OpenRouter's sign-in (`openrouter_signin.enabled`).
+        "openrouter_signin": (
+            "**1.** Press **Sign in with OpenRouter ↗** and approve MimicAI. Your key arrives here by "
+            "itself as your **Personal** key, and only you can see it. Have a key already? "
+            "**Paste key** takes it.\n"
+            "**2.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
+            "Free models cost nothing; for the rest you buy credit on OpenRouter. "
+            "**Never paste a key into the chat.**"
+        ),
         "gemini": (
             "**1.** Press **Get a key ↗**, create a key in Google AI Studio, then turn on **billing** for its "
             "project. Google may train on what a free key sends, so only keys with billing on are accepted.\n"
@@ -720,6 +732,16 @@ WIZARD_COPY = {
             "on **billing** for the key's project: only keys with billing on are accepted).\n"
             "**2.** Press the matching **Paste** button and paste the key into the form. It becomes your "
             "**Personal** key, and only you can see it.\n"
+            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
+            "**Never paste a key into the chat.**"
+        ),
+        "none_signin": (
+            "Characters still need an OpenRouter or Google key: add either, or both. OpenRouter is the one "
+            "to start with.\n"
+            "**1.** Press **Sign in with OpenRouter ↗** and approve MimicAI: the key arrives here by itself. "
+            "For Google, press **Get Google key ↗** (turn on **billing** for the key's project: only keys "
+            "with billing on are accepted), then **Paste Google key**.\n"
+            "**2.** Either becomes your **Personal** key, and only you can see it.\n"
             "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
             "**Never paste a key into the chat.**"
         ),
@@ -834,7 +856,7 @@ DEFAULT_HELP_DOCS = {
         "Command: `/start` opens a guided setup wizard. It is the first thing a new user should run.\n"
         "Concept: Five steps -- create your account (accept the Terms and choose a provider: OpenRouter, Google or None), add your API key for it, get a character, add it to a channel, say something to it. The wizard checks which are already done every time it is opened, so it can be closed and reopened freely and always resumes correctly. No progress is stored anywhere.\n"
         "One screen: the checklist, then the step you are on with its buttons. The dropdown jumps to any step; a finished step you pick keeps its buttons where that makes sense -- switch provider, get another character, reopen the cast.\n"
-        "Adding a key: works anywhere, a server channel included. 'Get a key' opens the provider's key page; 'Paste key' opens a private form, validates the key, saves it and makes it your Personal key. If you administer any servers, a dropdown under the step lists them -- the one you ran it in first, 21 per page with Previous, Next and jump-to-page -- and each tick is saved as you make it, with a confirmation first if another key already serves that server. `/settings` -> API Keys still manages all four slots.\n"
+        "Adding a key: works anywhere, a server channel included. 'Get a key' opens the provider's key page; 'Paste key' opens a private form, validates the key, saves it and makes it your Personal key. Where the bot offers it, 'Sign in with OpenRouter' takes the place of 'Get a key': approve MimicAI on OpenRouter and the key it makes is validated and saved as your Personal key the same way, with nothing to copy, and you are told when it lands. The key appears on OpenRouter's key page labelled MimicAI, where you can set it a spending limit or revoke it. If you administer any servers, a dropdown under the step lists them -- the one you ran it in first, 21 per page with Previous, Next and jump-to-page -- and each tick is saved as you make it, with a confirmation first if another key already serves that server. `/settings` -> API Keys still manages all four slots.\n"
         "Context awareness: The wizard states where you are and what you can do there. Adding a character to a channel requires server administrator permission, or a channel on Open casting. Steps that cannot be done from where you ran it are shown greyed out with the reason rather than hidden.\n"
         "Non-administrators: You can complete the first three steps anywhere and build characters freely, but only an administrator can add them to a channel. Profiles belong to you rather than to a server, so the fastest way to test your own is to create your own server -- you are its administrator -- and add the bot with `/invite`.\n"
         "Second track: Once setup is done, 'Using it' covers talking to characters, `/whisper`, memory commands, images and voice, and what to do when something is wrong. These are not setup steps and have no completion state.\n"
@@ -879,7 +901,7 @@ DEFAULT_HELP_DOCS = {
         "Clearing: 'Clear...' takes one group of settings, or everything, back to Platform default. Blanking a box inside a form clears that one setting the same way.\n"
         "Platform default: Any setting left on 'Platform default' follows the value the bot ships and keeps following it if that value changes in a later version. Selecting the same model by hand pins it instead.\n"
         "Saving: Values are written the moment they are chosen. This tab has no Save button, unlike the API Keys tab which requires Save Assignments.\n"
-        "Borrowed profiles: Borrowing asks whether to use your defaults or keep the author's; nothing is asked when yours would change nothing. Your provider's models and your defaults for models, memory, timezone and toggles apply to borrows. Defaults for temperature, Top P, Top K, advanced OpenRouter sampling, TTS voice, placeholder emoji, custom error message and the Director's Desk apply only to profiles you create, because on a borrow those belong to the author. Persona and instructions can never be defaulted or edited locally at all.\n"
+        "Borrowed profiles: Borrowing asks whether to use your defaults or keep the author's; nothing is asked when yours would change nothing. Your provider's models and your defaults for models, memory, timezone and toggles apply to borrows. Defaults for temperature, Top P, Top K, advanced OpenRouter sampling, TTS voice, placeholder emoji, custom error message and the Director's Desk apply only to profiles you create, because on a borrow those belong to the author -- bar the error message, which a borrow starts without: the author's is never copied, since no content rating checks it. Set your own under Misc. Persona and instructions can never be defaulted or edited locally at all.\n"
         "Provider rescue: If a borrowed profile names a provider you hold no key for, its model slots are repointed to the bot defaults at borrow time and you are told which ones. This only happens when you do hold a key for the replacement; if you hold neither, the author's choice is left alone.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I set a default but my existing profiles did not change.' Fix: Defaults only apply to profiles made or borrowed afterwards. Use `/profile bulk manage` -> Set Models to change profiles you already have.\n"
@@ -936,7 +958,7 @@ DEFAULT_HELP_DOCS = {
         "No verdict: When the rating model answers with nothing usable -- it blocks the profile, returns no text, or answers in words instead of a verdict -- the classifier's Fallback is asked instead. When no model gives a verdict, the profile is never treated as General or Refused. It stays Pending (a declared 18+ stays unchecked, so it runs nowhere), leaves the Public Library, and joins the bot operator's Review Queue with the reason the model gave, if any. The operator rates it General or Adult, or refuses it, which counts as a strike; a new verdict from the model also settles it.\n"
         "Strikes: Each refusal both models agree on, or the bot operator upholds, is a strike against its owner's account -- once per profile, however often it is resubmitted -- that counts for a year. A refusal awaiting review is none yet. At three, the account is blocked automatically with no end date, until the bot operator lifts it under /mod -> Blacklist. Clearing a refusal removes its strike, not a block it caused. /settings -> About Me shows the account's strike count and when the oldest expires.\n"
         "What is judged: The profile name, display name, avatar and mood avatar images, library intro, persona, AI instructions, image prompt and lorebook. Never long-term memories, training examples or conversation logs. The avatar is judged as an image; if it cannot be downloaded the text is judged alone rather than the profile being refused.\n"
-        "Editing a rated profile: The rating no longer describes the profile, so you are asked whether to re-check it or set it back to Unrated; Unrated also takes it out of the Public Library. If you do not choose within three minutes, a listed or borrowed profile is re-checked automatically and any other is set to Unrated. Every edit of judged text asks: persona, instructions, appearance, mood avatars, intro, image prompt, lorebook entries written, deleted or imported, and a rename. A bulk edit applies the rule at once instead of asking per profile. Publishing, sharing, cloning and opening Global Chat settle a stale rating before trusting it.\n"
+        "Editing a rated profile: The rating no longer describes the profile, so you are asked whether to re-check it or set it back to Unrated; Unrated also takes it out of the Public Library. If you do not choose within three minutes, a listed or borrowed profile is re-checked automatically and any other is set to Unrated. Still Editing makes each edit wait ten minutes instead, so several edits are rated once, after the last. Every edit of judged text asks: persona, instructions, appearance, mood avatars, intro, image prompt, lorebook entries written, deleted or imported, and a rename. A bulk edit applies the rule at once instead of asking per profile. Publishing, sharing, cloning and opening Global Chat settle a stale rating before trusting it.\n"
         "Why a profile was rated Adult: The dashboard shows a broad category -- 'Explicit sexual content', 'Sexually-focused persona', 'Graphic violence', 'Real-world atrocity' (a real dictator, war criminal or terrorist known for mass killing, such as Hitler), 'Self-harm encouragement', 'Hatred of a real group', 'Abusive towards the user', 'Drug glorification', 'Minor safety' or 'Sexualises a real person' (both Refused), or a generic 'Adult themes' -- and never a description of the persona itself.\n"
         "Disputing a verdict: Only the bot operator can clear a classifier Adult or Refused verdict, from the mod view of the profile. A refused profile's owner can ask for that review with Request Review on Content Safety, once per refusal. An Adult rating you declared yourself is different -- you can always withdraw that. A clearance is tied to the exact content that was flagged, so it lapses if the persona is edited afterwards.\n"
         "NSFW Gating: A profile rated Adult 18+ is checked against the destination channel before the prompt is sent. For a borrowed profile the rating is taken from the original owner's profile, so a borrower cannot downgrade it.\n"

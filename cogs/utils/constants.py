@@ -118,9 +118,6 @@ class DefaultConfigNamespace:
         # defined behaviour (it runs as a General one and cannot be shared), so there is
         # no undecided runtime case left to arbitrate.
         #
-        # Characters of persona + instructions sent to the classifier; the tail of a long
-        # persona is near-always more of the same register.
-        self.CONTENT_CLASSIFY_MAX_CHARS = 6000
         # Bytes of avatar sent with it. Beyond this the text is judged alone -- an avatar
         # is one signal among several, and not worth a 20 MB upload on this box.
         self.CONTENT_CLASSIFY_MAX_IMAGE_BYTES = 4 * 1024 * 1024
@@ -135,6 +132,12 @@ class DefaultConfigNamespace:
         self.CONTENT_CLASSIFY_UI_WAIT_SECONDS = 90.0
 
         self.MIMIC_NEWS = ""
+
+        # Sign in with OpenRouter, on /start's key step: the public URL OpenRouter sends
+        # the browser back to, and the webhook that URL relays the code through
+        # (`cloudflare/openrouter_signin.js`). Without both, the step offers paste alone.
+        self.OPENROUTER_SIGNIN_URL = get_config_value("OPENROUTER_SIGNIN_URL")
+        self.OPENROUTER_RELAY_WEBHOOK_ID = int(get_config_value("OPENROUTER_RELAY_WEBHOOK_ID") or 0)
 
 defaultConfig = DefaultConfigNamespace()
 
@@ -1025,8 +1028,10 @@ _MEDIA_READER_CHAINS = {
 }
 #: The classifier's verdict decides who may see a profile, so it ships one steady model a
 #: side, and Gemini 3.8 Flash on both as the last resort: asked only when the Primary is
-#: down or gives no verdict, and to confirm a Primary's refusal. Never at the owner's
-#: request, so it is no second opinion they can shop for. `_classify_profile_content`.
+#: down or gives no verdict, to confirm a Primary's refusal, and to agree to a verdict
+#: lighter than the last (`_hold_floor`). Never at the owner's request, and it can only
+#: hold the stricter answer, so it is no second opinion they can shop for.
+#: `_classify_profile_content`.
 #: Both OpenRouter models are paid, which Content Safety and its help text tell the owner.
 _CLASSIFIER_CHAINS = {'gemini': ('GOOGLE/gemini-3-flash-preview', 'GOOGLE/gemini-3.8-flash'),
                       'openrouter': (CLAUDE_HAIKU_MODEL, 'OPENROUTER/google/gemini-3.8-flash')}

@@ -7223,10 +7223,13 @@ class PostEditRatingView(BlockedGuard, ui.View):
     """
 
     TIMEOUT_SECONDS = 180
+    #: Still Editing's wait after each edit, so a run of edits is rated once. Short enough
+    #: that a shared profile is not left long on a verdict about text it no longer has.
+    HOLD_SECONDS = 600
 
     def __init__(self, cog: 'MimicCog', user_id: int, profile_name: str, verdict: str,
-                 listed: bool, borrowers: int):
-        super().__init__(timeout=self.TIMEOUT_SECONDS)
+                 listed: bool, borrowers: int, holding: bool = False):
+        super().__init__(timeout=self.HOLD_SECONDS if holding else self.TIMEOUT_SECONDS)
         self.cog = cog
         self.user_id = user_id
         self.profile_name = profile_name
@@ -7234,6 +7237,10 @@ class PostEditRatingView(BlockedGuard, ui.View):
         self.listed = listed
         self.borrowers = borrowers
         self.key = (int(user_id), profile_name)
+        #: Still Editing was pressed, here or on the prompt this one replaced.
+        self.holding = holding
+        if holding:
+            self.remove_item(self.still_editing)
         #: The prompt's own message, for rewriting it when nobody presses anything.
         self.message: Optional[discord.WebhookMessage] = None
 
@@ -7266,16 +7273,21 @@ class PostEditRatingView(BlockedGuard, ui.View):
         if reach:
             embed.add_field(name="Who Relies on This Rating", value=" ".join(reach), inline=False)
 
+        hold = self.HOLD_SECONDS // 60
         embed.add_field(name="Your Options", value=(
             "**Re-check Rating**: get a new verdict for the profile as it is now. This makes "
             "one API call.\n"
-            f"**Set to Unrated**: {self._unrated_consequences(done=False)}"), inline=False)
+            f"**Set to Unrated**: {self._unrated_consequences(done=False)}"
+            + ("" if self.holding else
+               f"\n**Still Editing**: wait {hold} minutes after each edit instead, so your "
+               f"changes are rated once you are done.")), inline=False)
 
-        minutes = self.TIMEOUT_SECONDS // 60
+        settle = ("it is re-checked automatically, since it is listed or borrowed."
+                  if self.listed or self.borrowers else "it is set to Unrated.")
         embed.set_footer(text=(
-            f"If you do not choose within {minutes} minutes, "
-            + ("it is re-checked automatically, since it is listed or borrowed."
-               if self.listed or self.borrowers else "it is set to Unrated.")))
+            f"Still editing: {hold} minutes after your last edit, if you have not chosen, {settle}"
+            if self.holding else
+            f"If you do not choose within {self.TIMEOUT_SECONDS // 60} minutes, {settle}"))
         return embed
 
     def _outcome_embed(self, text: str) -> discord.Embed:
@@ -7347,6 +7359,16 @@ class PostEditRatingView(BlockedGuard, ui.View):
                                       + self._unrated_consequences(done=True)),
             view=None)
 
+    @ui.button(label="Still Editing", style=discord.ButtonStyle.primary)
+    async def still_editing(self, i: discord.Interaction, button: ui.Button):
+        # The hold passes to each later edit's prompt (`maybe_prompt_rating_after_edit`):
+        # a fresh message every time, since this one can be edited only within Discord's
+        # fifteen minutes of the edit that sent it.
+        self.holding = True
+        self.timeout = self.HOLD_SECONDS
+        self.remove_item(button)
+        await i.response.edit_message(embed=self.build_embed(), view=self)
+
     async def on_timeout(self):
         self._release()
         try:
@@ -7384,11 +7406,12 @@ async def maybe_prompt_rating_after_edit(cog, interaction: discord.Interaction,
             return
         verdict, _rating = await asyncio.to_thread(pm._content_rating_state, user_id, profile_name)
         listed, borrowers = await asyncio.to_thread(pm.distribution_of, user_id, profile_name)
-        view = PostEditRatingView(cog, user_id, profile_name, verdict, listed, borrowers)
-
         # One prompt per profile: a second edit inside the window replaces the first,
-        # whose buttons would otherwise act on a hold it no longer owns.
+        # whose buttons would otherwise act on a hold it no longer owns -- and keeps its
+        # Still Editing, restarting the wait from this edit.
         previous = cog.rating_prompts_open.get(key)
+        view = PostEditRatingView(cog, user_id, profile_name, verdict, listed, borrowers,
+                                  holding=getattr(previous, "holding", False))
         cog.rating_prompts_open[key] = view
         if previous is not None:
             await previous.close("Replaced by the prompt for your latest edit.")

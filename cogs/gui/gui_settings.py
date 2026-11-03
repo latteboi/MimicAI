@@ -4,7 +4,7 @@ import discord
 from discord import ui
 import asyncio
 import datetime
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 from .base_components import (
     BlockedGuard, PageJumpModal, TabbedView, add_button, add_select, paged_nav_options,
@@ -71,53 +71,58 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         raw_key = self.key_input.value.strip()
-        
+
         if not raw_key.startswith(("AIzaSy", "AQ.", "sk-or-")):
             await interaction.followup.send(embed=text_embed("❌ **Invalid Format.** Keys must start with `AIzaSy`, `AQ.`, or `sk-or-`."), ephemeral=True)
             return
 
-        is_valid, err, tier = await self.cog.api_service._validate_api_keys(
-            raw_key if self.provider == "gemini" else None, 
-            raw_key if self.provider == "openrouter" else None
-        )
-        
-        if not is_valid:
-            await interaction.followup.send(embed=text_embed(f"❌ **Validation Failed:** {suppress_link_previews(str(err))}"), ephemeral=True)
-            return
-
-        # Refused before anything is written -- see may_save_free_gemini_key.
-        if (self.provider == "gemini" and not is_paid_gemini_slot({"tier": tier})
-                and not may_save_free_gemini_key(interaction.user.id)):
-            await interaction.followup.send(embed=text_embed(f"❌ {GEMINI_FREE_TIER_KEY_REFUSED}"), ephemeral=True)
-            return
-
-        user_data = self.cog.storage_manager._get_user_keys_data(interaction.user.id)
-        user_data.setdefault("slots", {})[self.slot_id] = {
-            "key": raw_key,
-            "provider": self.provider,
-            "tier": tier
-        }
-        if self.assign_personal:
-            user_data.setdefault("personal_assignments", {})[self.provider] = self.slot_id
-        self.cog.storage_manager._save_user_keys_data(interaction.user.id, user_data)
-        
-        self.cog.decrypted_key_cache[(interaction.user.id, self.slot_id)] = raw_key
-
-        # has_personal_key is set by _save_user_keys_data above, together with the
-        # stat stamp _index_is_consistent checks it against. Setting the flag here
-        # without the stamp is what this used to do, and it bought a full index
-        # repair on the next hourly pass.
-
-        msg = f"✅ {self.provider.title()} key saved to slot `{self.slot_id}` ({tier.title()} Tier)."
-        if self.assign_personal:
-            msg += "\nIt is now your **Personal** key."
-        if self.provider == "gemini" and not is_paid_gemini_slot({"tier": tier}):
-            msg += "\nGoogle may train on what a free-tier key is sent, so it is not used in servers or Global Chat."
-
-        if self.view:
+        saved, msg = await save_api_key(self.cog, interaction.user.id, self.slot_id, self.provider,
+                                        raw_key, self.assign_personal)
+        if saved and self.view:
             await self.view._repaint()
 
         await interaction.followup.send(embed=text_embed(msg), ephemeral=True)
+
+
+async def save_api_key(cog: 'MimicCog', user_id: int, slot_id: str, provider: str, raw_key: str,
+                       assign_personal: bool) -> Tuple[bool, str]:
+    """Validates a key and saves it to a slot: where a pasted key and an OpenRouter sign-in
+    both end. Returns (saved, the line to tell the user)."""
+    is_valid, err, tier = await cog.api_service._validate_api_keys(
+        raw_key if provider == "gemini" else None,
+        raw_key if provider == "openrouter" else None
+    )
+    if not is_valid:
+        return False, f"❌ **Validation Failed:** {suppress_link_previews(str(err))}"
+
+    # Refused before anything is written -- see may_save_free_gemini_key.
+    if (provider == "gemini" and not is_paid_gemini_slot({"tier": tier})
+            and not may_save_free_gemini_key(user_id)):
+        return False, f"❌ {GEMINI_FREE_TIER_KEY_REFUSED}"
+
+    user_data = cog.storage_manager._get_user_keys_data(user_id)
+    user_data.setdefault("slots", {})[slot_id] = {
+        "key": raw_key,
+        "provider": provider,
+        "tier": tier
+    }
+    if assign_personal:
+        user_data.setdefault("personal_assignments", {})[provider] = slot_id
+    cog.storage_manager._save_user_keys_data(user_id, user_data)
+
+    cog.decrypted_key_cache[(user_id, slot_id)] = raw_key
+
+    # has_personal_key is set by _save_user_keys_data above, together with the
+    # stat stamp _index_is_consistent checks it against. Setting the flag here
+    # without the stamp is what this used to do, and it bought a full index
+    # repair on the next hourly pass.
+
+    msg = f"✅ {provider.title()} key saved to slot `{slot_id}` ({tier.title()} Tier)."
+    if assign_personal:
+        msg += "\nIt is now your **Personal** key."
+    if provider == "gemini" and not is_paid_gemini_slot({"tier": tier}):
+        msg += "\nGoogle may train on what a free-tier key is sent, so it is not used in servers or Global Chat."
+    return True, msg
 
 class OverrideConfirmView(BlockedGuard, ui.View):
     """Asks before taking over assignments another key holds, then applies them through

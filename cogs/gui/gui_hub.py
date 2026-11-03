@@ -106,6 +106,8 @@ class HubPublicLibraryView(HubBaseView):
         # "page" counter counted profiles.
         self.selected_index = 0
         self.current_page = 0
+        #: PID -> display name, for the dropdown page on show (`_load_display_names`).
+        self._display_names: Dict[str, str] = {}
         
         self.setup_items()
 
@@ -153,9 +155,14 @@ class HubPublicLibraryView(HubBaseView):
             options = paged_nav_options(self.current_page, num_pages, nav_suffix=" of profiles")
             for abs_index, p in enumerate(self.filtered_list[start:start + self.PER_PAGE], start):
                 owner = self.cog.bot.get_user(p['owner_id'])
+                # The name the listing's card is titled with, where it is not the profile's.
+                shown = self._display_names.get(p.get('original_pid')) or ""
+                description = " \u00B7 ".join(filter(None, (
+                    shown if shown.lower() != p['profile_name'].lower() else "",
+                    f"by {owner.name}" if owner else "")))
                 options.append(discord.SelectOption(
                     label=p['profile_name'][:100], value=str(abs_index),
-                    description=f"by {owner.name}"[:100] if owner else None,
+                    description=description[:100] or None,
                     default=(abs_index == self.selected_index)))
             add_select(self, options, self.select_callback,
                        placeholder="Select a profile to view...", row=0)
@@ -182,6 +189,15 @@ class HubPublicLibraryView(HubBaseView):
         add_button(self, "Publish Yours", self.publish_cb, row=2,
                    style=discord.ButtonStyle.green, emoji="🌐")
 
+    async def _load_display_names(self):
+        """The dropdown page's display names, read in a thread: a listing's first read
+        decrypts its profile file (`library_display_name`)."""
+        start = self.current_page * self.PER_PAGE
+        page = [p for p in self.filtered_list[start:start + self.PER_PAGE] if p.get('original_pid')]
+        pm = self.cog.profile_manager
+        self._display_names = await asyncio.to_thread(lambda: {
+            p['original_pid']: pm.library_display_name(p['owner_id'], p['original_pid']) for p in page})
+
     async def update_display(self):
         if not self.filtered_list:
             embed = discord.Embed(title="Public Library", description="No profiles found.", color=discord.Color.red())
@@ -190,6 +206,8 @@ class HubPublicLibraryView(HubBaseView):
 
         if self.selected_index >= len(self.filtered_list):
             self.selected_index = 0
+        await self._load_display_names()
+        self.setup_items()
         
         p_info = self.filtered_list[self.selected_index]
         owner_id = p_info['owner_id']
@@ -239,6 +257,7 @@ class HubPublicLibraryView(HubBaseView):
         if value == "jump_page":
             async def _jump(inner: discord.Interaction, page: int):
                 self.current_page = page
+                await self._load_display_names()
                 self.setup_items()
                 await inner.response.edit_message(view=self)
 
@@ -247,6 +266,7 @@ class HubPublicLibraryView(HubBaseView):
         if value in ("prev_page", "next_page"):
             # Only the dropdown moves; the profile on show stays put.
             self.current_page += -1 if value == "prev_page" else 1
+            await self._load_display_names()
             self.setup_items()
             await i.response.edit_message(view=self)
             return

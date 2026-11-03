@@ -72,7 +72,8 @@ DEFAULT_NEW_ONLY = frozenset({
     "frequency_penalty", "presence_penalty", "repetition_penalty", "min_p", "top_a",
     # Voice and presentation belong to the character, not to the person borrowing it.
     "speech_voice", "placeholder_emoji",
-    # Written in the character's voice, and inherited from the author by the snapshot.
+    # Written in the character's voice. A borrow starts on the shipped one, never its
+    # author's (`_accept_share_request`), and is given another by hand.
     "error_response",
 })
 

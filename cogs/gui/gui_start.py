@@ -34,13 +34,14 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from ..utils.constants import (BOT_PERMISSIONS, CAST_POLICY_OPEN, CHILD_BOT_PERMISSIONS,
                                DEFAULT_CAST_POLICY, MODEL_PROVIDERS, PROVIDER_CHOICES,
                                PROVIDER_NONE, defaultConfig)
+from ..utils import openrouter_signin
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, PERMISSION_EFFECTS,
                              SERVER_KEY_PITCH, WIZARD_COPY, WIZARD_TOUR)
 from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
                               add_select)
 from .gui_settings import (KEY_SLOTS, SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
-                           SubmitAPIKeyModal, _fit_list)
+                           SubmitAPIKeyModal, _fit_list, save_api_key)
 from .base_components import text_embed
 
 if TYPE_CHECKING:
@@ -88,9 +89,13 @@ class _Step:
 
     def blurb(self, state: Dict[str, Any]) -> str:
         copy = WIZARD_COPY.get(self.key, "")
-        # The key step speaks for the provider chosen before it, and only that one.
+        # The key step speaks for the provider chosen before it, and only that one --
+        # and, where this instance offers it, of signing in rather than making a key.
         if isinstance(copy, dict):
-            return copy.get(state.get("provider") or "openrouter", "")
+            provider = state.get("provider") or "openrouter"
+            if openrouter_signin.enabled() and f"{provider}_signin" in copy:
+                provider += "_signin"
+            return copy.get(provider, "")
         return copy
 
     def in_context(self, state: Dict[str, Any]) -> bool:
@@ -391,6 +396,9 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         # The step picked from the dropdown; None follows the first one not done.
         self.step_key: Optional[str] = None
         self.tour_page = next(iter(WIZARD_TOUR))
+        # This wizard's OpenRouter sign-in link, and the task waiting on its code.
+        self._sign_in_url: Optional[str] = None
+        self._sign_in_task: Optional[asyncio.Task] = None
         self._init_scopes()
         if interaction.guild is not None:
             # The server it was run in first: the one its runner came here to fix.
@@ -644,8 +652,12 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         for provider in providers:
             name = MODEL_PROVIDERS[provider]
             # A link: Discord opens it, and no interaction reaches us.
-            buttons.append(ui.Button(label=f"Get {name} key ↗" if named else "Get a key ↗",
-                                     row=0, url=KEY_PAGES[provider]))
+            if provider == "openrouter" and openrouter_signin.enabled():
+                buttons.append(ui.Button(label="Sign in with OpenRouter ↗", row=0,
+                                         url=self._open_sign_in()))
+            else:
+                buttons.append(ui.Button(label=f"Get {name} key ↗" if named else "Get a key ↗",
+                                         row=0, url=KEY_PAGES[provider]))
             paste = ui.Button(label=f"🔑 Paste {name} key" if named else "🔑 Paste key",
                               style=discord.ButtonStyle.success, row=0)
             paste.callback = lambda i, p=provider: self._act_paste_key(i, p)
@@ -690,16 +702,52 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
                                    start_category=category, start_page=page)
         await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
 
-    async def _act_paste_key(self, interaction: discord.Interaction, provider: str):
+    def _slot_for(self, provider: str) -> str:
         filled = (self.cog.storage_manager._get_user_keys_data(self.user_id) or {}).get("slots") or {}
         mine = [slot for slot, _label, p in KEY_SLOTS if p == provider]
         # An empty slot first; with both full, the first is replaced, as Edit Key would.
-        slot = next((s for s in mine if s not in filled), mine[0])
+        return next((s for s in mine if s not in filled), mine[0])
+
+    async def _act_paste_key(self, interaction: discord.Interaction, provider: str):
         if self.admin_guilds:
             # Stay on this step once it is done: the server picker appears under it.
             self.step_key = "key"
         await interaction.response.send_modal(
-            SubmitAPIKeyModal(self.cog, slot, provider, view=self, assign_personal=True))
+            SubmitAPIKeyModal(self.cog, self._slot_for(provider), provider, view=self,
+                              assign_personal=True))
+
+    def _open_sign_in(self) -> str:
+        """The sign-in link, and the wait for its code, begun when the link is first drawn:
+        a link button opens the browser without an interaction reaching us. One per
+        wizard, so a repaint keeps the link the user may already have open."""
+        if self._sign_in_url is None:
+            self._sign_in_url, state, verifier = openrouter_signin.start()
+            self._sign_in_task = asyncio.create_task(self._await_sign_in(state, verifier))
+        return self._sign_in_url
+
+    async def _await_sign_in(self, state: str, verifier: str):
+        # As long as the wizard lives: the /start token it repaints through lasts that long.
+        code = await openrouter_signin.receive_code(self.cog.bot, state, self.timeout or 900)
+        # Spent either way; the next repaint draws a fresh link.
+        self._sign_in_url = None
+        if code is None:
+            return
+        try:
+            key = await openrouter_signin.exchange(code, verifier)
+            saved, message = await save_api_key(self.cog, self.user_id, self._slot_for("openrouter"),
+                                                "openrouter", key, assign_personal=True)
+        except openrouter_signin.SignInFailed as e:
+            saved, message = False, f"❌ {e}"
+        if saved:
+            message += ("\n\nFree models work now. For the rest, add credit at "
+                        "<https://openrouter.ai/settings/credits>.")
+            if self.admin_guilds:
+                self.step_key = "key"
+        try:
+            await self._repaint()
+            await self.original_interaction.followup.send(embed=text_embed(message), ephemeral=True)
+        except discord.HTTPException:
+            pass  # The /start token has lapsed. The key is saved: /start again shows it.
 
     async def _act_prefer_gemini(self, interaction: discord.Interaction):
         await self._prefer(interaction, "gemini")
