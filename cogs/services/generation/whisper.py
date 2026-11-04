@@ -15,7 +15,7 @@ from . import tool_loop
 from .reply import ReplyText, reply_gen_config
 from ...gui.gui_sessions import WhisperActionView
 from ...managers.session_manager import intern_turn
-from ...gui.base_components import text_embed
+from ...gui.base_components import dismissible, text_embed
 
 
 class WhisperMixin:
@@ -337,7 +337,7 @@ class WhisperMixin:
                 timed_out = (f"The session is still busy after {int(WHISPER_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
                              "Nothing was regenerated \u2014 try again in a moment.")
                 if answered:
-                    await interaction.edit_original_response(content=None, embed=text_embed(timed_out), view=None)
+                    await interaction.edit_original_response(content=None, embed=dismissible(text_embed(timed_out)), view=None)
                 else:
                     await interaction.response.send_message(embed=text_embed(timed_out), ephemeral=True)
                 return

@@ -11,7 +11,7 @@ from .base_components import (BlockedGuard, PageJumpModal, TabbedView, add_butto
                               build_pagination_controls, bulk_select_options,
                               paged_nav_options, refuse_unregistered, resolve_bulk_select)
 from .gui_start import NewProfileModal
-from .base_components import text_embed
+from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -979,7 +979,7 @@ class BorrowDefaultsView(BlockedGuard, ui.View):
     async def _answer(self, interaction: discord.Interaction, use_mine: bool):
         self.use_mine = use_mine
         await interaction.response.edit_message(
-            content=None, embed=text_embed("Using your defaults." if use_mine else "Keeping the original's settings."),
+            content=None, embed=dismissible(text_embed("Using your defaults." if use_mine else "Keeping the original's settings.")),
             view=None)
         self.stop()
 

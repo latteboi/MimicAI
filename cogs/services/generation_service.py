@@ -58,7 +58,7 @@ from .generation.global_chat import GlobalChatMixin
 from .generation.whisper import WhisperMixin
 from .generation.image_round import ImageRoundMixin
 from .generation.triggers import (TriggerIntakeMixin, batched_message, labelled, referenced_message,
-                                  said, reply_record, wakeword_position)
+                                  round_notes, said, reply_record, wakeword_position)
 from .generation.compaction import SessionCompactionMixin
 from .generation.ltm_capture import LtmCaptureMixin
 from .generation.turn_deletion import TurnDeletionMixin
@@ -1455,6 +1455,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # the round's own material, so the transcript before it stays a
                         # cacheable prefix.
                         supplementary_parts = [turn_context] if turn_context else []
+                        supplementary_parts.extend(round_notes(all_triggers_for_round))
 
                         # [UPDATED] Standardised XML injection for pending whispers
                         whisper_context = whisper_recap(

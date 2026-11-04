@@ -52,7 +52,7 @@ from .base_components import BlockedGuard, add_button, add_select
 from ..services.games import dice, eights
 from ..services.games.eights import COLOURS, Card, Move
 from ..services.games.table import NAMES
-from .base_components import text_embed
+from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -472,7 +472,7 @@ class HandView(BlockedGuard, ui.View):
         """
         if self.game.state.phase != "playing":
             await interaction.response.edit_message(
-                content=None, embed=text_embed("That game has finished."), view=None)
+                content=None, embed=dismissible(text_embed("That game has finished.")), view=None)
             return
         view = type(self)(self.cog, self.game, self.seat_id,
                           colour_filter=self.colour_filter)

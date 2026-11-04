@@ -23,7 +23,7 @@ from .base_components import (PAGE_NAV_VALUES, BaseBulkProfileView, BlockedGuard
 from .gui_data_policy import DataPolicyView, add_data_policy_fields
 from ..utils import data_policy
 from ..utils.data_policy import may_set_data_policy
-from .base_components import text_embed
+from .base_components import dismissible, text_embed
 
 class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
@@ -655,7 +655,7 @@ class DataManageView(BlockedGuard, ui.View):
                 delete = mm.delete_ltms if self.mode == 'ltm' else mm.delete_training_examples
                 gone = await delete(self.user_id, self.profile_name, ids)
             await i.response.edit_message(content=None,
-                                          view=None, embed=text_embed(f"Deleted {gone} item(s)." if gone else "Nothing was found to delete."))
+                                          view=None, embed=dismissible(text_embed(f"Deleted {gone} item(s)." if gone else "Nothing was found to delete.")))
             await self._refresh()
             if self.mode in ('lore', 'examples') and gone:
                 from .gui_profiles import maybe_prompt_rating_after_edit

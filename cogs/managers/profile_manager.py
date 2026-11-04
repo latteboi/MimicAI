@@ -64,7 +64,7 @@ from .storage_manager import IOManager, _get_compressor, _get_decompressor
 #: Two searches run in two worker threads, and LRUCache's eviction is several steps.
 _LIBRARY_TEXT_LOCK = threading.Lock()
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
-from ..gui.base_components import text_embed
+from ..gui.base_components import dismissible, text_embed
 
 try:
     import orjson as json
@@ -1977,7 +1977,7 @@ class ProfileManager:
             f"Use yours, or keep what its author chose?"), view=view, ephemeral=True, wait=True)
         if await view.wait():
             try:
-                await message.edit(embed=text_embed("No answer, so the original's settings were kept."),
+                await message.edit(embed=dismissible(text_embed("No answer, so the original's settings were kept.")),
                                    view=None)
             except discord.HTTPException:
                 pass

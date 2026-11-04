@@ -19,7 +19,7 @@ from ..services.profile_generation import (ProfileGenerationError, generate_draf
                                            save_draft)
 from ..utils.helpers import suppress_link_previews
 from .base_components import BlockedGuard, TimeoutCleanupMixin, add_button
-from .base_components import text_embed
+from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
     from ..MimicCog import MimicCog
@@ -226,7 +226,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     async def discard(self, interaction: discord.Interaction):
         self.stop()
         await interaction.response.edit_message(
-            content=None, embed=text_embed("Draft discarded. Nothing was saved."), view=None)
+            content=None, embed=dismissible(text_embed("Draft discarded. Nothing was saved.")), view=None)
 
     async def open_dashboard(self, interaction: discord.Interaction):
         self.stop()

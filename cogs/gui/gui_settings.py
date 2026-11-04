@@ -12,7 +12,7 @@ from .base_components import (
 from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
 from ..utils.helpers import _get_user_hash, _resolve_zoneinfo, suppress_link_previews
 from ..utils.data_policy import is_paid_gemini_slot, may_save_free_gemini_key
-from .base_components import text_embed
+from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -147,11 +147,11 @@ class OverrideConfirmView(BlockedGuard, ui.View):
         await interaction.response.defer(ephemeral=True)
         self.parent_view._apply_assignments(self.slot_id, self.new_scopes)
         await self.parent_view._repaint()
-        await interaction.edit_original_response(content=None, embed=text_embed("✅ Assignments saved successfully."), view=None)
+        await interaction.edit_original_response(content=None, embed=dismissible(text_embed("✅ Assignments saved successfully.")), view=None)
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
     async def cancel_override(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.edit_message(content=None, embed=text_embed("❌ Assignment update cancelled."), view=None)
+        await interaction.response.edit_message(content=None, embed=dismissible(text_embed("❌ Assignment update cancelled.")), view=None)
 
 def _defaults_view(v):
     # Imported here, not at module scope: gui_defaults adopts ModelPickerMixin from

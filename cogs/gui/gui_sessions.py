@@ -23,7 +23,7 @@ from ..managers.session_manager import (director_enabled, director_model_config,
 from ..services.generation.global_chat import build_global_chat_embed
 from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, cast_costs, quiet_label, session_advice
 from ..services.generation.tool_loop import functions_for
-from .base_components import text_embed
+from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -594,7 +594,7 @@ class GlobalChatHistoryView(BlockedGuard, ui.View):
                         content=None, embeds=[text_embed("Round deleted. Switching to next available profile."),
                                               self.get_embed()], view=self)
                 else:
-                    await interaction.edit_original_response(content=None, embed=text_embed("History cleared and session deleted."), view=None)
+                    await interaction.edit_original_response(content=None, embed=dismissible(text_embed("History cleared and session deleted.")), view=None)
             else:
                 await interaction.edit_original_response(embed=self.get_embed(), view=self)
         else:
@@ -893,11 +893,11 @@ class SpeakPreviewView(BlockedGuard, ui.View):
 
         if delivered:
             await interaction.edit_original_response(
-                content=None, embed=text_embed(f"Sent, after {self.takes} take(s)."), view=None)
+                content=None, embed=dismissible(text_embed(f"Sent, after {self.takes} take(s).")), view=None)
         else:
             await interaction.edit_original_response(
                 content=None,
-                embed=text_embed("That profile is no longer seated in this channel's session, so nothing was sent."), view=None)
+                embed=dismissible(text_embed("That profile is no longer seated in this channel's session, so nothing was sent.")), view=None)
         self.stop()
 
     @ui.button(label="Reroll", style=discord.ButtonStyle.primary)
@@ -925,7 +925,7 @@ class SpeakPreviewView(BlockedGuard, ui.View):
 
     @ui.button(label="Cancel", style=discord.ButtonStyle.danger)
     async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
-        await interaction.response.edit_message(content=None, embed=text_embed("Discarded."), view=None)
+        await interaction.response.edit_message(content=None, embed=dismissible(text_embed("Discarded.")), view=None)
         self.stop()
 
 
@@ -944,14 +944,14 @@ class WhisperActionView(BlockedGuard, ui.View):
     async def delete_button(self, interaction: discord.Interaction, button: ui.Button):
         session = self.cog.multi_profile_channels.get(self.channel_id)
         if not session:
-            await interaction.response.edit_message(content=None, view=None, embed=text_embed("Session not found or has ended."))
+            await interaction.response.edit_message(content=None, view=None, embed=dismissible(text_embed("Session not found or has ended.")))
             return
 
         if not session.get("is_hydrated"):
             session = await self.cog.session_manager._ensure_session_hydrated(self.channel_id, session.get("type", "multi"))
 
         if not session:
-            await interaction.response.edit_message(content=None, view=None, embed=text_embed("Failed to load session memory."))
+            await interaction.response.edit_message(content=None, view=None, embed=dismissible(text_embed("Failed to load session memory.")))
             return
 
         turn_ids_to_delete = {self.whisper_turn_id, self.response_turn_id}
@@ -975,7 +975,7 @@ class WhisperActionView(BlockedGuard, ui.View):
             # is_hydrated, which stranded the in-memory log past eviction.
             self.cog.session_manager._recompute_pending_whispers(session)
 
-        await interaction.response.edit_message(content=None, view=None, embed=text_embed("Whisper has been deleted from the profile's memory."))
+        await interaction.response.edit_message(content=None, view=None, embed=dismissible(text_embed("Whisper has been deleted from the profile's memory.")))
 
     @ui.button(label="Regenerate", style=discord.ButtonStyle.secondary, custom_id="regenerate_whisper")
     async def regenerate_button(self, interaction: discord.Interaction, button: ui.Button):

@@ -1103,6 +1103,12 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.response.defer(ephemeral=True)
         await self._swap_session_impl(interaction, profile_name, use_child_bot, slot)
 
+    def _seat_embed(self, seat: Dict[str, Any], text: str) -> discord.Embed:
+        """A `/session swap` reply headed by the seat it is about: the name and small avatar
+        it speaks under, so a swap shows who came or went at a glance."""
+        name, avatar = self.generation_service._resolve_appearance_data(seat["owner_id"], seat["profile_name"])
+        return text_embed(text).set_author(name=name[:256], icon_url=avatar)
+
     async def _remove_session_participant(self, interaction: discord.Interaction,
                                           session: Dict[str, Any], index: int) -> None:
         """Drops one seated participant and tells its child bot to stand down.
@@ -1135,7 +1141,9 @@ class MimicCog(EventListeners, commands.Cog):
 
         self.session_manager._save_multi_profile_sessions()
         await interaction.followup.send(
-            embed=text_embed(f"Removed `{removed_participant['profile_name']}` from the session."), ephemeral=True)
+            embed=self._seat_embed(removed_participant,
+                                   f"Removed `{removed_participant['profile_name']}` from the session."),
+            ephemeral=True)
 
     async def _swap_session_impl(self, interaction: discord.Interaction, profile_name: Optional[str],
                                  use_child_bot: Optional[bool], slot: Optional[int]):
@@ -1313,7 +1321,8 @@ class MimicCog(EventListeners, commands.Cog):
 
                 self.session_manager._save_multi_profile_sessions()
                 await interaction.followup.send(
-                    embed=text_embed(f"Session started with `{profile_name}`. Send a message in this channel to talk to it.\n"
+                    embed=self._seat_embed(new_participant,
+                    f"Session started with `{profile_name}`. Send a message in this channel to talk to it.\n"
                     f"Add more with `/session swap`, or open `/session config` to tune reactivity, "
                     f"mode and prompts."),
                     ephemeral=True)
@@ -1373,7 +1382,7 @@ class MimicCog(EventListeners, commands.Cog):
                         })
 
             self.session_manager._save_multi_profile_sessions()
-            await interaction.followup.send(embed=text_embed(action_description), ephemeral=True)
+            await interaction.followup.send(embed=self._seat_embed(new_participant, action_description), ephemeral=True)
             return
 
     @session_group.command(name="audit", description="Run a diagnostic and token telemetry audit on the active session.")
@@ -1537,7 +1546,7 @@ class MimicCog(EventListeners, commands.Cog):
     @cooldown_unless_refused(2, 10.0, _no_session_key)
     @app_commands.guild_only()
     @app_commands.describe(profile="Optional: this cast member answers, and only them, whatever their chance.",
-                           note="Optional (Admin Only): a note the cast reads this round, as they read the AI Director's.")
+                           note="Optional (Admin Only): a note the cast reads this round only. Not kept in the history.")
     @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
     async def trigger_session_slash(self, interaction: discord.Interaction, profile: Optional[str] = None,
                                     note: Optional[app_commands.Range[str, 1, 1000]] = None):

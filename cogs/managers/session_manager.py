@@ -278,6 +278,14 @@ def reply_quote(text: str) -> str:
     return text[:cut if cut > 0 else REPLY_QUOTE_CHARS] + "…"
 
 
+def has_header(content: str) -> bool:
+    """Whether a turn opens on the speaker header `with_reply` tags. The one test for both
+    sides of a number: a turn numbered without a header to show it on -- a SYSTEM note --
+    shifted every number after it, and a reply naming it pointed at nothing."""
+    header, sep, _ = content.partition("\n")
+    return bool(sep) and header.endswith(":")
+
+
 def reply_tags(turns: List[Dict[str, Any]]) -> Dict[str, int]:
     """`turn_id` -> `n` for the turns a later turn in `turns` replies to, numbered in the
     order they appear. `turns` is what one prompt shows, oldest first.
@@ -298,7 +306,8 @@ def reply_tags(turns: List[Dict[str, Any]]) -> Dict[str, int]:
             targets.add(target)
         if turn.get("turn_id"):
             seen.add(turn["turn_id"])
-    ordered = [turn["turn_id"] for turn in turns if turn.get("turn_id") in targets]
+    ordered = [turn["turn_id"] for turn in turns
+               if turn.get("turn_id") in targets and has_header(turn.get("content") or "")]
     return {turn_id: n for n, turn_id in enumerate(ordered, 1)}
 
 
@@ -2008,7 +2017,8 @@ class SessionManager:
         # inside the cached prefix, and everything after it re-billed. The start holds
         # still between steps, so a number never changes until the prefix does anyway.
         public = (t for t in log_slice if not t.get("type") and not t.get("is_hidden")
-                  and not (hide_folded and t.get("compacted")) and t.get("turn_id"))
+                  and not (hide_folded and t.get("compacted")) and t.get("turn_id")
+                  and has_header(t.get("content") or ""))
         tags = {t["turn_id"]: n for n, t in enumerate(public, 1)}
         find = turn_lookup(full_log)
         # A profile that does not always read the synopsis reads it here instead, where it

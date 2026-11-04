@@ -196,8 +196,8 @@ class BatchedMessage(NamedTuple):
 
 
 def log_system_note(session: Dict[str, Any], content: str, new_round_turn_data: list) -> None:
-    """A note nobody said -- the AI Director's, or `/trigger note:` -- as a SYSTEM turn
-    the round reads. No name or timestamp header: it is not a line of the conversation."""
+    """A note nobody said -- the AI Director's -- as a SYSTEM turn the round reads. No
+    name or timestamp header: it is not a line of the conversation."""
     system_content = f"<system_note>\n{content}\n</system_note>"
     session.setdefault("unified_log", []).append(intern_turn({
         "turn_id": str(uuid.uuid4()),
@@ -208,6 +208,13 @@ def log_system_note(session: Dict[str, Any], content: str, new_round_turn_data: 
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
     }))
     new_round_turn_data.append((system_content, None, []))
+
+
+def round_notes(triggers: Sequence[Any]) -> List[str]:
+    """This round's `/trigger note:`s, as `<system_note>` blocks for each speaker's final
+    turn. Read off the triggers, never the log: a note is for the round it was given to."""
+    return [f"<system_note>\n{t[1]}\n</system_note>" for t in triggers
+            if isinstance(t, tuple) and t[0] == 'cue' and t[1]]
 
 
 async def batched_message(trigger: Any) -> Optional[BatchedMessage]:
@@ -441,11 +448,15 @@ class TriggerIntakeMixin:
 
             # `/trigger`'s arguments. Its note is read wherever it lands in the batch -- a
             # bare string is read at index 0 alone, and someone typing first would drop it.
+            # Never logged: the note is for this round, so the worker hands it to each
+            # speaker's final turn (`round_notes`). In the log, every later round read it
+            # again, and each retry of a round nobody answered stacked another copy.
+            # Here only for recall and grounding, which query the round's text.
             if isinstance(trigger, tuple) and trigger[0] == 'cue':
                 if i == 0 and trigger[2] is not None:
                     starting_profile_override = trigger[2]
                 if trigger[1]:
-                    log_system_note(session, trigger[1], new_round_turn_data)
+                    new_round_turn_data.append((trigger[1], None, []))
                 continue
 
             if i == 0:

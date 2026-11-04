@@ -59,12 +59,20 @@ def text_embed(text: str, title: Optional[str] = None) -> discord.Embed:
     return discord.Embed(title=title, description=text[:4096], colour=discord.Colour.blurple())
 
 
-DISMISS = "You may dismiss this interface."
+DISMISS = "-# You may dismiss this interface."
 
 
-def closed_embed(title: str, description: str = DISMISS) -> discord.Embed:
+def dismissible(embed: discord.Embed) -> discord.Embed:
+    """`embed` closing an ephemeral message whose controls are gone: the dismiss line in
+    subtext under its text. On a line of its own -- `-#` is subtext only at a line's start."""
+    text = (embed.description or "")[:4095 - len(DISMISS)]
+    embed.description = f"{text}\n{DISMISS}" if text else DISMISS
+    return embed
+
+
+def closed_embed(title: Optional[str], description: str = "") -> discord.Embed:
     """What a spent prompt is left showing once it has been answered, cancelled or expired."""
-    return discord.Embed(title=title, description=description, colour=discord.Colour.dark_grey())
+    return dismissible(discord.Embed(title=title, description=description, colour=discord.Colour.dark_grey()))
 
 
 def build_confirm_view(button_label: str, on_confirm,
@@ -80,7 +88,7 @@ def build_confirm_view(button_label: str, on_confirm,
 
     async def cancel(i: discord.Interaction):
         view.stop()
-        await i.response.edit_message(content=None, embed=closed_embed("Cancelled", f"Nothing was changed. {DISMISS}"),
+        await i.response.edit_message(content=None, embed=closed_embed("Cancelled", "Nothing was changed."),
                                       view=None)
 
     async def expire():
@@ -88,7 +96,7 @@ def build_confirm_view(button_label: str, on_confirm,
             return
         try:
             await interaction.edit_original_response(
-                content=None, embed=closed_embed("This prompt has expired", f"Nothing was changed. {DISMISS}"), view=None)
+                content=None, embed=closed_embed("This prompt has expired", "Nothing was changed."), view=None)
         except discord.HTTPException:
             pass
 

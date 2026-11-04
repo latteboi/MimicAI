@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 
 from .gui_profiles import (ModelPickerMixin, OpenRouterHostView, ProfileManageView,
                            SingleProfileThinkingView, ThinkingPickerMixin)
-from .base_components import text_embed
+from .base_components import dismissible, text_embed
 
 class ModBaseView(TabbedView):
     """Base for every /mod tab.
@@ -196,7 +196,7 @@ class ModDocsView(ModBaseView):
 
                 self.selected_file = None
                 self._build_view()
-                await confirm_i.response.edit_message(content=None, view=None, embed=text_embed("Deleted successfully."))
+                await confirm_i.response.edit_message(content=None, view=None, embed=dismissible(text_embed("Deleted successfully.")))
                 await self.update_display()
 
             confirm_view = build_confirm_view("Confirm Delete", confirm_action, i)
@@ -368,7 +368,7 @@ class ModBanEffectsView(BlockedGuard, ui.View):
             applied = await self.cog.server_manager.apply_ban_effects(
                 self.user_id, **self.effects)
             await i.edit_original_response(
-                content=None, embed=text_embed("\n".join(applied) if applied else "Nothing selected."), view=None)
+                content=None, embed=dismissible(text_embed("\n".join(applied) if applied else "Nothing selected.")), view=None)
 
         add_button(self, "Apply", apply_cb, row=3, style=discord.ButtonStyle.danger,
                    disabled=not any(self.effects.values()))
@@ -702,11 +702,11 @@ class ModStatsView(ModBaseView):
                     view=None, embed=text_embed(f"Suspending `{live}` session(s) across every server..."))
                 channels, guilds, swept = await self.cog.session_manager.suspend_all_sessions()
                 await confirm_i.edit_original_response(
-                    content=None, embed=text_embed(f"**Global suspend complete.**\n"
+                    content=None, embed=dismissible(text_embed(f"**Global suspend complete.**\n"
                              f"• Live sessions suspended: `{channels}`\n"
                              f"• Servers affected: `{guilds}`\n"
                              f"• Session log directories removed: `{swept}`\n\n"
-                             "Every channel is now silent until a session is configured again."),
+                             "Every channel is now silent until a session is configured again.")),
                     view=None)
                 # The button's count is now stale -- repaint the dashboard rather than
                 # leave a live-looking control behind on it.
@@ -829,7 +829,7 @@ class ModProfilesView(ModBaseView):
                     lines.append(f"• ⚠️ Errors: `{counts['errors']}` (see the console log)")
                 lines.append("\nEvery profile is now Unrated. Owners re-submit from "
                              "`/profile manage` -> Home -> Content Safety.")
-                await confirm_i.edit_original_response(content=None, embed=text_embed("\n".join(lines)), view=None)
+                await confirm_i.edit_original_response(content=None, embed=dismissible(text_embed("\n".join(lines))), view=None)
 
             await i.response.send_message(
                 embed=text_embed("**Reset every content rating on this instance?**\n"

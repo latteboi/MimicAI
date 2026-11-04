@@ -1720,18 +1720,18 @@ class ProfileManageView(BlockedGuard, ui.View):
             
             is_valid, err_msg = self.cog.profile_manager._is_valid_profile_name(new_name)
             if not is_valid:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Rename failed: {err_msg}")); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Rename failed: {err_msg}"))); return
                 
             if not new_name or new_name.lower() == 'clyde':
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed("Rename failed: Invalid name.")); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed("Rename failed: Invalid name."))); return
             user_index = self.cog.profile_manager._get_user_index(self.user_id)
             if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed("Rename failed: Name already exists.")); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed("Rename failed: Name already exists."))); return
             
             if self.cog.profile_manager._rename_profile(self.user_id, old_name, new_name, self.is_borrowed):
                 invalidate_model_cache(self.cog, self.user_id, old_name)
                 
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Profile '{old_name}' renamed to '{new_name}'."))
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Profile '{old_name}' renamed to '{new_name}'.")))
                 await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, new_name)
         modal.on_submit = rename_submit
         await interaction.response.send_modal(modal)
@@ -1749,21 +1749,21 @@ class ProfileManageView(BlockedGuard, ui.View):
             
             is_valid, err_msg = self.cog.profile_manager._is_valid_profile_name(new_name)
             if not is_valid:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Duplicate failed: {err_msg}")); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Duplicate failed: {err_msg}"))); return
                 
             user_index = self.cog.profile_manager._get_user_index(self.user_id)
             if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed("Duplicate failed: Name already exists.")); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed("Duplicate failed: Name already exists."))); return
             
             limit = defaultConfig.LIMIT_PROFILES
             if len(user_index.get("personal", {})) >= limit:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed("Limit reached.")); return
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed("Limit reached."))); return
             
             success, msg = self.cog.profile_manager._duplicate_profile(self.user_id, self.profile_name, new_name)
             if success:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Duplicated to '{new_name}'."))
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Duplicated to '{new_name}'.")))
             else:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Duplicate failed: {msg}"))
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Duplicate failed: {msg}")))
         modal.on_submit = duplicate_submit
         await interaction.response.send_modal(modal)
 
@@ -1834,7 +1834,7 @@ class ProfileManageView(BlockedGuard, ui.View):
         async def confirm_delete(i: discord.Interaction):
             await i.response.defer()
             if await self.cog.profile_manager.delete_profiles(self.user_id, [self.profile_name]):
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=text_embed(f"Profile '{self.profile_name}' deleted."))
+                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Profile '{self.profile_name}' deleted.")))
         confirm_view = build_confirm_view("Confirm Deletion", confirm_delete, interaction)
         await interaction.response.send_message(embed=text_embed(f"Delete profile '{self.profile_name}'?"), view=confirm_view, ephemeral=True)
 
@@ -1843,7 +1843,7 @@ class ProfileManageView(BlockedGuard, ui.View):
         await interaction.response.send_message(embed=text_embed(view._get_header_content()), view=view, ephemeral=True)
 
     async def on_timeout(self):
-        try: await self.original_interaction.edit_original_response(content=None, embed=text_embed("Manager timed out."), view=None)
+        try: await self.original_interaction.edit_original_response(content=None, embed=dismissible(text_embed("Manager timed out.")), view=None)
         except: pass
 
 class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
@@ -5263,7 +5263,7 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
 
 
 from ..utils.helpers import _resolve_zoneinfo
-from .base_components import text_embed
+from .base_components import dismissible, text_embed
 
 EXTENSIVE_TIMEZONES = [
     # --- Page 0: Americas (North & Central) ---
@@ -5489,7 +5489,7 @@ class UserTimezoneView(_TimezonePickerView):
         self.parent_about_view._build_view()
         await self.parent_about_view.update_display()
         await interaction.response.edit_message(
-            content=None, embed=text_embed(f"✅ Your timezone is now **{canonical_tz}**."), view=None)
+            content=None, embed=dismissible(text_embed(f"✅ Your timezone is now **{canonical_tz}**.")), view=None)
 
 
 class SingleProfileTimezoneView(_TimezonePickerView):
@@ -5520,7 +5520,7 @@ class SingleProfileTimezoneView(_TimezonePickerView):
         await self.parent_manage_view.original_interaction.edit_original_response(
             embed=new_embed, view=self.parent_manage_view)
         await interaction.response.edit_message(
-            content=None, embed=text_embed(f"✅ Timezone set to **{canonical_tz}**."), view=None)
+            content=None, embed=dismissible(text_embed(f"✅ Timezone set to **{canonical_tz}**.")), view=None)
 
 
 class CustomTimezoneModal(ui.Modal, title="Enter Custom Timezone"):
@@ -5712,7 +5712,7 @@ class BulkResetView(_BulkSubView):
         targets = self._targets()
         if not self.reset_choice or not targets:
             await interaction.edit_original_response(
-                content=None, embed=text_embed("Nothing to reset."), view=None)
+                content=None, embed=dismissible(text_embed("Nothing to reset.")), view=None)
             return
 
         if self.reset_choice == "reset_examples":
@@ -5721,8 +5721,8 @@ class BulkResetView(_BulkSubView):
             message = await self.cog.memory_manager.bulk_reset_ltm(self.user_id, targets)
 
         await interaction.edit_original_response(
-            content=None, embed=discord.Embed(description=f"✅ {message}",
-                                              colour=discord.Colour.green()), view=None)
+            content=None, embed=dismissible(discord.Embed(description=f"✅ {message}",
+                                              colour=discord.Colour.green())), view=None)
 
 
 class BulkDeleteView(_BulkSubView):
@@ -5762,13 +5762,13 @@ class BulkDeleteView(_BulkSubView):
         names = sorted(self.wizard.selected_profiles)
         if not names:
             await interaction.edit_original_response(
-                content=None, embed=text_embed("No profiles selected."), view=None)
+                content=None, embed=dismissible(text_embed("No profiles selected.")), view=None)
             return
         deleted = await self.cog.profile_manager.delete_profiles(self.user_id, names)
         await interaction.edit_original_response(
             content=None,
-            embed=discord.Embed(description=f"✅ Deleted {deleted} profile(s).",
-                                colour=discord.Colour.green()),
+            embed=dismissible(discord.Embed(description=f"✅ Deleted {deleted} profile(s).",
+                                colour=discord.Colour.green())),
             view=None)
 
 
@@ -6618,8 +6618,8 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
         async def callback(interaction: discord.Interaction):
             self.stop()
             await interaction.response.edit_message(
-                embed=discord.Embed(description="Cancelled. Nothing was changed.",
-                                    colour=discord.Colour.greyple()), view=None)
+                embed=dismissible(discord.Embed(description="Cancelled. Nothing was changed.",
+                                    colour=discord.Colour.greyple())), view=None)
         add_button(self, "Cancel", callback, style=discord.ButtonStyle.secondary, row=row)
 
     # --- Navigation --------------------------------------------------------
@@ -6747,15 +6747,15 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
         if notes:
             e.add_field(name="Skipped", value="\n".join(notes)[:1024], inline=False)
 
-        await interaction.edit_original_response(embed=e, view=None)
+        await interaction.edit_original_response(embed=dismissible(e), view=None)
 
     async def on_timeout(self):
         try:
             await self.original_interaction.edit_original_response(
-                embed=discord.Embed(
+                embed=dismissible(discord.Embed(
                     description=("This bulk session timed out and nothing was written. Run "
                                  "`/profile bulk manage` again to start over."),
-                    colour=discord.Colour.greyple()),
+                    colour=discord.Colour.greyple())),
                 view=None)
         except Exception:
             pass
@@ -7304,7 +7304,7 @@ class PostEditRatingView(BlockedGuard, ui.View):
         self._release()
         if self.message is not None:
             try:
-                await self.message.edit(embed=self._outcome_embed(text), view=None)
+                await self.message.edit(embed=dismissible(self._outcome_embed(text)), view=None)
             except Exception:
                 pass  # expired or dismissed; there is nothing left to tell
 
@@ -7337,7 +7337,7 @@ class PostEditRatingView(BlockedGuard, ui.View):
                     text += " It has been taken out of the Public Library."
         finally:
             self._release()
-        await i.edit_original_response(embed=self._outcome_embed(text), view=None)
+        await i.edit_original_response(embed=dismissible(self._outcome_embed(text)), view=None)
 
     @ui.button(label="Set to Unrated", style=discord.ButtonStyle.secondary)
     async def unrate(self, i: discord.Interaction, _: ui.Button):
@@ -7355,8 +7355,8 @@ class PostEditRatingView(BlockedGuard, ui.View):
         finally:
             self._release()
         await i.edit_original_response(
-            embed=self._outcome_embed(f"**{self.profile_name}** is now **Unrated**. "
-                                      + self._unrated_consequences(done=True)),
+            embed=dismissible(self._outcome_embed(f"**{self.profile_name}** is now **Unrated**. "
+                                      + self._unrated_consequences(done=True))),
             view=None)
 
     @ui.button(label="Still Editing", style=discord.ButtonStyle.primary)

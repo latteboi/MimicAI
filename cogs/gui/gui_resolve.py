@@ -15,7 +15,7 @@ import discord
 from discord import ui
 from typing import TYPE_CHECKING, Awaitable, Callable, List, Optional, Sequence
 
-from .base_components import DISMISS, BlockedGuard, add_button, add_select, closed_embed, text_embed
+from .base_components import BlockedGuard, add_button, add_select, closed_embed, text_embed
 from ..utils.fuzzy import MAX_CHOICES, best_match, rank_keyed
 
 if TYPE_CHECKING:
@@ -195,7 +195,7 @@ class ProfileSuggestionView(BlockedGuard, ui.View):
                 name = next((c.name for c in self.candidates if c.value == value), value)
                 await self._retire(f"Selected '{name[:60]}'")
 
-    async def _retire(self, title: str, description: str = DISMISS):
+    async def _retire(self, title: str, description: str = ""):
         """Close the prompt to `closed_embed`. Silent if it is already gone."""
         if self.message is None:
             return
