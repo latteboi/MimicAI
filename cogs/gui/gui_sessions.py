@@ -157,6 +157,9 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
         # The card never times out, so it holds the profile by PID and its name only as
         # of the last press: a rename between presses otherwise played the old name.
         self.pid = cog.profile_manager._get_pid_from_name(user_id, profile_name)
+        # The round Play started, until its reply lands (`_round_landed`): what Cancel stops.
+        self.round_task: Optional[asyncio.Task] = None
+        self.round_landed = False
 
     def _follow_rename(self):
         name = self.pid and self.cog.profile_manager._get_name_from_pid(
@@ -183,6 +186,9 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
             
     def _build_view(self):
         self.clear_items()
+        if self.round_task:
+            add_button(self, "Cancel", self.cancel_callback, style=discord.ButtonStyle.danger, row=0)
+            return
         session_data = self.cog.global_chat_sessions.get(self.session_key, {})
         queue = session_data.get("pending_queue", {})
         active_typers = session_data.get("active_typers", set())
@@ -303,17 +309,46 @@ class GlobalChatPlayView(BlockedGuard, ui.View):
         session_data["timer_extensions"] = set()
         session_data["active_typers"] = set()
         session_data["lock_deadline"] = 0
-        
-        self.clear_items()
+
+        self.round_task, self.round_landed = asyncio.current_task(), False
+        self._build_view()
         await interaction.response.edit_message(view=self)
 
         host_user_id = self.session_key[1]
         profile_name = self.session_key[2]
-        await self.cog.generation_service._execute_global_chat(interaction, host_user_id, profile_name, queued_turns)
-        
-        await self._load_current_session()
+        try:
+            await self.cog.generation_service._execute_global_chat(
+                interaction, host_user_id, profile_name, queued_turns, self._round_landed)
+        except asyncio.CancelledError:
+            pass  # Cancel: redrawn below, as any round that did not land.
+        self.round_task = None
+
+        session_data = await self._load_current_session()
+        if not self.round_landed:
+            # Cancelled, refused or failed: nobody's message is lost. Back in the queue,
+            # behind anything its writer has queued since.
+            queue = session_data.setdefault("pending_queue", {})
+            for turn in queued_turns:
+                queue.setdefault(turn["user_id"], turn)
         self._build_view()
         await interaction.edit_original_response(embed=self.get_embed(), view=self)
+
+    def _round_landed(self):
+        # From here the round is being logged: too late to cancel, and nothing to put back.
+        self.round_task, self.round_landed = None, True
+
+    async def cancel_callback(self, interaction: discord.Interaction):
+        session_data = self.cog.global_chat_sessions.get(self.session_key) or {}
+        if session_data.get("is_locked", True) and interaction.user.id != self.user_id:
+            await interaction.response.send_message(embed=text_embed("This session is currently locked by the host."), ephemeral=True)
+            return
+        # Taken and cancelled with no await between: `_round_landed` cannot slip in.
+        task, self.round_task = self.round_task, None
+        if not task:
+            await interaction.response.send_message(embed=text_embed("Too late to cancel: the reply is already in."), ephemeral=True)
+            return
+        task.cancel()
+        await interaction.response.defer()
 
 class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
     model_id_input = ui.TextInput(label="Model ID", placeholder="e.g. anthropic/claude-3 or google/gemini-2.5-flash", required=True)
@@ -610,7 +645,8 @@ class WhisperHistoryView(BlockedGuard, ui.View):
         self.all_whispers = all_whispers # This is a list of whisper turns, paired with their responses
 
         self.filtered_whispers = self.all_whispers
-        self.current_page = 0
+        # The newest, clamped by _build_view: this is where a dismissed whisper card comes back.
+        self.current_page = len(all_whispers)
         self.selected_profile_key: Optional[str] = None
         
         self._build_view()
@@ -665,7 +701,7 @@ class WhisperHistoryView(BlockedGuard, ui.View):
                 
                 whisper_options.append(discord.SelectOption(label=f"({ts_str}) {content_preview}...", value=str(i), default=(i == self.current_page)))
             
-            add_select(self, whisper_options[:DROPDOWN_MAX_OPTIONS], self.whisper_jump_callback,
+            add_select(self, whisper_options[-DROPDOWN_MAX_OPTIONS:], self.whisper_jump_callback,
                        placeholder="Jump to a whisper...", row=1)
 
         # --- Build Buttons ---
@@ -682,6 +718,8 @@ class WhisperHistoryView(BlockedGuard, ui.View):
         build_pagination_controls(self, self.current_page, len(self.filtered_whispers), 2, _prev, _next)
 
         add_button(self, "Delete", self.delete_callback, style=discord.ButtonStyle.danger, row=2,
+                   disabled=not self.filtered_whispers)
+        add_button(self, "Regenerate", self.regenerate_callback, row=2,
                    disabled=not self.filtered_whispers)
 
     def _get_current_embed(self) -> discord.Embed:
@@ -724,7 +762,7 @@ class WhisperHistoryView(BlockedGuard, ui.View):
     async def profile_filter_callback(self, interaction: discord.Interaction):
         selection = interaction.data['values'][0]
         self.selected_profile_key = selection if selection != "all" else None
-        self.current_page = 0
+        self.current_page = len(self.all_whispers)  # the newest, once clamped
         self._build_view()
         await interaction.response.edit_message(embed=self._get_current_embed(), view=self)
 
@@ -748,6 +786,24 @@ class WhisperHistoryView(BlockedGuard, ui.View):
         
         # After deletion, refresh the history view
         await self.cog._show_whisper_history(self.original_interaction)
+
+    async def regenerate_callback(self, interaction: discord.Interaction):
+        whisper_turn, response_turn = self.filtered_whispers[self.current_page]
+        # The seat is found by the PID the whisper was logged against, which is how
+        # _run_whisper_turn computed `target_pid` from that same seat.
+        pm = self.cog.profile_manager
+        session = self.cog.multi_profile_channels.get(self.channel_id) or {}
+        target = next((p for p in session.get("profiles", [])
+                       if pm._get_pid_from_name_any(p["owner_id"], p["profile_name"]) == whisper_turn.get("target_pid")),
+                      None)
+        if not target:
+            await interaction.response.send_message(
+                embed=text_embed("That profile is no longer seated in this session, so its reply cannot be regenerated."),
+                ephemeral=True)
+            return
+        await self.cog.generation_service._execute_whisper_regeneration(
+            interaction, whisper_turn.get("turn_id"), response_turn.get("turn_id"), target,
+            strip_history_envelope(whisper_turn.get("content", "")))
 
 class SpeakRewriteEditModal(ui.Modal, title="Edit the line"):
     """Edits the *source* line, not the rewrite -- then re-runs it.
@@ -926,6 +982,38 @@ class SpeakPreviewView(BlockedGuard, ui.View):
     @ui.button(label="Cancel", style=discord.ButtonStyle.danger)
     async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.edit_message(content=None, embed=dismissible(text_embed("Discarded.")), view=None)
+        self.stop()
+
+
+class WhisperCancelView(BlockedGuard, ui.View):
+    """Cancel, on a whisper (or its regeneration) still waiting for the channel or the model.
+
+    Stops the task that made it. The whisper path sets `task` to None the moment the reply
+    lands, because from there it is writing the log. Nothing is recorded before that point,
+    so a cancelled whisper leaves no trace, and a cancelled regeneration leaves the reply
+    that was already there.
+    """
+
+    def __init__(self, cog: 'MimicCog', cancelled_embed: discord.Embed, restore_view: Optional[ui.View] = None):
+        # Longer than the busy wait plus a primary and a fallback timing out in turn.
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.task = asyncio.current_task()
+        self.cancelled_embed = cancelled_embed
+        self.restore_view = restore_view
+
+    @ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel_button(self, interaction: discord.Interaction, button: ui.Button):
+        task, self.task = self.task, None
+        if task is None or task.done():
+            await interaction.response.send_message(embed=text_embed("Too late to cancel: it has already answered."), ephemeral=True)
+            return
+        task.cancel()
+        await interaction.response.defer()
+        # Drawn once the task has stopped: a heartbeat edit still in flight would otherwise
+        # land on top of this card.
+        await asyncio.wait({task}, timeout=10)
+        await interaction.edit_original_response(content=None, embed=self.cancelled_embed, view=self.restore_view)
         self.stop()
 
 

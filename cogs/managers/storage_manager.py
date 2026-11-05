@@ -1,5 +1,6 @@
 import os
 import gzip
+import zlib
 import threading
 import zstandard as zstd
 import pathlib
@@ -230,52 +231,102 @@ def _delete_file_shard(file_path: str):
     except OSError as e:
         print(f"Error deleting file shard {file_path}: {e}")
 
+
+def _atomic_write(file_path: str, data: bytes) -> None:
+    """Writes `data` to `file_path` whole or not at all: a temp file, then os.replace.
+
+    The temp file is named for the writing thread. A fixed `path.tmp` was shared by two
+    threads saving one path at once -- two to_thread saves of the same shard -- so one
+    truncated the other's half-written file, and the loser's os.replace found nothing to
+    move. A thread cannot overlap itself, so its own name is enough.
+    """
+    temp = f"{file_path}.{threading.get_ident()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with open(temp, 'wb') as f:
+            f.write(data)
+        os.replace(temp, file_path)
+    except Exception as e:
+        print(f"IOManager Write Error ({file_path}): {e}")
+        try:
+            os.remove(temp)
+        except OSError:
+            pass
+        raise
+
+
+# What a file whose *bytes* are bad raises on the way in: a failed tag, a frame neither
+# zstd nor gzip will take (a truncated gzip is EOFError, a bad deflate stream
+# zlib.error), or plaintext that is not JSON.
+UNDECODABLE = (InvalidToken, zstd.ZstdError, gzip.BadGzipFile, EOFError, zlib.error,
+               json.JSONDecodeError)
+
+
+def quarantine(file_path: str, error: Exception) -> None:
+    """Moves a file that will not decode to `<path>.corrupt`.
+
+    Every caller reads None as "nothing there yet", and the next save then writes over
+    the only copy: an LTM shard became the one memory being added, and keys.json.gz was
+    deleted outright. Aside, it stays recoverable with decrypt_dump.py. One per path --
+    a second failure replaces the first. A failed *open* never comes here: EMFILE or EIO
+    says nothing about the bytes.
+    """
+    try:
+        os.replace(file_path, file_path + ".corrupt")
+        print(f"IOManager: {file_path} will not decode ({error!r}); moved aside to .corrupt")
+    except OSError as e:
+        print(f"IOManager: {file_path} will not decode ({error!r}) and could not be moved aside: {e}")
+
+
+def _read_bytes(file_path: str) -> Optional[bytes]:
+    """A file's bytes; None when it is absent or the read itself failed."""
+    try:
+        with open(file_path, 'rb') as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        print(f"IOManager Read Error ({file_path}): {e}")
+        return None
+
+
+def _decode(file_bytes: bytes, fernet, encrypted: bool) -> bytes:
+    """A `.json.gz` file's JSON bytes: unsealed, then zstd, or gzip for a legacy file."""
+    if encrypted and fernet:
+        file_bytes = unseal_blob(file_bytes, fernet)
+    try:
+        return _get_decompressor().decompress(file_bytes)
+    except zstd.ZstdError:
+        return gzip.decompress(file_bytes)
+
+
 class IOManager:
     """Centralised I/O Helper Block for MimicAI Data Ops."""
 
     @staticmethod
     def read_json(file_path: str) -> Optional[Any]:
-        if not os.path.exists(file_path): return None
+        file_bytes = _read_bytes(file_path)
+        if file_bytes is None:
+            return None
         try:
-            with open(file_path, 'rb') as f:
-                return json.loads(f.read())
-        except Exception as e:
-            print(f"IOManager read_json Error ({file_path}): {e}")
+            return json.loads(file_bytes)
+        except json.JSONDecodeError as e:
+            quarantine(file_path, e)
             return None
 
     @staticmethod
     def write_json(data: Any, file_path: str):
-        temp = file_path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            with open(temp, 'wb') as f:
-                f.write(json.dumps(data))
-            os.replace(temp, file_path)
-        except Exception as e:
-            print(f"IOManager write_json Error ({file_path}): {e}")
-            if os.path.exists(temp): os.remove(temp)
-            raise
+        _atomic_write(file_path, json.dumps(data))
 
     @staticmethod
     def read_json_gzip(file_path: str, fernet: Optional[Fernet] = None, encrypted: bool = True) -> Optional[Any]:
-        if not os.path.exists(file_path):
+        file_bytes = _read_bytes(file_path)
+        if file_bytes is None:
             return None
         try:
-            with open(file_path, 'rb') as f:
-                file_bytes = f.read()
-
-            if encrypted and fernet:
-                file_bytes = unseal_blob(file_bytes, fernet)
-
-            try:
-                decompressed_bytes = _get_decompressor().decompress(file_bytes)
-            except zstd.ZstdError:
-                # Automatic fallback for legacy gzip files on disk
-                decompressed_bytes = gzip.decompress(file_bytes)
-
-            return json.loads(decompressed_bytes)
-        except (IOError, json.JSONDecodeError, gzip.BadGzipFile, InvalidToken, zstd.ZstdError) as e:
-            print(f"IOManager Read Error ({file_path}): {e}")
+            return json.loads(_decode(file_bytes, fernet, encrypted))
+        except UNDECODABLE as e:
+            quarantine(file_path, e)
             return None
 
     @staticmethod
@@ -298,19 +349,13 @@ class IOManager:
                 plaintext = None
 
         if plaintext is None:
+            file_bytes = _read_bytes(file_path)
+            if file_bytes is None:
+                return None
             try:
-                with open(file_path, 'rb') as f:
-                    file_bytes = f.read()
-
-                if encrypted and fernet:
-                    file_bytes = unseal_blob(file_bytes, fernet)
-
-                try:
-                    plaintext = _get_decompressor().decompress(file_bytes)
-                except zstd.ZstdError:
-                    plaintext = gzip.decompress(file_bytes)
-            except (IOError, OSError, gzip.BadGzipFile, InvalidToken, zstd.ZstdError) as e:
-                print(f"IOManager Read Error ({file_path}): {e}")
+                plaintext = _decode(file_bytes, fernet, encrypted)
+            except UNDECODABLE as e:
+                quarantine(file_path, e)
                 return None
 
             # Stamped from before the read on purpose. A write landing mid-read leaves
@@ -322,30 +367,15 @@ class IOManager:
         try:
             return json.loads(plaintext)
         except json.JSONDecodeError as e:
-            print(f"IOManager Read Error ({file_path}): {e}")
+            quarantine(file_path, e)
             return None
 
     @staticmethod
     def write_json_gzip(data: Any, file_path: str, fernet: Optional[Fernet] = None, encrypted: bool = True):
-        temp_file_path = file_path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            json_bytes = json.dumps(data)
-            compressed_bytes = _get_compressor().compress(json_bytes)
-
-            bytes_to_write = compressed_bytes
-            if encrypted and fernet:
-                bytes_to_write = seal_blob(compressed_bytes, fernet)
-
-            with open(temp_file_path, 'wb') as f:
-                f.write(bytes_to_write)
-            os.replace(temp_file_path, file_path)
-        except Exception as e:
-            print(f"IOManager Write Error ({file_path}): {e}")
-            if os.path.exists(temp_file_path):
-                try: os.remove(temp_file_path)
-                except OSError: pass
-            raise
+        payload = _get_compressor().compress(json.dumps(data))
+        if encrypted and fernet:
+            payload = seal_blob(payload, fernet)
+        _atomic_write(file_path, payload)
 
     @staticmethod
     def read_blob(file_path: str, fernet) -> Optional[bytes]:
@@ -353,31 +383,19 @@ class IOManager:
 
         For what does not compress -- audio -- so there is no zstd pass either way.
         """
-        if not os.path.exists(file_path):
+        file_bytes = _read_bytes(file_path)
+        if file_bytes is None:
             return None
         try:
-            with open(file_path, 'rb') as f:
-                return unseal_blob(f.read(), fernet)
-        except (IOError, OSError, InvalidToken) as e:
-            print(f"IOManager Read Error ({file_path}): {e}")
+            return unseal_blob(file_bytes, fernet)
+        except InvalidToken as e:
+            quarantine(file_path, e)
             return None
 
     @staticmethod
     def write_blob(payload: bytes, file_path: str, fernet):
         """Seals `payload` to disk as it is, atomically."""
-        temp_file_path = file_path + ".tmp"
-        try:
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            sealed = seal_blob(payload, fernet)
-            with open(temp_file_path, 'wb') as f:
-                f.write(sealed)
-            os.replace(temp_file_path, file_path)
-        except Exception as e:
-            print(f"IOManager Write Error ({file_path}): {e}")
-            if os.path.exists(temp_file_path):
-                try: os.remove(temp_file_path)
-                except OSError: pass
-            raise
+        _atomic_write(file_path, seal_blob(payload, fernet))
 
 class StorageManager:
     """Owns key-derived encryption, atomic .json/.json.gz persistence primitives, generic entity
@@ -511,8 +529,14 @@ class StorageManager:
         # hundreds of bytes.
         data = IOManager.read_json_gzip_cached(path, self.fernet, encrypted=True)
 
-        # Auto-purge legacy/corrupted files (e.g., the old b'gA' format)
-        if not data or "slots" not in data:
+        # None is a failed read -- left in place -- or a file the read already moved
+        # aside. Neither is a reason to delete: this deleted every user's keys on
+        # any failure, a transient EMFILE included.
+        if data is None:
+            return {"slots": {}, "personal_assignments": {}}
+
+        # A pre-slots file decodes but holds nothing this build reads.
+        if not isinstance(data, dict) or "slots" not in data:
             try:
                 os.remove(path)
             except OSError:
@@ -710,9 +734,42 @@ class StorageManager:
         return []
 
     async def _perform_data_cleanup(self):
-        await asyncio.to_thread(self._sync_perform_data_cleanup)
+        if await asyncio.to_thread(self._sync_perform_data_cleanup):
+            await self._drop_departed_sessions()
 
-    def _sync_perform_data_cleanup(self):
+    async def _drop_departed_sessions(self):
+        """Step 9, on the loop: a session goes only once its channel is known to be gone.
+
+        Never "missing from guild.channels": that list holds no thread, so this deleted
+        every session in one, live or archived, each night -- and every session in a
+        guild in an outage. A server the bot has left is gone outright; a channel that
+        is merely uncached is asked about, and only a 404 drops it.
+        """
+        sm = self.cog.session_manager
+        guild_ids = {str(g.id) for g in self.cog.bot.guilds}
+        left, uncached = [], []
+        for channel_id in list(self.cog.multi_profile_channels):
+            if self.cog.bot.get_channel(channel_id):
+                continue
+            (uncached if sm._session_server(channel_id) in guild_ids else left).append(channel_id)
+        for channel_id in left:
+            await sm.suspend_channel_session(channel_id)
+        if left:
+            sm._save_multi_profile_sessions()
+        if uncached:
+            await sm._drop_deleted_channel_sessions(uncached)
+
+    def _sync_perform_data_cleanup(self) -> bool:
+        """Steps 1-8 and 10, off the loop. True when it ran, so step 9 may follow."""
+        # A guild in an outage or still chunking has no members and no channels here, so
+        # everyone who is only there reads as departed and loses their whole directory.
+        # The high-water guard below catches a collapse, not one guild of 47 missing.
+        not_ready = [g.id for g in self.cog.bot.guilds if g.unavailable or not g.chunked]
+        if not_ready:
+            print(f"[Cleanup] Skipped: {len(not_ready)} guild(s) unavailable or not fully "
+                  f"chunked ({not_ready[:5]}). Their members would read as departed.")
+            return False
+
         bot_guild_ids = {g.id for g in self.cog.bot.guilds}
         all_bot_member_ids = {str(m.id) for g in self.cog.bot.guilds for m in g.members}
         all_bot_channel_ids = {c.id for g in self.cog.bot.guilds for c in g.channels}
@@ -735,7 +792,7 @@ class StorageManager:
                 "an empty server -- refusing to treat every user as departed. Check "
                 "that the members intent is enabled and guild chunking completed."
             )
-            return
+            return False
 
         # An empty cache is the obvious failure and the check above catches it. The
         # dangerous one is a cache that is merely *short* -- chunking still in flight,
@@ -757,7 +814,7 @@ class StorageManager:
                 f"{high_water}. Too steep a drop to be departures -- refusing to treat "
                 "the difference as departed users. Check that guild chunking completed."
             )
-            return
+            return False
 
         if member_count > high_water:
             try:
@@ -903,15 +960,25 @@ class StorageManager:
             # the name it was taken under, and that snapshot goes stale the moment the
             # owner edits it. The PID never moves.
             #
+            # Read off the borrow index, which already holds borrow PID -> "<owner>:<source
+            # PID>", not out of each borrow's shard: that decrypted every borrow daily,
+            # through the shard cache, evicting the turn path's working set. The shard is
+            # read, uncached, only for a borrow the index cannot place -- above all one
+            # whose owner step 6 just removed, which `_borrow_index_drop_user` forgets as
+            # a source along with every borrower of it.
+            #
             # "system" is checked alongside "personal" because System profiles are
             # shareable (see _get_name_from_pid), so a borrow of one was validated
             # against a map it could never appear in and was deleted daily.
-            for borrowed_name in list(borrowed_profiles):
-                b_config = self.cog.profile_manager._get_profile_config(uid, borrowed_name, True)
-                if not b_config:
-                    continue
-                owner_id = b_config.get("original_owner_id")
-                source_pid = b_config.get("original_pid") or b_config.get("original_profile_id")
+            sources = self.cog.borrow_index_inverse.get(user_id_str) or {}
+            borrowed_map = index["borrowed"] if isinstance(index.get("borrowed"), dict) else {}
+            for borrowed_name, borrow_pid in list(borrowed_map.items()):
+                key = sources.get(borrow_pid)
+                if not key:
+                    shard = users_path / user_id_str / "profiles" / borrow_pid / "profile.json.gz"
+                    config = (IOManager.read_json_gzip(str(shard), self.fernet) or {}).get("config") or {}
+                    key = self.cog.profile_manager._borrow_key_for_config(config) or ""
+                owner_id, _, source_pid = key.partition(":")
                 if not (owner_id and source_pid):
                     continue
 
@@ -923,12 +990,8 @@ class StorageManager:
                         live_pids.update(mapping.values())
 
                 if source_pid not in live_pids:
-                    if isinstance(index["borrowed"], dict):
-                        pid = index["borrowed"].pop(borrowed_name, borrowed_name)
-                    else:
-                        index["borrowed"].remove(borrowed_name)
-                        pid = borrowed_name
-                    shutil.rmtree(str(users_path / user_id_str / "profiles" / pid), ignore_errors=True)
+                    borrowed_map.pop(borrowed_name)
+                    shutil.rmtree(str(users_path / user_id_str / "profiles" / borrow_pid), ignore_errors=True)
                     cleaned_borrows += 1
                     data_changed = True
             
@@ -978,6 +1041,7 @@ class StorageManager:
 
         # --- 8. Channel & User Session Directory Cleanup ---
         cleaned_channel_dirs, cleaned_user_session_dirs = 0, 0
+        sessions = set(self.cog.multi_profile_channels)
         servers_path = pathlib.Path(SERVERS_DIR)
         if servers_path.is_dir():
             for server_dir in list(servers_path.iterdir()):
@@ -993,8 +1057,12 @@ class StorageManager:
                         if not channel_dir.is_dir(): continue
                         try:
                             channel_id = int(channel_dir.name)
-                            # Remove if channel is gone or if directory is empty of actual data
-                            is_deleted = guild and channel_id not in {c.id for c in guild.channels}
+                            # Remove if channel is gone or if directory is empty of actual data.
+                            # A live session's log is never "gone" here -- step 9 decides
+                            # that, by asking Discord -- and a thread is in get_channel's
+                            # cache but never in guild.channels.
+                            is_deleted = (guild and channel_id not in sessions
+                                          and not self.cog.bot.get_channel(channel_id))
                             has_files = any(f.is_file() for f in channel_dir.rglob('*') if not f.name.startswith('.'))
                             
                             if is_deleted or not has_files:
@@ -1021,15 +1089,7 @@ class StorageManager:
                 except (ValueError, OSError): continue
         
 
-        # --- 9. Final Config File Cleanup ---
-        cleaned_channel_settings = 0
-        for ch_id in list(self.cog.multi_profile_channels.keys()):
-            if ch_id not in all_bot_channel_ids:
-                del self.cog.multi_profile_channels[ch_id]
-                cleaned_channel_settings += 1
-        
-        if cleaned_channel_settings > 0:
-            self.cog.session_manager._save_multi_profile_sessions()
+        # --- 9. Sessions whose channel is gone: `_drop_departed_sessions`, on the loop ---
 
         # --- 10. Inactive Session File Cleanup (30-Day TTL) ---
         cleaned_session_files_ttl = 0
@@ -1084,6 +1144,7 @@ class StorageManager:
                     if gc_file.exists() and gc_file.stat().st_mtime < thirty_days_ago:
                         _delete_file_shard(str(gc_file))
                         cleaned_session_files_ttl += 1
+        return True
 
     @tasks.loop(time=datetime.time(hour=17, minute=0, tzinfo=datetime.timezone.utc)) # 17:00 UTC = 3:00 AM AEST
     async def daily_cleanup_task(self):

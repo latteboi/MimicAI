@@ -298,7 +298,15 @@ plaintext orjson, since they hold only name-to-PID mappings.
 
 Nothing about the *shape* is detected from the name. `read_json_gzip` decrypts, attempts
 `zstd.decompress`, and falls back to `gzip.decompress` on `ZstdError`, so archives from
-older builds still load. Writes are atomic: temp file, then `os.replace`.
+older builds still load. Writes are atomic: a temp file named for the writing thread, so two
+threads saving one path never share it, then `os.replace` (`_atomic_write`).
+
+A file that will not decode -- a failed tag, a frame neither zstd nor gzip takes, JSON that
+does not parse -- is renamed to `<path>.corrupt` by the read that found it (`quarantine`),
+which then returns None. Every caller reads None as "nothing there yet" and its next save
+writes a fresh file, so left in place the bad file would be overwritten; set aside, it stays
+recoverable with `decrypt_dump.py`. A failed *open* -- EMFILE, EIO, a permission -- says
+nothing about the bytes and leaves the file where it is. Nothing deletes `.corrupt` files.
 
 The encryption was Fernet until it was measured. Fernet is a *token* format — it base64s
 its output so a token can be a URL-safe string — and for a binary file that is 33% wasted

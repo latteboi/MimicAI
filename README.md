@@ -91,7 +91,7 @@ shape of it.
 
 Personas are split into backstory, traits, likes, dislikes and appearance, with four
 separate instruction segments for behaviour and formatting. `/profile generate` will draft
-a whole profile from a one-line concept if you would rather start from something than from
+a whole profile from a one-line concept, a picture, or both, if you would rather start from something than from
 nothing. Profiles can be offered directly to another user, as a borrow or an independent clone,
 or published to the **Public Library** for anyone to borrow.
 

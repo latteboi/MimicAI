@@ -175,6 +175,22 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             return first[2]
         return None
 
+    def _defer_reactions(self, session, triggers):
+        """The mid-round batch less its 🍿/▶️/⏯️ presses, put back in the queue for a round of their own.
+
+        A press made while a round runs is acknowledged as waiting. Taken in at a handoff
+        it ran nothing -- the mid-round intake reads messages only -- and, no longer
+        queued, pulling it back withdrew nothing: the bot's copy stayed on for good.
+        """
+        kept = []
+        for t in triggers:
+            if isinstance(t, tuple) and t[0] in ('reaction', 'reaction_single'):
+                self.cog.session_manager.note_reaction_queued(session, (t[1].message_id, str(t[1].emoji)))
+                session['task_queue'].put_nowait(t)
+            else:
+                kept.append(t)
+        return kept
+
     @staticmethod
     def _first_human_author(triggers) -> Optional[int]:
         """The id of whoever sent the round's first message or reaction, or None.
@@ -2058,8 +2074,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         while not session['task_queue'].empty():
                             try: batched_triggers.append(session['task_queue'].get_nowait())
                             except asyncio.QueueEmpty: break
-                        batched_triggers = self.cog.session_manager.withdraw_cancelled_triggers(
-                            session, batched_triggers)
+                        batched_triggers = self._defer_reactions(session, self.cog.session_manager.withdraw_cancelled_triggers(
+                            session, batched_triggers))
                         called = self._user_called_seat(session, batched_triggers)
                         if called is not None:
                             self._give_next_turn(session, channel, profile_order, i, called,
@@ -2097,8 +2113,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             except asyncio.QueueEmpty: break
                         # The whole batch again: a message taken above can be deleted while
                         # it settles.
-                        batched_triggers = self.cog.session_manager.withdraw_cancelled_triggers(
-                            session, batched_triggers)
+                        batched_triggers = self._defer_reactions(session, self.cog.session_manager.withdraw_cancelled_triggers(
+                            session, batched_triggers))
 
                         if batched_triggers:
                             batched = []

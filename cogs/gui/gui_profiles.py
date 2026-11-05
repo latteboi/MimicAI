@@ -1761,7 +1761,12 @@ class ProfileManageView(BlockedGuard, ui.View):
             
             success, msg = self.cog.profile_manager._duplicate_profile(self.user_id, self.profile_name, new_name)
             if success:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Duplicated to '{new_name}'.")))
+                # Stopped first: this dashboard's timeout would otherwise overwrite the
+                # message, and with it the copy's dashboard if that was opened here.
+                self.stop()
+                await self.original_interaction.edit_original_response(
+                    content=None, embed=text_embed(f"Duplicated to '{new_name}'."),
+                    view=OpenDashboardView(self.cog, self.original_interaction, new_name))
             else:
                 await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Duplicate failed: {msg}")))
         modal.on_submit = duplicate_submit
@@ -1790,7 +1795,8 @@ class ProfileManageView(BlockedGuard, ui.View):
             )
             
             if success:
-                await i.followup.send(embed=text_embed(f"✅ {msg}"), ephemeral=True)
+                await i.followup.send(embed=text_embed(f"✅ {msg}"), ephemeral=True,
+                                      view=OpenDashboardView(self.cog, i, target_name))
             else:
                 await i.followup.send(embed=text_embed(f"❌ **Conversion Failed:** {msg}"), ephemeral=True)
 
@@ -1845,6 +1851,27 @@ class ProfileManageView(BlockedGuard, ui.View):
     async def on_timeout(self):
         try: await self.original_interaction.edit_original_response(content=None, embed=dismissible(text_embed("Manager timed out.")), view=None)
         except: pass
+
+
+class OpenDashboardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
+    """Open Dashboard under a newly created profile's confirmation, opening it in that message's place.
+
+    `original_interaction` is whichever one owns the confirmation, so the expiry takes
+    the button off the right message.
+    """
+
+    def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = original_interaction
+        self.profile_name = profile_name
+        add_button(self, "Open Dashboard", self.open_dashboard, style=discord.ButtonStyle.blurple)
+
+    async def open_dashboard(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.defer()
+        await self.cog._open_profile_manage(interaction, self.profile_name, repaint=True)
+
 
 class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     """Token Advice: what this profile's settings and the text it always sends cost, on
@@ -6894,9 +6921,10 @@ class ContentSafetyView(BlockedGuard, ui.View):
         if verdict == CONTENT_RATING_REFUSED:
             add_button(self, "Submit for Re-rating", self.submit_cb,
                        style=discord.ButtonStyle.success, row=0)
-            # Only one that settled itself: the rest are waiting on the operator, or were
-            # decided by them (`appeal_refusal`).
-            if not self.is_mod_view and not rating.get("review") and not rating.get("upheld_by"):
+            # Only one that settled itself: the rest are waiting on the operator, were
+            # decided by them, or are never put to them (`appeal_refusal`).
+            if (not self.is_mod_view and not rating.get("review") and not rating.get("upheld_by")
+                    and rating.get("reason") not in UNREVIEWED_REFUSALS):
                 add_button(self, "Request Review", self.appeal_cb,
                            style=discord.ButtonStyle.secondary, row=0)
 
@@ -6967,6 +6995,10 @@ class ContentSafetyView(BlockedGuard, ui.View):
                          "it. It counts as no strike unless the review upholds it.")
             elif rating.get("upheld_by"):
                 where = "The bot operator reviewed it and upheld the refusal."
+            elif rating.get("reason") in UNREVIEWED_REFUSALS:
+                where = ("No person reviews this kind of refusal." if rating.get("confirmed_by") else
+                         "A second check did not confirm this, so it counts as no strike. No person "
+                         "reviews this kind of refusal.")
             else:
                 where = ("Only the bot operator can clear this. If you think it is a mistake, "
                          "choose Request Review, once.")
@@ -6985,6 +7017,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
                              "of Service forbid outright.")
                     if (int(self.user_id), self.profile_name) in self.cog.pending_classifications:
                         value += "\nThe check is running now."
+                    elif rating.get("provider_blocked"):
+                        value += f"\n{pm.rating_failure_hint(rating)}"
                     elif rating.get("flagged"):
                         value += ("\nThe rating model gave no verdict, so the bot operator "
                                   "will review it.")
@@ -7014,6 +7048,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
                     value="The classifier is running now. This page will update "
                           "itself when the verdict lands.",
                     inline=False)
+            elif rating.get("provider_blocked"):
+                embed.add_field(name="Held", value=pm.rating_failure_hint(rating), inline=False)
             elif rating.get("flagged"):
                 embed.add_field(
                     name="Under review",
@@ -7071,6 +7107,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
                       f"hash: `{rating.get('hash') or '—'}`\n"
                       f"at: `{rating.get('at') or '—'}`\n"
                       f"flagged: `{rating.get('flagged') or '—'}`\n"
+                      f"provider blocked: `{rating.get('provider_blocked') or '—'}`\n"
                       f"confirmed by: `{rating.get('confirmed_by') or '—'}`\n"
                       f"review: `{rating.get('review') or '—'}`\n"
                       f"distributed: `{self.distributed}`")

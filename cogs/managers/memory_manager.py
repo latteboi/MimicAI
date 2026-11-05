@@ -58,6 +58,13 @@ from ..utils.helpers import (TURN_TIME_FORMAT, Timeout, _format_api_error, _reso
                             resolve_thinking_params, suppress_link_previews)
 from .storage_manager import IOManager
 from ..utils import fixed_examples
+
+# Held by every read-modify-write of an LTM or training shard. Each reads the shard,
+# awaits, and saves what it read plus its change, so two at once -- one character forming
+# memories in two channels, a delete during an add -- saved over each other: a change
+# lost, or a deleted entry back. Anything slow, an embedding call, is done before taking it.
+# ponytail: one lock for every profile; per-profile locks if shard writes ever queue.
+_SHARD_WRITE_LOCK = asyncio.Lock()
 from ..services.api_service import get_embedding_vector
 from ..gui.base_components import text_embed
 
@@ -523,99 +530,103 @@ class MemoryManager:
         ltm_user_id, ltm_profile_name = self._resolve_ltm_storage_target(profile_owner_id, profile_name, session_owner_id)
 
         owner_id_str = str(ltm_user_id)
-        ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, ltm_profile_name)
-        if ltm_data is None:
-            ltm_data = {"guild": []}
+        async with _SHARD_WRITE_LOCK:
+            ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, ltm_profile_name)
+            if ltm_data is None:
+                ltm_data = {"guild": []}
 
-        context_type = "guild"
-        ltm_list = ltm_data.get(context_type, [])
+            context_type = "guild"
+            ltm_list = ltm_data.get(context_type, [])
 
-        if duplicate_similarity is not None:
-            cache_key = self._ltm_cache_key(owner_id_str, ltm_profile_name)
-            new = [decode_embedding_b64(b64) for _, b64 in memories]
+            if duplicate_similarity is not None:
+                cache_key = self._ltm_cache_key(owner_id_str, ltm_profile_name)
+                new = [decode_embedding_b64(b64) for _, b64 in memories]
 
-            def _novel() -> List[bool]:
-                vectors = (_cached_vectors(_ltm_vec_cache, cache_key, _LTM_VEC_CACHE_MAX_ROWS,
-                                           _build_ltm_vectors, ltm_list) if ltm_list else None)
-                rows = vectors.guild_rows.get(str(guild_id)) if vectors else None
-                known = [vectors.unit[rows]] if rows is not None else []
-                keep = []
-                for vec in new:
-                    norm = float(np.linalg.norm(vec))
-                    if not norm:
-                        keep.append(True)
-                        continue
-                    unit = vec / norm
-                    rivals = [k for k in known if k.shape[1] == unit.shape[0]]
-                    closest = max((float((k @ unit).max()) for k in rivals), default=0.0)
-                    keep.append(closest < duplicate_similarity)
-                    if keep[-1]:
-                        known.append(unit[None, :])
-                return keep
+                def _novel() -> List[bool]:
+                    vectors = (_cached_vectors(_ltm_vec_cache, cache_key, _LTM_VEC_CACHE_MAX_ROWS,
+                                               _build_ltm_vectors, ltm_list) if ltm_list else None)
+                    rows = vectors.guild_rows.get(str(guild_id)) if vectors else None
+                    known = [vectors.unit[rows]] if rows is not None else []
+                    keep = []
+                    for vec in new:
+                        norm = float(np.linalg.norm(vec))
+                        if not norm:
+                            keep.append(True)
+                            continue
+                        unit = vec / norm
+                        rivals = [k for k in known if k.shape[1] == unit.shape[0]]
+                        closest = max((float((k @ unit).max()) for k in rivals), default=0.0)
+                        keep.append(closest < duplicate_similarity)
+                        if keep[-1]:
+                            known.append(unit[None, :])
+                    return keep
 
-            keep = await asyncio.to_thread(_novel)
-            memories = [m for m, k in zip(memories, keep) if k]
-            if not memories:
-                return 0
+                keep = await asyncio.to_thread(_novel)
+                memories = [m for m, k in zip(memories, keep) if k]
+                if not memories:
+                    return 0
 
-        limit = defaultConfig.LIMIT_LTM
+            limit = defaultConfig.LIMIT_LTM
 
-        # Entries are appended newest-last and only ever trimmed from the front, so the
-        # list is already in timestamp order. The full re-sort this replaces ran a Python
-        # key function over up to LIMIT_LTM entries on every write, and that key --
-        # `x.get('created_ts', x.get('ts'))` -- evaluated its fallback unconditionally.
-        #
-        # Trimming to fit happens here too. The clamp that used to follow the append was
-        # `max(len(ltm_list), LIMIT_LTM)`, which is LIMIT_LTM for any list at or under
-        # the cap: it never dropped anything and only copied the list. That left the
-        # single `pop(0)` as the whole cap, so a shard already over it -- profile import
-        # writes the bundle's entries without checking -- shed one entry per write
-        # forever. One slice deletion trims to fit in a single step.
-        overflow = len(ltm_list) - limit + len(memories)
-        if overflow > 0:
-            del ltm_list[:overflow]
+            # Entries are appended newest-last and only ever trimmed from the front, so the
+            # list is already in timestamp order. The full re-sort this replaces ran a Python
+            # key function over up to LIMIT_LTM entries on every write, and that key --
+            # `x.get('created_ts', x.get('ts'))` -- evaluated its fallback unconditionally.
+            #
+            # Trimming to fit happens here too. The clamp that used to follow the append was
+            # `max(len(ltm_list), LIMIT_LTM)`, which is LIMIT_LTM for any list at or under
+            # the cap: it never dropped anything and only copied the list. That left the
+            # single `pop(0)` as the whole cap, so a shard already over it -- profile import
+            # writes the bundle's entries without checking -- shed one entry per write
+            # forever. One slice deletion trims to fit in a single step.
+            overflow = len(ltm_list) - limit + len(memories)
+            if overflow > 0:
+                del ltm_list[:overflow]
 
-        now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        for summary, summary_embedding_b64 in memories:
-            entry = {
-                "id": str(uuid.uuid4())[:8],
-                "created_ts": now_ts,
-                "sum": summary.strip(),
-                "s_emb_b64": summary_embedding_b64,
-                # The guild the memory formed in, and the only place it is ever
-                # recalled: _build_ltm_vectors groups rows by this, and retrieval only
-                # ever looks at the current guild's group.
-                "context_id": str(guild_id)
-            }
-            if user_dn:
-                entry["usr"] = user_dn
-            if source:
-                entry["src"] = source
-            ltm_list.append(entry)
+            now_ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            for summary, summary_embedding_b64 in memories:
+                entry = {
+                    # 64 random bits: delete_ltms removes every entry sharing an id, and 32 bits
+                    # collided in ~0.3% of profiles at LIMIT_LTM. Older 8-char ids stay valid.
+                    "id": os.urandom(8).hex(),
+                    "created_ts": now_ts,
+                    "sum": summary.strip(),
+                    "s_emb_b64": summary_embedding_b64,
+                    # The guild the memory formed in, and the only place it is ever
+                    # recalled: _build_ltm_vectors groups rows by this, and retrieval only
+                    # ever looks at the current guild's group.
+                    "context_id": str(guild_id)
+                }
+                if user_dn:
+                    entry["usr"] = user_dn
+                if source:
+                    entry["src"] = source
+                ltm_list.append(entry)
 
-        ltm_data[context_type] = ltm_list
-        await asyncio.to_thread(self._save_ltm_shard, owner_id_str, ltm_profile_name, ltm_data)
-        return len(memories)
+            ltm_data[context_type] = ltm_list
+            await asyncio.to_thread(self._save_ltm_shard, owner_id_str, ltm_profile_name, ltm_data)
+            return len(memories)
 
     async def update_ltm(self, profile_owner_id: int, profile_name: str, ltm_id: str, new_summary: str, new_embedding_b64: str) -> bool:
         """Rewrites one memory in place. Async for the same shard-I/O reason as _add_ltm."""
         owner_id_str = str(profile_owner_id)
-        ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, profile_name)
-        if not ltm_data:
-            return False
+        async with _SHARD_WRITE_LOCK:
+            ltm_data = await asyncio.to_thread(self._load_ltm_shard, owner_id_str, profile_name)
+            if not ltm_data:
+                return False
 
-        ltm_list = ltm_data.get("guild",[])
-        for i, ltm_entry in enumerate(ltm_list):
-            if ltm_entry.get("id") == ltm_id:
-                ltm_data["guild"][i]["sum"] = new_summary.strip()
-                ltm_data["guild"][i]["s_emb_b64"] = new_embedding_b64
-                if "s_emb" in ltm_data["guild"][i]: del ltm_data["guild"][i]["s_emb"]
-                ltm_data["guild"][i]["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                if "kw" in ltm_data["guild"][i]:
-                    del ltm_data["guild"][i]["kw"]
-                await asyncio.to_thread(self._save_ltm_shard, owner_id_str, profile_name, ltm_data)
-                return True
-        return False
+            ltm_list = ltm_data.get("guild",[])
+            for i, ltm_entry in enumerate(ltm_list):
+                if ltm_entry.get("id") == ltm_id:
+                    ltm_data["guild"][i]["sum"] = new_summary.strip()
+                    ltm_data["guild"][i]["s_emb_b64"] = new_embedding_b64
+                    if "s_emb" in ltm_data["guild"][i]: del ltm_data["guild"][i]["s_emb"]
+                    ltm_data["guild"][i]["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                    if "kw" in ltm_data["guild"][i]:
+                        del ltm_data["guild"][i]["kw"]
+                    await asyncio.to_thread(self._save_ltm_shard, owner_id_str, profile_name, ltm_data)
+                    return True
+            return False
 
     async def load_ltms(self, owner_id: int, profile_name: str) -> List[Dict]:
         """Every memory in a profile's shard, newest first, `sum` in plain text -- read
@@ -643,7 +654,8 @@ class MemoryManager:
                 data["guild"] = kept
                 self._save_ltm_shard(str(owner_id), profile_name, data)
             return gone
-        return await asyncio.to_thread(_delete)
+        async with _SHARD_WRITE_LOCK:
+            return await asyncio.to_thread(_delete)
 
     async def rank_ltms(self, owner_id: int, profile_name: str, guild_id: str, query: str,
                         billing_guild_id: Optional[int], top: int = 5) -> Optional[List[Tuple[float, Dict]]]:
@@ -718,7 +730,8 @@ class MemoryManager:
             if len(kept) < len(examples):
                 self._save_training_shard(str(owner_id), profile_name, kept)
             return len(examples) - len(kept)
-        return await asyncio.to_thread(_delete)
+        async with _SHARD_WRITE_LOCK:
+            return await asyncio.to_thread(_delete)
 
     def _load_training_shard(self, user_id: str, profile_name: str) -> Optional[List[Dict]]:
         return self.cog.storage_manager._load_shard("training", user_id, profile_name)
@@ -1219,9 +1232,10 @@ class MemoryManager:
         training_shard = await asyncio.to_thread(self._load_training_shard, owner_id_str, profile_name) or []
 
         limit = defaultConfig.LIMIT_TRAINING
+        full = False, f"**Limit Reached.**\n\nYou have reached the maximum of **{limit}** training examples."
 
         if len(training_shard) >= limit:
-            return False, f"**Limit Reached.**\n\nYou have reached the maximum of **{limit}** training examples."
+            return full
 
         if not self.cog.storage_manager._embedding_routes(guild_id, profile_owner_id):
             return False, NO_EMBEDDING_KEY_MSG
@@ -1230,9 +1244,13 @@ class MemoryManager:
         if not emb:
             return False, EMBEDDING_FAILED_MSG
 
-        training_shard.append(_training_entry(usr_in, bot_out, emb))
-
-        await asyncio.to_thread(self._save_training_shard, owner_id_str, profile_name, training_shard)
+        async with _SHARD_WRITE_LOCK:
+            # Read again: the embedding took seconds, and what was saved meanwhile stays.
+            training_shard = await asyncio.to_thread(self._load_training_shard, owner_id_str, profile_name) or []
+            if len(training_shard) >= limit:
+                return full
+            training_shard.append(_training_entry(usr_in, bot_out, emb))
+            await asyncio.to_thread(self._save_training_shard, owner_id_str, profile_name, training_shard)
         return True,f"Example added for profile '{profile_name}'. Total: {len(training_shard)}/{limit}"
 
     async def add_training_examples(self, owner_id: int, profile_name: str, pairs: List[Dict[str, str]],
@@ -1287,7 +1305,10 @@ class MemoryManager:
                 self._save_training_shard(owner, profile_name, shard + kept)
             return len(kept)
 
-        added = await asyncio.to_thread(_append) if made else 0
+        added = 0
+        if made:
+            async with _SHARD_WRITE_LOCK:
+                added = await asyncio.to_thread(_append)
         late = len(made) - added   # filled by another write while these embedded
         message = f"Added {added} training example{'' if added == 1 else 's'} to **{profile_name}**."
         if len(said) > len(fresh):
@@ -1316,25 +1337,31 @@ class MemoryManager:
             return False, f"No training examples found for profile '{profile_name}'."
 
         example_found = False
-        for i, example in enumerate(example_list):
-            if example.get("id") == example_id:
-                new_embedding = await self._get_embedding(new_user_input, guild_id,
-                                                          task_type="RETRIEVAL_DOCUMENT",
-                                                          owner_id=profile_owner_id)
-                if not new_embedding:
-                    return False, EMBEDDING_FAILED_MSG
+        if any(example.get("id") == example_id for example in example_list):
+            new_embedding = await self._get_embedding(new_user_input, guild_id,
+                                                      task_type="RETRIEVAL_DOCUMENT",
+                                                      owner_id=profile_owner_id)
+            if not new_embedding:
+                return False, EMBEDDING_FAILED_MSG
+            b64_emb = encode_embedding_b64(new_embedding)
 
-                b64_emb = encode_embedding_b64(new_embedding)
+            # Read again for the write: the embedding took seconds, and an edit or delete
+            # saved meanwhile is kept rather than overwritten by the list read above.
+            def _update() -> bool:
+                examples = self._load_training_shard(owner_id_str, profile_name) or []
+                for example in examples:
+                    if example.get("id") == example_id:
+                        example["u_in"] = new_user_input.strip()
+                        example["b_out"] = new_bot_response.strip()
+                        example["u_emb_b64"] = b64_emb
+                        example.pop("u_emb", None)
+                        example["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                        self._save_training_shard(owner_id_str, profile_name, examples)
+                        return True
+                return False
 
-                example_list[i]["u_in"] = new_user_input.strip()
-                example_list[i]["b_out"] = new_bot_response.strip()
-                example_list[i]["u_emb_b64"] = b64_emb
-                if "u_emb" in example_list[i]: del example_list[i]["u_emb"]
-                example_list[i]["modified_ts"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-
-                await asyncio.to_thread(self._save_training_shard, owner_id_str, profile_name, example_list)
-                example_found = True
-                break
+            async with _SHARD_WRITE_LOCK:
+                example_found = await asyncio.to_thread(_update)
 
         if example_found:
             return True, f"Successfully updated training example `{example_id}` for profile '{profile_name}'."
@@ -1406,24 +1433,26 @@ class MemoryManager:
     async def bulk_reset_examples(self, user_id: int, profile_names: List[str]) -> str:
         user_id_str = str(user_id)
         reset_count = 0
-        for name in profile_names:
-            pid = self.cog.profile_manager._get_pid_from_name_any(user_id, name)
-            shard_path = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid, "training.json.gz")
-            if os.path.exists(shard_path):
-                self._delete_training_shard(user_id_str, name)
-                reset_count += 1
-        
+        async with _SHARD_WRITE_LOCK:
+            for name in profile_names:
+                pid = self.cog.profile_manager._get_pid_from_name_any(user_id, name)
+                shard_path = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid, "training.json.gz")
+                if os.path.exists(shard_path):
+                    self._delete_training_shard(user_id_str, name)
+                    reset_count += 1
+
         return f"Reset all training examples for {reset_count} profile(s)."
 
     async def bulk_reset_ltm(self, user_id: int, profile_names: List[str]) -> str:
         user_id_str = str(user_id)
         reset_count = 0
-        for name in profile_names:
-            pid = self.cog.profile_manager._get_pid_from_name_any(user_id, name)
-            shard_path = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid, "ltm.json.gz")
-            if os.path.exists(shard_path):
-                self._delete_ltm_shard(user_id_str, name)
-                reset_count += 1
-        
+        async with _SHARD_WRITE_LOCK:
+            for name in profile_names:
+                pid = self.cog.profile_manager._get_pid_from_name_any(user_id, name)
+                shard_path = os.path.join(self.cog.USERS_DIR, user_id_str, "profiles", pid, "ltm.json.gz")
+                if os.path.exists(shard_path):
+                    self._delete_ltm_shard(user_id_str, name)
+                    reset_count += 1
+
         return f"Reset all Long-Term Memories for {reset_count} profile(s)."
     

@@ -68,12 +68,20 @@ class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
 class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
 
-    def __init__(self, cog, profile_owner_id: int, profile_name: str, guild_id: Optional[int]):
+    def __init__(self, cog, profile_owner_id: int, profile_name: str, guild_id: Optional[int],
+                 file_under: Optional[int] = None, server_name: str = ""):
         super().__init__()
         self.cog: MimicCog = cog
         self.profile_owner_id = profile_owner_id
         self.profile_name = profile_name
+        # Two servers, not one: the memory is filed under the server the screen is showing,
+        # but the embedding bills where the user is (else the owner's key) -- picking a
+        # server from the list must not spend that server's key from somewhere else.
         self.guild_id = guild_id
+        self.file_under = file_under or guild_id
+        self.server_name = server_name
+        if server_name:
+            self.summary_field.placeholder = f"Recalled only in {server_name}"[:100]
 
     async def on_submit(self, i: discord.Interaction):
         await i.response.defer(ephemeral=True, thinking=True)
@@ -83,11 +91,11 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
         # than store something nothing can recall. That drop was silent, and this modal
         # reported "LTM entry added" on top of it. Refuse up front instead: the work
         # below (a limit check, an embedding, a shard write) all leads nowhere here.
-        if not self.guild_id:
+        if not self.file_under:
             await i.followup.send(
                 embed=text_embed("A memory has to be filed under a server, because that is where it can "
-                "be recalled. Run `/profile manage` in the server this memory belongs to "
-                "and add it there."), ephemeral=True)
+                "be recalled. Choose a server first, or run `/profile manage` in the server this "
+                "memory belongs to and add it there."), ephemeral=True)
             return
 
         # Refused at the limit rather than rolled over: automatic creation drops the
@@ -115,8 +123,9 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
 
         await self.cog.memory_manager._add_ltm(
             self.profile_owner_id, self.profile_name, summary, encode_embedding_b64(embedding),
-            self.guild_id, i.user.id, i.user.display_name, source="manual")
-        await i.followup.send(embed=text_embed(f"Memory added for '{self.profile_name}' "
+            self.file_under, i.user.id, i.user.display_name, source="manual")
+        where = f" in **{self.server_name}**" if self.server_name else ""
+        await i.followup.send(embed=text_embed(f"Memory added for '{self.profile_name}'{where} "
                               f"({current_count + 1}/{limit})."), ephemeral=True)
 
     async def on_error(self, i: discord.Interaction, e: Exception):
@@ -607,16 +616,19 @@ class DataManageView(BlockedGuard, ui.View):
         elif self.mode == 'examples':
             modal = FixedExampleModal(self.cog, self.user_id, self.profile_name)
         else:
-            modal = AddLtmModal(self.cog, self.user_id, self.profile_name, self.guild_id)
+            # Filed under the server on screen; the one it was opened in when none is picked.
+            target = int(self.server_id) if self.server_id and self.server_id.isdigit() else self.guild_id
+            guild = self.cog.bot.get_guild(target) if target else None
+            modal = AddLtmModal(self.cog, self.user_id, self.profile_name, self.guild_id,
+                                target, guild.name if guild else "")
 
         original_on_submit = modal.on_submit
         async def on_submit_refresh(i: discord.Interaction):
             await original_on_submit(i)
-            # Newest first, so the new entry heads page one -- of the server it was
-            # filed under, which is the one this screen was opened in.
+            # Newest first, so the new entry heads page one -- of the server it was filed under.
             self.page, self.open_id, self.search_term = 0, None, None
-            if self.mode == 'ltm' and self.guild_id:
-                self.server_id = str(self.guild_id)
+            if self.mode == 'ltm' and modal.file_under:
+                self.server_id = str(modal.file_under)
             await self._refresh()
         modal.on_submit = on_submit_refresh
         await interaction.response.send_modal(modal)

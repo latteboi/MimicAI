@@ -1928,6 +1928,10 @@ REFUSAL_CONFIRMERS = {
     "MINOR_SAFETY": ("CONTENT_CONFIRMER", DEFAULT_CONTENT_CONFIRMER_PROMPT),
     "REAL_PERSON": ("CONTENT_CONFIRMER_REAL_PERSON", DEFAULT_REAL_PERSON_CONFIRMER_PROMPT),
 }
+#: Refusing codes no person is ever sent to review: reading one could be reading child abuse
+#: material. The two models settle it alone -- unconfirmed, it stays Refused with no strike
+#: and off the queue -- and its owner edits and resubmits rather than appealing.
+UNREVIEWED_REFUSALS = frozenset({"MINOR_SAFETY"})
 
 # What a stored content_rating reason renders as. The classifier returns one of these
 # codes rather than prose, because a free-text reason quoted the persona back at whoever
@@ -2049,7 +2053,7 @@ CONTENT_RATING_BLURBS = {
     CONTENT_RATING_REFUSED: (
         "This profile's content rating found that it sexualises a minor or a real person, "
         "which the Terms of Service forbid. It cannot run anywhere, be shared, published, or used in Global "
-        "Chat until the bot operator reviews it."
+        "Chat unless a new rating clears it."
     ),
 }
 
@@ -2100,6 +2104,7 @@ CHANNEL_ACCESS_LABELS = {
     "restricted": "Any channel",
     "unrestricted": "Age-restricted only",
     "checking": "Nowhere until rated",
+    "blocked": "Nowhere until rated",
     "refused": "Nowhere",
 }
 
@@ -2111,8 +2116,10 @@ PLACEMENT_REFUSALS = {
                      "or seat the character somewhere that already is."),
     "checking": ("is declared 🔞 **Adult 18+** and is rated before it runs, on its owner's "
                  "own API key. That usually takes a few seconds."),
-    "refused": ("was ⛔ **Refused** by its content rating and cannot run anywhere until the "
-                "bot operator reviews it."),
+    "blocked": ("could not be rated: its owner's AI provider refused to read it. It cannot "
+                "run anywhere until its owner edits it and submits it again."),
+    "refused": ("was ⛔ **Refused** by its content rating and cannot run anywhere unless a "
+                "new rating clears it."),
 }
 
 DEFAULT_SAFETY_SETTINGS = {

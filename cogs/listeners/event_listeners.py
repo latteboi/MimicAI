@@ -729,6 +729,16 @@ class EventListeners:
                 if 'task_queue' not in session or session['task_queue'] is None:
                     session['task_queue'] = asyncio.Queue()
 
+                async def _clear_replaced(message_id, emoji):
+                    try:
+                        msg = await self.bot.get_channel(payload.channel_id).fetch_message(message_id)
+                        await msg.clear_reaction(emoji)
+                    except Exception: pass
+
+                # One press waits per session: this one replaces any already waiting.
+                for message_id, emoji in self.session_manager.replace_queued_reaction(
+                        session, (payload.message_id, emoji_str)):
+                    asyncio.create_task(_clear_replaced(message_id, emoji))
                 # Recorded before the put, so pulling the reaction back off can find it.
                 self.session_manager.note_reaction_queued(session, (payload.message_id, emoji_str))
                 await session['task_queue'].put(reaction_trigger)
@@ -747,7 +757,8 @@ class EventListeners:
 
     @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
-        if not self.has_lock: return
+        # The bot taking its own copy off raises this too, and must not withdraw a press.
+        if not self.has_lock or payload.user_id == self.bot.user.id: return
         
         emoji_str = str(payload.emoji)
 
@@ -794,27 +805,28 @@ class EventListeners:
                 break
 
         if turn_object:
-            if is_regen:
-                regen_task = session.get('regen_tasks', {}).pop(payload.message_id, None)
-                if regen_task and not regen_task.done():
-                    regen_task.cancel()
-                    try:
-                        channel = self.bot.get_channel(payload.channel_id)
-                        msg = await channel.fetch_message(payload.message_id)
+            if is_regen or is_continue or is_next:
+                if is_regen:
+                    regen_task = session.get('regen_tasks', {}).pop(payload.message_id, None)
+                    withdrew = bool(regen_task and not regen_task.done())
+                    if withdrew:
+                        regen_task.cancel()
+                else:
+                    # Only a trigger still waiting can be withdrawn -- see cancel_queued_reaction.
+                    withdrew = self.session_manager.cancel_queued_reaction(session, (payload.message_id, emoji_str))
+                # Withdrawing nothing still takes the bot's copy off. A press dropped without
+                # running (/cancel, /refresh, a 🔁 that timed out) left it there, and
+                # nothing else will ever clear it.
+                try:
+                    channel = self.bot.get_channel(payload.channel_id)
+                    msg = await channel.fetch_message(payload.message_id)
+                    if withdrew:
                         await msg.clear_reaction(payload.emoji)
-                    except: pass
+                    else:
+                        await msg.remove_reaction(payload.emoji, self.bot.user)
+                except Exception: pass
                 return
-            
-            elif is_continue or is_next:
-                # Only a trigger still waiting can be withdrawn -- see cancel_queued_reaction.
-                if self.session_manager.cancel_queued_reaction(session, (payload.message_id, emoji_str)):
-                    try:
-                        channel = self.bot.get_channel(payload.channel_id)
-                        msg = await channel.fetch_message(payload.message_id)
-                        await msg.clear_reaction(payload.emoji)
-                    except: pass
-                return
-                
+
             elif is_mute:
                 turn_object["is_hidden"] = False
                 await self.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])

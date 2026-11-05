@@ -459,24 +459,22 @@ class TriggerIntakeMixin:
                     new_round_turn_data.append((trigger[1], None, []))
                 continue
 
+            # Every press the round takes comes off its message, not only the one that
+            # opened it: one batched behind a message would sit there reading as still
+            # waiting, and, out of the queue, pulling it back could withdraw nothing.
+            if isinstance(trigger, tuple) and trigger[0] in ('reaction', 'reaction_single'):
+                try:
+                    ch = self.cog.bot.get_channel(trigger[1].channel_id)
+                    msg_obj = await ch.fetch_message(trigger[1].message_id)
+                    await msg_obj.clear_reaction(trigger[1].emoji)
+                except Exception: pass
+
             if i == 0:
                 if isinstance(trigger, tuple):
                     if trigger[0] == 'reply':
                         _, message_trigger, starting_profile_override = trigger
-                    elif trigger[0] == 'reaction': 
+                    elif trigger[0] in ('reaction', 'reaction_single'):
                         _, reaction_trigger, starting_profile_override = trigger
-                        try:
-                            ch = self.cog.bot.get_channel(reaction_trigger.channel_id)
-                            msg_obj = await ch.fetch_message(reaction_trigger.message_id)
-                            await msg_obj.clear_reaction(reaction_trigger.emoji)
-                        except: pass
-                    elif trigger[0] == 'reaction_single': 
-                        _, reaction_trigger, starting_profile_override = trigger
-                        try:
-                            ch = self.cog.bot.get_channel(reaction_trigger.channel_id)
-                            msg_obj = await ch.fetch_message(reaction_trigger.message_id)
-                            await msg_obj.clear_reaction(reaction_trigger.emoji)
-                        except: pass
                     elif trigger[0] == 'child_mention': _, message_payload, starting_profile_override = trigger
                 elif isinstance(trigger, discord.RawReactionActionEvent): reaction_trigger = trigger
                 elif isinstance(trigger, str):

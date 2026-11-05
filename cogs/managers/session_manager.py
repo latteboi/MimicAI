@@ -16,7 +16,6 @@ import datetime
 import collections
 import discord
 from typing import Callable, Dict, List, Any, Optional, Set, Union, Tuple
-from cryptography.fernet import InvalidToken
 import orjson as json
 
 from ..utils.constants import (
@@ -32,8 +31,9 @@ from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, always_reads_s
                              resolve_grounding_mode, resolve_url_mode, restamp_turn,
                              turn_posted_at)
 from ..services.generation.turn_deletion import branch_log
-from .storage_manager import (IOManager, _delete_file_shard, _get_compressor,
-                              _get_decompressor, seal_blob, unseal_blob)
+from .storage_manager import (UNDECODABLE, IOManager, _atomic_write, _delete_file_shard,
+                              _get_compressor, _get_decompressor, quarantine, seal_blob,
+                              unseal_blob)
 from ..gui.base_components import text_embed
 
 # Turns allowed to accumulate in the tail sidecar before the next flush re-seals the
@@ -446,15 +446,7 @@ class SessionManager:
 
     @staticmethod
     def _atomic_write(path: pathlib.Path, blob: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = path.with_suffix(path.suffix + '.tmp')
-        with open(temp_path, 'wb') as f:
-            f.write(blob)
-        try:
-            os.replace(temp_path, path)
-        except FileNotFoundError:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(temp_path, path)
+        _atomic_write(str(path), blob)
 
     def _get_live_session(self, session_key: Any, session_type: str) -> Optional[Dict]:
         """The in-memory session dict a save/flush refers to, or None if it is gone."""
@@ -693,9 +685,12 @@ class SessionManager:
                     for item in data:
                         intern_turn(item)
                 return data, cold_len
-        except (gzip.BadGzipFile, zstd.ZstdError, json.JSONDecodeError, InvalidToken):
-             print(f"Warning: Corrupted or old-format session file for key {session_key}. Deleting file.")
-             await self._delete_session_from_disk(session_key, session_type)
+        except UNDECODABLE as e:
+            # The cold segment (an unreadable tail is absorbed above). Moved aside rather
+            # than deleted: it is the only copy of the history. The tail goes with the
+            # rest -- without its cold segment nothing can line it up.
+            await asyncio.to_thread(quarantine, str(path), e)
+            await self._delete_session_from_disk(session_key, session_type)
         except Exception as e:
             print(f"Error loading session for key {session_key}: {e}")
         return None, 0
@@ -2167,6 +2162,21 @@ class SessionManager:
     def note_reaction_queued(session: Dict, key: Tuple[int, str]) -> None:
         """Record a 🍿, ▶️ or ⏯️ trigger as waiting in the queue, keyed `(message_id, emoji)`."""
         session.setdefault('queued_reaction_triggers', set()).add(key)
+
+    @staticmethod
+    def replace_queued_reaction(session: Dict, key: Tuple[int, str]) -> List[Tuple[int, str]]:
+        """Withdraw whatever press is waiting so this one waits alone; returns those on another message or emoji.
+
+        One 🍿, ▶️ or ⏯️ waits per session, and the latest wins. Each picks its speaker when
+        pressed, so a stack ran against a cast order that had moved on -- two ▶️ on one
+        character's messages gave the same seat two turns running -- and each was a paid
+        round. The caller takes the returned presses' reactions off; the same key needs
+        no clearing, since it is pressed again.
+        """
+        waiting = list(session.get('queued_reaction_triggers') or ())
+        for k in waiting:
+            SessionManager.cancel_queued_reaction(session, k)
+        return [k for k in waiting if k != key]
 
     @staticmethod
     def cancel_queued_reaction(session: Dict, key: Tuple[int, str]) -> bool:

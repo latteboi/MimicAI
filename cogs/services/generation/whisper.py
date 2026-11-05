@@ -13,7 +13,7 @@ from ...utils.helpers import (_format_citation_subtext, _format_history_entry, _
                              turn_posted_at)
 from . import tool_loop
 from .reply import ReplyText, reply_gen_config
-from ...gui.gui_sessions import WhisperActionView
+from ...gui.gui_sessions import WhisperActionView, WhisperCancelView
 from ...managers.session_manager import intern_turn
 from ...gui.base_components import dismissible, text_embed
 
@@ -66,6 +66,7 @@ class WhisperMixin:
         # counter before it claims a round, so a whisper cannot be starved by a channel
         # that never goes quiet -- polling for an idle instant at 2 Hz would lose that race
         # every time against a worker that re-arms is_running the moment its queue refills.
+        cancel = WhisperCancelView(self.cog, dismissible(text_embed("Whisper cancelled. Nothing was recorded.")))
         session['whisper_waiting'] = session.get('whisper_waiting', 0) + 1
         waiting_msg = None
         try:
@@ -74,7 +75,8 @@ class WhisperMixin:
             # notice is then edited into the placeholder rather than replaced, so this costs
             # no extra message when the channel was busy and none at all when it was not.
             if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
-                waiting_msg = await interaction.followup.send(embed=text_embed(WHISPER_WAITING_NOTICE), ephemeral=True, wait=True)
+                waiting_msg = await interaction.followup.send(embed=text_embed(WHISPER_WAITING_NOTICE), view=cancel,
+                                                              ephemeral=True, wait=True)
 
             if not await self.cog.session_manager._wait_for_session_flags(
                 session, SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
@@ -82,7 +84,7 @@ class WhisperMixin:
                 timed_out = (f"The session is still busy after {int(WHISPER_BUSY_WAIT_TIMEOUT_SECONDS)}s. "
                              "Your whisper was not sent \u2014 try again in a moment.")
                 if waiting_msg:
-                    await waiting_msg.edit(content=None, embed=text_embed(timed_out))
+                    await waiting_msg.edit(content=None, embed=text_embed(timed_out), view=None)
                 else:
                     await interaction.followup.send(embed=text_embed(timed_out), ephemeral=True)
                 return
@@ -96,7 +98,7 @@ class WhisperMixin:
             session['whisper_waiting'] = max(0, session.get('whisper_waiting', 1) - 1)
 
         try:
-            await self._run_whisper_turn(interaction, session, target_participant, whisper_message, waiting_msg)
+            await self._run_whisper_turn(interaction, session, target_participant, whisper_message, cancel, waiting_msg)
         finally:
             session['is_whispering'] = False
 
@@ -207,7 +209,8 @@ class WhisperMixin:
         embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
         return embed
 
-    async def _run_whisper_turn(self, interaction: discord.Interaction, session: Dict, target_participant: Dict, whisper_message: str, waiting_msg: Optional[discord.Message] = None):
+    async def _run_whisper_turn(self, interaction: discord.Interaction, session: Dict, target_participant: Dict, whisper_message: str,
+                                cancel: WhisperCancelView, waiting_msg: Optional[discord.Message] = None):
         """The whisper turn proper. Only called with the channel already claimed by
         _execute_whisper -- never call this directly."""
         owner_id = target_participant['owner_id']
@@ -240,7 +243,7 @@ class WhisperMixin:
         if waiting_msg is not None:
             placeholder_msg = await waiting_msg.edit(content=None, embed=placeholder_embed)
         else:
-            placeholder_msg = await interaction.followup.send(embed=placeholder_embed, ephemeral=True, wait=True)
+            placeholder_msg = await interaction.followup.send(embed=placeholder_embed, view=cancel, ephemeral=True, wait=True)
 
         try:
             reply = await self._whisper_reply(
@@ -248,11 +251,12 @@ class WhisperMixin:
                 placeholder_msg, custom_emoji, display_name, avatar_url, "whisper")
         except asyncio.CancelledError:
             return
+        cancel.task = None  # Landed: from here it is logged, and Cancel is too late.
 
         if reply.blocked:
             # Nothing is logged: the character said nothing, and the whisper is theirs to send again.
             await placeholder_msg.edit(embed=self._whisper_embed(
-                interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message))
+                interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message), view=None)
             return
 
         # Recorded with its citations, as a session turn is; the warnings are shown, never
@@ -324,11 +328,14 @@ class WhisperMixin:
             await interaction.response.send_message(embed=text_embed("Session not found."), ephemeral=True)
             return
 
+        # Cancelled, the card goes back to the reply it was showing, its buttons with it.
+        cancel = WhisperCancelView(self.cog, interaction.message.embeds[0], WhisperActionView(
+            self.cog, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message))
         session['whisper_waiting'] = session.get('whisper_waiting', 0) + 1
         answered = False
         try:
             if any(session.get(flag) for flag in SESSION_BUSY_FLAGS):
-                await interaction.response.edit_message(content=None, embed=text_embed(WHISPER_WAITING_NOTICE), view=None)
+                await interaction.response.edit_message(content=None, embed=text_embed(WHISPER_WAITING_NOTICE), view=cancel)
                 answered = True
 
             if not await self.cog.session_manager._wait_for_session_flags(
@@ -347,11 +354,12 @@ class WhisperMixin:
             session['whisper_waiting'] = max(0, session.get('whisper_waiting', 1) - 1)
 
         try:
-            await self._run_whisper_regeneration(interaction, session, whisper_turn_id, response_turn_id, target_participant, whisper_message, answered)
+            await self._run_whisper_regeneration(interaction, session, whisper_turn_id, response_turn_id, target_participant, whisper_message, cancel, answered)
         finally:
             session['is_whispering'] = False
 
-    async def _run_whisper_regeneration(self, interaction: discord.Interaction, session: Dict, whisper_turn_id: str, response_turn_id: str, target_participant: Dict, whisper_message: str, answered: bool = False):
+    async def _run_whisper_regeneration(self, interaction: discord.Interaction, session: Dict, whisper_turn_id: str, response_turn_id: str, target_participant: Dict, whisper_message: str,
+                                        cancel: WhisperCancelView, answered: bool = False):
         """Only called with the channel already claimed by _execute_whisper_regeneration."""
         owner_id = target_participant['owner_id']
         profile_name = target_participant['profile_name']
@@ -365,9 +373,9 @@ class WhisperMixin:
         placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url, whisper_message)
         if answered:
             # The waiting notice already consumed the interaction response.
-            await interaction.edit_original_response(content=None, embed=placeholder_embed, view=None)
+            await interaction.edit_original_response(content=None, embed=placeholder_embed, view=cancel)
         else:
-            await interaction.response.edit_message(embed=placeholder_embed, view=None)
+            await interaction.response.edit_message(embed=placeholder_embed, view=cancel)
         placeholder_msg = await interaction.original_response()
 
         # Reconstruct context for AI
@@ -375,7 +383,7 @@ class WhisperMixin:
         indices = {t.get("turn_id"): i for i, t in enumerate(log)
                    if t.get("turn_id") in (whisper_turn_id, response_turn_id)}
         if response_turn_id not in indices:
-            await interaction.followup.send(embed=text_embed("Original response not found in log."), ephemeral=True)
+            await interaction.edit_original_response(embed=dismissible(text_embed("Original response not found in log.")), view=None)
             return
         # The log as it stood when the whisper was sent, and the whisper as it was logged.
         cut = indices.get(whisper_turn_id, indices[response_turn_id])
@@ -390,12 +398,13 @@ class WhisperMixin:
                 placeholder_msg, custom_emoji, display_name, avatar_url, "whisper_regen")
         except asyncio.CancelledError:
             return
+        cancel.task = None  # Landed: from here it is logged, and Cancel is too late.
 
         if reply.blocked:
             # The old reply stays in the log; this one only says why it was not replaced.
             await interaction.edit_original_response(embed=self._whisper_embed(
                 interaction, ("Regeneration failed.\n\n" + self._whisper_display(reply))[:4096],
-                display_name, avatar_url, whisper_message))
+                display_name, avatar_url, whisper_message), view=cancel.restore_view)
             return
 
         response_text = reply.text

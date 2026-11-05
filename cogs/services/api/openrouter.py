@@ -329,6 +329,14 @@ class OpenRouterModel:
                 # and carried whole: _format_api_error would cut it at 80 characters.
                 if self.data_collection == "deny" and "data policy" in response.text.lower():
                     err.formatted_reason = OPENROUTER_DATA_POLICY_BLOCKED
+                if response.status_code == 403:
+                    # A moderated model's flag names its categories, which the content
+                    # rating reads (`_ask_classifier`).
+                    try:
+                        reasons = ((response.json().get("error") or {}).get("metadata") or {}).get("reasons")
+                    except (ValueError, AttributeError):
+                        reasons = None
+                    err.moderation_reasons = reasons if isinstance(reasons, list) else []
                 raise err
 
             data = response.json()
@@ -342,7 +350,7 @@ class OpenRouterModel:
             class OpenRouterThoughtResponse:
                 def __init__(self, content, reasoning, finish_reason, input_toks, output_toks,
                              billed_cost=None, served_tier=None, served_by=None,
-                             function_calls=None, cached_toks=0):
+                             function_calls=None, cached_toks=0, native_finish_reason=None):
                     self.text = content
                     #: Normalised the same way GoogleRESTResponse normalises its own,
                     #: so a dispatcher never branches on which provider answered.
@@ -370,6 +378,9 @@ class OpenRouterModel:
                     self.candidates = [_RestView({
                         'content': {'parts': [{'text': content}]},
                         'finish_reason': finish_reason,
+                        # The host's own, which `finish_reason` normalises away: Google's
+                        # PROHIBITED_CONTENT reads as a bare "content_filter" without it.
+                        'native_finish_reason': native_finish_reason,
                         'grounding_metadata': _grounding_metadata(msg_obj.get('annotations')),
                     })]
                     #: GoogleRESTResponse keeps its candidates under `.raw` as well, and
@@ -391,6 +402,7 @@ class OpenRouterModel:
                 data.get('provider') if isinstance(data.get('provider'), str) else None,
                 function_calls=from_openrouter_message(msg_obj),
                 cached_toks=(usage_obj.get('prompt_tokens_details') or {}).get('cached_tokens') or 0,
+                native_finish_reason=choice.get('native_finish_reason'),
             )
         except httpx.RequestError as e:
             # httpx's ReadError and its kin carry no message: name the class instead.

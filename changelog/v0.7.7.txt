@@ -1,0 +1,17 @@
+v0.7.7 Beta — YYYY-MM-DD (UTC)
+A `/trigger` note lasts one round, and turn numbers stay true.
+## **Added**
+- **Whispers and Global Chat replies have a Cancel button** while they wait or generate. A cancelled whisper leaves nothing recorded; a cancelled regeneration keeps the reply it was replacing. A cancelled Global Chat round puts everyone's messages back in the queue.
+## **Changed**
+- **`/whisper` with no options reopens your latest whisper**, with Regenerate as well as Delete, so a whisper dismissed by accident can be brought back.
+- **A Global Chat round that fails or is refused keeps its messages** in the queue to send again, instead of dropping them.
+- **`/session swap` shows who it seated or removed**: its reply is headed by the character's name and avatar.
+- **A finished prompt says it can be dismissed**, in small text under its result, once its buttons are gone.
+## **Fixed**
+- **The nightly cleanup deleted every session running in a thread**, log and all, and every session in a server that was briefly unavailable. A session now ends only once Discord confirms its channel is deleted or the bot has left the server.
+- **The nightly cleanup could delete the data of everyone in a server that was unavailable or still loading members** when it ran. It now waits for a night when every server is fully loaded.
+- **Memories or training examples saved at the same moment could overwrite each other**, losing one, or bringing back one just deleted.
+- **A damaged data file was replaced by the next save, and a failed read of saved API keys deleted them.** A file that cannot be read is now set aside intact, and a momentary read failure leaves it where it is.
+- **Two saves of the same file at once could fail.**
+- **A `/trigger` note stayed in the conversation**, so every later round read it again, and triggering again after a round nobody answered added another copy. Only the round it was given to reads it now.
+- **Session notes threw off turn numbers.** Each AI Director note, `/trigger` note or age-restriction notice in view moved every number after it, so the first message could be read as #4. Notes are no longer numbered.

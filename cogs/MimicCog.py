@@ -32,7 +32,7 @@ from .gui.gui_sessions import (
 )
 from .gui.gui_settings import (SettingsHomeView, ParentPresenceView, ShutdownConfirmView,
                                 build_about_embed)
-from .gui.gui_profiles import (ProfileManageView, BulkManageView, VoiceSampleConsentView,
+from .gui.gui_profiles import (ProfileManageView, BulkManageView, VoiceSampleConsentView, OpenDashboardView,
                                maybe_prompt_rating_after_edit)
 from .gui.gui_resolve import (
     autocorrect_profile, gather_owned_candidates, gather_participant_candidates,
@@ -429,11 +429,16 @@ class MimicCog(EventListeners, commands.Cog):
                 await interaction.followup.send(embed=text_embed(f"A system profile with the name '{profile_name}' already exists."), ephemeral=True)
                 return
             new_profile = self.profile_manager._get_or_create_system_profile(profile_name)
-            await interaction.followup.send(embed=text_embed(f"Successfully created new System Profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it."), ephemeral=True)
+            await interaction.followup.send(embed=text_embed(f"Successfully created new System Profile '{profile_name}'.\nOpen its dashboard below, or later with `/profile manage profile_name:{profile_name}`."),
+                                            ephemeral=True, view=OpenDashboardView(self, interaction, profile_name))
             return
 
         refusal = self._create_blank_profile(interaction.user.id, profile_name)
-        await interaction.followup.send(embed=text_embed(refusal or f"Successfully created new profile '{profile_name}'.\nUse `/profile manage profile_name:{profile_name}` to start editing it."), ephemeral=True)
+        if refusal:
+            await interaction.followup.send(embed=text_embed(refusal), ephemeral=True)
+            return
+        await interaction.followup.send(embed=text_embed(f"Successfully created new profile '{profile_name}'.\nOpen its dashboard below, or later with `/profile manage profile_name:{profile_name}`."),
+                                        ephemeral=True, view=OpenDashboardView(self, interaction, profile_name))
 
     def _blank_profile_refusal(self, user_id: int, profile_name: str) -> Optional[str]:
         """Why `user_id` may not create `profile_name` (already lowercased), or None."""
@@ -3054,8 +3059,6 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.followup.send(embed=text_embed("You have no whisper history in this session."), ephemeral=True)
             return
 
-        # Note: History view regeneration is disabled because the target_participant dict 
-        # is not easily reconstructed from old logs without PID-to-Owner mapping.
         view = WhisperHistoryView(self, interaction, paired_whispers)
         await interaction.followup.send(embed=view._get_current_embed(), view=view, ephemeral=True)
 

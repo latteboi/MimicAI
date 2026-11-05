@@ -21,6 +21,7 @@ the request after the last round is sent with calls forbidden, so a character th
 would keep asking has to answer instead of ending the turn with no text.
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
@@ -216,6 +217,12 @@ def exchange_turns(results: List[Tuple[FunctionCall, Any]], spoken: str,
     ]
 
 
+#: A call written out as the reply's text instead of sent as one. A host that is told
+#: "no calls" can switch off its call parser without stopping the model calling, and
+#: MiniMax M3 then posts its own syntax raw (`]<]minimax[>[<tool_call>
+#: <invoke name="search_web">...`): 4 of 8 capped turns in `prod_tests/function_calls_live.py`.
+WRITTEN_CALL = re.compile(r"<(?:\w+:)?tool_call>|<invoke name=")
+
 #: How much of a query the audit line keeps. Long enough to recognise what was asked,
 #: short enough that a turn's metadata stays metadata -- it is persisted in the session
 #: log, once per call, forever.
@@ -275,6 +282,10 @@ class LoopResult:
             meta["function_calls_capped"] = True
 
 
+def _wrote_call(response: Any) -> bool:
+    return bool(WRITTEN_CALL.search(getattr(response, "text", "") or ""))
+
+
 def spaced(content: Any) -> Any:
     """`content` with a blank line closing every text part that has another after it.
 
@@ -313,8 +324,16 @@ async def run(cog, model, contents: List[Any], gen_config: Optional[Dict[str, An
     for round_no in range(LIMIT_FUNCTION_CALL_ROUNDS + 1):
         last = bool(offered) and round_no == LIMIT_FUNCTION_CALL_ROUNDS
         result.capped = last
-        result.response = await send(turn, forbid_calls(gen_config) if last else gen_config)
-        calls = list(getattr(result.response, "function_calls", None) or ())
+        cfg = forbid_calls(gen_config) if last else gen_config
+        result.response = await send(turn, cfg)
+        if _wrote_call(result.response):
+            # Sampled, so the same request usually answers the second time (half the
+            # capped turns above). Twice means no answer: failed, like an empty reply,
+            # so the caller's fallback or error runs and the markup is never posted.
+            result.response = await send(turn, cfg)
+            if _wrote_call(result.response):
+                raise ValueError("The model wrote a function call as its reply, twice")
+        calls =list(getattr(result.response, "function_calls", None) or ())
         if not offered or not calls or last:
             break
         answered = await execute(cog, calls, ctx, offered)

@@ -4,7 +4,7 @@ import asyncio
 import discord
 import traceback
 import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from ...utils.constants import (
     defaultConfig, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
@@ -165,7 +165,10 @@ class GlobalChatMixin:
                      "The host of this session needs to submit a personal API key using `/settings` to use this feature.")
         return user_api_key, or_key, block
 
-    async def _execute_global_chat(self, interaction: discord.Interaction, host_user_id: int, profile_name: str, queued_turns: List[Dict]):
+    async def _execute_global_chat(self, interaction: discord.Interaction, host_user_id: int, profile_name: str,
+                                   queued_turns: List[Dict], on_landed: Callable[[], None]):
+        """`on_landed` is called the moment the reply is in hand, before anything is logged: the
+        card's Cancel is refused from then on, and a round that never calls it is put back."""
         t1_start_mono = time.monotonic()
         t1_start_utc = datetime.datetime.now(datetime.timezone.utc)
 
@@ -271,7 +274,8 @@ class GlobalChatMixin:
                 description=custom_emoji, incoming=queued_turns,
                 colour=discord.Colour.dark_grey())
 
-            await interaction.edit_original_response(embed=placeholder_embed, view=None)
+            # The view is left alone: it is the card's Cancel.
+            await interaction.edit_original_response(embed=placeholder_embed)
             placeholder_msg = await interaction.original_response()
 
             url_mode = profile_data.get('url_mode', 'off')
@@ -386,6 +390,8 @@ class GlobalChatMixin:
 
                 await self._dispatch_warnings(interaction.channel, 'webhook', None, turn_warnings, host_user_id, profile_name)
                 return
+
+            on_landed()
 
             response_text = reply.text
             sources_text_list = _format_citation_subtext(_merge_sources(global_rag_sources, reply.sources))

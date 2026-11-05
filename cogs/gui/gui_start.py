@@ -853,23 +853,23 @@ class NewProfileModal(ui.Modal):
         self.name_input = ui.TextInput(
             label="Internal Name", placeholder="e.g. detective", max_length=32, required=True)
         self.add_item(self.name_input)
+        # Concept and image side by side, each naming the other: either one is enough.
         self.concept_input = ui.TextInput(
-            label="Concept (optional with an image)", style=discord.TextStyle.paragraph,
+            label="Concept (or an image below)", style=discord.TextStyle.paragraph,
             max_length=500, required=False,
             placeholder="e.g. A cynical noir detective who never removes his coat.")
         self.add_item(self.concept_input)
+        self.image_input = ui.FileUpload(required=False)
+        self.add_item(ui.Label(
+            text="Image (or a concept above)", component=self.image_input,
+            description="A picture to draft from. It becomes the avatar unless you give a URL."))
         self.display_name_input = ui.TextInput(
             label="Display Name (optional)", max_length=20, required=False,
             placeholder="The name it speaks under. Blank lets the draft pick one.")
         self.add_item(self.display_name_input)
         self.avatar_url_input = ui.TextInput(
             label="Avatar URL (optional)", required=False, placeholder="https://...")
-        self.add_item(self.avatar_url_input)
-        # The fifth component, which is all a modal holds.
-        self.image_input = ui.FileUpload(required=False)
-        self.add_item(ui.Label(
-            text="Image (optional)", component=self.image_input,
-            description="A picture to draft from. It becomes the avatar unless you give a URL."))
+        self.add_item(self.avatar_url_input)  # Five components: all a modal holds.
 
     async def on_submit(self, interaction: discord.Interaction):
         await self.cog.profile_generate_slash.callback(

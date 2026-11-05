@@ -451,7 +451,9 @@ class SpeakAsMixin:
         parts = split_turn(turn.get("content"))
         if not parts:
             return None, "That reply is stored in an older format and cannot be edited."
-        shown = _TRAILING_CREDIT.sub("", message.content or "")
+        # Less the spacer a message carrying a file is sent with (`_send_channel_message_once`):
+        # str.split() keeps a zero-width space as a word the stored reply never said.
+        shown = _TRAILING_CREDIT.sub("", (message.content or "").removesuffix("\n​"))
         mention = _LEADING_MENTION.match(shown)
         prefix = mention.group(0) if mention else ""
         shown = shown[len(prefix):].strip()

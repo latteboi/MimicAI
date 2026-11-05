@@ -33,7 +33,7 @@ from ..utils.constants import (
     DEFAULT_SAFETY_SETTINGS,
     CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS,
     CONTENT_RATING_REASON_LABELS, CONTENT_RATING_REASON_FALLBACK,
-    DEFAULT_CONTENT_CLASSIFIER_PROMPT, REFUSAL_CONFIRMERS,
+    DEFAULT_CONTENT_CLASSIFIER_PROMPT, REFUSAL_CONFIRMERS, UNREVIEWED_REFUSALS,
     CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_GENERAL,
     CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED, PLACEMENT_REFUSALS, REFUSED_INDEX_FILE,
     CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS,
@@ -94,7 +94,7 @@ _BORROW_POINTER_KEYS = ("original_owner_id", "original_pid", "original_profile_i
                         "original_profile_name", "pointer")
 
 #: `_effective_safety_level`'s answers, least to most restrictive.
-_SAFETY_LEVEL_ORDER = ("restricted", "unrestricted", "checking", "refused")
+_SAFETY_LEVEL_ORDER = ("restricted", "unrestricted", "checking", "blocked", "refused")
 
 #: Rating jobs land in worker threads, and write_json's temp name is fixed.
 _REFUSED_INDEX_LOCK = threading.Lock()
@@ -106,6 +106,24 @@ _VERDICT_LINE = re.compile(r"\W*(GENERAL|ADULT)\b[^\w:]*(?::\W*(\w+))?")
 _CONFIRM_LINE = re.compile(r"\W*(YES|NO)\b", re.IGNORECASE)
 #: OpenRouter's out-of-credit refusal, as a classifier failure carries it (`openrouter.py`).
 _NO_CREDIT = "API Error 402"
+#: A provider refusing to read a profile at all: Google's filter that no setting reaches,
+#: as a block or finish reason, or passed through OpenRouter as `native_finish_reason`.
+#: Not a verdict, but a hold (`provider_blocked`), never the operator's queue: they would
+#: be reading what the provider would not.
+_PROVIDER_REFUSALS = frozenset({"PROHIBITED_CONTENT"})
+#: The same from a moderated OpenRouter model: its 403 names its categories, and the
+#: wording is the moderator's own, so matched rather than compared.
+_MINORS_FLAGGED = re.compile(r"minor|child", re.IGNORECASE)
+
+
+def _provider_refusal(*codes) -> Optional[str]:
+    """The first of a reply's block and finish reasons in `_PROVIDER_REFUSALS`, by name:
+    the SDK's enums and REST's strings alike."""
+    for code in codes:
+        name = str(getattr(code, "name", code) or "")
+        if name in _PROVIDER_REFUSALS:
+            return name
+    return None
 
 
 def _awaits_review(rating: Dict[str, Any]) -> bool:
@@ -134,9 +152,17 @@ def _rating_floor(rating: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]
     return None, None
 
 
+def _carried_hold(rating: Dict[str, Any]) -> Dict[str, str]:
+    """A provider's refusal to read the profile, for any record replacing `rating` but a
+    verdict: only a model reading it lifts the hold, so no rewrite of the record may."""
+    return {"provider_blocked": rating["provider_blocked"]} if rating.get("provider_blocked") else {}
+
+
 def _carried_floor(rating: Dict[str, Any]) -> Dict[str, str]:
-    """`was`, for an Unrated or Pending record replacing `rating`. Refused never is one."""
-    return {"was": CONTENT_RATING_ADULT} if _rating_floor(rating)[0] == CONTENT_RATING_ADULT else {}
+    """`was` and the hold, for an Unrated or Pending record replacing `rating`. Refused
+    never is one."""
+    was = {"was": CONTENT_RATING_ADULT} if _rating_floor(rating)[0] == CONTENT_RATING_ADULT else {}
+    return {**was, **_carried_hold(rating)}
 
 
 def _clean_imported_prompts(value: Any) -> Any:
@@ -2868,13 +2894,16 @@ class ProfileManager:
         Adult restricts placement; Refused, and a declared 18+ not yet checked by the
         classifier, stop it altogether. Unrated, Pending and General are identical at
         runtime -- the rating governs distribution, not execution -- so a profile whose
-        owner has never submitted it is not silenced, it is merely undistributable.
+        owner has never submitted it is not silenced, it is merely undistributable. One its
+        provider would not even read (`provider_blocked`) runs nowhere until a model does.
         """
+        rating = config.get("content_rating") or {}
+        if rating.get("provider_blocked"):
+            return "blocked"
         capabilities = CONTENT_RATING_CAPABILITIES[self._verdict_of(config)]
         if not capabilities["runs"]:
             return "refused"
         if capabilities["age_restricted_only"]:
-            rating = config.get("content_rating") or {}
             if rating.get("source") == "owner_declared" and not rating.get("checked"):
                 return "checking"
             return "unrestricted"
@@ -3226,7 +3255,9 @@ class ProfileManager:
 
         `status` is "success" when `answer` matches the text, "no_verdict" when the model
         replied without one -- blocked, empty, or words in place of the line -- "api_error"
-        when the call failed, and "no_key" when the owner has no usable key for it.
+        when the call failed, and "no_key" when the owner has no usable key for it. A block
+        that is the provider refusing to read the profile at all (`_provider_refusal`, or a
+        moderation 403 naming minors) is "blocked" instead, `why` the provider's own code.
         """
         provider, model_name, model_cls, role = attempt
         key = self.cog.storage_manager._get_api_key_for_user(owner_id, provider)
@@ -3257,14 +3288,19 @@ class ProfileManager:
             if answer.match(raw):
                 status = "success"
             else:
-                status = "no_verdict"
                 block = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
                 finish = getattr(candidate, "finish_reason", None)
-                why = ("answered without a verdict" if raw
+                refused = _provider_refusal(block, finish, getattr(candidate, "native_finish_reason", None))
+                status = "blocked" if refused else "no_verdict"
+                why = (refused if refused
+                       else "answered without a verdict" if raw
                        else f"blocked ({block})" if block
                        else f"no text (finish reason {finish})" if finish else "no text")
         except Exception as e:
-            why = f"{provider}: {e}"
+            # Not the body: a moderation 403 quotes the input it flagged.
+            minors = next((str(r) for r in getattr(e, "moderation_reasons", ())
+                           if _MINORS_FLAGGED.search(str(r))), None)
+            status, why = ("blocked", minors) if minors else (status, f"{provider}: {e}")
         finally:
             self.cog._log_api_call(user_id=0, guild_id=None, context="content_classification",
                                    model_used=model_name, status=status)
@@ -3282,12 +3318,17 @@ class ProfileManager:
         A refusing code refuses the profile and strikes its owner, so the other model is
         asked whether it holds, in that code's words (`REFUSAL_CONFIRMERS`). Agreed, the
         refusal is `confirmed_by` that model and settles itself. Disputed, or with no
-        answer, it is still Refused but waits on the operator's `review`, with no strike.
+        answer, it is still Refused but waits on the operator's `review`, with no strike --
+        bar `UNREVIEWED_REFUSALS`, which wait on no one: their owner edits and resubmits.
 
         A verdict lighter than the one the profile stands on (`_rating_floor`) holds only
         once a second model agrees (`_hold_floor`).
+
+        No verdict from any model, and at least one provider refusing to read it at all, is
+        not flagged for the operator: it is held (`provider_blocked`) for its owner to edit.
         """
         self._last_classify_flagged = False  # a raise before any answer flags nothing
+        self._last_classify_blocked = None
         surface = await asyncio.to_thread(self._moderated_surface, owner_id, profile_name)
         surface_hash = self._surface_hash(surface)
         floor, floor_reason = await asyncio.to_thread(
@@ -3308,24 +3349,29 @@ class ProfileManager:
 
         settings, attempts = self._classifier_attempts(owner_id)
         raw, answered_by = None, None
-        failures, no_verdicts = [], []
+        failures, no_verdicts, blocked = [], [], []
         for n, attempt in enumerate(attempts):
             status, text, why = await self._ask_classifier(
                 owner_id, attempt, settings, prompt_text, payload, _VERDICT_LINE)
             if status == "success":
                 raw, answered_by = text, n
                 break
-            if status == "no_verdict":
+            if status == "blocked":
+                blocked.append(why)
+                no_verdicts.append(f"{attempt[1]}: blocked ({why})")
+            elif status == "no_verdict":
                 no_verdicts.append(f"{attempt[1]}: {why}")
             else:
                 failures.append(why)
 
         if answered_by is None:
             # A model replying with no verdict is never General and never Refused: the
-            # operator reviews it. Retrying cannot help within the backoff window either
-            # -- a key is not going to appear in fifteen seconds, credit is not bought, and
-            # a block is not lifted -- so tell the caller not to bother.
-            self._last_classify_flagged = bool(no_verdicts)
+            # operator reviews it, bar a provider refusing to read it, which holds it.
+            # Retrying cannot help within the backoff window either -- a key is not going
+            # to appear in fifteen seconds, credit is not bought, and a block is not
+            # lifted -- so tell the caller not to bother.
+            self._last_classify_blocked = blocked[0] if blocked else None
+            self._last_classify_flagged = bool(no_verdicts) and not blocked
             self._last_classify_failure = "; ".join(failures + no_verdicts) or "unknown"
             self._last_classify_retryable = not no_verdicts and (
                 not all("no usable key" in f or _NO_CREDIT in f for f in failures)
@@ -3364,7 +3410,7 @@ class ProfileManager:
             confirmed = _CONFIRM_LINE.match(text) if status == "success" else None
             if confirmed and confirmed.group(1).upper() == "YES":
                 record["confirmed_by"] = other[1]
-            else:
+            elif reason not in UNREVIEWED_REFUSALS:
                 record["review"] = "disputed" if confirmed else "unconfirmed"
         elif floor and _STRICTNESS[verdict] < _STRICTNESS[floor]:
             record = await self._hold_floor(owner_id, record, floor, floor_reason, settings,
@@ -3380,7 +3426,8 @@ class ProfileManager:
         edits resubmitted could walk a refusal or an Adult rating down until a draw came back
         lighter. Tightening needs no second opinion. Asked of the other model, or of the same
         one again when the chain has only one: a refusal its own confirmer's question, anything
-        else the classifier's. Held Refused, it waits on the operator with no strike.
+        else the classifier's. Held Refused, it waits on the operator with no strike, or on
+        no one for `UNREVIEWED_REFUSALS`.
         """
         second = next((a for i, a in enumerate(attempts) if i != answered_by), attempts[answered_by])
         if floor == CONTENT_RATING_REFUSED and floor_reason in REFUSAL_CONFIRMERS:
@@ -3403,8 +3450,8 @@ class ProfileManager:
                 if _STRICTNESS[held] <= _STRICTNESS[record["verdict"]]:
                     return record
         if held == CONTENT_RATING_REFUSED:
-            return {**record, "verdict": held, "reason": reason, "underlying": record["verdict"],
-                    "review": "disputed" if answer else "unconfirmed"}
+            review = {} if reason in UNREVIEWED_REFUSALS else {"review": "disputed" if answer else "unconfirmed"}
+            return {**record, "verdict": held, "reason": reason, "underlying": record["verdict"], **review}
         return {**record, "verdict": held, "reason": reason,
                 **({"model": second[1]} if answer else {})}
 
@@ -3436,7 +3483,7 @@ class ProfileManager:
             # it does not relax. Rebuilt rather than mutated: _duplicate_profile
             # shallow-copies the config, so a duplicate can share this dict with its source.
             checked = {k: v for k, v in existing.items()
-                       if k not in ("retry_after", "check_failure", "flagged")}
+                       if k not in ("retry_after", "check_failure", "flagged", "provider_blocked")}
             config["content_rating"] = {**checked, "hash": rating.get("hash"), "checked": True}
             self._save_profile_config(owner_id, profile_name, config, False)
             self._invalidate_content_rating(owner_id, profile_name)
@@ -3594,37 +3641,47 @@ class ProfileManager:
     @staticmethod
     def rating_failure_hint(rating: Dict[str, Any]) -> str:
         """The likeliest fix for a classification that gave up, read off the failure it stored."""
+        if rating.get("provider_blocked"):
+            return ("Your AI provider's safety system refused to read this profile, so it "
+                    "cannot run until it is rated. Edit it, then submit it again.")
         if _NO_CREDIT in (rating.get("check_failure") or rating.get("reason") or ""):
             return ("Your OpenRouter account is out of credit, which the rating models need: "
                     "top it up at <https://openrouter.ai/settings/credits>.")
         return "This usually means no API key was available: check `/settings`."
 
     def _record_classification_failure(self, owner_id: int, profile_name: str, reason: str,
-                                       flagged: bool = False):
+                                       flagged: bool = False, blocked: Optional[str] = None):
         """Stamps a retry-after on a profile the classifier could not judge.
 
         `flagged`: the model answered with no verdict, so the profile also goes on the
         operator's review list -- never Refused, since a model producing no text is not a
         finding. The flag outlives a later failure of the plain kind, until a verdict
         lands: the model's, or the operator's (`moderator_verdict`).
+
+        `blocked`: a provider refused to read it at all. No finding either, but it holds
+        the profile (`provider_blocked`) until a model gives a verdict, and replaces any
+        flag: the operator would be reading what the provider would not.
         """
         config = self._get_profile_config(owner_id, profile_name, False)
         if config is None:
             return
         rating = config.get("content_rating") or {}
+        if blocked:
+            rating = {k: v for k, v in rating.items() if k != "flagged"}
         flag = reason[:200] if flagged else rating.get("flagged")
         flag = {"flagged": flag} if flag else {}
+        hold = {"provider_blocked": blocked} if blocked else {}
         verdict = self._verdict_of(config)
         if verdict == CONTENT_RATING_ADULT and rating.get("source") == "owner_declared":
             # A declaration's check failed. The declaration stands, still unchecked, and
             # the retry-after stops every session setup re-queueing the same failure.
             config["content_rating"] = {
                 **rating, "check_failure": reason[:200],
-                "retry_after": time.time() + defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER, **flag}
+                "retry_after": time.time() + defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER, **flag, **hold}
             self._save_profile_config(owner_id, profile_name, config, False)
             self._invalidate_content_rating(owner_id, profile_name)
         elif verdict in (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED) or (
-                verdict == CONTENT_RATING_GENERAL and not flagged):
+                verdict == CONTENT_RATING_GENERAL and not (flagged or blocked)):
             # A real verdict already stands; a later failure must not erase it. Bar a
             # General one re-checked after an edit that the model would not rate: the
             # edited text is what its borrowers run, so it waits on review as Pending.
@@ -3644,15 +3701,16 @@ class ProfileManager:
                 "retry_after": time.time() + defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER,
                 **flag,
                 **_carried_floor(rating),
+                **hold,
             }
             self._save_profile_config(owner_id, profile_name, config, False)
             self._invalidate_content_rating(owner_id, profile_name)
-        if flagged:
+        if flagged or blocked:
             # Not the Pending that `_delist_unless_publishable` leaves listed: no verdict
             # is on its way.
             self.unpublish_profile(owner_id, profile_name)
             self._set_refused_entry(owner_id, self._get_pid_from_name(owner_id, profile_name),
-                                    profile_name)
+                                    None if blocked else profile_name)
 
     def _classification_on_cooldown(self, owner_id: int, profile_name: str) -> bool:
         config = self._get_profile_config(owner_id, profile_name, False) or {}
@@ -3724,11 +3782,12 @@ class ProfileManager:
     def appeal_refusal(self, owner_id: int, profile_name: str) -> bool:
         """The owner asks the operator to review a refusal that settled itself. Not one the
         operator already decided (`upheld_by`), so once per refusal: a new one, after an edit
-        and a re-rating, may be appealed again."""
+        and a re-rating, may be appealed again. Never one no person reviews
+        (`UNREVIEWED_REFUSALS`): its owner edits and resubmits instead."""
         config = self._get_profile_config(owner_id, profile_name, False)
         rating = (config or {}).get("content_rating") or {}
         if (rating.get("verdict") != CONTENT_RATING_REFUSED or rating.get("review")
-                or rating.get("upheld_by")):
+                or rating.get("upheld_by") or rating.get("reason") in UNREVIEWED_REFUSALS):
             return False
         config["content_rating"] = {**rating, "review": "appealed"}
         self._save_profile_config(owner_id, profile_name, config, False)
@@ -3795,7 +3854,7 @@ class ProfileManager:
             if verdict == "adult":
                 return True
             # Not queued here: this may run in a thread.
-            config["content_rating"] = _unchecked_declaration()
+            config["content_rating"] = {**_unchecked_declaration(), **_carried_hold(rating)}
         else:
             if source != "owner_declared":
                 return False
@@ -3811,6 +3870,7 @@ class ProfileManager:
                 "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "reason": None,
                 "source": "declaration_withdrawn",
+                **_carried_hold(rating),
             }
 
         self._save_profile_config(owner_id, profile_name, config, False)
@@ -3875,7 +3935,8 @@ class ProfileManager:
                     return False, "The bot operator is reviewing this refusal."
                 return False, ("This profile has not changed since it was refused, so it would "
                                "be judged on the same text. Edit it first"
-                               + ("." if rating.get("upheld_by") else
+                               + ("." if rating.get("upheld_by")
+                                  or rating.get("reason") in UNREVIEWED_REFUSALS else
                                   ", or choose Request Review if you think the refusal is a mistake."))
             self.schedule_content_classification(owner_id, profile_name)
             return True, ("Submitted. It stays Refused until the new verdict lands, which "
@@ -3964,7 +4025,8 @@ class ProfileManager:
         rating = (self._get_profile_config(owner_id, profile_name, False) or {}).get("content_rating") or {}
         if not allowed and rating.get("source") == "failed":
             # Given up, not still running: "waiting on the verdict" would send them off to wait.
-            return False, f"The content rating could not be reached. {self.rating_failure_hint(rating)}"
+            lead = "" if rating.get("provider_blocked") else "The content rating could not be reached. "
+            return False, lead + self.rating_failure_hint(rating)
         return allowed, reason
 
     async def publish_profile(self, owner_id: int, profile_name: str) -> Tuple[bool, Optional[str]]:
@@ -4159,6 +4221,8 @@ class ProfileManager:
                 except Exception as e:
                     print(f"Classification job errored for {owner_id}/{profile_name}: {e}")
                     rating = None
+                    # A raise is no finding, and another job may have set these meanwhile.
+                    self._last_classify_flagged, self._last_classify_blocked = False, None
 
                 if rating:
                     stored = await asyncio.to_thread(self._store_content_rating, owner_id, profile_name, rating)
@@ -4181,13 +4245,15 @@ class ProfileManager:
             # Out of attempts. Record why and when, so the next dashboard render or
             # session setup does not immediately re-queue the same doomed job -- that
             # loop is what turned one unclassifiable profile into an endless stream of
-            # give-up lines. The profile stays Pending, which runs normally but
-            # cannot be shared until a verdict is actually reached.
+            # give-up lines. The profile stays Pending, which runs normally -- unless its
+            # provider would not read it (`provider_blocked`) -- but cannot be shared
+            # until a verdict is actually reached.
             reason = getattr(self, "_last_classify_failure", None) or "unknown"
             print(f"Classification gave up for {owner_id}/{profile_name}: {reason}. "
                   f"Retrying no sooner than {defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER}s from now.")
             await asyncio.to_thread(self._record_classification_failure, owner_id, profile_name, reason,
-                                    getattr(self, "_last_classify_flagged", False))
+                                    getattr(self, "_last_classify_flagged", False),
+                                    getattr(self, "_last_classify_blocked", None))
         finally:
             self.cog.pending_classifications.pop(key, None)
             # Popped before it is set, so a waiter arriving after this point falls
@@ -4364,14 +4430,18 @@ class ProfileManager:
                 # write, and a verdict it claimed -- hash and all, which the file's own text
                 # computes -- ran without the check for what Refused catches. Any other was
                 # made about another copy, perhaps on another instance. Unrated runs the
-                # same and waits to be submitted before sharing.
+                # same and waits to be submitted before sharing. A provider's hold crosses
+                # with whatever it rode on, for the same reason Refused does.
                 rating = config.pop("content_rating", None)
                 verdict = rating.get("verdict") if isinstance(rating, dict) else None
+                hold = _carried_hold(rating) if isinstance(rating, dict) else {}
                 if verdict == CONTENT_RATING_REFUSED:
                     config["content_rating"] = rating
                 elif verdict == CONTENT_RATING_ADULT:
-                    config["content_rating"] = _unchecked_declaration()
+                    config["content_rating"] = {**_unchecked_declaration(), **hold}
                     declared.append(local_name)
+                elif hold:
+                    config["content_rating"] = {"verdict": CONTENT_RATING_UNRATED, **hold}
                 elif verdict == CONTENT_RATING_GENERAL:
                     unrated.append(local_name)
 
