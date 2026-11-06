@@ -1,4 +1,4 @@
-v0.7.7 Beta — YYYY-MM-DD (UTC)
+v0.7.7 Beta — 2026-11-05 (UTC)
 A `/trigger` note lasts one round, and turn numbers stay true.
 ## **Added**
 - **Whispers and Global Chat replies have a Cancel button** while they wait or generate. A cancelled whisper leaves nothing recorded; a cancelled regeneration keeps the reply it was replacing. A cancelled Global Chat round puts everyone's messages back in the queue.

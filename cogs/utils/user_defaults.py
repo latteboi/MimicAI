@@ -46,7 +46,7 @@ from .helpers import is_real_model
 #: Config keys that must never be defaulted regardless of what the table says.
 #:
 #: The resolver reads all but the last of these. `original_*` and `pointer` are how
-#: `_resolve_effective_profile` and `_resolve_borrowed_pointer` find the profile a
+#: `_resolve_effective_profile` and `_borrow_source` find the profile a
 #: borrow points at -- overwrite one and the borrow generates with no persona, or
 #: orphans. `neuro_state` is the one that is not identity: it is the *live* hormone vector,
 #: rewritten as a character reacts, so defaulting it would reset a mood mid-session.

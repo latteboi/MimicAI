@@ -448,8 +448,9 @@ A reply is the turn's `reply_to`, never text in its `content`: the replied-to tu
 `turn_id`, or — for a message outside the log — a snapshot of who, when and the start of
 what it said (`reply_record`). `render_reply` draws it per reader, inside the replier's
 block: every public turn that reader has in view is numbered `[#n]` in its header, counted
-from the window's start, and the reply names the number, not quoting it again. The start
-holds still between steps, so a reply rewrites no earlier turn and the cached prefix
+from the log's start (hidden and folded turns keep theirs), so every reader gives a turn the
+same number, and the reply names the number, not quoting it again. A number moves only on
+the log trim or a deleted round, so a reply rewrites no earlier turn and the cached prefix
 survives it (compaction and memory capture tag only replied-to turns, `reply_tags`); one out of view is
 quoted from the log, so deleting or muting it takes it out of every reply too. The replied-to message comes off the gateway payload
 (`referenced_message`); a child bot's payload carries the same snapshot.

@@ -496,7 +496,7 @@ class ServerManager:
 
         if unpublish:
             pids = []
-            for pub_id, info in self.cog.public_profiles.items():
+            for pub_id, info in list(self.cog.public_profiles.items()):
                 if isinstance(info, str) and ":" in info:
                     if info.startswith(user_id_str + ":"):
                         pids.append(pub_id)

@@ -750,6 +750,26 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if game_beat_participant is not None:
                     initial_trigger = all_triggers_for_round[0]
 
+                # The log trim, here and not at the round's end: a round nobody speaks in
+                # (every chance missed, every seat refused, an empty cast) logs its user
+                # turns and leaves early, so a trim at the end let a quiet session grow
+                # without bound -- and its turn numbers with it. Before the batch start is
+                # taken, which indexes the trimmed log.
+                #
+                # Hysteresis, not a hard cap. Trimming *to* the threshold left the log
+                # sitting exactly on it, so the next append crossed it again and every
+                # round from then on zeroed the boundary and rewrote the whole log
+                # instead of appending a tail -- an O(log length) write per round,
+                # forever, on precisely the sessions long enough for it to hurt.
+                # Trimming to LOG_TRIM_TARGET only once the log reaches
+                # LOG_TRIM_HIGH_WATER pays that rewrite once per 150 rounds instead.
+                if len(session.get("unified_log", [])) > LOG_TRIM_HIGH_WATER:
+                    session["unified_log"] = session["unified_log"][-LOG_TRIM_TARGET:]
+                    # A new list object whose head no longer matches the cold segment.
+                    session["_log_cold_len"] = 0
+                    self.cog.session_manager.mark_session_dirty(
+                        (channel_id, None, None), session_type, structural=True)
+
                 # [NEW] Record the start of this batch for Hybrid STM
                 batch_start_index = len(session.get("unified_log", []))
 
@@ -2278,22 +2298,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # AGGRESSIVE GC: Clear references
                 if 'new_round_content_objects' in locals(): del new_round_content_objects
                 if 'all_triggers_for_round' in locals(): del all_triggers_for_round
-
-                # Trim the unified log to be the single source of truth for the session's history window.
-                #
-                # Hysteresis, not a hard cap. Trimming *to* the threshold left the log
-                # sitting exactly on it, so the next append crossed it again and every
-                # round from then on zeroed the boundary and rewrote the whole log
-                # instead of appending a tail -- an O(log length) write per round,
-                # forever, on precisely the sessions long enough for it to hurt.
-                # Trimming to LOG_TRIM_TARGET only once the log reaches
-                # LOG_TRIM_HIGH_WATER pays that rewrite once per 150 rounds instead.
-                if len(session.get("unified_log", [])) > LOG_TRIM_HIGH_WATER:
-                    session["unified_log"] = session["unified_log"][-LOG_TRIM_TARGET:]
-                    # A new list object whose head no longer matches the cold segment.
-                    # Zeroing the boundary makes the round-end flush a full rewrite,
-                    # which re-seals the trimmed log.
-                    session["_log_cold_len"] = 0
 
                 # [NEW] Mandatory Round-End Persistence
                 # Ensures the transcript is saved immediately after the last participant speaks.

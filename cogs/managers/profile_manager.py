@@ -96,8 +96,11 @@ _BORROW_POINTER_KEYS = ("original_owner_id", "original_pid", "original_profile_i
 #: `_effective_safety_level`'s answers, least to most restrictive.
 _SAFETY_LEVEL_ORDER = ("restricted", "unrestricted", "checking", "blocked", "refused")
 
-#: Rating jobs land in worker threads, and write_json's temp name is fixed.
+#: Rating jobs land in worker threads, and each read-modify-writes the whole file.
 _REFUSED_INDEX_LOCK = threading.Lock()
+#: A rating job delists from a worker thread while the loop publishes: serialised inside
+#: this lock, the last os.replace always carries the newest dict, never an older snapshot.
+_PUBLIC_INDEX_LOCK = threading.Lock()
 
 #: The one line the classifier is asked for, bolded or quoted at most. Anything else is no
 #: verdict -- never General: a model declining in words must not rate a profile clean.
@@ -493,15 +496,18 @@ class ProfileManager:
             return self._get_pid_from_name_any(user_id, profile_name)
 
     def _load_public_profiles(self):
-        self.cog.public_profiles = {}
         index_path = os.path.join(PUBLIC_PROFILES_DIR, "index.json")
         data = IOManager.read_json(index_path)
-        if data:
-            self.cog.public_profiles = data
+        if data is None and os.path.exists(index_path):
+            # A failed open, not bad bytes (those were quarantined): the listings exist
+            # nowhere else, and starting empty meant the next save wrote over all of them.
+            raise RuntimeError(f"Public index unreadable, refusing to start empty: {index_path}")
+        self.cog.public_profiles = data if isinstance(data, dict) else {}
 
     def _save_public_index(self):
         index_path = os.path.join(PUBLIC_PROFILES_DIR, "index.json")
-        IOManager.write_json(self.cog.public_profiles, index_path)
+        with _PUBLIC_INDEX_LOCK:
+            IOManager.write_json(self.cog.public_profiles, index_path)
 
     # --- Borrow reverse index --------------------------------------------------
     #
@@ -1152,42 +1158,6 @@ class ProfileManager:
                 if str(p_info.get("owner_id")) == str(effective_owner_id) and p_info.get("original_pid") == effective_pid:
                     return True
         return False
-
-    def _resolve_borrowed_pointer(self, pointer: str) -> Optional[Tuple[int, str]]:
-        """A borrow's pointer resolved to (owner_id, pid), or None if it is broken.
-
-        A pointer has one of two shapes: "<owner_id>:<pid>" for a private share-code
-        borrow, or a key into the public index for a Public Library borrow. The
-        public form used to be recognised by an allowlist of leading characters --
-        "pub_" or "A" -- which was the source profile's own PID class showing
-        through, since publishing keys the index by the profile's PID. Any other
-        class fell through both branches and resolved to None, orphaning the borrow,
-        and the list would have needed a new case for every class added since.
-
-        The colon is what actually separates the two shapes, so that is what is
-        tested. No PID class is named here and none needs to be.
-        """
-        if not pointer:
-            return None
-
-        if ":" not in pointer:
-            if not self.cog.public_profiles:
-                self._load_public_profiles()
-            target = self.cog.public_profiles.get(pointer)
-            if isinstance(target, dict):
-                owner_id = target.get("owner_id")
-                pid = target.get("original_pid") or target.get("original_profile_id")
-                return (int(owner_id), pid) if owner_id and pid else None
-            if not isinstance(target, str):
-                return None
-            # Indirection into the "<owner_id>:<pid>" form, resolved below.
-            pointer = target
-
-        try:
-            owner_id_str, pid = pointer.split(":", 1)
-            return int(owner_id_str), pid
-        except ValueError:
-            return None
 
     def _get_profile(self, user_id: int, profile_name: str, is_borrowed: bool = False) -> Optional[Dict[str, Any]]:
         if not profile_name:
@@ -4042,8 +4012,6 @@ class ProfileManager:
             return False, reason
         if not self.list_public(owner_id, profile_name):
             return False, "Profile not found."
-        # On the loop: write_json's temp name is fixed, so two threads saving the index at
-        # once would trip over each other, and the dict is the loop's to mutate.
         self._save_public_index()
         self.note_publishes(owner_id, 1)
         return True, None
@@ -4585,7 +4553,7 @@ class ProfileManager:
             
         # 2. Scrub from Public Hub
         pids_to_unpublish = []
-        for pub_id, info in self.cog.public_profiles.items():
+        for pub_id, info in list(self.cog.public_profiles.items()):
             if isinstance(info, str) and ":" in info:
                 if info.startswith(user_id_str + ":"):
                     pids_to_unpublish.append(pub_id)

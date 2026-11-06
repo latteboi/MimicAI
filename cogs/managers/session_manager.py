@@ -281,9 +281,10 @@ def reply_quote(text: str) -> str:
 def has_header(content: str) -> bool:
     """Whether a turn opens on the speaker header `with_reply` tags. The one test for both
     sides of a number: a turn numbered without a header to show it on -- a SYSTEM note --
-    shifted every number after it, and a reply naming it pointed at nothing."""
-    header, sep, _ = content.partition("\n")
-    return bool(sep) and header.endswith(":")
+    shifted every number after it, and a reply naming it pointed at nothing. Asked of
+    every turn in the log per prompt, so it copies nothing: `partition` copied each body."""
+    end = content.find("\n")
+    return end > 0 and content.endswith(":", 0, end)
 
 
 def reply_tags(turns: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -296,7 +297,8 @@ def reply_tags(turns: List[Dict[str, Any]]) -> Dict[str, int]:
     and date cost thirty. A turn nothing in view replies to carries no tag.
 
     For the one-off prompts, compaction and memory capture. A session prompt numbers every
-    turn instead (`_build_history_for_participant`), so a reply rewrites nothing cached.
+    turn from the log's start instead (`_build_history_for_participant`), so a reply
+    rewrites nothing cached.
     """
     seen: Set[str] = set()
     targets: Set[str] = set()
@@ -2006,15 +2008,22 @@ class SessionManager:
         clock, _ = _resolve_zoneinfo(p_settings.get("timezone"))
 
         participant_history = []
-        # Every public turn numbered from the window's start, and a reply names the number
+        # Every public turn numbered from the log's start, and a reply names the number
         # rather than quoting its turn again. Not `reply_tags`, which tags only a turn
         # something replies to: that rewrote the target's header the moment someone did,
-        # inside the cached prefix, and everything after it re-billed. The start holds
-        # still between steps, so a number never changes until the prefix does anyway.
-        public = (t for t in log_slice if not t.get("type") and not t.get("is_hidden")
-                  and not (hide_folded and t.get("compacted")) and t.get("turn_id")
-                  and has_header(t.get("content") or ""))
-        tags = {t["turn_id"]: n for n, t in enumerate(public, 1)}
+        # inside the cached prefix, and everything after it re-billed. Not from the
+        # window's start either: each character's window starts in its own place, so one
+        # turn was #5 to one reader and #12 to the next, and every step renumbered the lot.
+        # From the log, a number moves only on the trim or a deleted round; the trim keeps
+        # it under LOG_TRIM_HIGH_WATER. A hidden or folded turn keeps its number, or a mute
+        # or a compaction would renumber the whole window and re-bill it. Typed turns take
+        # none: a synopsis is inserted mid-log, and a gap would show a whisper happened.
+        # `tags` holds only what is shown -- `render_reply` reads it as "in view".
+        shown = {t.get("turn_id") for t in log_slice if not t.get("is_hidden")
+                 and not (hide_folded and t.get("compacted"))}
+        numbered = (t for t in full_log if not t.get("type") and t.get("turn_id")
+                    and has_header(t.get("content") or ""))
+        tags = {tid: n for n, t in enumerate(numbered, 1) if (tid := t["turn_id"]) in shown}
         find = turn_lookup(full_log)
         # A profile that does not always read the synopsis reads it here instead, where it
         # was written, while the window still reaches it. The newest only: each carries
