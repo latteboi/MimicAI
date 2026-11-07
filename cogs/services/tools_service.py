@@ -629,17 +629,9 @@ class ToolsService:
             # searching, which is the one outcome this whole phase exists to prevent --
             # and handing it back as a result would launder a guess into a fact the
             # character then states with a citation-shaped confidence. The `note` is
-            # deliberately something the character can act on.
-            #
-            # Printed, not silent. "Answered without searching" and "searched and found
-            # nothing" are the same empty result to every caller, and they want opposite
-            # responses -- the first is a model or prompt problem on a slot the operator
-            # chose, the second is the truth about the query. The legacy path surfaces
-            # the same condition as a channel warning; this one has a character waiting,
-            # so it goes to the log instead.
+            # deliberately something the character can act on. Silent by choice: it
+            # is routine for a lite model, and only crowded the log.
             if not sources:
-                print(f"Web search: {model_name} answered without citing a search "
-                      f"({query[:60]!r}) -- dropped: {summary[:100]!r}")
                 return {"note": "That search found nothing on the web. Say you do not "
                                 "know rather than guessing."}
             return {"summary": _truncate_text_by_char(summary, MAX_GROUNDING_SUMMARY_CHARACTERS),

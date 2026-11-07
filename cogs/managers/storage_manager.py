@@ -734,7 +734,22 @@ class StorageManager:
         return []
 
     async def _perform_data_cleanup(self):
-        if await asyncio.to_thread(self._sync_perform_data_cleanup):
+        # `Guild.chunked` is `member_count == len(members)`, and Discord's count can sit
+        # off by a phantom for good -- one such guild skipped every run for all of them.
+        # A member request that completes is the whole list whatever the count says.
+        rechunked = set()
+        for g in self.cog.bot.guilds:
+            if g.unavailable or g.chunked:
+                continue
+            try:
+                members = await asyncio.wait_for(g.chunk(), timeout=60)
+            except Exception:
+                continue
+            if members:
+                rechunked.add(g.id)
+                print(f"[Cleanup] Guild {g.id} re-chunked: {len(members)} members against "
+                      f"a count of {g.member_count}; proceeding on the member list.")
+        if await asyncio.to_thread(self._sync_perform_data_cleanup, rechunked):
             await self._drop_departed_sessions()
 
     async def _drop_departed_sessions(self):
@@ -759,12 +774,13 @@ class StorageManager:
         if uncached:
             await sm._drop_deleted_channel_sessions(uncached)
 
-    def _sync_perform_data_cleanup(self) -> bool:
+    def _sync_perform_data_cleanup(self, rechunked=frozenset()) -> bool:
         """Steps 1-8 and 10, off the loop. True when it ran, so step 9 may follow."""
         # A guild in an outage or still chunking has no members and no channels here, so
         # everyone who is only there reads as departed and loses their whole directory.
         # The high-water guard below catches a collapse, not one guild of 47 missing.
-        not_ready = [g.id for g in self.cog.bot.guilds if g.unavailable or not g.chunked]
+        not_ready = [g.id for g in self.cog.bot.guilds
+                     if g.unavailable or not (g.chunked or g.id in rechunked)]
         if not_ready:
             print(f"[Cleanup] Skipped: {len(not_ready)} guild(s) unavailable or not fully "
                   f"chunked ({not_ready[:5]}). Their members would read as departed.")
