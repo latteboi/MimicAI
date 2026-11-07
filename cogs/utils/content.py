@@ -1444,7 +1444,7 @@ WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")
 #: Keep this in step with the site. It is the same document, not a summary of one:
 #: shortening a clause here would leave the bot and the website disagreeing about what
 #: the operator has undertaken.
-LEGAL_EFFECTIVE_DATE = "15 October, 2026 (UTC)"
+LEGAL_EFFECTIVE_DATE = "7 November, 2026 (UTC)"
 
 LEGAL_DOCUMENTS = {
     "Terms of Service": {
@@ -1710,6 +1710,12 @@ LEGAL_DOCUMENTS = {
             "remain until their log is purged; what other people's profiles remember "
             "about you, including Bonds, which belong to those profiles; or copies of "
             "your profiles you sent as clones, which belong to their recipients.\n"
+            "\n"
+            "The Official Instance's storage is backed up by a daily snapshot, and each"
+            " snapshot is deleted after 14 days. Anything deleted or purged, by you or "
+            "automatically, may remain in those snapshots for up to 14 days. Snapshots "
+            "are encrypted at rest, are not used to run the Service, and are restored "
+            "only to recover from a failure.\n"
             "\n"
             "Data held in a server's session logs or in other people's profiles cannot "
             "be deleted through /privacy. Deleting one of your messages in Discord "

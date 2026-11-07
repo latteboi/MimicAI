@@ -3,6 +3,7 @@ A `/trigger` note lasts one round, and turn numbers stay true.
 ## **Added**
 - **Whispers and Global Chat replies have a Cancel button** while they wait or generate. A cancelled whisper leaves nothing recorded; a cancelled regeneration keeps the reply it was replacing. A cancelled Global Chat round puts everyone's messages back in the queue.
 ## **Changed**
+- **Privacy Policy revised**, effective 7 November 2026 and shown in full in `/terms`. The Official Instance is now backed up daily and each backup is kept for 14 days, so anything you delete, or that is purged, may remain in a backup for up to 14 days.
 - **`/whisper` with no options reopens your latest whisper**, with Regenerate as well as Delete, so a whisper dismissed by accident can be brought back.
 - **A Global Chat round that fails or is refused keeps its messages** in the queue to send again, instead of dropping them.
 - **`/session swap` shows who it seated or removed**: its reply is headed by the character's name and avatar.
