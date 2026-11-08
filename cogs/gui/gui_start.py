@@ -230,7 +230,8 @@ def _permission_warning(mine: List[str], children: List[Tuple[str, Optional[List
         parts.append("**Me:**\n" + _permission_lines(mine))
     for name, lacking in children:
         if lacking is None:
-            parts.append(f"**{name}** (child bot) isn't in this server, so it can't speak here.")
+            parts.append(f"**{name}** (child bot) isn't in this server, so it can't speak here. "
+                         "Its owner's `/invite` has the link.")
         else:
             parts.append(f"**{name}** (child bot):\n" + _permission_lines(lacking))
     return "\n".join(parts)
@@ -363,8 +364,8 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
         "server_key": guild is not None and cog._session_key_block(guild, user_id) is None,
         "guild": guild,
         "channel": interaction.channel,
-        # A self-hosted instance holds Administrator and never lacks one; the official
-        # invite asks for exactly BOT_PERMISSIONS, which a channel's overrides can revoke.
+        # Every invite asks for exactly BOT_PERMISSIONS, which a channel's overrides can
+        # revoke. A bot invited with Administrator (a self-hosted one, before 0.7.8) lacks none.
         "missing_perms": _missing_permissions(interaction),
         "child_gaps": _child_bot_gaps(cog, guild, channel_id, profiles),
         "has_written": bool(state["written_name"]),

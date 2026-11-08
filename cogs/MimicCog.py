@@ -12,7 +12,7 @@ from .utils.constants import (
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, LIMIT_FIXED_EXAMPLES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
     PERSONA_TEXT_INPUT_MAX_LENGTH,
-    BOT_PERMISSIONS, invite_url, KOFI_URL, TOPGG_URL,
+    BOT_PERMISSIONS, CHILD_BOT_PERMISSIONS, invite_url, KOFI_URL, TOPGG_URL,
 )
 from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError, clean_display_name,
                                            draft_from_card, generate_draft, generator_models)
@@ -20,7 +20,7 @@ from .utils.character_card import (CardError, card_portrait, prompt_text, profil
                                    read_examples, read_lorebook)
 from .utils.memory_tuning import low_memory
 from .listeners.event_listeners import EventListeners
-from .gui.base_components import (ActionTextInputModal, DropdownContentView, InviteView, build_confirm_view,
+from .gui.base_components import (ActionTextInputModal, DropdownContentView, build_confirm_view,
                                   refuse_unregistered, text_embed,
                                   send_status, settle_status, update_status)
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
@@ -2756,41 +2756,50 @@ class MimicCog(EventListeners, commands.Cog):
         view.block_exempt = True
         await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
-    @app_commands.command(name="invite", description="Get the invite link to add MimicAI to your server.")
+    @app_commands.command(name="invite", description="Get the link that adds MimicAI to a server.")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
     async def invite_slash(self, interaction: discord.Interaction):
+        # Public, so whoever asked can show it to the person who will press it. What it is,
+        # what it costs, what to do next: the feature list belongs to /help.
+        # Not SERVER_KEY_PITCH: its "everyone here" means the server /invite was run in, not
+        # the one the link is for.
+        from .utils.content import PERMISSION_EFFECTS
         embed = discord.Embed(
-            title="Bring Your Personas to Life with MimicAI",
-            description="Experience a revolutionary, unified orchestration engine that gives you complete control over your chatbot. MimicAI brings unparalleled customisation and model diversity directly into your Discord servers.",
-            color=discord.Color.blue()
-        )
-        
-        embed.add_field(
-            name="Bring Your Own API (BYO API)",
-            value="Connect your own Google Gemini or OpenRouter API keys to unlock virtually any language model on the market, from lightweight performance engines to frontier reasoning models. Pay only for what you generate directly with your provider.",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="Advanced Customisation",
-            value="Configure Short-Term Memory limits, fine-tune sampling parameters (Temperature, Top P, Top K), or manipulate advanced OpenRouter heuristics. Integrate external tools like real-time Web Grounding (RAG), URL context fetching, custom placeholder emojis, and simulated neuro-endocrine emotional engines.",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="Multi-Profile Chat Sessions",
-            value="Organise several unique characters into a single, unified Chat Session. Watch them interact with each other and server members with chronological awareness and deep memory coherence.",
-            inline=False
-        )
-        
-        embed.add_field(
-            name="Disclaimer",
-            value="-# All software features and customisation options within MimicAI are completely free to use. However, connecting to background AI models for text, speech, or image generation requires an active billing account with your selected API provider (Google or OpenRouter). Token overhead usage applies.",
-            inline=False
-        )
-        
-        view = InviteView(invite_url(self.bot, self.bot.user.id, BOT_PERMISSIONS))
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+            title=f"Add MimicAI to your server {PLACEHOLDER_EMOJI}",
+            description=(
+                "AI characters with their own persona, memory, name and face, talking with your "
+                "members and with each other.\n\n"
+                "**Every feature is free.** Replies run on your own OpenRouter or Google key, and "
+                "you pay the provider for what you use.\n"
+                "**One key runs the whole server.** An admin adds theirs; everyone else just talks.\n"
+                f"**Then run {self.command_mention('start')}.** It sets up the rest. Seating a "
+                "character takes Administrator, so if you don't have it anywhere, make your own "
+                "server."),
+            color=discord.Color.blurple())
+        # The Top.gg page's first screenshot: two characters, each citing its own web sources.
+        embed.set_image(url="https://github.com/user-attachments/assets/e64ed8e0-d60b-4a06-9e3a-0a213687764d")
+        flags = [PERMISSION_EFFECTS[flag][0] for flag, on in BOT_PERMISSIONS if on]
+        embed.add_field(name=f"Asks for {len(flags)} permissions, never Administrator",
+                        value="-# " + " · ".join(flags), inline=False)
+        view = ui.View(timeout=None)
+        view.add_item(ui.Button(label="Add to Server",
+                                url=invite_url(self.bot.user.id, BOT_PERMISSIONS)))
+        await interaction.response.send_message(embed=embed, view=view)
+
+        # A child bot's link is otherwise shown once, when it is linked, and /start can only
+        # say one is missing from a server. Its owner's alone, so never in the public reply.
+        mine = [(bid, b) for bid, b in self.child_bots.items()
+                if b.get('owner_id') == interaction.user.id][:25]
+        if mine:
+            kids = ui.View(timeout=None)
+            for bid, b in mine:
+                client = self.child_bot_manager.clients.get(bid)
+                name = client.user.name if client and client.user else b.get('profile_name', bid)
+                kids.add_item(ui.Button(label=f"Add {name}"[:80],
+                                        url=invite_url(bid, CHILD_BOT_PERMISSIONS)))
+            await interaction.followup.send(
+                embed=text_embed("Your child bots join a server on links of their own."),
+                view=kids, ephemeral=True)
 
     # Not DM-only: every screen here answers ephemerally, and a key is typed into a
     # modal, which nobody but its submitter sees wherever it is opened.

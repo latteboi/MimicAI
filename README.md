@@ -209,8 +209,8 @@ source .venv/bin/activate && python3 BotManager.py
 ```
 
 Once it is online the console prints `Invite link: …`. Open it to add the bot to your
-server; `/invite` posts the same link from inside Discord. A self-hosted bot's link asks for
-**Administrator**, since it is your own bot. The official bot's asks only for what it uses.
+server; `/invite` posts the same link from inside Discord. It asks only for the permissions
+the bot uses, never **Administrator**.
 
 ### 4. Add an API key
 

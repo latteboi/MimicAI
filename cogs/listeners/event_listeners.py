@@ -66,7 +66,7 @@ class EventListeners:
 
             await self._cache_command_ids()
             # A fresh self-hosted bot is in no server yet, so there is nowhere to run /invite.
-            print(f"Invite link: {invite_url(self.bot, self.bot.user.id, BOT_PERMISSIONS)}")
+            print(f"Invite link: {invite_url(self.bot.user.id, BOT_PERMISSIONS)}")
             self.profile_manager._get_or_create_system_profile("mimicguide")
             self.bot.loop.create_task(self.help_service._load_and_embed_docs())
             

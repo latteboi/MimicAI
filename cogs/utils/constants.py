@@ -3187,7 +3187,7 @@ OFFICIAL_BOT_ID = 1376696185947164854
 KOFI_URL = "https://ko-fi.com/latteboi"
 TOPGG_URL = f"https://top.gg/bot/{OFFICIAL_BOT_ID}"
 
-#: Every permission the bot uses, and all the official invite asks a server for.
+#: Every permission the bot uses, and all any instance's invite asks a server for.
 BOT_PERMISSIONS = discord.Permissions(
     view_channel=True, send_messages=True, send_messages_in_threads=True,
     read_message_history=True, embed_links=True, attach_files=True, add_reactions=True,
@@ -3201,16 +3201,12 @@ CHILD_BOT_PERMISSIONS = BOT_PERMISSIONS & ~discord.Permissions(manage_webhooks=T
                                                                create_public_threads=True)
 
 
-def invite_url(instance: discord.Client, client_id, permissions: discord.Permissions) -> str:
-    """The link that adds `client_id` to a server, as handed out by `instance`.
+def invite_url(client_id, permissions: discord.Permissions) -> str:
+    """The link that adds `client_id` to a server, asking for `permissions` and no more.
 
-    Administrator only from a self-hosted instance, whose owner is inviting their own bot;
-    the official one never asks a server for more than it uses. Decided by the instance
-    handing out the link, not the bot it names: the official instance's child bots are
-    official too.
+    The same on every instance, never Administrator: a permission missing from the list
+    then fails on a self-hosted or dev bot just as it does on the official one.
     """
-    if instance.user.id != OFFICIAL_BOT_ID:
-        permissions = discord.Permissions(administrator=True)
     return discord.utils.oauth_url(client_id, permissions=permissions,
                                    scopes=("bot", "applications.commands"))
 

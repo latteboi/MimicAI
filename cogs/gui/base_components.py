@@ -668,12 +668,6 @@ class DropdownContentView(BlockedGuard, ui.View):
             embed.set_footer(text=self.footer)
         return embed
 
-class InviteView(ui.View):
-    def __init__(self, invite_url: str):
-        super().__init__(timeout=None)
-        btn = ui.Button(label="Add MimicAI to Server", url=invite_url, style=discord.ButtonStyle.link)
-        self.add_item(btn)
-
 class BaseBulkProfileView(BlockedGuard, ui.View):
     def __init__(self, cog, user_id, include_borrowed=True, timeout=300, exclude_public=False):
         super().__init__(timeout=timeout)
