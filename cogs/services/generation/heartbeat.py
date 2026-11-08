@@ -331,7 +331,7 @@ class HeartbeatMixin:
                     raise err
 
                 if not is_fallback and state_container.get('fallback_racing'):
-                    await asyncio.sleep(1)
+                    await asyncio.wait((gen_task,), timeout=1)
                     continue
 
                 # Periodic typing pulse for Child Bots without a placeholder (Discord typing expires in 9s)
@@ -376,8 +376,9 @@ class HeartbeatMixin:
                     except Exception:
                         pass
 
-                # Check exactly every 1 second
-                await asyncio.sleep(1)
+                # A tick a second, cut short by the reply: a bare sleep(1) held every
+                # reply up to a second (half on average) after the model had answered.
+                await asyncio.wait((gen_task,), timeout=1)
 
             return gen_task.result(), state_container
 

@@ -2429,10 +2429,9 @@ class SessionConfigView(BlockedGuard, ui.View):
         """Per-participant response chance and wakewords."""
         names_on = self.session.get('name_wakewords', True)
         embed.description = (
-            "Manage how likely participants are to respond to messages.\n\n"
-            + ("A character's **name** is also a wakeword: said in a message, or by another "
-               "character, it makes that character answer next."
-               if names_on else "Names are **not** wakewords: only the words set below call a character."))
+            "How likely each character is to answer, and which words call it.\n"
+            + ("-# A character's **name** is a wakeword too: whoever says it, that character answers next."
+               if names_on else "-# Names are **not** wakewords: only the words set below call a character."))
         profiles = self.session.get('profiles', [])
         total_items = len(profiles)
         num_pages = max(1, (total_items - 1) // 20 + 1)
@@ -2572,11 +2571,10 @@ class SessionConfigView(BlockedGuard, ui.View):
         cfg = resolve_compaction_settings(self.session)
         enabled = cfg["enabled"]
         embed.description = (
-            "Fold the oldest part of a long conversation into a running synopsis, so the "
-            "cast keeps the thread of a scene after it scrolls past their Short-Term Memory.\n\n"
-            "Folded turns are hidden from prompts, not deleted \u2014 the transcript, "
-            "regeneration and the audit view are unaffected, and turning this off brings "
-            "them back. Private whispers are never summarised."
+            "Summarises the oldest turns of a long scene, so the cast keeps track of it "
+            "after it leaves Short-Term Memory.\n"
+            "-# Folded turns are hidden from prompts, not deleted; turning this off brings "
+            "them back. Whispers are never summarised."
         )
         embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
         embed.add_field(name="Trigger", value=f"Every `{cfg['threshold']}` turns, or `{cfg['idle_threshold']}` "

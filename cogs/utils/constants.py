@@ -571,7 +571,7 @@ THINKING_SLOT_MODELS = {'response': 'primary_model', 'grounding': 'grounding_rag
 #: `ModelPickerMixin._CATEGORY_LABELS` where they overlap: one taxonomy, not two.
 THINKING_SLOT_LABELS = (
     ('response',  'Response', "The profile's own replies."),
-    ('grounding', 'Grounding Summariser', 'Summarises web search results in RAG mode.'),
+    ('grounding', 'Grounding Summariser', 'Runs the web searches for RAG and Legacy RAG, and summarises them.'),
     ('critic',    'Anti-Repetition Critic', 'Screens replies for semantic repetition.'),
     ('ltm',       'LTM Summariser', 'Turns conversations into long-term memories.'),
     ('training',  'Training Analysis', 'Writes a style guide from training examples.'),

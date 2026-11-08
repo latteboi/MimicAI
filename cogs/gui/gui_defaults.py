@@ -355,11 +355,9 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
     def _embed_actions(self) -> discord.Embed:
         e = self._base_embed(
             "Override Defaults",
-            "Applied to profiles you **create**, and offered on those you **borrow**, from "
-            "now on. Existing profiles are untouched — use `/profile bulk manage` for those.\n"
-            "-# Anything left on *Platform default* follows the bot's own value for your "
-            "provider, including if that value changes later. The tabs and the settings "
-            "under them are the ones on a profile's own dashboard.")
+            "Starting settings for profiles you **create**, offered on ones you **borrow**. "
+            "Existing profiles keep theirs; `/profile bulk manage` changes those.\n"
+            "-# *Platform default* follows the bot's value for your provider, even if it changes.")
         note = (NO_PROVIDER_NOTE if self._preferred() == PROVIDER_NONE
                 else PROVIDER_PREFERENCE_NOTE)
         e.add_field(name="Provider", value=f"`{PROVIDER_CHOICES[self._preferred()]}` — "

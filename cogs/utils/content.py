@@ -1300,12 +1300,12 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Links are ignored on my Gemini 2.5 profile.' Fix: On Google, Gemini 2.5 cannot open links natively while RAG grounding or Memory Search is on, and Native URL Context is dropped to keep them. Set URL Context to RAG, or use a Gemini 3 model.\n"
         "- Symptom: 'My images stopped using web research.' Fix: Images no longer follow Web Grounding. Set `/profile manage` -> Images -> Set Image Output -> Search grounding to Legacy RAG.\n"
         "- Symptom: 'The bot ignored a link in my text file.' Fix: Expected in RAG mode. URL Context reads links typed in the message, so put the link in the message itself.\n"
-        "- Symptom: 'Responses got much slower after I enabled these.' Fix: RAG mode adds a model call per message for each of Grounding and URL Context. Set them to OFF, or to NATIVE on a Google model."
+        "- Symptom: 'Responses got much slower after I enabled these.' Fix: LEGACY RAG asks a model before every round. Switch Grounding to RAG, which calls one only when the character searches, or to OFF. URL Context in RAG mode makes no model call."
     ),
     "features/typing_simulation.txt": (
         "Concept: Realistic Typing splits a reply on sentence boundaries and streams it with human-like delays instead of posting one block.\n"
         "Configuration: `/profile manage` -> Tools -> Realistic Typing. Set the characters-per-second rate, a maximum delay cap, the chunking mode, and the cursor.\n"
-        "Cursor: While the reply is still being edited in, the profile's placeholder emoji is attached to the message so a partial reply is not mistaken for a finished one. 'below' puts it on its own line underneath (the default -- nothing already on screen moves), 'prefix' puts it in front of the text, and 'off' restores the old behaviour. The final edit removes it. The emoji is the profile's own placeholder (Tools -> Placeholder), falling back to the bot-wide one.\n"
+        "Cursor: While the reply is still being edited in, the profile's placeholder emoji is attached to the message so a partial reply is not mistaken for a finished one. 'below' puts it on its own line underneath (the default -- nothing already on screen moves), 'prefix' puts it in front of the text, and 'off' restores the old behaviour. The final edit removes it. The emoji is the profile's own placeholder (Misc -> Generation Visual), falling back to the bot-wide one.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Messages take far too long to arrive.' Fix: Raise the characters-per-second value or lower the maximum delay cap. Long replies multiply the effect."
     ),
