@@ -1,4 +1,4 @@
-"""Set Models for a model pair that is no profile slot: the AI Director, the session
+"""Models for a model pair that is no profile slot: the AI Director, the session
 synopsis and training analysis -- and the session pairs' Thinking.
 
 Its own module because it adopts `ModelPickerMixin` from `gui_profiles`, which imports
@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 
 class _SlotPairView(BlockedGuard, ModelPickerMixin, ui.View):
-    """A Primary and a Fallback, as Set Models presents a profile's, on the message of the
+    """A Primary and a Fallback, as Models presents a profile's, on the message of the
     screen that opened it. Back returns there.
 
     Sparse: the model a slot would run anyway is no choice, so the pair keeps following
@@ -343,7 +343,7 @@ class TrainingAnalysisView(_SlotPairView):
     _TITLE = "Analyse Training Examples"
     _DESCRIPTION = ("Writes a style guide from this profile's newest training examples, shown "
                     "under Training \u2192 Style Guide. The models are this profile's Training "
-                    "Analysis models, also under Set Models.")
+                    "Analysis models, also under Models.")
     _FOOTER = "✏️ chosen for this profile · changes save as you make them"
     _SUBJECT = "Training analysis"
 
@@ -352,7 +352,7 @@ class TrainingAnalysisView(_SlotPairView):
         super().__init__(cog, parent, parent.user_id)
 
     def refuse_custom_model(self, key: str, value: str) -> Optional[str]:
-        """As Set Models takes this slot: CustomModelModal keeps Ollama to the bot owner."""
+        """As Models takes this slot: CustomModelModal keeps Ollama to the bot owner."""
         return None
 
     def _config(self) -> Dict[str, Any]:

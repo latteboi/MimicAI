@@ -472,7 +472,7 @@ class DataManageView(BlockedGuard, ui.View):
             add_button(self, "Back to list", self.close_callback, row=0, emoji="⬅️")
             return
 
-        # Paged the way Set Models pages its models: the page controls are the dropdown's
+        # Paged the way Models pages its models: the page controls are the dropdown's
         # first options, so no row of buttons is spent on them.
         if self.mode == 'ltm' and self.servers:
             start = self.server_page * SERVER_PAGE_SIZE

@@ -61,7 +61,7 @@ _ROW_VALUE_LINES = 4
 
 #: The Provider field with None chosen, where PROVIDER_PREFERENCE_NOTE would promise models.
 NO_PROVIDER_NOTE = ("No provider ships models to your new profiles: they start on what you set "
-                    "under **Set Models** here, and a slot you leave on *Platform default* "
+                    "under **Models** here, and a slot you leave on *Platform default* "
                     "starts with none.")
 
 
@@ -378,7 +378,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         wording = next((lbl for value, lbl, _d in self._CATEGORY_LABELS
                         if value == self.category), self.category.title())
         e = self._base_embed(
-            "Override Defaults — Set Models",
+            "Override Defaults — Models",
             f"**{wording}** — the model a profile you make from now on starts on. "
             f"Switch categories for the rest.\n"
             f"-# *Platform default* on a slot follows the bot's own choice, including "
@@ -595,7 +595,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
             return
         self._notice = None
         self.current_action = action
-        # Set Models is the one row with a screen of its own here: only stored values
+        # Models is the one row with a screen of its own here: only stored values
         # can offer "clear this slot", which a staging picker has no state for.
         if action.value == "models":
             self.step = "models"

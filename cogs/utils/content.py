@@ -40,8 +40,8 @@ HELP_CATEGORIES = {
             "Click **Save Assignments** -- nothing is stored until you do.\n\n"
             "**2. Create a profile.** `/profile create profile_name:detective`. If you would rather start from a concept or a picture than a blank form, "
             "`/profile generate` drafts a whole profile for you.\n\n"
-            "**3. Shape it.** `/profile manage profile_name:detective` opens the dashboard. **Persona** -> Edit Persona for backstory and traits; "
-            "Edit Instructions for speech and formatting; Edit Appearance for a display name and avatar URL.\n\n"
+            "**3. Shape it.** `/profile manage profile_name:detective` opens the dashboard. **Persona** -> Persona for backstory and traits; "
+            "Instructions for speech and formatting; Appearance for a display name and avatar URL.\n\n"
             "**4. Start talking.** `/session config` -> **Cast** -> pick your profile (it is seated as soon as you choose it) -> "
             "**Start / Update Session**. Then just send a message in the channel.\n\n"
             "*The bot posts this same pointer once, in a server, the moment it is invited. That is the only message it ever "
@@ -113,8 +113,8 @@ HELP_CATEGORIES = {
             "examples that clear the relevance threshold are injected for that turn. So a large library stays cheap -- you pay for the "
             "handful that are actually relevant.\n\n"
             "This makes them ideal for situational voice: how the character greets someone, how they react to being insulted, how they "
-            "handle a question they cannot answer. Manage them at `/profile manage` -> **Training** -> Manage Training Examples, and tune "
-            "the match with **Set Training Parameters**.\n\n"
+            "handle a question they cannot answer. Manage them at `/profile manage` -> **Training** -> Training Examples, and tune "
+            "the match with **Training Parameters**.\n\n"
             "**Limit:** 100 examples per profile."
         ),
         "Generating a Profile with AI": (
@@ -134,7 +134,7 @@ HELP_CATEGORIES = {
     },
     "3. Models and Parameters": {
         "Choosing Models": (
-            "Set at `/profile manage` -> **Params** -> Set Models. You choose a **Primary Model** and a **Fallback Model**.\n\n"
+            "Set at `/profile manage` -> **Params** -> Models. You choose a **Primary Model** and a **Fallback Model**.\n\n"
             "**Providers:**\n"
             "• **Google Gemini** -- Gemini models, plus Gemini's own speech and image models.\n"
             "• **OpenRouter** -- Anthropic, Meta, xAI, DeepSeek and many others through one key.\n"
@@ -149,7 +149,7 @@ HELP_CATEGORIES = {
             "how hard it thinks are one decision. See *Thinking and Reasoning* below."
         ),
         "Thinking and Reasoning": (
-            "`/profile manage` -> **Params** -> Set Thinking Parameters, or the **Thinking** button inside Set Models. "
+            "`/profile manage` -> **Params** -> Thinking Parameters, or the **Thinking** button inside Models. "
             "Reasoning effort and token budget are set **per model slot and per model**, not once for the whole profile.\n\n"
             "**Three dropdowns.** The first picks the slot; the second sets the **primary** model's effort; the third sets the "
             "**fallback** model's. The token budget button holds both budgets in one modal. A fallback is usually the cheap standby "
@@ -172,11 +172,11 @@ HELP_CATEGORIES = {
             "are preserved between turns, so a multi-turn chain of reasoning stays coherent.\n\n"
             "Reasoning is usually the single largest contributor to latency. Lowering the Response slot's effort is the first thing to try "
             "on a sluggish profile.\n\n"
-            "Image thinking is not here: it is an output control and lives with aspect ratio and resolution under Set Image Output."
+            "Image thinking is not here: it is an output control and lives with aspect ratio and resolution under Image Output."
         ),
         "Media Input Resolution": (
-            "`/profile manage` -> **Params** -> Set Media Input Resolution. How many tokens the model spends **reading an image or PDF "
-            "you send it**. This is the opposite direction from the image size under Set Image Output, which is about what an image model "
+            "`/profile manage` -> **Params** -> Media Input Resolution. How many tokens the model spends **reading an image or PDF "
+            "you send it**. This is the opposite direction from the image size under Image Output, which is about what an image model "
             "draws.\n\n"
             "On Gemini 3 the levels cost roughly 280 (Low), 560 (Medium), 1120 (High) and 2240 (Ultra High) tokens per image, and the "
             "model default is High. In an image-heavy session that is charged per attachment, per participant, per round -- so Low is "
@@ -192,7 +192,7 @@ HELP_CATEGORIES = {
             "Images, Audio, Memory, Training, Misc -- holding the same settings, and choosing one opens the same form "
             "`/profile bulk manage` opens for it. Nearly every setting a profile has can be given a standing value "
             "this way.\n\n"
-            "**Models.** Set Models on the Params tab covers every one of the six categories -- Response, Image, TTS, "
+            "**Models.** Models on the Params tab covers every one of the six categories -- Response, Image, TTS, "
             "Grounding, Critic, LTM -- and both slots of each. Set your Response Primary to an OpenRouter model once, "
             "and every profile you make afterwards starts there instead of on your provider's shipped default.\n\n"
             "**Clearing.** *Clear...* takes one group of settings, or all of them, back to Platform default.\n\n"
@@ -205,7 +205,7 @@ HELP_CATEGORIES = {
             "There is no Save button. A choice is written when you make it."
         ),
         "Core Sampling": (
-            "At `/profile manage` -> **Params** -> Set Generation Parameters.\n\n"
+            "At `/profile manage` -> **Params** -> Generation Parameters.\n\n"
             "• **Temperature (0.0 - 2.0):** overall randomness. Around 0.3 is analytical and predictable; around 1.5 is chaotic and inventive. "
             "Most roleplay sits between 0.8 and 1.2.\n"
             "• **Top K:** hard-limits the pool to the K most likely next tokens, cutting off the tail of nonsense.\n"
@@ -214,7 +214,7 @@ HELP_CATEGORIES = {
             "Short-Term Memory is set on the Memory tab -- see *The Three Layers*."
         ),
         "Advanced Sampling and Penalties": (
-            "At `/profile manage` -> **Params** -> Set Advanced Parameters. These are honoured by OpenRouter models; Google models ignore them, so the row appears only once the profile's response models can leave Google.\n\n"
+            "At `/profile manage` -> **Params** -> Advanced Parameters. These are honoured by OpenRouter models; Google models ignore them, so the row appears only once the profile's response models can leave Google.\n\n"
             "• **Min P (0.0 - 1.0):** an adaptive floor scaled to the top token's confidence. If the best token is at 50% and Min P is 0.1, "
             "anything under 5% is dropped. It generally holds coherence better than Top P at high temperature.\n"
             "• **Top A (0.0 - 1.0):** truncates based on the square of the top token's probability -- prunes hard when the model is confident, "
@@ -238,7 +238,7 @@ HELP_CATEGORIES = {
         "The Three Layers": (
             "**Short-Term Memory** is the running conversation. One shared transcript per session; each profile's view is derived from it at "
             "generation time, so private turns stay private. Depth is the profile's STM Length (0 - 200, 50 for a new profile), at "
-            "`/profile manage` -> **Memory** -> **Set STM Parameters**. Higher is more coherent and more expensive; very high values can "
+            "`/profile manage` -> **Memory** -> **STM Parameters**. Higher is more coherent and more expensive; very high values can "
             "dilute the model's adherence to its instructions. `/refresh` clears it for the channel without touching anything persistent.\n\n"
             "**Always Read Synopsis**, on the same form and on by default, has the profile read a session's rolling synopsis however far "
             "back it was written. Off, it reads the synopsis only while it is still inside its STM, like any other turn -- which changes "
@@ -388,7 +388,7 @@ HELP_CATEGORIES = {
             "• **Legacy RAG** -- the old behaviour. Before *every* round, a background model is shown the conversation and asked "
             "whether a search would help; it usually says no, and you pay for the question either way.\n\n"
             "Prefer **RAG**. The two differ in who decides, not in what searching costs when it happens.\n\n"
-            "This grounds replies only. Images have their own **Search grounding** in Images -> Set Image Output."
+            "This grounds replies only. Images have their own **Search grounding** in Images -> Image Output."
         ),
         "URL Context": (
             "`/profile manage` -> **Tools** -> URL Context Fetching. Also **OFF**, **NATIVE** or **RAG**.\n\n"
@@ -407,9 +407,9 @@ HELP_CATEGORIES = {
             "**Self-portraits:** if the prompt asks for a picture of the character, its Appearance text is injected into the image prompt "
             "automatically, so it looks consistent between generations.\n\n"
             "**Edits:** reply to an existing image with `!image` and a new instruction to iterate on it.\n\n"
-            "**Model** (Params -> Set Models -> Image Generation) is a Gemini image model on the Google tab, or one of OpenRouter's image models "
+            "**Model** (Params -> Models -> Image Generation) is a Gemini image model on the Google tab, or one of OpenRouter's image models "
             "-- FLUX, GPT Image, Seedream and others -- on the OpenRouter tab, each priced per image, megapixel or token.\n\n"
-            "**Output** (`/profile manage` -> Images -> Set Image Output) sets aspect ratio, resolution, quality, thinking level and search "
+            "**Output** (`/profile manage` -> Images -> Image Output) sets aspect ratio, resolution, quality, thinking level and search "
             "grounding. Only the options the profile's image model accepts are offered -- quality is OpenRouter's, thinking and web search "
             "Gemini's -- and 4K, where offered, can exceed an unboosted server's 20 MB upload limit: an image that does is paid for and reported as failed rather than posted.\n\n"
             "**Search grounding on an image** looks things up before the picture is drawn, separately from the profile's own Grounding, "
@@ -418,7 +418,7 @@ HELP_CATEGORIES = {
             "*RAG*, where the character does the searching itself. *Web search* lets a Gemini model look facts up itself (a current logo, today's weather), and "
             "*Web + image search* also pulls real photographs off the web as visual reference. 3.1 Flash Image carries both, 3 Pro Image web "
             "search only, and the Lite and 2.5 models neither.\n\n"
-            "**Sampling** (Images -> Set Image Sampling) sets temperature, Top P and Top K for the image model specifically -- separate keys from "
+            "**Sampling** (Images -> Image Sampling) sets temperature, Top P and Top K for the image model specifically -- separate keys from "
             "the text profile's. Blank sends nothing, which is the right answer for most profiles: Google asks that the Gemini 3 family be left "
             "at its default temperature.\n\n"
             "**Gemini image models require a paid-tier Google key** -- Google blocks them on free-tier keys entirely. OpenRouter image models "
@@ -428,9 +428,9 @@ HELP_CATEGORIES = {
             "TTS is a generative model, not a synthesiser reading text -- so it is directed with description rather than tuned with sliders.\n\n"
             "**Director's Desk** (`/profile manage` -> Audio -> TTS Instructions) takes plain English: **Archetype** ('a grizzled detective'), "
             "**Accent** ('standard British'), **Dynamics** ('whispering in a cavern'), **Pacing and Style** ('rapid, with a subtle smile').\n\n"
-            "**Voice** (Audio -> Choose TTS Voice) offers the voices of the profile's speech model. On a Gemini model that is all thirty prebuilt voices, grouped by gender and described by Google's own "
-            "one-word character -- Kore is firm and female, Enceladus breathy and male, Sulafat warm and female; on an OpenRouter model, the voices that model lists. **Set Speech Settings** holds the on/off switch, temperature and speed, and **Set TTS Language** pins the language a Gemini voice speaks; keep temperature "
-            "near default, since far from it produces audible artefacts. The speech model itself is under Set Models, on Google or OpenRouter. "
+            "**Voice** (Audio -> TTS Voice) offers the voices of the profile's speech model. On a Gemini model that is all thirty prebuilt voices, grouped by gender and described by Google's own "
+            "one-word character -- Kore is firm and female, Enceladus breathy and male, Sulafat warm and female; on an OpenRouter model, the voices that model lists. **Speech Settings** holds the on/off switch, temperature and speed, and **TTS Language** pins the language a Gemini voice speaks; keep temperature "
+            "near default, since far from it produces audible artefacts. The speech model itself is under Models, on Google or OpenRouter. "
             "An OpenRouter speech model is sent the reply alone, with a speed if one is set: the Director's Desk, temperature and language reach Gemini models only.\n\n"
             "**Audio tags** steer delivery mid-line: `[whispers]`, `[shouting]`, `[laughs]`, `[sighs]`. There is no fixed list. On OpenRouter only Fish Audio S2 and Qwen Audio 3.0 are sent them, and no model there is sent an action standing as its own sentence ('*sighs* Fine.'), so neither is read out as words.\n\n"
             "**Session audio** (`/session config` -> Config -> Text-to-Speech) voices a channel: while it is on, each reply from a character "
@@ -450,7 +450,7 @@ HELP_CATEGORIES = {
             "behaves as `Off`."
         ),
         "Anti-Repetition Critic": (
-            "`/profile manage` -> **Tools** -> Configure Anti-Repetition Critic.\n\n"
+            "`/profile manage` -> **Tools** -> Anti-Repetition Critic.\n\n"
             "Before a reply is sent, recent output is screened for structural repetition -- the same opening phrase every turn, the same "
             "sentence rhythm, a verbatim loop. If a pattern is found, a negative constraint goes into the prompt banning it for the coming turn.\n\n"
             "**Mode.** `lexical` runs only the local n-gram scan: no extra API call, no added latency, and it catches verbatim loops and "
@@ -460,7 +460,7 @@ HELP_CATEGORIES = {
             "repetition a multi-profile roleplay actually falls into: four characters converging on one rhythm, none of them individually looping.\n\n"
             "**Strictness** sets how short a repeated phrase has to be before it counts. **Lookback** is how many turns are read back through. "
             "**Persistence** is how many further rounds a constraint stays in force after the round that earned it.\n\n"
-            "The prompt itself is editable per profile at **Tools** -> Set Critic Instructions, a row shown in Full mode only: Lexical sends no prompt. Leave it blank to follow the bot-wide prompt."
+            "The prompt itself is editable per profile at **Tools** -> Critic Instructions, a row shown in Full mode only: Lexical sends no prompt. Leave it blank to follow the bot-wide prompt."
         ),
         "Neuro-Endocrine Engine": (
             "`/profile manage` -> **Tools** -> Neuro-Endocrine Engine.\n\n"
@@ -476,7 +476,7 @@ HELP_CATEGORIES = {
             "scores for up to 100 people, forgetting whoever it updated longest ago, and **Reset bonds** clears them."
         ),
         "Time Awareness": (
-            "Every profile knows the time. `/profile manage` -> **Tools** -> Set Timezone gives it an IANA timezone "
+            "Every profile knows the time. `/profile manage` -> **Tools** -> Timezone gives it an IANA timezone "
             "(`Australia/Sydney`, `Europe/London`); until you set one it runs on UTC.\n\n"
             "The profile's local time is injected as `<current_time>`, and every message in history carries a timestamp. Together these give the "
             "character a real sense of when things happened -- that it is late at night where it is, or that you have not spoken in three days. "
@@ -484,7 +484,7 @@ HELP_CATEGORIES = {
         ),
         "Birthdays": (
             "A character can have a birthday, and so can you.\n\n"
-            "**The character's**: `/profile manage` -> **Persona** -> Set Birthday. Day and month, and a year if you want it to have an age "
+            "**The character's**: `/profile manage` -> **Persona** -> Birthday. Day and month, and a year if you want it to have an age "
             "to turn. It belongs to the character, so anyone borrowing the profile gets the same one.\n\n"
             "**Yours**: `/settings` -> About Me -> Set Birthday. Day and month only; no year is kept.\n\n"
             "The day before, on the day and the day after, the character is told in `<birthday_context>` -- its own birthday going by its "
@@ -694,8 +694,8 @@ WIZARD_COPY = {
     "provider_none": (
         "**None chosen, so no models are set for you.** You still need an OpenRouter or Google key: "
         "the next step takes either. New profiles start with no models, so choose the ones they "
-        "should start on in `/settings` → Override Defaults → Set Models, or per profile in "
-        "`/profile manage` → Set Models."
+        "should start on in `/settings` → Override Defaults → Models, or per profile in "
+        "`/profile manage` → Models."
     ),
     # One per provider: the step says only what the provider chosen before it needs.
     "key": {
@@ -817,14 +817,14 @@ WIZARD_TOUR = {
         "**Long-term** is summarised memories retrieved by relevance. `/memorise` forces summarisation right now "
         "rather than waiting for the interval.\n\n"
         "**Training examples** are input/output pairs teaching a character how to phrase things. Write them in "
-        "`/profile manage` → **Training** → Manage Training Examples."
+        "`/profile manage` → **Training** → Training Examples."
     ),
     "Pictures and voice": (
         "Turn them on per character in `/profile manage` → **Images** → Image Generation, and "
-        "→ **Audio** → Set Speech Settings.\n\n"
+        "→ **Audio** → Speech Settings.\n\n"
         "Then `!image` and `!imagine` in a channel produce pictures, and a TTS-enabled character speaks its rounds "
         "aloud. Both run on Gemini or OpenRouter models, whatever model the character thinks on.\n\n"
-        "Images can also search the web for reference photographs first — `/profile manage` → Images → Set Image Output."
+        "Images can also search the web for reference photographs first — `/profile manage` → Images → Image Output."
     ),
     "When something is wrong": (
         "`/help` puts **MimicGuide** into the channel, where it answers questions about the bot from its own "
@@ -895,17 +895,17 @@ DEFAULT_HELP_DOCS = {
     ),
     "profiles/default_settings.txt": (
         "Command: `/settings` -> Override Defaults, open once `/start` has set you up. Sets standing preferences applied to profiles created afterwards and offered on borrows. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
-        "Provider: The Provider button beside Clear steps through Google, OpenRouter and None. Google and OpenRouter ship their models to new profiles; None ships none, so a new profile starts on the models set here under Set Models, and any slot left on 'Platform default' starts with no model. Set Models opens on the chosen provider's models.\n"
+        "Provider: The Provider button beside Clear steps through Google, OpenRouter and None. Google and OpenRouter ship their models to new profiles; None ships none, so a new profile starts on the models set here under Models, and any slot left on 'Platform default' starts with no model. Models opens on the chosen provider's models.\n"
         "Scope: Nearly every setting a profile has. The screen is the profile dashboard's own tabs (Params, Tools, Images, Audio, Memory, Training, Misc) and rows, and choosing a row opens the same form `/profile bulk manage` opens for it, so a setting reachable in bulk is reachable as a default. What is not: a persona, an instruction block, the LTM summarisation or critic prompts and the image-generation prompt (a borrow stores no prompts, so a default one would never be read), a content rating, and the neuro engine's live hormone levels. A row that has to leave part of what you entered behind says so on the panel it returns to.\n"
-        "Models: Set Models on the Params tab covers all twelve slots across the six categories (Response, Image, TTS, Grounding, Anti-Repetition Critic, LTM Summariser). Each slot has its own 'Platform default' option, which clears it.\n"
+        "Models: Models on the Params tab covers all twelve slots across the six categories (Response, Image, TTS, Grounding, Anti-Repetition Critic, LTM Summariser). Each slot has its own 'Platform default' option, which clears it.\n"
         "Clearing: 'Clear...' takes one group of settings, or everything, back to Platform default. Blanking a box inside a form clears that one setting the same way.\n"
         "Platform default: Any setting left on 'Platform default' follows the value the bot ships and keeps following it if that value changes in a later version. Selecting the same model by hand pins it instead.\n"
         "Saving: Values are written the moment they are chosen. This tab has no Save button, unlike the API Keys tab which requires Save Assignments.\n"
         "Borrowed profiles: Borrowing asks whether to use your defaults or keep the author's; nothing is asked when yours would change nothing. Your provider's models and your defaults for models, memory, timezone and toggles apply to borrows. Defaults for temperature, Top P, Top K, advanced OpenRouter sampling, TTS voice, placeholder emoji, custom error message and the Director's Desk apply only to profiles you create, because on a borrow those belong to the author -- bar the error message, which a borrow starts without: the author's is never copied, since no content rating checks it. Set your own under Misc. Persona and instructions can never be defaulted or edited locally at all.\n"
         "Provider rescue: If a borrowed profile names a provider you hold no key for, its model slots are repointed to the bot defaults at borrow time and you are told which ones. This only happens when you do hold a key for the replacement; if you hold neither, the author's choice is left alone.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'I set a default but my existing profiles did not change.' Fix: Defaults only apply to profiles made or borrowed afterwards. Use `/profile bulk manage` -> Set Models to change profiles you already have.\n"
-        "- Symptom: 'This profile has no model set.' Fix: Your provider is None, or it was made before you chose one. Set its models in `/profile manage` -> Params -> Set Models, and set the ones new profiles start on here under Set Models.\n"
+        "- Symptom: 'I set a default but my existing profiles did not change.' Fix: Defaults only apply to profiles made or borrowed afterwards. Use `/profile bulk manage` -> Models to change profiles you already have.\n"
+        "- Symptom: 'This profile has no model set.' Fix: Your provider is None, or it was made before you chose one. Set its models in `/profile manage` -> Params -> Models, and set the ones new profiles start on here under Models.\n"
         "- Symptom: 'A profile I borrowed is using a different model than the library showed.' Fix: Either your default replaced it, or it named a provider you have no key for and was repointed. The bot sends a message saying which at borrow time. Change it in `/profile manage`.\n"
         "- Symptom: 'My default temperature was ignored on a borrowed profile.' Fix: That is deliberate. Sampling is part of how a character was tuned, so a borrow keeps the author's values. Set it on that profile directly.\n"
         "- Symptom: 'I want to stop using a default.' Fix: Choose 'Platform default' on that row. That is different from selecting the shipped value by hand, which pins it."
@@ -1001,13 +1001,13 @@ DEFAULT_HELP_DOCS = {
     ),
     "apis/openrouter.txt": (
         "Requirements: An OpenRouter API Key submitted via `/start` or `/settings` -> API Keys.\n"
-        "MimicAI Auto: In Set Models -> Response, the OpenRouter tab's Browse dropdown lists up to three tiers first -- Auto · Free, Auto · Budget and Auto · Recommended -- each a Primary and a Fallback the bot owner picks in `/mod` and can change at any time. A profile on a tier runs whatever it names from its next reply, sent with the host and service tier the owner set for it rather than the profile's own Hosts & Tier. New profiles on OpenRouter start on Auto · Free, and a tier the owner has left empty is not offered. Choosing a tier sets the Primary and the Fallback; the Fallback can then be changed on its own. `/settings` -> Override Defaults, having no Browse dropdown, lists the tiers in the model dropdowns.\n"
+        "MimicAI Auto: In Models -> Response, the OpenRouter tab's Browse dropdown lists up to three tiers first -- Auto · Free, Auto · Budget and Auto · Recommended -- each a Primary and a Fallback the bot owner picks in `/mod` and can change at any time. A profile on a tier runs whatever it names from its next reply, sent with the host and service tier the owner set for it rather than the profile's own Hosts & Tier. New profiles on OpenRouter start on Auto · Free, and a tier the owner has left empty is not offered. Choosing a tier sets the Primary and the Fallback; the Fallback can then be changed on its own. `/settings` -> Override Defaults, having no Browse dropdown, lists the tiers in the model dropdowns.\n"
         "Capabilities: Allows users to access non-Google models like Anthropic's Claude, Meta's Llama, DeepSeek and xAI's Grok. OpenRouter models are also the only ones that honour the advanced sampling parameters (Min P, Top A, and the frequency, presence and repetition penalties).\n"
         "Cost and free models: One key covers every model, billed per token from an OpenRouter credit balance. Some models cost nothing to run -- DeepSeek V4 0731, and OpenRouter's own Free Models Router, which routes to a free model for you -- and they are supported like any other, including as a fallback model. Free or paid, you are only offered models some host is known to serve without training on what it is sent, so a free model here is not paying for itself with your conversations. This is why OpenRouter is the provider to connect first; add Google Gemini for Gemini's speech and image models.\n"
         "Web search and links: Native Grounding and URL Context on OpenRouter use OpenRouter's own web search and fetch tools. The model searches or opens a link when it decides to, through its provider's own search where it has one and Exa otherwise, and each search is billed to the OpenRouter balance. RAG and Legacy RAG search on the Grounding Summariser's model, which ships as DeepSeek for anyone who prefers OpenRouter.\n"
-        "Image models: OpenRouter's image models (FLUX, GPT Image, Seedream and others) generate pictures through a separate image endpoint. Choose one in Set Models -> Image Generation with the API button on OpenRouter; Set Image Output then offers only the ratios, resolutions and quality levels that model takes. Only models with a single host are listed, so the bot can check that host against a server's data policy.\n"
-        "Speech models: OpenRouter's speech models (Voxtral, Aura, MiniMax Speech and others) speak through a separate speech endpoint. Choose one in Set Models -> TTS Generation with the API button on OpenRouter; Choose TTS Voice then offers that model's own voices. They are sent the reply alone, so the Director's Desk and speech temperature do not reach them, and their audio arrives as MP3. Only models with a single host are listed, as for images.\n"
-        "Choosing a model: In `/profile manage` -> Params -> Set Models, switch the API button to OpenRouter. A Browse dropdown lists Most Popular (the models used most on this bot), Trending (biggest climbers in OpenRouter's rankings over the past week), Cheapest, and then every model author A-Z. The model dropdowns page through whatever is chosen, and every option shows its price per million tokens, context size, and whether it has zero-retention hosts (🔒 ZDR), sees images (👁) or is moderated (🛡). A model no host is known to serve without training on prompts is offered to the bot's owner alone. The list refreshes daily from OpenRouter. `/settings` -> Override Defaults pages through Most Popular without the Browse dropdown.\n"
+        "Image models: OpenRouter's image models (FLUX, GPT Image, Seedream and others) generate pictures through a separate image endpoint. Choose one in Models -> Image Generation with the API button on OpenRouter; Image Output then offers only the ratios, resolutions and quality levels that model takes. Only models with a single host are listed, so the bot can check that host against a server's data policy.\n"
+        "Speech models: OpenRouter's speech models (Voxtral, Aura, MiniMax Speech and others) speak through a separate speech endpoint. Choose one in Models -> TTS Generation with the API button on OpenRouter; TTS Voice then offers that model's own voices. They are sent the reply alone, so the Director's Desk and speech temperature do not reach them, and their audio arrives as MP3. Only models with a single host are listed, as for images.\n"
+        "Choosing a model: In `/profile manage` -> Params -> Models, switch the API button to OpenRouter. A Browse dropdown lists Most Popular (the models used most on this bot), Trending (biggest climbers in OpenRouter's rankings over the past week), Cheapest, and then every model author A-Z. The model dropdowns page through whatever is chosen, and every option shows its price per million tokens, context size, and whether it has zero-retention hosts (🔒 ZDR), sees images (👁) or is moderated (🛡). A model no host is known to serve without training on prompts is offered to the bot's owner alone. The list refreshes daily from OpenRouter. `/settings` -> Override Defaults pages through Most Popular without the Browse dropdown.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Trending is empty' or 'Trending needs a second day'. Fix: Trending compares daily snapshots of OpenRouter's rankings, so it fills in over the first week after the bot starts.\n"
         "- Symptom: 'The model I want is not listed.' Fix: The list holds the text models OpenRouter currently lists, refreshed daily. Use Custom Model... and type its id if it is newer than the last refresh. A model no host is known to serve without training on prompts is offered to the bot's owner alone, typed or picked.\n"
@@ -1034,7 +1034,7 @@ DEFAULT_HELP_DOCS = {
     "apis/ollama.txt": (
         "Availability: Only this bot's owner -- the person running the instance -- can use Ollama models. An Ollama host receives every message a profile sees, so it has to be the operator's own machine. Everyone else sees Google and OpenRouter only.\n"
         "Requirements: Ollama installed on your local machine, and the specific model downloaded via your terminal (e.g., `ollama run llama3`).\n"
-        "Setup (bot owner): Go to `/profile manage` -> Params -> Set Models. Click the 'API' button until it says 'Ollama'. Click 'Set Host URL'.\n"
+        "Setup (bot owner): Go to `/profile manage` -> Params -> Models. Click the 'API' button until it says 'Ollama'. Click 'Set Host URL'.\n"
         "Cost: Ollama models run on your own hardware and cost nothing per message. They cannot generate images or speech, cannot carry a function declaration, and must use Legacy RAG for Grounding and RAG mode for URL Context.\n"
         "Remote Hosting: If your Discord bot is hosted on a cloud server, it cannot see your home PC's 127.0.0.1 address. You MUST expose your local Ollama port using a secure SSH tunnel (e.g., `ssh -R 80:localhost:11434 nokey@localhost.run`) and paste the resulting HTTPS link into the Host URL setting.\n"
         "Troubleshooting / Symptoms:\n"
@@ -1052,7 +1052,7 @@ DEFAULT_HELP_DOCS = {
         "- 404 (Model Not Found): The selected model has been deprecated or renamed by the provider.\n"
         "- 413 (File Too Large): An attachment exceeded what the provider accepts.\n"
         "- Empty Response: The model returned no text, most often a silent safety block.\n"
-        "Failover Protocol: When a request fails, the bot temporarily marks the key as cooling down and immediately redirects the payload to your designated Fallback Model. Setting a cheap, reliable fallback at `/profile manage` -> Params -> Set Models -- on the other provider, if you hold keys for both -- is what keeps a profile alive through an outage.\n"
+        "Failover Protocol: When a request fails, the bot temporarily marks the key as cooling down and immediately redirects the payload to your designated Fallback Model. Setting a cheap, reliable fallback at `/profile manage` -> Params -> Models -- on the other provider, if you hold keys for both -- is what keeps a profile alive through an outage.\n"
         "Stalls: A primary model that has not answered in three times its usual time (at least 45 seconds, at most 3 minutes; 90 seconds for a model the bot has not timed yet) has the Fallback Model started beside it. Whichever answers first is posted and the other is cancelled, so a hung host costs a minute or two rather than four. Both requests may be billed.\n"
         "Custom wording: `/profile manage` -> Misc -> Custom Error Message sets what users see when generation fails.\n"
         "Troubleshooting / Symptoms:\n"
@@ -1071,7 +1071,7 @@ DEFAULT_HELP_DOCS = {
         "Settle Window: How long a round waits before it reads the channel, so several quick messages -- from one person or several -- get one reply instead of one each. The replying character's placeholder is already up while it waits. Quiet gap (0-10 seconds, default 3) is how long the channel must be quiet after the last message; 0 starts the round at once. Maximum wait (up to 30, default 8) caps the wait while messages keep arriving. Typing wait (0-30, default 15, 0 for off) is how long the first person typing can hold the round so a follow-up still being written makes it in. Who answers is decided by the message that opened the round. Messages sent while a character is replying always go into the next round together. Reset to Defaults clears all three.\n"
         "Seating versus starting: choosing a profile on the Cast tab seats it immediately -- it appears on the Reactivity tab and can have its chance and wakewords set straight away, with no button press in between. It does not make the channel live. Until 'Start / Update Session' is pressed the session is a draft: the footer reads 'Draft', ordinary messages pass through untouched and the AI Director stays quiet. The button, on every tab, starts it -- saving the configuration and loading the transcript. Pressing it again on a live session re-saves it.\n"
         "An empty cast is allowed. A started session with nobody in it keeps its transcript, Master Prompt and settings and simply has no one to answer, which is what 'Clear Cast' leaves behind. `/suspend` is what ends a session outright.\n"
-        "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory -- except a profile with Always Read Synopsis off (its Memory tab, Set STM Parameters), which reads the synopsis only while it is inside its own STM. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time and the synopsis length (100-800 words, 220 by default). 'Summariser Model…' opens Set Models for its Primary and Fallback, and there is no third. Until you choose, it runs its own defaults for the session owner's provider: Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.1 Flash-Lite then 3.5 Flash-Lite on Google. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it. To fold now rather than wait, run `/compact` (or press Compact Now): everything but the newest 10 turns (`keep` sets how many) goes into the synopsis, including the pages people linked and the files they pasted, and the Rolling Synopsis is switched on if it was off. `/compact undo:True` (or Uncompact) unfolds every turn and removes the synopsis; while the Rolling Synopsis stays on, it starts folding again once the session is past its trigger.\n"
+        "Rolling Synopsis (Compaction tab): once a conversation reaches 50 public turns, the oldest 25 are folded into one running synopsis that every participant is given with each reply, so a long scene keeps its thread after it scrolls out of Short-Term Memory -- except a profile with Always Read Synopsis off (its Memory tab, STM Parameters), which reads the synopsis only while it is inside its own STM. Sessions created now start with it on; a session made before keeps what it had. 'Edit Settings' sets when it folds, how many turns go each time and the synopsis length (100-800 words, 300 by default). The synopsis is a short retelling followed by a list of Standing facts (debts, promises, secrets, names, who holds what), which each fold carries forward instead of retelling them. 'Summariser Model…' opens Models for its Primary and Fallback, and there is no third. Until you choose, it runs its own defaults for the session owner's provider: Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.1 Flash-Lite then 3.5 Flash-Lite on Google. Turning it off puts the folded turns back into the prompt and stops sending the synopsis. Whispers are never summarised, and a folded turn is only left out of the prompt -- the transcript, regeneration and `/session audit` still have it. To fold now rather than wait, run `/compact` (or press Compact Now): everything but the newest 10 turns (`keep` sets how many) goes into the synopsis, including the pages people linked and the files they pasted, and the Rolling Synopsis is switched on if it was off. `/compact undo:True` (or Uncompact) unfolds every turn and removes the synopsis; while the Rolling Synopsis stays on, it starts folding again once the session is past its trigger.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'I configured a session but nothing happens.' Fix: Press 'Start / Update Session'. Seating a cast does not start it -- check the footer, which reads 'Draft' until you do.\n"
         "- Symptom: 'Select All did not clear everything.' Fix: The Select All and Unselect All options only affect the source currently shown; 'Clear Cast' empties every source.\n"
@@ -1124,7 +1124,7 @@ DEFAULT_HELP_DOCS = {
     "sessions/proactivity_and_director.txt": (
         "Setup: Enabled via `/session config` -> Proactivity.\n"
         "Mechanism: When Proactivity is active, an asynchronous system loop monitors the channel. Each time the channel has been quiet for the Cooldown, the Trigger Chance (0-100%) is rolled once, and any message starts the wait over. When a roll hits, the cast starts talking with no user message at all; in an empty channel it keeps going (10% every 5 minutes is about 29 rounds a day).\n"
-        "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Its Primary and Fallback are chosen at `/session config` -> Proactivity -> Director Model, which works like Set Models and has the Director's on/off switch; until you choose, it runs the LTM Summariser's models. It falls back to the next model if the first is busy. Blank instructions (Edit Settings & AI Director) use the default wording.\n"
+        "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Its Primary and Fallback are chosen at `/session config` -> Proactivity -> Director Model, which works like Models and has the Director's on/off switch; until you choose, it runs the LTM Summariser's models. It falls back to the next model if the first is busy. Blank instructions (Edit Settings & AI Director) use the default wording.\n"
         "Payload: This scene update is injected as an <internal_note> directly to the cast list, forcing the AI characters to dynamically react to the new situation autonomously.\n"
         "Cost: Proactive rounds consume API quota without anyone prompting them, and the Director is an extra call on top. Start with a low chance and a long cooldown.\n"
         "Troubleshooting / Symptoms:\n"
@@ -1192,7 +1192,7 @@ DEFAULT_HELP_DOCS = {
     # --- MEMORY ---
     "memory/stm_buffer.txt": (
         "Concept: Short-Term Memory (STM) is the running conversation buffer. The session keeps one shared transcript, and each participant's view is derived from it at generation time, so private turns stay visible only to the profile they involved.\n"
-        "Limits: STM Length defines how many previous conversational turns are appended to the context window (0-200; a new profile starts at 50). Set it at `/profile manage` -> Memory -> Set STM Parameters.\n"
+        "Limits: STM Length defines how many previous conversational turns are appended to the context window (0-200; a new profile starts at 50). Set it at `/profile manage` -> Memory -> STM Parameters.\n"
         "Synopsis: 'Always Read Synopsis', on the same form and on by default, has the profile read a session's rolling synopsis however far back it is. Off, the synopsis is read only while it is inside the profile's STM, like any other turn. That changes nothing unless the STM is shorter than the session's Compaction trigger (50 turns by default).\n"
         "Tradeoff: A longer buffer is more coherent and more expensive, and a very long one can dilute the model's adherence to its persona and instructions.\n"
         "Command: `/refresh` clears the buffer for the channel without deleting anything persistent.\n"
@@ -1209,10 +1209,10 @@ DEFAULT_HELP_DOCS = {
         "Memory Search: Retrieval above is automatic and searches on the turn's own wording. Turning on 'Memory Search' also lets the character run its own search, with a query it writes, when a reply needs something it cannot see -- which finds what the turn's wording would miss. While it is on the automatic pass tightens to its surest matches and the rest is reached by asking, so the stored Relevance Threshold applies again the moment it goes off. It costs one extra model request on the turns it actually searches, and needs a Google or OpenRouter model.\n"
         "Keys: Embedding uses the server's Google key, or its OpenRouter key when there is none or the Google request fails. Both ask for the same Google model, so one archive holds memories embedded either way.\n"
         "Where a memory applies: Every memory belongs to the server it formed in and is recalled only there. A profile used in several servers keeps a separate archive per server, and none of them reach global chat.\n"
-        "Management: `/profile manage` -> Memory -> Manage Long-Term Memories. Choose a server first -- memories are listed one server at a time, since that is the only place each is recalled -- then open, edit or delete them ten to a page, or several at once. 'Test recall' shows which memories a phrase would match and how closely, against the profile's Relevance Threshold. Tune recall with 'Set LTM Parameters', and rewrite the summarisation instruction with 'Set LTM Summarization Prompt', shown while Auto-Creation is on; leave it blank for the default.\n"
+        "Management: `/profile manage` -> Memory -> Long-Term Memories. Choose a server first -- memories are listed one server at a time, since that is the only place each is recalled -- then open, edit or delete them ten to a page, or several at once. 'Test recall' shows which memories a phrase would match and how closely, against the profile's Relevance Threshold. Tune recall with 'LTM Parameters', and rewrite the summarisation instruction with 'LTM Summarization Prompt', shown while Auto-Creation is on; leave it blank for the default.\n"
         "Manual trigger: `/memorise` in a session channel forces summarisation immediately for the whole cast (administrators) or one named profile (its owner), rather than waiting for the Creation Interval.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'The profile keeps bringing up irrelevant old events.' Fix: Raise the LTM Relevance Threshold in Set LTM Parameters before deleting memories.\n"
+        "- Symptom: 'The profile keeps bringing up irrelevant old events.' Fix: Raise the LTM Relevance Threshold in LTM Parameters before deleting memories.\n"
         "- Symptom: 'The profile never remembers anything.' Fix: Check Auto-Creation AND Auto-Recall are on in Memory Settings -- a new profile has both off -- then that the Creation Interval is not set very high and the Relevance Threshold is not too strict.\n"
         "- Symptom: 'Memories are not being created.' Fix: Summarisation needs a working API key on the server. Check `/settings` -> API Keys.\n"
         "- Symptom: 'I want a memory formed right now instead of waiting for the interval.' Fix: Run `/memorise`."
@@ -1221,14 +1221,14 @@ DEFAULT_HELP_DOCS = {
         "Concept: Training Examples are explicit input-output pairs you author by hand to dictate a profile's voice, formatting and tone. Maximum 100 per profile.\n"
         "Retrieval: They are not all injected. Each is embedded, and your current message is matched against the library; only examples clearing the relevance threshold are injected for that turn. A large library therefore stays cheap.\n"
         "Best use: Situational voice -- how the character greets someone, reacts to an insult, or handles a question it cannot answer.\n"
-        "Fixed examples: `/profile manage` -> Training -> Manage Fixed Examples holds up to 20 examples that go out with every reply instead of being matched, so they suit the character's everyday voice. What someone says before the reply is optional: a reply on its own is a sample of how the character talks. Each one is paid for on every reply, at the cheaper cached rate once the prompt is cached. A character card's example dialogue is imported as fixed examples. Like the lorebook, they are part of what the content rating judges.\n"
-        "Management: `/profile manage` -> Training -> Manage Training Examples. 'Test match' shows which examples a message would pull in and how closely. 'Analyse' opens the profile's Training Analysis models, which Set Models also holds -- Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.5 Flash-Lite then 3.1 Flash-Lite on Google, until you choose others -- and 'Analyse…' there writes a style guide from the newest examples, which Training -> Style Guide shows, turns on or off, and regenerates. Tune matching with 'Set Training Parameters'.\n"
+        "Fixed examples: `/profile manage` -> Training -> Fixed Examples holds up to 20 examples that go out with every reply instead of being matched, so they suit the character's everyday voice. What someone says before the reply is optional: a reply on its own is a sample of how the character talks. Each one is paid for on every reply, at the cheaper cached rate once the prompt is cached. A character card's example dialogue is imported as fixed examples. Like the lorebook, they are part of what the content rating judges.\n"
+        "Management: `/profile manage` -> Training -> Training Examples. 'Test match' shows which examples a message would pull in and how closely. 'Analyse' opens the profile's Training Analysis models, which Models also holds -- Claude Haiku 5.5 then OpenRouter's free router on OpenRouter, Gemini 3.5 Flash-Lite then 3.1 Flash-Lite on Google, until you choose others -- and 'Analyse…' there writes a style guide from the newest examples, which Training -> Style Guide shows, turns on or off, and regenerates. Tune matching with 'Training Parameters'.\n"
         "Availability: Training Examples belong to the profile owner. They cannot be edited on a borrowed profile.\n"
-        "Reaction capture: `/train` is switched off. It could store other people's messages on your profile where they could neither see nor delete them. Examples are written on the Manage Training Examples screen.\n"
+        "Reaction capture: `/train` is switched off. It could store other people's messages on your profile where they could neither see nor delete them. Examples are written on the Training Examples screen.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'My training examples never seem to apply.' Fix: Try the message in 'Test match' to see its scores, then lower the relevance threshold in Set Training Parameters, or rewrite the example input to resemble how users actually phrase things.\n"
+        "- Symptom: 'My training examples never seem to apply.' Fix: Try the message in 'Test match' to see its scores, then lower the relevance threshold in Training Parameters, or rewrite the example input to resemble how users actually phrase things.\n"
         "- Symptom: 'The character copies my examples word for word.' Fix: Provide several varied examples for the same situation rather than one, and raise temperature slightly.\n"
-        "- Symptom: 'Reacting 1️⃣/2️⃣ does nothing' or 'There is no /train command.' Fix: Reaction capture is switched off. Add the example on the Manage Training Examples screen instead."
+        "- Symptom: 'Reacting 1️⃣/2️⃣ does nothing' or 'There is no /train command.' Fix: Reaction capture is switched off. Add the example on the Training Examples screen instead."
     ),
     "memory/context_metadata_and_xml.txt": (
         "Concept: MimicAI uses an XML partitioning protocol to keep background technical context isolated from conversational chat. Models separate tagged system data from user speech far more reliably than they separate prose from prose.\n"
@@ -1246,26 +1246,26 @@ DEFAULT_HELP_DOCS = {
         "Self-portraits: The system automatically injects the profile's 'Appearance' text into the image prompt if the request appears to be for a picture of the character itself, keeping it consistent between generations.\n"
         "Editing: Reply to an existing image with `!image` and a new instruction to iterate on that image.\n"
         "Enabling: `/profile manage` -> Images -> Image Generation.\n"
-        "Choosing a model: `/profile manage` -> Params -> Set Models -> Image Generation. The Google tab lists the Gemini image models. The OpenRouter tab lists OpenRouter's image models -- FLUX, GPT Image and Seedream among them -- by Most Popular and by author, each with its price per image, per megapixel or per million tokens. It lists only models that return an image Discord can show, draw without a reference image, and have a single host, which is what lets the bot check that host against a server's data policy. An OpenRouter image model runs on the server's OpenRouter key.\n"
-        "Output settings: `/profile manage` -> Images -> Set Image Output (shown once Image Generation is on) chooses aspect ratio, resolution, quality, thinking level and search grounding. The options offered are only the ones the profile's chosen image model accepts, so the list changes with the model. Leaving a setting on 'Model default' sends no preference at all.\n"
+        "Choosing a model: `/profile manage` -> Params -> Models -> Image Generation. The Google tab lists the Gemini image models. The OpenRouter tab lists OpenRouter's image models -- FLUX, GPT Image and Seedream among them -- by Most Popular and by author, each with its price per image, per megapixel or per million tokens. It lists only models that return an image Discord can show, draw without a reference image, and have a single host, which is what lets the bot check that host against a server's data policy. An OpenRouter image model runs on the server's OpenRouter key.\n"
+        "Output settings: `/profile manage` -> Images -> Image Output (shown once Image Generation is on) chooses aspect ratio, resolution, quality, thinking level and search grounding. The options offered are only the ones the profile's chosen image model accepts, so the list changes with the model. Leaving a setting on 'Model default' sends no preference at all.\n"
         "Resolution: 512, 1K, 2K and 4K, where the model offers them. A 4K render can exceed an unboosted server's 20 MB upload limit; one that does is still paid for, and reported as failed rather than posted. Gemini 3.1 Flash Lite Image renders at 1K only and takes no resolution request at all, so the picker hides the row for it.\n"
         "Search grounding: Set here, separately from the profile's Grounding (Web Search), which grounds replies only. 'Legacy RAG' works with any image model: a background model searches first and its visual summary is added to the image prompt, at one extra call per image. It is named for the chat mode of the same shape -- a gate model in front of the request -- and is a different mechanism from the chat's 'RAG', which is the character calling a search tool itself. 'Web search' attaches Google Search so a Gemini model can look facts up before drawing;'Web + image search' additionally returns real photographs off the web for the model to use as visual reference. Gemini 3.1 Flash Image supports both, Gemini 3 Pro Image web search only, and Gemini 3.1 Flash Lite Image and 2.5 Flash Image neither -- a mode the model does not carry is kept on the profile and left out of the request.\n"
-        "Sampling: `/profile manage` -> Images -> Set Image Sampling (shown once Image Generation is on with a Gemini image model) sets temperature, Top P and Top K for the image model. These are separate from the text profile's Generation Parameters because they go to a different model on a different request. Blank means the field is not sent at all; type '-' to clear one back to blank. Google recommends leaving the Gemini 3 family at its default temperature, so these exist for the profile that has a reason to move them. OpenRouter image models take none of the three.\n"
+        "Sampling: `/profile manage` -> Images -> Image Sampling (shown once Image Generation is on with a Gemini image model) sets temperature, Top P and Top K for the image model. These are separate from the text profile's Generation Parameters because they go to a different model on a different request. Blank means the field is not sent at all; type '-' to clear one back to blank. Google recommends leaving the Gemini 3 family at its default temperature, so these exist for the profile that has a reason to move them. OpenRouter image models take none of the three.\n"
         "Thinking level: Only the Gemini 3 image models take one. HIGH refines the composition before drawing, which is slower and billed for the extra thinking; MINIMAL draws straight away.\n"
         "Quality: Only OpenRouter image models that offer it take one, from low up to max where the model goes that far. Higher quality draws more detail and costs more. Gemini image models have no quality setting.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Paid Key Required' or a Gemini image model fails. Fix: Google blocks its image models on free-tier API keys. A valid billing account must be active in Google AI Studio -- or choose an OpenRouter image model instead.\n"
-        "- Symptom: '!image does nothing.' Fix: Image generation is disabled for that profile, or its image slot holds something that cannot draw, such as a text model. Choose a Google or OpenRouter image model under Set Models -> Image Generation.\n"
+        "- Symptom: '!image does nothing.' Fix: Image generation is disabled for that profile, or its image slot holds something that cannot draw, such as a text model. Choose a Google or OpenRouter image model under Models -> Image Generation.\n"
         "- Symptom: 'No OpenRouter host serves this model without the right to train on prompts.' Fix: The server has not been opened to OpenRouter hosts that may train, and that image model's host is not known to avoid it. Choose another image model; only a self-hosted bot's owner can change a server's data policy, from `/privacy`.\n"
-        "- Symptom: 'My images stopped using web research.' Fix: Images no longer follow the profile's Grounding setting. Set `/profile manage` -> Images -> Set Image Output -> Search grounding to Legacy RAG.\n"
+        "- Symptom: 'My images stopped using web research.' Fix: Images no longer follow the profile's Grounding setting. Set `/profile manage` -> Images -> Image Output -> Search grounding to Legacy RAG.\n"
         "- Symptom: 'The aspect ratio I picked was ignored.' Fix: The profile's image model does not carry that ratio. The setting is kept on the profile and left out of the request rather than failing it, so switching back to a model that supports it restores the setting."
     ),
     "features/speech_tts.txt": (
         "Concept: Text-To-Speech uses a generative audio model, so it is directed with description rather than tuned with sliders.\n"
-        "Configuration: The Director's Desk (`/profile manage` -> Audio -> TTS Instructions, shown once TTS is on with a Gemini speech model, as is Set TTS Language) takes plain English for Vocal Archetype, Accent, Dynamics, and Pacing and Style.\n"
-        "Voice: `/profile manage` -> Audio -> Choose TTS Voice (shown once TTS is on) offers the voices of the profile's speech model. On a Gemini model that is all thirty prebuilt voices, grouped by gender (14 female, 16 male) and described by Google's own one-word character (Kore is firm, Enceladus breathy, Sulafat warm); on an OpenRouter model, the voices that model lists, a page at a time. It is a dropdown rather than a text box because an unrecognised voice name is rejected by the API. A voice the model does not carry, such as one kept from another model, is swapped for the Gemini default or the OpenRouter model's first voice.\n"
-        "Other speech settings: TTS on/off, temperature and speed are at `/profile manage` -> Audio -> Set Speech Settings, and the language at Audio -> Set TTS Language; the speech model is under Set Models, on Google or OpenRouter. Temperature, language and the Director's Desk reach Gemini models only: an OpenRouter speech model is sent the reply alone, as MP3, with the speed if one is set -- and only some hosts, such as OpenAI's, honour speed. Language is Auto-detect unless pinned, and Gemini then reads it from the text. New profiles start at temperature 0.1; a lower temperature produces stable audio, and values far from default cause audible artefacts.\n"
-        "Cloned voice: `/profile voice_sample` gives a profile you own a voice cloned from a short recording -- a clean 10 to 30 seconds of one speaker, up to 1 MB, with an optional transcript of what is said. A profile has 3 slots; choose one with `slot`, or leave it out to fill an empty one. Choose TTS Voice selects which slot the profile speaks with, and only that recording is sent. Only upload your own voice, or one you have the speaker's permission to use. It is stored encrypted with the profile, sent only to speech models that can clone a voice (marked 'clones voices' in the OpenRouter tab), and used by anyone who borrows the profile. Remove a slot's recording from Choose TTS Voice.\n"
+        "Configuration: The Director's Desk (`/profile manage` -> Audio -> TTS Instructions, shown once TTS is on with a Gemini speech model, as is TTS Language) takes plain English for Vocal Archetype, Accent, Dynamics, and Pacing and Style.\n"
+        "Voice: `/profile manage` -> Audio -> TTS Voice (shown once TTS is on) offers the voices of the profile's speech model. On a Gemini model that is all thirty prebuilt voices, grouped by gender (14 female, 16 male) and described by Google's own one-word character (Kore is firm, Enceladus breathy, Sulafat warm); on an OpenRouter model, the voices that model lists, a page at a time. It is a dropdown rather than a text box because an unrecognised voice name is rejected by the API. A voice the model does not carry, such as one kept from another model, is swapped for the Gemini default or the OpenRouter model's first voice.\n"
+        "Other speech settings: TTS on/off, temperature and speed are at `/profile manage` -> Audio -> Speech Settings, and the language at Audio -> TTS Language; the speech model is under Models, on Google or OpenRouter. Temperature, language and the Director's Desk reach Gemini models only: an OpenRouter speech model is sent the reply alone, as MP3, with the speed if one is set -- and only some hosts, such as OpenAI's, honour speed. Language is Auto-detect unless pinned, and Gemini then reads it from the text. New profiles start at temperature 0.1; a lower temperature produces stable audio, and values far from default cause audible artefacts.\n"
+        "Cloned voice: `/profile voice_sample` gives a profile you own a voice cloned from a short recording -- a clean 10 to 30 seconds of one speaker, up to 1 MB, with an optional transcript of what is said. A profile has 3 slots; choose one with `slot`, or leave it out to fill an empty one. TTS Voice selects which slot the profile speaks with, and only that recording is sent. Only upload your own voice, or one you have the speaker's permission to use. It is stored encrypted with the profile, sent only to speech models that can clone a voice (marked 'clones voices' in the OpenRouter tab), and used by anyone who borrows the profile. Remove a slot's recording from TTS Voice.\n"
         "Audio tags: Inline tags in a response steer delivery for that stretch of text -- `[whispers]`, `[shouting]`, `[laughs]`, `[sighs]`, `[excitedly]`, `[sarcastic]`. There is no fixed list; the model interprets what it is given. OpenRouter speech models other than Fish Audio S2 and Qwen Audio 3.0 are sent the reply without them, and every OpenRouter model without an action standing as its own sentence ('*sighs* Fine.'), so neither is read out as words; a stressed word, as in 'I *never* said that', is still spoken.\n"
         "Session audio: `/session config` -> Config -> Text-to-Speech switches voicing on or off for the channel. While it is on, each reply from a character with speech set up carries an audio clip; while it is off, nobody in that channel is voiced.\n"
         "Troubleshooting / Symptoms:\n"
@@ -1291,14 +1291,14 @@ DEFAULT_HELP_DOCS = {
         "RAG Mode (grounding): The character calls a `search_web` function when a reply needs a fact it cannot be sure of, and a background model -- the Grounding Summariser -- runs that one query and reports back. Costs nothing on the turns it does not search, and sends the researcher one query rather than the conversation. Works on Google and OpenRouter models, and the Grounding Summariser can be either.\n"
         "Legacy RAG Mode (grounding): The behaviour RAG used to have. Before every round a background model is given the recent transcript and asked whether a search is warranted; if it says yes it searches and summarises. Costs one extra API call per message whether or not anything is searched.\n"
         "RAG Mode (URL context): The bot fetches the page, strips it to text and injects it as `<document_context>`. Unrelated to the grounding modes above.\n"
-        "Images: Web Grounding applies to replies only. Image generation has its own Search grounding at `/profile manage` -> Images -> Set Image Output: Legacy RAG for any image model, or Web search on a Gemini image model.\n"
+        "Images: Web Grounding applies to replies only. Image generation has its own Search grounding at `/profile manage` -> Images -> Image Output: Legacy RAG for any image model, or Web search on a Gemini image model.\n"
         "Links: URL Context in RAG mode reads only links typed in the message itself, not links inside an attached text file or in the message being replied to. A site that answers with an error is reported by its status, such as 'HTTP 404 Not Found'.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'RAG grounding does nothing on my OpenRouter profile.' Fix: Check Set Models -> Grounding Summariser. A Google model there needs a Google key on the server; switch it to an OpenRouter model.\n"
+        "- Symptom: 'RAG grounding does nothing on my OpenRouter profile.' Fix: Check Models -> Grounding Summariser. A Google model there needs a Google key on the server; switch it to an OpenRouter model.\n"
         "- Symptom: 'My profile searches the web far more often than it needs to.' Fix: That is LEGACY RAG, which asks before every round. Switch to RAG so the character searches only when it reaches for one.\n"
         "- Symptom: 'My profile never searches now that I switched to RAG.' Fix: RAG is the character's own call, so it searches only when a reply turns on a fact it lacks -- and never for anything inside the story. Check `/session audit`, where a search shows in Function Calls with the query it ran.\n"
         "- Symptom: 'Links are ignored on my Gemini 2.5 profile.' Fix: On Google, Gemini 2.5 cannot open links natively while RAG grounding or Memory Search is on, and Native URL Context is dropped to keep them. Set URL Context to RAG, or use a Gemini 3 model.\n"
-        "- Symptom: 'My images stopped using web research.' Fix: Images no longer follow Web Grounding. Set `/profile manage` -> Images -> Set Image Output -> Search grounding to Legacy RAG.\n"
+        "- Symptom: 'My images stopped using web research.' Fix: Images no longer follow Web Grounding. Set `/profile manage` -> Images -> Image Output -> Search grounding to Legacy RAG.\n"
         "- Symptom: 'The bot ignored a link in my text file.' Fix: Expected in RAG mode. URL Context reads links typed in the message, so put the link in the message itself.\n"
         "- Symptom: 'Responses got much slower after I enabled these.' Fix: LEGACY RAG asks a model before every round. Switch Grounding to RAG, which calls one only when the character searches, or to OFF. URL Context in RAG mode makes no model call."
     ),
@@ -1327,8 +1327,8 @@ DEFAULT_HELP_DOCS = {
         "Modes: 'off' disables it. 'lexical' runs only the local n-gram scan -- no API call, no added latency. 'full' adds a model pass that also catches recycled suggestions and tonal sameness, at one extra API call per message.\n"
         "Scope: 'self' screens a profile against its own recent replies; 'session' screens it against every participant's, which is what catches a multi-profile session converging on one rhythm.\n"
         "Tuning: strictness (lenient/normal/strict) sets how short a repeated phrase has to be to count; lookback is how many turns are read; persistence is how many further rounds a constraint stays in force.\n"
-        "Prompt: editable per profile at `/profile manage` -> Tools -> Set Critic Instructions, shown in Full mode only. Left blank, the profile follows the bot-wide ANTI_REPETITION prompt.\n"
-        "Enabling: `/profile manage` -> Tools -> Configure Anti-Repetition Critic.\n"
+        "Prompt: editable per profile at `/profile manage` -> Tools -> Critic Instructions, shown in Full mode only. Left blank, the profile follows the bot-wide ANTI_REPETITION prompt.\n"
+        "Enabling: `/profile manage` -> Tools -> Anti-Repetition Critic.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Replies became noticeably slower.' Fix: 'full' mode is an extra model call per message. Switch to 'lexical' to keep repetition screening at no latency cost."
     ),
@@ -1339,7 +1339,7 @@ DEFAULT_HELP_DOCS = {
         "File size: Nothing over 25 MB is downloaded -- not an image, audio, video or text attachment, a reference picture for !image, or a `.mimic` import. The character is told a larger attachment was sent and not read, and a larger import is refused. Media is billed by its length, so the limit bounds what one file can cost as well as the memory it takes.\n"
         "Text-only models: Many OpenRouter models cannot read attachments at all. The profile's fallback model is tried first, and answers if it can read the file. If neither model can, the attachment is dropped and the character is told the filename and that it cannot read it, so it answers the message instead of failing the turn; a note under the reply says so.\n"
         "Unreadable Attachments (`/profile manage` -> Params -> Unreadable Attachments): what that character is told. `Off` (the default) names the file and nothing more, and costs nothing. `Simulated` has a cheap model on the profile owner's provider read the file at high resolution first -- Gemini 3.1 Flash-Lite then 3.5 Flash-Lite on Google, Claude Haiku 5.5 (images only) then OpenRouter's free router on OpenRouter -- and writes the description into that profile's prompt alone -- other participants never see it, exactly as with grounding and URL context. One describe call per round, shared by every character that needs it, and it requires a key for that provider: without one, or if the description is refused, the profile behaves as `Off`.\n"
-        "Media Input Resolution: `/profile manage` -> Params -> Set Media Input Resolution controls how many tokens the model spends reading an image or PDF you send. On Gemini 3 that is roughly 280 (Low), 560 (Medium), 1120 (High, the model default) and 2240 (Ultra High) tokens per image, charged per attachment per participant per round. This is the opposite direction from the image size under Set Image Output, which is what an image model draws. Google honours it exactly; OpenRouter maps it onto the nearest of its two `detail` steps.\n"
+        "Media Input Resolution: `/profile manage` -> Params -> Media Input Resolution controls how many tokens the model spends reading an image or PDF you send. On Gemini 3 that is roughly 280 (Low), 560 (Medium), 1120 (High, the model default) and 2240 (Ultra High) tokens per image, charged per attachment per participant per round. This is the opposite direction from the image size under Image Output, which is what an image model draws. Google honours it exactly; OpenRouter maps it onto the nearest of its two `detail` steps.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Unsupported File Format.' Fix: The profile's model cannot read that media type. Switch to a vision-capable model, or omit the attachment.\n"
         "- Symptom: 'File Too Large' or 413. Fix: The attachment exceeds what the provider accepts. Send a smaller file.\n"
@@ -1348,18 +1348,18 @@ DEFAULT_HELP_DOCS = {
     ),
     "models/thinking_and_reasoning.txt": (
         "Concept: Reasoning effort and token budget are set per model slot AND per model within that slot. The four slots are Response (the profile's own replies), Grounding Summariser, Anti-Repetition Critic and LTM Summariser, and each holds a primary and a fallback with independent settings.\n"
-        "Where: `/profile manage` -> Params -> Set Thinking Parameters, or the Thinking button inside Set Models, which opens on whichever slot the category dropdown is showing. Three dropdowns: slot, primary effort, fallback effort. The budget button holds both budgets.\n"
+        "Where: `/profile manage` -> Params -> Thinking Parameters, or the Thinking button inside Models, which opens on whichever slot the category dropdown is showing. Three dropdowns: slot, primary effort, fallback effort. The budget button holds both budgets.\n"
         "Defaults: The three utility slots default to Low effort with a 512-token budget. Response defaults to High. Unset means inherit -- a slot you never touch follows the shipped default, and a fallback you never touch follows its own primary rather than the shipped default.\n"
         "Levels: Max, Extra High, High, Medium, Low, Minimal, None. Max is OpenRouter's own top step (~95% of max_tokens), where it and Extra High are the same allocation; nothing else has a step above High, so both collapse onto it on Google.\n"
         "Clearing a value: Submit the budget field empty to put the slot back on its default. That is not the same as 0, which disables thinking outright.\n"
         "Provider and model differences: Gemini 3 takes effort and ignores the budget, and 3 Pro collapses the six steps to two. Gemini 2.5 takes the budget and ignores effort, except Flash Lite which takes neither. Image and speech models take neither. OpenRouter takes both, budget winning where both are set.\n"
         "Thought summaries: Response-only. A utility slot's reasoning reaches no user, so requesting it would only bill tokens.\n"
-        "Image thinking: Not here. It is an output control alongside aspect ratio and resolution under Set Image Output.\n"
+        "Image thinking: Not here. It is an output control alongside aspect ratio and resolution under Image Output.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'Long-term memory creation costs far more than it should.' Fix: The LTM Summariser slot used to inherit a high reasoning default. It now defaults to Low with a 512-token budget; check it has not been raised by hand at `/profile manage` -> Params -> Set Thinking Parameters -> Slot: LTM Summariser.\n"
+        "- Symptom: 'Long-term memory creation costs far more than it should.' Fix: The LTM Summariser slot used to inherit a high reasoning default. It now defaults to Low with a 512-token budget; check it has not been raised by hand at `/profile manage` -> Params -> Thinking Parameters -> Slot: LTM Summariser.\n"
         "- Symptom: 'I set a reasoning effort and nothing changed.' Fix: The slot's model probably takes the other control. Gemini 2.5 reads the budget and ignores effort; Gemini 3 reads effort and ignores the budget. The picker names which one applies to the model that slot is on.\n"
         "- Symptom: 'My replies are slow.' Fix: Lower the Response slot's primary effort. Reasoning is usually the single largest contributor to latency.\n"
-        "- Symptom: 'My fallback model costs as much as the primary.' Fix: The fallback inherits the primary's effort until you set its own. Open Set Thinking Parameters and set the third dropdown -- the fallback effort -- to Low."
+        "- Symptom: 'My fallback model costs as much as the primary.' Fix: The fallback inherits the primary's effort until you set its own. Open Thinking Parameters and set the third dropdown -- the fallback effort -- to Low."
     ),
     "features/help_mode.txt": (
         "Commands: `/help`, `/help ask:<question>`, `/guide`\n"

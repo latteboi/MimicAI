@@ -222,7 +222,7 @@ There are four slots — two for Google Gemini, two for OpenRouter. Pick an empt
 the assignments.
 
 To use Ollama instead, set the host URL per profile under
-`/profile manage → Params → Set Models`.
+`/profile manage → Params → Models`.
 
 ### 5. Create a character
 
@@ -231,8 +231,8 @@ To use Ollama instead, set the host URL per profile under
 /profile manage profile_name:detective
 ```
 
-From the dashboard: **Edit Persona** for backstory and traits, **Edit Instructions** for
-speech and formatting, **Edit Appearance** for a display name and avatar URL. (Tip: upload
+From the dashboard: **Persona** for backstory and traits, **Instructions** for
+speech and formatting, **Appearance** for a display name and avatar URL. (Tip: upload
 an image to any Discord channel and copy its URL to use as an avatar.)
 
 Then start a session:

@@ -101,7 +101,7 @@ def ProfileDirectorDeskModal(cog, profile_name: str, current_params: Dict[str, A
 
 
 def ProfileSpeechSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
-    # No voice field: it moved to the Choose TTS Voice picker. A text box here accepted
+    # No voice field: it moved to the TTS Voice picker. A text box here accepted
     # any string, and an unknown voice name comes back as a 400 on every turn -- the
     # profile looked configured and never spoke.
     # values_only drops the fields the setting's own screen renders as controls. The
@@ -925,7 +925,7 @@ PROFILE_ACTIONS = (
             # is the owner's to set in bulk -- the 18+ declaration -- is not. A
             # classifier verdict is deliberately excluded.
             bulk=_Bulk(_bulk_method("_bulk_adult_declaration"), scope="personal",
-                       label="Set Adult 18+ Declaration",
+                       label="Adult 18+ Declaration",
                        description="Declare or withdraw 18+ across multiple profiles.")),
     _Action("delete", "home",
             lambda v: "Remove Borrowed Profile" if v.is_borrowed else "Delete Profile",
@@ -937,14 +937,14 @@ PROFILE_ACTIONS = (
                        description="Permanently delete the selected profiles.")),
 
     # --- Persona (tab hidden entirely for borrowed profiles) ---
-    _Action("edit_persona", "persona", "Edit Persona", "Edit backstory, traits, likes, dislikes, and appearance.",
+    _Action("edit_persona", "persona", "Persona", "Edit backstory, traits, likes, dislikes, and appearance.",
             _method("_act_edit_persona", wants_profile=True),
             bulk=_Bulk(_bulk_method("_bulk_edit_persona"), scope="personal", destructive=True,
                        prompt_keys=("persona",),
                        description="Overwrite backstory, traits, likes, dislikes and appearance.",
                        warning="Replaces every selected profile's **entire persona** with what you "
                                "typed; blank sections are cleared. Not recoverable.")),
-    _Action("edit_instructions", "persona", "Edit Instructions", "Your own instructions for the character, sent with every reply, plus Enhance Awareness.",
+    _Action("edit_instructions", "persona", "Instructions", "Your own instructions for the character, sent with every reply, plus Enhance Awareness.",
             _method("_act_edit_instructions", wants_profile=True),
             bulk=_Bulk(_bulk_method("_bulk_edit_instructions"), scope="personal", destructive=True,
                        prompt_keys=("ai_instructions", "enhance_awareness_enabled"),
@@ -952,15 +952,15 @@ PROFILE_ACTIONS = (
                        warning="Replaces every selected profile's **AI instructions** (all four parts) "
                                "and sets Enhance Awareness as you left it. All four left blank only turns "
                                "Enhance Awareness on. Not recoverable.")),
-    _Action("edit_appearance", "persona", "Edit Appearance", "The display name and avatar it posts with.",
+    _Action("edit_appearance", "persona", "Appearance", "The display name and avatar it posts with.",
             _method("_handle_appearance"), _own),
     # Identity, so it is stored with the persona and a borrow reads the original's. No
     # bulk form: one birthday stamped onto forty characters means nothing.
-    _Action("birthday", "persona", "Set Birthday", "Set the character's birthday, and the year if it has one.",
+    _Action("birthday", "persona", "Birthday", "Set the character's birthday, and the year if it has one.",
             _method("_act_birthday"), _own),
 
     # --- Params ---
-    _Action("models", "params", "Set Models", "Primary and fallback models for replies, images, speech, memory and its other jobs.",
+    _Action("models", "params", "Models", "Primary and fallback models for replies, images, speech, memory and its other jobs.",
             _method("_act_models", wants_profile=True),
             bulk=_Bulk(_bulk_sub("ModelApplyView"), scope="all",
                        keys=("primary_model", "fallback_model", "show_fallback_indicator",
@@ -971,11 +971,11 @@ PROFILE_ACTIONS = (
                              "ltm_model", "ltm_fallback_model",
                              "ollama_host_url", "openrouter_service_tier",
                              "openrouter_endpoints"))),
-    _Action("gen_params", "params", "Set Generation Parameters", "How random or predictable its replies are: Temperature, Top P and Top K.",
+    _Action("gen_params", "params", "Generation Parameters", "How random or predictable its replies are: Temperature, Top P and Top K.",
             _modal("ProfileParamsModal"),
             bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",
                        keys=("temperature", "top_p", "top_k"))),
-    _Action("adv_params", "params", "Set Advanced Parameters", "Repetition penalties, and Min P/Top A to cut unlikely words.",
+    _Action("adv_params", "params", "Advanced Parameters", "Repetition penalties, and Min P/Top A to cut unlikely words.",
             _modal("ProfileAdvancedParamsModal"), _not_google,
             bulk=_Bulk(_bulk_modal("ProfileAdvancedParamsModal"), scope="all",
                        keys=("frequency_penalty", "presence_penalty", "repetition_penalty",
@@ -984,12 +984,12 @@ PROFILE_ACTIONS = (
     # and image-output rows already are: the controls change with the slot, and a
     # screen's controls are declared once. The screen it replaces could only ever edit
     # the response slot, which was the whole problem.
-    _Action("thinking_params", "params", "Set Thinking Parameters",
+    _Action("thinking_params", "params", "Thinking Parameters",
             "How much each model reasons before answering, set per model slot.",
             _method("_act_thinking", wants_profile=True),
             bulk=_Bulk(_bulk_sub("ThinkingApplyView"), scope="all",
                        keys=THINKING_ALL_KEYS)),
-    _Action("media_resolution", "params", "Set Media Input Resolution",
+    _Action("media_resolution", "params", "Media Input Resolution",
             "How many tokens an image or PDF you send is worth.",
             _open_screen("media_resolution"), render=_render_media_resolution,
             screen=_Screen(
@@ -1013,7 +1013,7 @@ PROFILE_ACTIONS = (
                             for value, label, desc in MEDIA_RESOLUTIONS],
                            to_payload=lambda v: {
                                "media_input_resolution": "" if v == _MEDIA_RES_DEFAULT else v}),
-                       scope="all", label="Set Media Input Resolution",
+                       scope="all",
                        keys=("media_input_resolution",))),
     _Action("unreadable_media", "params", "Unreadable Attachments",
             "What this profile does with an image or audio file its models cannot read.",
@@ -1038,7 +1038,7 @@ PROFILE_ACTIONS = (
                            "Select unreadable-attachment handling...",
                            [(label, value, desc) for value, label, desc in UNREADABLE_MEDIA_MODES],
                            to_payload=lambda v: {"unreadable_media_mode": v}),
-                       scope="all", label="Set Unreadable Attachments",
+                       scope="all",
                        keys=("unreadable_media_mode",))),
     # --- Tools ---
     _Action("grounding", "tools", "Grounding (Web Search)",
@@ -1057,10 +1057,10 @@ PROFILE_ACTIONS = (
                      "one query, not the conversation. **Legacy RAG** pays a call every round "
                      "to ask whether to search.\n"
                      "-# **Native** searches through the model's own provider. Images have their "
-                     "own setting in **Set Image Output**."),
+                     "own setting in **Image Output**."),
             bulk=_Bulk(_bulk_choice("Select Grounding Mode...", _GROUNDING_MODES,
                                     to_payload=lambda v: {"grounding_mode": v}),
-                       scope="all", label="Set Grounding Mode", keys=("grounding_mode",))),
+                       scope="all", label="Grounding Mode", keys=("grounding_mode",))),
     _Action("url_toggle", "tools", "URL Context Fetching", "Whether it reads links posted in chat: Off, Native or RAG.",
             _open_screen("url_toggle"), render=_render_url,
             # url_fetching_enabled is the legacy flag `resolve_url_mode` falls back to
@@ -1079,7 +1079,7 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_choice("Select URL Mode...", _URL_MODES,
                                     to_payload=lambda v: {"url_mode": v,
                                                           "url_fetching_enabled": v == "rag"}),
-                       scope="all", label="Set URL Context Mode",
+                       scope="all", label="URL Context Mode",
                        keys=("url_mode", "url_fetching_enabled"))),
     _Action("cycle_response", "tools", "Response Mode", "Choose how a reply attaches to your message.",
             _open_screen("cycle_response"), render=_render_response_mode,
@@ -1091,11 +1091,11 @@ PROFILE_ACTIONS = (
                      "character answers is its Chance, in `/session config` → Reactivity."),
             bulk=_Bulk(_bulk_choice("Select Response Mode...", _RESPONSE_MODES,
                                     to_payload=lambda v: {"response_mode": v}),
-                       scope="all", label="Set Response Mode", keys=("response_mode",))),
+                       scope="all", keys=("response_mode",))),
     # Time awareness is always on, so the zone is the whole setting and the row opens its
     # picker directly. The on/off toggle that used to sit on a screen here is retired with
     # `time_tracking_enabled`, which nothing reads any more.
-    _Action("time", "tools", "Set Timezone", "Set the timezone the character's clock runs on.",
+    _Action("time", "tools", "Timezone", "Set the timezone the character's clock runs on.",
             _method("_handle_timezone", wants_profile=True, wants_borrowed=True),
             bulk=_Bulk(_bulk_sub("BulkTimezoneView"), scope="all", keys=("timezone",))),
     _Action("typing", "tools", "Realistic Typing", "Types a reply out a sentence at a time instead of posting it at once.",
@@ -1123,7 +1123,7 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_modal("ProfileTypingSettingsModal"), scope="all",
                        keys=("realistic_typing_enabled", "typing_mode", "typing_cps",
                              "typing_max_delay", "typing_cursor"))),
-    _Action("critic", "tools", "Configure Anti-Repetition Critic",
+    _Action("critic", "tools", "Anti-Repetition Critic",
             "Spots repetition in its recent replies and tells the next ones to avoid it.",
             _open_screen("critic"), render=_render_critic,
             screen=_Screen(
@@ -1151,10 +1151,9 @@ PROFILE_ACTIONS = (
                      f"{DEFAULT_CRITIC_LOOKBACK}); **Persistence** is how many more rounds a "
                      f"ban lasts (default {DEFAULT_CRITIC_PERSISTENCE})."),
             bulk=_Bulk(_bulk_modal("ProfileCriticSettingsModal"), scope="all",
-                       label="Configure Anti-Repetition Critic",
                        keys=("critic_mode", "critic_enabled", "critic_scope",
                              "critic_strictness", "critic_lookback", "critic_persistence"))),
-    _Action("critic_instructions", "tools", "Set Critic Instructions",
+    _Action("critic_instructions", "tools", "Critic Instructions",
             "Customise the prompt the critic screens replies with.",
             _method("_act_critic_instructions", wants_profile=True), _own_full_critic,
             bulk=_Bulk(_bulk_modal("ProfileCriticInstructionsModal",
@@ -1187,9 +1186,9 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_choice("Select action...",
                                     [("Enable Help Mode", "true"), ("Disable Help Mode", "false")],
                                     to_payload=lambda v: {"help_mode_enabled": v == "true"}),
-                       scope="all", label="Set Help Mode", keys=("help_mode_enabled",))),
+                       scope="all", label="Help Mode", keys=("help_mode_enabled",))),
 
-    # --- Images (what a profile draws; the image models stay in Set Models) ---
+    # --- Images (what a profile draws; the image models stay in Models) ---
     _Action("image_toggle", "images", "Image Generation", "Allow this profile to generate images via !image/!imagine.",
             _open_screen("image_toggle"), render=_render_image_toggle,
             screen=_Screen(_Toggle("image_generation_enabled", "Image Generation"),
@@ -1200,23 +1199,22 @@ PROFILE_ACTIONS = (
                                 "-# **Edit prompt…** is its standing instruction to the image model, "
                                 "sent with every image."),
             bulk=_Bulk(_bulk_modal("ProfileImageGenSettingsModal", action_key="update_both"),
-                       scope="all", label="Configure Image Generation",
+                       scope="all",
                        keys=("image_generation_enabled",),
                        prompt_keys=("image_generation_prompt",))),
-    _Action("image_output", "images", "Set Image Output",
+    _Action("image_output", "images", "Image Output",
             "Aspect ratio, resolution, quality, thinking and web search for the images it draws.",
             _method("_act_image_output", wants_profile=True), _images,
-            bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all", label="Set Image Output",
+            bulk=_Bulk(_bulk_sub("ImageOutputApplyView"), scope="all",
                        keys=IMAGE_OUTPUT_KEYS)),
-    _Action("image_sampling", "images", "Set Image Sampling",
+    _Action("image_sampling", "images", "Image Sampling",
             "How random its images are: Temperature, Top P and Top K. Gemini image models only.",
             _modal("ProfileImageSamplingModal"), _gemini_images,
             bulk=_Bulk(_bulk_modal("ProfileImageSamplingModal"), scope="all",
-                       label="Set Image Sampling",
                        keys=IMAGE_SAMPLING_KEYS)),
 
-    # --- Audio (how a profile sounds; the speech models stay in Set Models) ---
-    _Action("speech_settings", "audio", "Set Speech Settings",
+    # --- Audio (how a profile sounds; the speech models stay in Models) ---
+    _Action("speech_settings", "audio", "Speech Settings",
             "Turn TTS on or off, and set its temperature and speed.",
             _open_screen("speech_settings"), render=_render_speech,
             screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
@@ -1227,12 +1225,12 @@ PROFILE_ACTIONS = (
                                 "voiced unless its Text-to-Speech is on."),
             bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
                        keys=("speech_tts_enabled", "speech_temperature", "speech_speed"))),
-    _Action("voice", "audio", "Choose TTS Voice", "Pick a voice from the ones its speech model offers.",
+    _Action("voice", "audio", "TTS Voice", "Pick a voice from the ones its speech model offers.",
             _method("_act_voice", wants_profile=True), _voice,
-            bulk=_Bulk(_bulk_sub("VoiceApplyView"), scope="all", label="Choose TTS Voice",
-                       description="Stage a voice for the TTS model staged in Set Models.",
+            bulk=_Bulk(_bulk_sub("VoiceApplyView"), scope="all",
+                       description="Stage a voice for the TTS model staged in Models.",
                        keys=("speech_voice",), needs=("speech_model",))),
-    _Action("speech_language", "audio", "Set TTS Language",
+    _Action("speech_language", "audio", "TTS Language",
             "Pin the language a Gemini voice speaks, or let it detect one.",
             _open_screen("speech_language"), _gemini_tts, render=_render_speech_language,
             screen=_Screen(
@@ -1242,7 +1240,7 @@ PROFILE_ACTIONS = (
                 note="-# Gemini voices only: OpenRouter's speech endpoint takes no language."),
             bulk=_Bulk(_bulk_choice("Select speech language...", _SPEECH_LANGUAGE_CHOICES,
                                     to_payload=_speech_language_payload),
-                       scope="all", label="Set TTS Language", keys=("speech_language",))),
+                       scope="all", keys=("speech_language",))),
     # Owner-only, as it was: the Persona tab it moved from is hidden on a borrow, and that
     # was the only thing keeping a borrower out of it.
     _Action("tts_instructions", "audio", "TTS Instructions", "Direct its voice: archetype, accent, acoustics, style and pacing. Gemini voices only.",
@@ -1255,12 +1253,12 @@ PROFILE_ACTIONS = (
     # --- Behaviour (how the profile conducts itself) ---
 
     # --- Memory ---
-    _Action("stm_params", "memory", "Set STM Parameters",
+    _Action("stm_params", "memory", "STM Parameters",
             "How many recent turns it reads, and whether it always reads the session synopsis.",
             _modal("ProfileSTMParamsModal"), render=_render_stm,
             bulk=_Bulk(_bulk_modal("ProfileSTMParamsModal"), scope="all",
                        keys=("stm_length", "always_read_synopsis"))),
-    _Action("manage_ltm", "memory", "Manage Long-Term Memories", "Browse, search, add, edit or delete its long-term memories.",
+    _Action("manage_ltm", "memory", "Long-Term Memories", "Browse, search, add, edit or delete its long-term memories.",
             _method("_act_manage_ltm", wants_profile=True),
             # Editing memories one at a time has no bulk form; wiping them does.
             bulk=_Bulk(_bulk_sub("BulkResetView"), scope="all", terminal=True,
@@ -1301,15 +1299,15 @@ PROFILE_ACTIONS = (
                                      ("Creation: Every N Replies", "mode_interval"),
                                      ("Creation: When Flagged", "mode_flag")],
                                     to_payload=lambda v: dict(_MEMORY_BULK_PAYLOADS[v])),
-                       scope="all", label="Set Memory Switches",
+                       scope="all", label="Memory Switches",
                        keys=("ltm_creation_enabled", "ltm_recall_enabled",
                              "ltm_recall_tool_enabled", "ltm_creation_mode"))),
-    _Action("ltm_params", "memory", "Set LTM Parameters", "How often memories are written, how many are recalled, and how close a match must be.",
+    _Action("ltm_params", "memory", "LTM Parameters", "How often memories are written, how many are recalled, and how close a match must be.",
             _modal("ProfileLTMParamsModal", pass_borrowed=False),
             bulk=_Bulk(_bulk_modal("ProfileLTMParamsModal", pass_borrowed=False), scope="all",
                        keys=("ltm_creation_interval", "ltm_context_size",
                              "ltm_relevance_threshold"))),
-    _Action("ltm_summarization", "memory", "Set LTM Summarization Prompt", "Customize how the AI creates memories.",
+    _Action("ltm_summarization", "memory", "LTM Summarization Prompt", "Customize how the AI creates memories.",
             _method("_act_ltm_summarization", wants_profile=True), _own_ltm_creating,
             bulk=_Bulk(_bulk_modal("ProfileLTMSummarizationModal",
                                    action_key="update_prompts", pass_borrowed=False,
@@ -1320,16 +1318,16 @@ PROFILE_ACTIONS = (
                                "Profiles using a customised prompt lose it.")),
 
     # --- Training (tab hidden entirely for borrowed profiles: every row is owner-only) ---
-    _Action("manage_training", "training", "Manage Training Examples", "Example exchanges that teach its voice. Those matching a message are sent with that reply.",
+    _Action("manage_training", "training", "Training Examples", "Example exchanges that teach its voice. Those matching a message are sent with that reply.",
             _method("_act_manage_training", wants_profile=True), _own),
-    _Action("manage_fixed_examples", "training", "Manage Fixed Examples",
+    _Action("manage_fixed_examples", "training", "Fixed Examples",
             "Examples of how the character speaks, sent with every reply.",
             _method("_act_manage_fixed_examples", wants_profile=True), _own),
     _Action("style_guide", "training", "Style Guide", "View, turn on or off, or regenerate the style guide written from training examples.",
             _method("_act_style_guide", wants_profile=True), _own),
-    _Action("manage_lore", "training", "Manage Lorebook", "What the character knows, handed to it when a keyword comes up.",
+    _Action("manage_lore", "training", "Lorebook", "What the character knows, handed to it when a keyword comes up.",
             _method("_act_manage_lore", wants_profile=True), _own),
-    _Action("train_params", "training", "Set Training Parameters", "How many matching training examples are sent per reply, and how close a match must be.",
+    _Action("train_params", "training", "Training Parameters", "How many matching training examples are sent per reply, and how close a match must be.",
             _modal("ProfileTrainingParamsModal", pass_borrowed=False), _own,
             bulk=_Bulk(_bulk_modal("ProfileTrainingParamsModal", pass_borrowed=False),
                        scope="personal",
@@ -1409,7 +1407,6 @@ PROFILE_ACTIONS = (
                      "first line, before the last, and around Markdown. A kept gap is one "
                      "blank line. Borrowed copies follow it."),
             bulk=_Bulk(_bulk_modal("ProfileLineSpacingModal"), scope="personal",
-                       label="Set Line Spacing",
                        keys=("line_spacing_enabled", "line_spacing_opening",
                              "line_spacing_closing", "line_spacing_markdown"))),
 )
@@ -2258,7 +2255,7 @@ def ProfileSTMParamsModal(cog, profile_name: str, current_params: Dict[str, Any]
         if not (v["always_read_synopsis"] and opened_unset):
             c["always_read_synopsis"] = v["always_read_synopsis"]
         return {"config": c}
-    return ConfigModal(cog, profile_name, is_borrowed, "Set STM Parameters", fields, parser, callback, target_user_id)
+    return ConfigModal(cog, profile_name, is_borrowed, "STM Parameters", fields, parser, callback, target_user_id)
 
 def ProfileTrainingParamsModal(cog, profile_name: str, current_params: Dict[str, Any], values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [
@@ -2393,7 +2390,7 @@ def ProfileCriticInstructionsModal(cog, profile_name: str, current_instructions:
         ins = _ps(v["critic_instructions"])
         return {"prompts": {"critic_instructions": cog.storage_manager._encrypt_data(ins) if ins else ""}}
 
-    return ConfigModal(cog, profile_name, False, "Set Critic Instructions", fields, parser, callback, target_user_id)
+    return ConfigModal(cog, profile_name, False, "Critic Instructions", fields, parser, callback, target_user_id)
 
 
 def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
@@ -3075,7 +3072,7 @@ class ModelPickerMixin(ReportErrorMixin):
 
     @staticmethod
     def preferred_api(cog, user_id) -> str:
-        """The API tab Set Models opens on: the user's provider, Google until they choose."""
+        """The API tab Models opens on: the user's provider, Google until they choose."""
         return "openrouter" if cog.profile_manager.provider_preference(user_id) == "openrouter" else "google"
 
     def _may_use_ollama(self) -> bool:
@@ -3729,7 +3726,7 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
         data = self._get_current_profile_data()
         wording = next((lbl for value, lbl, _ in self._CATEGORY_LABELS if value == self.category),
                        self.category.title())
-        e = discord.Embed(title="Set Models", colour=discord.Colour.blurple())
+        e = discord.Embed(title="Models", colour=discord.Colour.blurple())
         note = self._get_selection_feedback_message()
         e.description = f"**{wording}**" + (f"\n{note}" if note else "")
 
@@ -3837,13 +3834,13 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
 
 
 class OpenRouterHostView(BlockedGuard, ui.View):
-    """Which OpenRouter endpoint each model on one Set Models tab is sent to.
+    """Which OpenRouter endpoint each model on one Models tab is sent to.
 
     An endpoint is a host at a tier -- Gemini 3.8 Flash lists AI Studio and Vertex at
     flex, standard and priority -- so one dropdown per slot offers every one of them,
     plus Auto. Auto sends the profile's Default Tier, whose button lives here too: it is
     what every unpinned model gets, and it still does what no pin can -- any host at a
-    tier, on every model, including ones never opened here. Opened from Set Models onto
+    tier, on every model, including ones never opened here. Opened from Models onto
     the same message, with a Back that returns to it, as Thinking is. A slot holding a
     Google or Ollama model gets a greyed dropdown saying why rather than none.
 
@@ -4101,7 +4098,7 @@ class ThinkingPickerMixin:
     primary's effort made it waste the money it was chosen to save.
 
     The slot vocabulary is deliberately the model picker's: a user who has learned what
-    "Grounding Summariser" means in Set Models does not have to learn it twice.
+    "Grounding Summariser" means in Models does not have to learn it twice.
 
     Adopters provide `_current(key)`, `_write(key, value)`, `_render()` and
     `_slot_model(slot, role)`.
@@ -4290,8 +4287,8 @@ class _SlotThinkingBudgetModal(ui.Modal):
 class SingleProfileThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
     """Per-slot, per-role thinking for one profile, written as it is chosen.
 
-    Reachable from two places on purpose: `Set Thinking Parameters` on the Params tab,
-    where it has always lived, and a button inside Set Models, which is where the slot
+    Reachable from two places on purpose: `Thinking Parameters` on the Params tab,
+    where it has always lived, and a button inside Models, which is where the slot
     vocabulary comes from. One implementation, two entrances -- the second exists
     because choosing a model and choosing how hard it thinks are the same decision.
     """
@@ -4308,7 +4305,7 @@ class SingleProfileThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
         self.slot = slot if slot in THINKING_SLOT_KEYS else "response"
-        #: Set when opened from Set Models, so Back returns to the picker that opened
+        #: Set when opened from Models, so Back returns to the picker that opened
         #: this rather than dead-ending on an ephemeral message.
         self.parent_model_view = parent_model_view
         self._build_view()
@@ -4617,7 +4614,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
         return self.embed().description or ""
 
     def embed(self) -> discord.Embed:
-        e = discord.Embed(title="Set Models", colour=discord.Colour.blurple())
+        e = discord.Embed(title="Models", colour=discord.Colour.blurple())
         # The declared label, not category.title(): the ids are short keys, so titling
         # them rendered "Tts" and "Ltm" at the user.
         wording = next((lbl for value, lbl, _ in self._CATEGORY_LABELS if value == self.category),
@@ -4914,7 +4911,7 @@ class _MediaOptionsApplyView(MediaOptionsMixin, _BulkSubView):
 
 class ImageOutputApplyView(_MediaOptionsApplyView):
     ACTION = "image_output"
-    TITLE = "Set Image Output"
+    TITLE = "Image Output"
 
     def __init__(self, wizard):
         #: Whose option fills row 2. Ratio, resolution, thinking, grounding and the
@@ -4983,13 +4980,13 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
 class VoiceApplyView(_MediaOptionsApplyView):
     """Stages a voice for the TTS model staged beside it.
 
-    Offered only once Set Models has staged a speech model (`_Bulk.needs`): voices differ
+    Offered only once Models has staged a speech model (`_Bulk.needs`): voices differ
     per model, and profiles selected together may be on different ones, so the voice list
     is the one model the changeset is about to put them all on.
     """
 
     ACTION = "voice"
-    TITLE = "Choose TTS Voice"
+    TITLE = "TTS Voice"
 
     def _voice_model(self) -> Optional[str]:
         return self.session.config.get("speech_model")
@@ -5006,7 +5003,7 @@ class VoiceApplyView(_MediaOptionsApplyView):
             about = "This model lists no voices to choose from, so it speaks in its own."
         e = discord.Embed(
             title=self.TITLE, colour=discord.Colour.blurple(),
-            description=(f"Voices for `{self._voice_model()}`, staged in Set Models. {about}\n"
+            description=(f"Voices for `{self._voice_model()}`, staged in Models. {about}\n"
                          "-# Accent, mood and pacing are set in TTS Instructions."))
         described = " · ".join(d for d in (TTS_VOICE_GENDER.get(chosen),
                                            TTS_VOICE_CHARACTER.get(chosen)) if d)
@@ -5066,7 +5063,7 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
                          "profile and sent to the speech model whenever the profile speaks on a "
                          "model that can clone voices, while its slot is the one selected. Anyone "
                          "who borrows this profile speaks with it too. Select or remove it any "
-                         "time from Choose TTS Voice."))
+                         "time from TTS Voice."))
         e.add_field(name="Recording",
                     value=f"`{self.sample.filename}` · {self.sample.size / 1048576:.1f} MB", inline=True)
         e.add_field(name="Transcript", value="Provided" if self.transcript else "None", inline=True)
@@ -5123,7 +5120,7 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
                        "on models that clone voices.")
         else:
             # Not switched to: slots are there to keep a voice for later, and the one in use stays.
-            outcome = (f"Saved to slot {self.slot}. Select it in Choose TTS Voice for "
+            outcome = (f"Saved to slot {self.slot}. Select it in TTS Voice for "
                        f"**{self.profile_name}** to speak with it.")
         if consent and selected:
             # Checked now, so a consent Google will not take is heard about here rather
@@ -5559,7 +5556,7 @@ class BulkTimezoneView(_BulkSubView):
 
     def embed(self) -> discord.Embed:
         e = discord.Embed(
-            title="Set Timezone",
+            title="Timezone",
             colour=discord.Colour.blurple(),
             description=("The zone each selected character's clock runs on.\n\nBrowse a "
                          "region, jump between regions, or enter any IANA timezone ID by hand."))
@@ -5872,7 +5869,7 @@ class AppearanceModal(ui.Modal):
 
 class MoodAvatarModal(ui.Modal):
     """`config["mood_avatars"]` and its threshold: one avatar per Neuro Engine level, five
-    fields, Discord's most. Saved like Edit Appearance, and rated with it. Opened from the
+    fields, Discord's most. Saved like Appearance, and rated with it. Opened from the
     Neuro Engine screen, which `on_saved` redraws."""
 
     def __init__(self, cog: 'MimicCog', owner_id: int, profile_name: str, on_saved):
@@ -5902,7 +5899,7 @@ class MoodAvatarModal(ui.Modal):
             await interaction.response.send_message(embed=text_embed("❌ The level must be a whole number from 0 to 100."),
                                                     ephemeral=True)
             return
-        # Sparse, as Edit Appearance is: an unset avatar or level is no key.
+        # Sparse, as Appearance is: an unset avatar or level is no key.
         avatars = {axis: field.value.strip() for axis, field in self.inputs.items() if field.value.strip()}
         bad = next((axis for axis, url in avatars.items() if not is_web_url(url)), None)
         if bad:
@@ -6299,7 +6296,7 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
     def _resolved_field(self) -> str:
         """The changeset as resolved fields, not as a list of actions.
 
-        Two staged rows can touch the same key -- Set Response Mode and a modal that
+        Two staged rows can touch the same key -- Response Mode and a modal that
         also carries it -- and last write wins. Showing the actions would imply two
         writes; showing the resolved keys shows the value that will actually land.
         """

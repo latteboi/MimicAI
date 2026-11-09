@@ -362,7 +362,7 @@ OPENROUTER_SERVICE_TIER_VALUES = frozenset(v for v, _l, _d in OPENROUTER_SERVICE
 # pickers both ask.
 OLLAMA_OWNER_ONLY = (
     "Ollama models can only be used by this bot's owner. Choose a Google or OpenRouter "
-    "model in `/profile manage` -> Params -> Set Models."
+    "model in `/profile manage` -> Params -> Models."
 )
 
 # Providers that train on what they are sent.
@@ -426,7 +426,7 @@ IMAGE_PROMPT_EMPTY = "an empty prompt -- there was nothing in the request to dra
 
 OPENROUTER_DATA_POLICY_BLOCKED = (
     "No OpenRouter host serves this model without the right to train on prompts, so it "
-    "cannot be used here. Choose another model in `/profile manage` -> Params -> Set Models."
+    "cannot be used here. Choose another model in `/profile manage` -> Params -> Models."
 )
 
 #: A model resting on its key after a rate limit (api_service._RATE_LIMIT_REST_DEFAULT).
@@ -446,7 +446,7 @@ OPENROUTER_TRAINING_MODEL_HIDDEN = (
 #: A typed OpenRouter id the image catalogue does not list: a text model there reaches
 #: the Image API and 400s, and an omission is deliberate -- api/openrouter_image_catalogue.
 NO_MODEL_SET = (
-    "This profile has no model set. Choose one under `/profile manage` -> Set Models, or pick "
+    "This profile has no model set. Choose one under `/profile manage` -> Models, or pick "
     "a provider in `/start` so the profiles you make next start with one."
 )
 
@@ -1073,7 +1073,7 @@ OPENROUTER_SHIPPED_MODELS = {
     'compaction_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
 }
 
-#: Chains kept per session rather than per profile, so no Set Models category ships them:
+#: Chains kept per session rather than per profile, so no Models category ships them:
 #: the session synopsis. Google's side here; OpenRouter's is in the table above, which
 #: `user_defaults.model_chain` reads for both. Stored under `session['compaction']`.
 SESSION_SLOT_PAIRS = {'compaction_model': 'compaction_fallback_model'}
@@ -2431,18 +2431,30 @@ COMPACT_RUN_DEADLINE_SECONDS = 480
 DEFAULT_SESSION_SYNOPSIS_PROMPT = (
     "You are a continuity editor for an ongoing roleplay scene. You will be given a "
     "transcript excerpt and, sometimes, the synopsis of everything that came before it.\n\n"
-    "Write a single tight synopsis covering BOTH, in past tense, third person. Preserve: "
-    "who was present and what they did, decisions made, promises, threats, revelations, "
-    "changes of location or time, unresolved questions, and any object or fact a later "
-    "scene would need. Preserve distinctive names verbatim.\n\n"
+    "Write a single updated synopsis covering BOTH, in two parts.\n\n"
+    "First, the story so far, in past tense, third person: who was present and what they "
+    "did, decisions made, changes of location or time, and how things stand now. Compress "
+    "older events harder than recent ones.\n\n"
+    "Then a line reading \"Standing facts:\" and under it at most {max_facts} lines, one "
+    "fact each, starting \"- \" and no longer than 15 words. A standing fact is anything a "
+    "later scene could need that a retelling would lose: where the group is now, debts, "
+    "promises, oaths, threats, secrets and who knows them, revelations, true names, a "
+    "person's traits and injuries, what an object does, who holds what, people and places "
+    "by name, and unresolved questions. Copy every standing fact from the previous synopsis "
+    "forward word for word, dropping or correcting one only when the excerpt settles or "
+    "contradicts it, then add the excerpt's new ones. When the list is full, merge related "
+    "facts and drop those least likely to matter again. Do not repeat in the story what "
+    "the list already holds. Give a date rather than \"tomorrow\" or \"in three days\", and "
+    "a clock time only when the hour itself matters.\n\n"
     "Links and files people shared appear as <document_context> and <text_attachment> "
     "blocks, pictures and audio as [Attached ...] notes: keep who shared what and the part "
     "the scene used, never their full contents.\n\n"
-    "Discard: turn-by-turn phrasing, greetings, small talk, and anything already implied "
-    "by what you keep.\n\n"
-    "Do not invent events. Do not address the reader. Do not use XML tags, headings or "
-    "bullet points -- write flowing prose of about {max_words} words, or fewer when there "
-    "is less worth keeping."
+    "Discard: turn-by-turn phrasing, greetings, small talk and banter, and anything already "
+    "implied by what you keep.\n\n"
+    "Do not invent events. Do not address the reader. Use no XML tags, and no headings but "
+    "that one line. Preserve distinctive names verbatim. Keep the whole synopsis, list "
+    "included, to about {max_words} words, or fewer when there is less worth keeping; when "
+    "the list crowds the story, shorten the story."
 )
 
 DEFAULT_SESSION_SYNOPSIS_USER_PROMPT = (
@@ -2453,7 +2465,12 @@ DEFAULT_SESSION_SYNOPSIS_USER_PROMPT = (
 # The length of the whole synopsis, not of each fold -- every fold rewrites the previous
 # one plus the new excerpt into a single block, so this is how much of a long session
 # survives. The ceiling is a cost bound: it rides in every reply's system instruction.
-COMPACTION_SYNOPSIS_WORDS_DEFAULT = 220
+# Story and Standing facts share it; 220 was set when there was only the story.
+# `prod_tests/synopsis_drift_live.py` measures what a length keeps.
+COMPACTION_SYNOPSIS_WORDS_DEFAULT = 300
+#: Standing facts allowed per word of that length (`{max_facts}`): a count is a cap a model
+#: keeps, where "half the words" ran the list to nearly twice the length.
+COMPACTION_WORDS_PER_FACT = 20
 
 COMPACTION_SYNOPSIS_WORDS_MIN = 100
 COMPACTION_SYNOPSIS_WORDS_MAX = 800

@@ -1037,7 +1037,7 @@ MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
     "DIRECTOR_USER_PROMPT": ({"history"}, "format"),
     "SPEAK_REWRITE_STRICT": ({"source_text"}, "format"),
     "SPEAK_REWRITE_LOOSE": ({"source_text"}, "format"),
-    "SESSION_SYNOPSIS": ({"max_words"}, "format"),
+    "SESSION_SYNOPSIS": ({"max_words", "max_facts"}, "format"),
     "SESSION_SYNOPSIS_USER": ({"previous_synopsis", "transcript"}, "format"),
     "IMAGE_PRESENT": ({"prompt"}, "format"),
     "IMAGE_PRESENT_OTHER": ({"name", "prompt"}, "format"),
@@ -1359,10 +1359,10 @@ _SYSTEM_MODEL_NOTES = {
 
 
 class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, ui.View):
-    """The models no profile chooses, as Set Models presents a profile's.
+    """The models no profile chooses, as Models presents a profile's.
 
     Opened from the Prompts tab onto the same message, with a Back, as Thinking opens from
-    Set Models: /mod's nav bar is a full row of five, and a picker needs every row it has.
+    Models: /mod's nav bar is a full row of five, and a picker needs every row it has.
     """
 
     _CATEGORY_LABELS = (
@@ -1444,7 +1444,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         if key in _PROFILE_KEYS:
             config = self._system_config()
             config[key] = value
-            # A pin goes when its model leaves the profile, as Set Models prunes one.
+            # A pin goes when its model leaves the profile, as Models prunes one.
             if "openrouter_endpoints" in config:
                 prune_openrouter_endpoints(config)
             self.cog.profile_manager._save_profile_config(self.user_id, self.profile_name, config, False)
@@ -1557,7 +1557,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
 
     def _add_thinking_button(self, row: int):
         """Thinking, on every tab -- greyed where the tab's models take none. The System
-        profiles open their own, every slot of them, as Set Models does."""
+        profiles open their own, every slot of them, as Models does."""
         if self.category in _NO_THINKING:
             add_button(self, _NO_THINKING[self.category], _noop, row=row, disabled=True)
             return
@@ -1803,7 +1803,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         # Every tab but System Profiles has two rows left: the API row, then the tab's own
         # Thinking and Hosts & Tier with Reset and Back. System Profiles has one for all of
         # them, so its Ollama tab leaves off Hosts & Tier, which pins OpenRouter models, and
-        # the Ollama Guide, which the profile's own Set Models offers, to fit Discord's five.
+        # the Ollama Guide, which the profile's own Models offers, to fit Discord's five.
         last_row = row if self.category == "system" else row + 1
         crowded = self.category == "system" and self.view_mode == "ollama"
 
@@ -1842,7 +1842,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
 
 class ModThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
     """Thinking for one System Models tab, bot-wide: how hard its Primary and its Fallback
-    reason. Opened onto the same message with a Back, as from Set Models.
+    reason. Opened onto the same message with a Back, as from Models.
 
     Kept under the response slot's keys in the tab's own settings (`helpers.system_settings`).
     A describer, classifier or generator tab resolves them as its own slot, whose shipped

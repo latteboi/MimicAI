@@ -2416,7 +2416,7 @@ class ProfileManager:
     def _get_user_appearance(self, owner_id: int, profile_name: str) -> Dict[str, Optional[str]]:
         """The name and avatar a profile shows, with the avatar ready for Discord to draw.
 
-        The cache keeps the avatar as typed, which is what Edit Appearance shows back. A
+        The cache keeps the avatar as typed, which is what Appearance shows back. A
         Discord attachment is handed out without its signature, which expires a day
         after issue -- see `cogs/utils/discord_cdn.py`. Anything that downloads the
         avatar itself reads the config and signs it.

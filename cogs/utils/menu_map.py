@@ -82,13 +82,13 @@ _STATIC_DASHBOARDS = [
                 "Open once /start has registered you, as all of /settings is",
                 "Provider: Google, OpenRouter or None, stepped through by a button beside Clear. "
                 "Google and OpenRouter run every model Primary -> Fallback; None ships no "
-                "models, so new profiles start on what Set Models here names",
+                "models, so new profiles start on what Models here names",
                 "Standing preferences applied to profiles created LATER, and offered on borrows "
                 "(Use my defaults / Keep the original's)",
                 "The same tabs and settings as `/profile manage`: Params, Tools, Images, "
                 "Audio, Memory, Training, Misc. Choosing a row opens the form "
                 "`/profile bulk manage` opens for it",
-                "Set Models gives every slot a Platform default option, which clears it",
+                "Models gives every slot a Platform default option, which clears it",
                 "Anything left on Platform default follows the bot's own value, "
                 "including if that value changes later",
                 "Clear... takes a setting, or everything, back to Platform default",
@@ -130,7 +130,7 @@ _STATIC_DASHBOARDS = [
             ("Proactivity", [
                 "Toggle Proactivity (the autonomous round timer)",
                 "Edit Settings & AI Director (chance, cooldown, director instructions)",
-                "Director Model: opens Set Models for the AI Director on the same message, with Back "
+                "Director Model: opens Models for the AI Director on the same message, with Back "
                 "(Primary and Fallback, the API button, Browse on OpenRouter, Director ON/OFF, Reset to Default)",
             ]),
         ],

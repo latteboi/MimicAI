@@ -260,7 +260,7 @@ def session_advice(session: Dict[str, Any], seats: Sequence[Tuple[Dict[str, Any]
     # Mostly a saving: folded turns leave every prompt. Worth an item only where it is not
     # one for somebody, or where its synopsis is a cost of its own.
     if compaction.get("enabled"):
-        synopsis = round(compaction.get("max_words", 220) * 4 / 3)
+        synopsis = round(compaction["max_words"] * 4 / 3)
         # Against the idle mark, the shallower of the two: a window short of it is short of
         # every fold, where one short only of `threshold` is still shortened by quiet ones.
         unshortened = [str(seat.get("profile_name") or "?") for seat, cfg in seats

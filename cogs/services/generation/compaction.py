@@ -8,7 +8,7 @@ from ...utils.constants import (
     COMPACTION_CHUNK_DEFAULT, COMPACTION_CHUNK_MIN, COMPACTION_MAX_CHUNK_RATIO,
     COMPACTION_SYNOPSIS_WORDS_DEFAULT, COMPACTION_SYNOPSIS_WORDS_MAX,
     COMPACTION_SYNOPSIS_WORDS_MIN, COMPACTION_THRESHOLD_DEFAULT, COMPACTION_THRESHOLD_MAX,
-    COMPACTION_THRESHOLD_MIN, DEFAULT_SESSION_SYNOPSIS_PROMPT,
+    COMPACTION_THRESHOLD_MIN, COMPACTION_WORDS_PER_FACT, DEFAULT_SESSION_SYNOPSIS_PROMPT,
     DEFAULT_SESSION_SYNOPSIS_USER_PROMPT, GREEDY_SAMPLING, SESSION_BUSY_FLAGS,
     COMPACT_KEEP_DEFAULT, COMPACT_PASS_MAX_CHARS, COMPACT_RUN_DEADLINE_SECONDS,
     PURGE_BUSY_WAIT_TIMEOUT_SECONDS,
@@ -422,12 +422,20 @@ class SessionCompactionMixin:
 
         system_instruction = self.cog.global_prompts.get(
             "SESSION_SYNOPSIS", DEFAULT_SESSION_SYNOPSIS_PROMPT
-        ).format(max_words=settings["max_words"])
+        ).format(max_words=settings["max_words"],
+                 max_facts=settings["max_words"] // COMPACTION_WORDS_PER_FACT)
 
         previous_block = f"Synopsis of everything before this excerpt:\n{previous}\n\n" if previous else ""
         user_prompt = self.cog.global_prompts.get(
             "SESSION_SYNOPSIS_USER", DEFAULT_SESSION_SYNOPSIS_USER_PROMPT
         ).format(previous_synopsis=previous_block, transcript=transcript)
+
+        # A synopsis replaces the one before it, so a reply cut off mid-sentence, or one that
+        # dropped the Standing facts the previous one carried, loses them for good (the free
+        # router did both in `prod_tests/synopsis_drift_live.py`). Raised, so the next model
+        # in the chain gets a go and, failing that, the turns wait unfolded.
+        keeps_list = ("standing facts:" in system_instruction.casefold()
+                      and "standing facts:" in (previous or "").casefold())
 
         async def _attempt(model_name, is_fallback):
             # `{}` here was the same defect the LTM summariser had: not "no thinking"
@@ -438,8 +446,16 @@ class SessionCompactionMixin:
                 config_owner_id=session.get("owner_id"),
                 thinking_params=resolve_thinking_params(
                     session.get("compaction"), "compaction", "fallback" if is_fallback else "primary"))
-            return await model.generate_content_async(
+            resp = await model.generate_content_async(
                 [user_prompt], generation_config=dict(GREEDY_SAMPLING))
+            candidate = (getattr(resp, "candidates", None) or [None])[0]
+            finish = str(getattr(candidate, "finish_reason", None) or "").upper()
+            text = getattr(resp, "text", None) or ""
+            if finish in ("LENGTH", "MAX_TOKENS"):
+                raise ValueError(f"synopsis cut off ({finish})")
+            if keeps_list and text.strip() and "standing facts:" not in text.casefold():
+                raise ValueError("synopsis dropped its Standing facts")
+            return resp
 
         try:
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(

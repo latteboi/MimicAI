@@ -1233,7 +1233,7 @@ def image_suffix_for_mime(mime_type: Optional[str]) -> str:
 
 def check_portrait_upload(image: Any) -> Tuple[Optional[str], Optional[str]]:
     """(mime type, None) for an uploaded picture a profile may wear, or (None, the refusal).
-    `/profile generate` and Edit Appearance both ask this, so both refuse alike."""
+    `/profile generate` and Appearance both ask this, so both refuse alike."""
     mime_type = ((image.content_type or "").split(";", 1)[0].strip().lower()
                  or IMAGE_SUFFIX_MIMES.get(os.path.splitext(image.filename)[1].lower()))
     if mime_type not in IMAGE_MIME_SUFFIXES:

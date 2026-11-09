@@ -602,7 +602,7 @@ Gemini 3.8 reads its text verbatim, so it gets the reply with its actions as voc
 (`<sigh>`) and the Desk as one `speechMetadata.style` line; earlier models get the Desk itself.
 
 A text model can be **pinned to one endpoint** — a host at a tier, e.g.
-`google-vertex/global/priority` — from Set Models → Hosts & Tier (`OpenRouterHostView`),
+`google-vertex/global/priority` — from Models → Hosts & Tier (`OpenRouterHostView`),
 which also holds the profile's tier as the default for unpinned models. Bulk Manage stages the
 same through `BulkOpenRouterHostView`, for slots with a model staged on them only, and apply
 merges those pins into each profile's rather than replacing them (`_BulkSession.pins`).
