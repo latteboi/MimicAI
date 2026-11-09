@@ -12,7 +12,8 @@ from ...utils.constants import (
     DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_NEURO_DEFINITION,
     DEFAULT_MEMORY_CAPTURE_INSTRUCTION, DEFAULT_MEMORY_WRITTEN_NOTE, LORE_SCAN_TURNS,
     DEFAULT_BOND_DEFINITION, DEFAULT_BOND_INSTRUCTION, BOND_ROSTER_SIZE,
-    DEFAULT_ENHANCE_AWARENESS, DEFAULT_ENHANCE_AWARENESS_GROUP,
+    DEFAULT_ENHANCE_AWARENESS,
+    DEFAULT_ROLEPLAY_FORMATTING, DEFAULT_INTERNAL_MONOLOGUE,
 )
 from ...managers.session_manager import _TURN_IDENTITY
 from ...utils import fixed_examples, lorebook
@@ -281,9 +282,10 @@ class PromptBuilderMixin:
 
         if prompts.get("enhance_awareness_enabled"):
             stable_parts.append(self.cog.global_prompts.get("ENHANCE_AWARENESS", DEFAULT_ENHANCE_AWARENESS))
-            if len((session or {}).get("profiles") or []) > 1:
-                stable_parts.append(self.cog.global_prompts.get(
-                    "ENHANCE_AWARENESS_GROUP", DEFAULT_ENHANCE_AWARENESS_GROUP))
+        if prompts.get("roleplay_formatting_enabled"):
+            stable_parts.append(self.cog.global_prompts.get("ROLEPLAY_FORMATTING", DEFAULT_ROLEPLAY_FORMATTING))
+        if prompts.get("internal_monologue_enabled"):
+            stable_parts.append(self.cog.global_prompts.get("INTERNAL_MONOLOGUE", DEFAULT_INTERNAL_MONOLOGUE))
 
         decrypted_parts = []
         if isinstance(ai_instr_str, list):

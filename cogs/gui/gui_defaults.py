@@ -33,7 +33,7 @@ import discord
 from discord import ui
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
-from .base_components import add_button, add_select
+from .base_components import add_button, add_select, redraw_select
 from ..utils.helpers import resolve_openrouter_endpoint
 from ..utils.constants import PROVIDER_CHOICES, PROVIDER_NONE
 from ..utils.user_defaults import defaultable_keys, model_slot_labels, setting_label
@@ -602,6 +602,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
             await self.refresh(interaction)
             return
         await action.bulk.run(self, interaction)
+        await redraw_select(interaction, self.original_interaction, self)
 
     async def _choice_callback(self, interaction: discord.Interaction):
         value = interaction.data["values"][0]

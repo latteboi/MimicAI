@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 from .base_components import (
     BlockedGuard,
     BaseBulkProfileView, ConfigModal, ActionTextInputModal, TimeoutCleanupMixin,
-    ReportErrorMixin, add_button, add_select, build_pagination_controls,
+    ReportErrorMixin, add_button, add_select, redraw_select, build_pagination_controls,
     build_confirm_view, invalidate_model_cache, PageJumpModal, paged_nav_options,
     refuse_unregistered,
 )
@@ -944,14 +944,17 @@ PROFILE_ACTIONS = (
                        description="Overwrite backstory, traits, likes, dislikes and appearance.",
                        warning="Replaces every selected profile's **entire persona** with what you "
                                "typed; blank sections are cleared. Not recoverable.")),
-    _Action("edit_instructions", "persona", "Instructions", "Your own instructions for the character, sent with every reply, plus Enhance Awareness.",
+    _Action("edit_instructions", "persona", "Instructions", "Your own instructions for the character, sent with every reply, plus MimicAI's own guidance.",
             _method("_act_edit_instructions", wants_profile=True),
             bulk=_Bulk(_bulk_method("_bulk_edit_instructions"), scope="personal", destructive=True,
-                       prompt_keys=("ai_instructions", "enhance_awareness_enabled"),
-                       description="Overwrite all four AI instruction parts and Enhance Awareness.",
+                       prompt_keys=("ai_instructions", *(key for key, *_ in INSTRUCTION_TICKS)),
+                       description="Overwrite all four AI instruction parts and the guidance boxes.",
                        warning="Replaces every selected profile's **AI instructions** (all four parts) "
-                               "and sets Enhance Awareness as you left it. All four left blank only turns "
-                               "Enhance Awareness on. Not recoverable.")),
+                               "and sets each guidance box as you left it. All four left blank only turns "
+                               "the ticked boxes on. Not recoverable.")),
+    _Action("view_guidance", "persona", "MimicAI's Guidance",
+            "Read what each guidance box in Instructions adds, and which are on.",
+            _method("_act_view_guidance")),
     _Action("edit_appearance", "persona", "Appearance", "The display name and avatar it posts with.",
             _method("_handle_appearance"), _own),
     # Identity, so it is stored with the persona and a borrow reads the original's. No
@@ -1559,7 +1562,8 @@ class ProfileManageView(BlockedGuard, ui.View):
             interaction, self.profile_name, target_user_id=self.user_id)
         await self.original_interaction.edit_original_response(embed=new_embed, view=self)
 
-    async def dropdown_callback(self, interaction: discord.Interaction):
+    async def dropdown_callback(self, interaction: discord.Interaction, owner: Optional[ui.View] = None):
+        """`owner` is the view the select sits on, when it is not the dashboard (Token Advice)."""
         choice = interaction.data['values'][0]
         profile = self.cog.profile_manager._get_profile_config(
             self.user_id, self.profile_name, self.is_borrowed)
@@ -1571,6 +1575,7 @@ class ProfileManageView(BlockedGuard, ui.View):
         if action is None:
             return
         await action.run(self, interaction, profile)
+        await redraw_select(interaction, self.original_interaction, owner or self)
 
     # --- Bespoke dropdown handlers ---
     #
@@ -1622,8 +1627,13 @@ class ProfileManageView(BlockedGuard, ui.View):
     async def _act_edit_instructions(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         prompts = self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {}
         modal = EditUserProfileAIInstructionsModal(self.cog, self.profile_name, prompts.get("ai_instructions", ""), self.user_id,
-                                                   enhance_awareness=bool(prompts.get("enhance_awareness_enabled")))
+                                                   ticked=prompts)
         await interaction.response.send_modal(modal)
+
+    async def _act_view_guidance(self, interaction: discord.Interaction):
+        view = GuidanceView(self.cog, interaction,
+                            self.cog.profile_manager._get_profile_prompts(self.user_id, self.profile_name) or {})
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     async def _act_models(self, interaction: discord.Interaction, profile: Dict[str, Any]):
         view = SingleProfileModelView(self.cog, self.original_interaction, self.profile_name,
@@ -1874,6 +1884,38 @@ class OpenDashboardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await self.cog._open_profile_manage(interaction, self.profile_name, repaint=True)
 
 
+class GuidanceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
+    """MimicAI's Guidance: one page per Instructions box. The text is resolved as the prompt
+    builder resolves it, so a /mod override is what shows."""
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, ticked: Dict[str, Any]):
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.original_interaction = interaction
+        get = cog.global_prompts.get
+        self.pages = [(f"{label} · {'on' if ticked.get(key) else 'off'}", does, get(mod_key, text))
+                      for key, label, mod_key, text, does in INSTRUCTION_TICKS]
+        self.current_page = 0
+        self._build()
+
+    def _build(self):
+        self.clear_items()
+        build_pagination_controls(self, self.current_page, len(self.pages), 0, self._turn(-1), self._turn(1))
+
+    def _turn(self, delta: int):
+        async def callback(interaction: discord.Interaction):
+            self.current_page += delta
+            self._build()
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+        return callback
+
+    def embed(self) -> discord.Embed:
+        title, does, text = self.pages[self.current_page]
+        if len(text) > 3800:  # only a long /mod override; an embed holds 4,096
+            text = text[:3799] + "…"
+        return text_embed(f"{does}\n```\n{text}\n```", title=title)
+
+
 class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     """Token Advice: what this profile's settings and the text it always sends cost, on
     the dashboard's own message, with a way to each setting and Back to the tab.
@@ -1932,7 +1974,8 @@ class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                                      + [target for _label, _tokens, target in self.standing]))
         options = [self._action(v).option(self.parent) for v in targets if self._action(v)]
         if options:
-            add_select(self, options, self.parent.dropdown_callback, placeholder="Go to a setting…", row=0)
+            add_select(self, options, lambda i: self.parent.dropdown_callback(i, owner=self),
+                       placeholder="Go to a setting…", row=0)
         add_button(self, "Back", self._back_callback, emoji="⬅️", row=1)
 
     async def _back_callback(self, interaction: discord.Interaction):
@@ -2174,7 +2217,7 @@ class EditUserProfilePersonaModal(ui.Modal):
 
 class EditUserProfileAIInstructionsModal(ui.Modal):
     def __init__(self, cog_instance, profile_name: str, current_instr:str, user_id: int, callback=None,
-                 enhance_awareness: bool = False):
+                 ticked: Optional[Dict[str, Any]] = None):
         self.cog:MimicCog=cog_instance
         self.profile_name = profile_name
         self.user_id = user_id
@@ -2185,16 +2228,19 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
         super().__init__(title=title)
 
         current = current_instr if isinstance(current_instr, list) else []
-        # Discord's five components: the tick, then four parts. The style guide has its own
-        # screen under Training, so Part 4 is a part like the others.
-        # Its cost, from the text as resolved (a /mod override counts as itself), and an
-        # estimate, as every model's tokeniser counts differently. The group half's cost is
-        # left to the Instructions help page: there is no room for both under 100.
-        solo = self.cog.global_prompts.get("ENHANCE_AWARENESS", DEFAULT_ENHANCE_AWARENESS)
-        self.enhance = ui.Checkbox(default=enhance_awareness)
-        self.add_item(ui.Label(text="Enhance Awareness", component=self.enhance, description=(
-            f"Thinks before replying, holds its view, and in groups stops echoing others. "
-            f"~{_estimate_text_tokens(solo):,} tokens.")[:100]))
+        # Discord's five components: one group of boxes, then four parts. The style guide has
+        # its own screen under Training, so Part 4 is a part like the others.
+        # Each box's cost, from the text as resolved (a /mod override counts as itself), and an
+        # estimate, as every model's tokeniser counts differently. Enhance Awareness's group
+        # half is left to the Instructions help page: there is no room for both under 100.
+        ticked = ticked or {}
+        self.ticks = ui.CheckboxGroup(required=False, min_values=0, max_values=len(INSTRUCTION_TICKS), options=[
+            discord.CheckboxGroupOption(
+                label=label, value=key, default=bool(ticked.get(key)),
+                description=f"{does} ~{_estimate_text_tokens(self.cog.global_prompts.get(mod_key, text)):,} tokens."[:100])
+            for key, label, mod_key, text, does in INSTRUCTION_TICKS])
+        self.add_item(ui.Label(text="MimicAI's own guidance", component=self.ticks,
+                               description="Kept up to date for you, never copied into the profile."))
         self.parts = [ui.TextInput(label=f"Part {n}", style=discord.TextStyle.paragraph,
                                    default=self.cog.storage_manager._decrypt_data(current[n - 1]) if len(current) >= n else "",
                                    required=False, max_length=AI_INSTRUCTIONS_PART_MAX_LENGTH)
@@ -2205,20 +2251,21 @@ class EditUserProfileAIInstructionsModal(ui.Modal):
     async def on_submit(self, i:discord.Interaction):
         await i.response.defer(ephemeral=True,thinking=True)
         instr_list = [part.value for part in self.parts]
+        ticks = {key: key in self.ticks.values for key, *_ in INSTRUCTION_TICKS}
 
         if self.profile_name == "BULK_APPLY":
             if self.callback:
-                await self.callback(i, instr_list, self.enhance.value)
+                await self.callback(i, instr_list, ticks)
             return
 
         success = await self.cog.profile_manager.update_user_profile_ai_instructions(
-            self.user_id, self.profile_name, instr_list, i.channel_id, enhance_awareness=self.enhance.value
+            self.user_id, self.profile_name, instr_list, i.channel_id, ticks=ticks
         )
         scope=f"your profile '{self.profile_name}'"
         message = f"AI Instructions for {scope} {'updated' if success else 'update failed -- that profile could not be written'}."
 
         await i.followup.send(embed=text_embed(message),ephemeral=True)
-        # The tick is not moderated text, so a change to it alone leaves the rating current.
+        # The ticks are not moderated text, so a change to them alone leaves the rating current.
         if success:
             await maybe_prompt_rating_after_edit(
                 self.cog, i, self.user_id, self.profile_name)
@@ -6670,6 +6717,7 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
             return
         self.current_action = action
         await action.bulk.run(self, interaction)
+        await redraw_select(interaction, self.original_interaction, self)
 
     async def _anchor_callback(self, interaction: discord.Interaction):
         self._load_anchor(interaction.data['values'][0])
@@ -6760,20 +6808,19 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
             self.cog, "BULK_APPLY", {}, self.user_id, callback=modal_callback))
 
     async def _bulk_edit_instructions(self, interaction: discord.Interaction):
-        async def modal_callback(i: discord.Interaction, instr_list: List[str], enhance: bool):
-            # Four blank parts with the tick set means "turn Enhance Awareness on", which is
-            # a likely thing to want across forty profiles; clearing every part is not.
+        async def modal_callback(i: discord.Interaction, instr_list: List[str], ticks: Dict[str, bool]):
+            # Four blank parts with boxes ticked means "turn these on", which is a likely
+            # thing to want across forty profiles; clearing every part is not.
             if not any(part.strip() for part in instr_list):
-                if enhance:
+                if any(ticks.values()):
                     await self._stage_from_modal(i, "edit_instructions", {},
-                                                 {"enhance_awareness_enabled": True})
+                                                 {k: True for k, on in ticks.items() if on})
                     return
                 await self._modal_reply(
                     i, "Every instruction part was left blank, so nothing was staged.")
                 return
             await self._stage_from_modal(i, "edit_instructions", {},
-                                         {"ai_instructions": instr_list,
-                                          "enhance_awareness_enabled": enhance})
+                                         {"ai_instructions": instr_list, **ticks})
 
         await interaction.response.send_modal(EditUserProfileAIInstructionsModal(
             self.cog, "BULK_APPLY", "", self.user_id, callback=modal_callback))

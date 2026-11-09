@@ -5151,7 +5151,8 @@ class ProfileManager:
             self._invalidate_channel_model_cache((channel_id_context, user_id))
         return True
 
-    async def update_user_profile_ai_instructions(self, user_id: int, profile_name: str, instructions: List[str], channel_id_context: int, enhance_awareness: Optional[bool] = None) -> bool:
+    async def update_user_profile_ai_instructions(self, user_id: int, profile_name: str, instructions: List[str], channel_id_context: int, ticks: Optional[Dict[str, bool]] = None) -> bool:
+        """`ticks` is `{key: bool}` for the Instructions boxes (`INSTRUCTION_TICKS`)."""
         if not self.cog.has_lock: return False
 
         def _sync_update():
@@ -5159,8 +5160,7 @@ class ProfileManager:
 
             prompts = self._get_profile_prompts(user_id, profile_name) or {}
             prompts["ai_instructions"] = instructions
-            if enhance_awareness is not None:
-                prompts["enhance_awareness_enabled"] = enhance_awareness
+            prompts.update(ticks or {})
             self._save_profile_prompts(user_id, profile_name, prompts)
 
             return self.cog.session_manager._get_active_user_profile_name_for_channel(user_id, channel_id_context) == profile_name

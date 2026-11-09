@@ -53,6 +53,22 @@ def add_select(view: ui.View, options, callback, *, row: int = 0,
     return select
 
 
+async def redraw_select(interaction: discord.Interaction, original: discord.Interaction, view: ui.View):
+    """Clear a select's pick after it answered somewhere else (a modal, a new message).
+
+    The pick stays on screen until its message is redrawn, and Discord sends nothing when
+    the same option is picked again, so a cancelled form could not be reopened without
+    picking another row first. A pick that already redrew its message is left alone.
+    """
+    if interaction.response.type in (discord.InteractionResponseType.modal,
+                                     discord.InteractionResponseType.channel_message,
+                                     discord.InteractionResponseType.deferred_channel_message):
+        try:
+            await original.edit_original_response(view=view)
+        except discord.HTTPException:
+            pass  # past the token's fifteen minutes: only the stale pick remains
+
+
 def text_embed(text: str, title: Optional[str] = None) -> discord.Embed:
     """A reply as every answer here is drawn: one embed, the text as its description, cut
     to an embed's 4096 characters. A plain-text reply is the one thing this replaces."""

@@ -205,7 +205,7 @@ class SpeakAsMixin:
 
         That position is the feature. Every block in the system instruction says "you
         are mid-scene, continue the conversation", and <session_rules> says
-        "Always respond as yourself"; a rewrite directive placed anywhere earlier loses
+        "Speak only as yourself"; a rewrite directive placed anywhere earlier loses
         to them and the model answers the transcript instead of re-voicing the line.
 
         The history tail is SPEAK_REWRITE_HISTORY_TURNS rather than the profile's STM

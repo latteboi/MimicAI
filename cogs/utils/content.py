@@ -92,10 +92,14 @@ HELP_CATEGORIES = {
             "takes priority over persona bias during generation. There are four separate instruction blocks so long rulesets do not hit a "
             "single field's character limit.\n\n"
             "**Enhance Awareness**, the box at the top of Instructions, adds MimicAI's own guidance on how a character thinks -- "
-            "judgement, self-awareness, not caving to insistence -- and, when two or more characters are seated, how to share a "
-            "room without echoing each other. It is off until you tick it, and it is kept up to date for you: the text is never "
-            "copied into your profile. The box's own description shows roughly how many tokens it adds to the system "
-            "instruction; a group chat adds about as many again."
+            "judgement, self-awareness, not caving to insistence, keeping a conversation moving without echoing anyone. It is "
+            "off until you tick it, and it is kept up to date for you: the text is never copied into your profile. The box's "
+            "own description shows roughly how many tokens it adds to the system instruction, and Persona → MimicAI's "
+            "Guidance shows the text itself.\n\n"
+            "**Enhanced Roleplay Formatting** and **Internal Monologue** sit beside it, kept up to date the same way. "
+            "Formatting writes each reply as beats: a line of unquoted dialogue, then a small italic action line under it. "
+            "Monologue ends every reply with one small line of the character's private thought. Either works alone. "
+            "Your own instructions come after all three and win where they disagree."
         ),
         "Instruction Style by Model Type": (
             "How much instruction a model wants depends on what kind of model it is.\n\n"
