@@ -1407,13 +1407,12 @@ class EventListeners:
                         continue
 
                 eff_owner, eff_name = self.profile_manager._resolve_effective_profile(o_id, p_name)
-                app = self.profile_manager._get_user_appearance(eff_owner, eff_name)
-                disp_name = app.get("custom_display_name") or eff_name
+                disp_name = self.profile_manager.catalogue_entry(o_id, p_name)[0] or eff_name
 
                 val = f"{o_id}:{p_name}"
-                # Participants are capped at MAX_MULTI_PROFILES, so resolving appearance
-                # up front here is bounded and lets the display name be matched on too --
-                # which the old code did for these commands and only these.
+                # Display names come off the catalogue, so they are resolved up front for
+                # every participant and matched on too -- which the old code did for these
+                # commands and only these.
                 pending.append((val, p_name))
                 pending.append((val, disp_name))
                 meta[val] = {"owner": o_id, "name": p_name, "eff_owner": eff_owner, "disp": disp_name}
@@ -1440,9 +1439,6 @@ class EventListeners:
             # empty menu for profiles the command accepts, which is every user who
             # has never published. Publication is not required to talk to your own
             # profile privately.
-            #
-            # The rating check reads the profile body (and the source's, for a
-            # borrow), so it walks the ranked list only until 25 pass, in a thread.
             user_id = interaction.user.id
             index = self.profile_manager._get_user_index(user_id)
 
@@ -1480,26 +1476,17 @@ class EventListeners:
                 pending.append((s_name, s_name))
                 meta[s_name] = {"kind": "system", "pid": s_pid}
 
-        # Shared formatting for the two owned-profile branches. Only the ranked
-        # survivors reach here, so the per-candidate config reads below are bounded at
-        # 25 no matter how many profiles the account holds.
+        # Shared formatting for the two owned-profile branches. Names, verdicts and
+        # borrow sources all come off the catalogue: nothing below opens a profile.
         user_id = interaction.user.id
+        pm = self.profile_manager
         if cmd_name == "global_chat":
-            ranked = [name for name, _ in rank_keyed(current, pending, limit=len(pending))]
-
-            def usable_in_global_chat():
-                # Filtered before the cut to 25, not after it: cutting first hid every
-                # rated profile ranked below 25 unrated ones, so a blank query on a
-                # large account could offer nothing at all.
-                usable = []
-                for name in ranked:
-                    if self.profile_manager.content_capability(user_id, name, "global_chat")[0]:
-                        usable.append(name)
-                        if len(usable) == MAX_CHOICES:
-                            break
-                return usable
-
-            survivors = await asyncio.to_thread(usable_in_global_chat)
+            # Filtered before the cut to 25, not after it: cutting first hid every rated
+            # profile ranked below 25 unrated ones, so a blank query on a large account
+            # could offer nothing at all. The command checks the profile's own verdict.
+            survivors = [name for name, _ in rank_keyed(current, pending, limit=len(pending))
+                         if CONTENT_RATING_CAPABILITIES[pm.catalogue_entry(user_id, name)[1]]["global_chat"]
+                         ][:MAX_CHOICES]
         else:
             survivors = [name for name, _ in rank_keyed(current, pending, limit=MAX_CHOICES)]
 
@@ -1508,29 +1495,24 @@ class EventListeners:
             kind = m["kind"]
 
             if kind == "system":
-                app = self.profile_manager._get_user_appearance(
-                    int(defaultConfig.DISCORD_OWNER_ID), name)
-                disp_name = app.get("custom_display_name") or name
+                disp_name = pm.catalogue_entry(user_id, name)[0] or name
                 choices.append(app_commands.Choice(
                     name=format_choice_name(disp_name, name, m["pid"], "System", True),
                     value=name))
                 continue
 
             if kind == "personal":
-                pid = m["pid"] or self.profile_manager._get_pid_from_name_any(user_id, name)
-                app = self.profile_manager._get_user_appearance(user_id, name)
-                disp_name = app.get("custom_display_name") or name
+                pid = pm._get_pid_from_name_any(user_id, name)
+                disp_name = pm.catalogue_entry(user_id, name)[0] or name
                 choices.append(app_commands.Choice(
                     name=format_choice_name(disp_name, name, pid, interaction.user.name, False),
                     value=name))
                 continue
 
-            b_cfg = self.profile_manager._get_profile_config(user_id, name, True) or {}
-            orig_oid = m.get("orig_oid") or b_cfg.get("original_owner_id", user_id)
-            orig_pid = m["pid"] or b_cfg.get("original_pid") or b_cfg.get("original_profile_id", "Unknown")
-            eff_owner, eff_name = self.profile_manager._resolve_effective_profile(user_id, name)
-            app = self.profile_manager._get_user_appearance(eff_owner, eff_name)
-            disp_name = app.get("custom_display_name") or eff_name
+            source = pm._borrow_source(user_id, name)
+            orig_oid, orig_pid = (source[0], source[1] or "Unknown") if source else (user_id, "Unknown")
+            eff_name = pm._resolve_effective_profile(user_id, name)[1]
+            disp_name = pm.catalogue_entry(user_id, name)[0] or eff_name
             creator = self.bot.get_user(int(orig_oid))
             c_name = creator.name if creator else str(orig_oid)
             choices.append(app_commands.Choice(

@@ -60,9 +60,6 @@ from ..utils.bonds import apply_updates as apply_bond_updates, describe as descr
 from ..utils.discord_cdn import is_web_url, signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager, _get_compressor, _get_decompressor
-
-#: Two searches run in two worker threads, and LRUCache's eviction is several steps.
-_LIBRARY_TEXT_LOCK = threading.Lock()
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
 from ..gui.base_components import dismissible, text_embed
 
@@ -1021,9 +1018,14 @@ class ProfileManager:
         removed (the bot owner's Exempt) reads Unrated now, and a Library borrow does
         not ask the rating again. One decrypt per listing, at boot.
 
+        The same read refreshes every kept listing's text, filed as a dict under its own
+        PID (see `_update_listing`): a legacy "owner_id:pid" string or a key that is not the
+        PID is converted here, and a second entry for the same PID dropped.
+
         Returns the removed entries so a caller can report them.
         """
         removed = []
+        changed = False
         for entry_id, p_info in list(self.cog.public_profiles.items()):
             desc = self._describe_public_entry(entry_id, p_info)
 
@@ -1038,14 +1040,27 @@ class ProfileManager:
                     USERS_DIR, str(desc["owner_id"]), "profiles", desc["original_pid"], "profile.json.gz")
                 if os.path.exists(profile_path):
                     p_data = IOManager.read_json_gzip(profile_path, self.cog.fernet) or {}
-                    verdict = self._verdict_of(p_data.get("config") or {})
+                    config = p_data.get("config") or {}
+                    verdict = self._verdict_of(config)
                     if verdict == CONTENT_RATING_PENDING or CONTENT_RATING_CAPABILITIES[verdict]["publish"]:
+                        pid = desc["original_pid"]
+                        entry = p_info if isinstance(p_info, dict) else {
+                            "owner_id": desc["owner_id"], "original_pid": pid}
+                        filed = self._with_listing_text(entry, config)
+                        if entry_id != pid:
+                            self.cog.public_profiles.pop(entry_id, None)
+                            changed = True
+                            if pid in self.cog.public_profiles:
+                                continue
+                        if self.cog.public_profiles.get(pid) != filed:
+                            self.cog.public_profiles[pid] = filed
+                            changed = True
                         continue
 
             removed.append(desc)
             self.cog.public_profiles.pop(entry_id, None)
 
-        if removed:
+        if removed or changed:
             self._save_public_index()
         return removed
 
@@ -1098,36 +1113,54 @@ class ProfileManager:
             self.save_user_about(owner_id, about)
         return bool(entries)
 
-    def _library_fields(self, owner_id: int, pid: str) -> Tuple[str, str]:
-        """A listing's (display name, intro), for the Library's search and its dropdown.
+    # --- A listing's text ------------------------------------------------------------
+    #
+    # What the Library searches and shows -- display name and intro -- is copied into the
+    # listing's own public-index entry, which is in memory whole, so a search or a page of
+    # the dropdown opens no profile. Public by definition, so plaintext. Written by
+    # _save_profile_by_pid on every save of a listed profile, by list_public when one is
+    # listed, and refreshed for every listing by the boot sweep (_prune_public_index), which
+    # also files each under its own PID: what lets a save find its listing in one lookup.
 
-        Read uncached -- a search touches every listing, which is no reason to fill the
-        shard cache -- and kept per version of the file, keyed by its mtime, so an edit is
-        picked up without a hook in every config write. Blocking: call it off the loop.
-        """
-        # ponytail: one stat per listing per search, and a decrypt per listing the first
-        # time; copy the text into the public index if the Library outgrows that.
-        path = os.path.join(USERS_DIR, str(owner_id), "profiles", pid, "profile.json.gz")
+    _LISTING_TEXT_KEYS = ("display_name", "intro")
+
+    @staticmethod
+    def _listing_text(config: Dict[str, Any]) -> Dict[str, str]:
+        text = {"display_name": config.get("custom_display_name"), "intro": config.get("library_intro")}
+        return {k: str(v) for k, v in text.items() if v}
+
+    def _with_listing_text(self, entry: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
+        return {**{k: v for k, v in entry.items() if k not in self._LISTING_TEXT_KEYS},
+                **self._listing_text(config)}
+
+    def _update_listing(self, owner_id: int, pid: str, config: Dict[str, Any]):
+        """Refresh a listed profile's text, saving the public index only when it changed.
+        One lookup for the unlisted: this runs on every profile save. Best-effort."""
         try:
-            version = os.path.getmtime(path)
-        except OSError:
-            return "", ""
-        cached = self.cog.library_text.get(pid)
-        if cached and cached[0] == version:
-            return cached[1]
-        config = (IOManager.read_json_gzip(path, self.cog.fernet) or {}).get("config") or {}
-        fields = (str(config.get("custom_display_name") or ""), str(config.get("library_intro") or ""))
-        with _LIBRARY_TEXT_LOCK:
-            self.cog.library_text[pid] = (version, fields)
-        return fields
+            entry = self.cog.public_profiles.get(pid)
+            if self._public_entry_owner(entry) != int(owner_id):
+                return
+            if not isinstance(entry, dict):  # "owner_id:pid", until the boot sweep files it
+                entry = {"owner_id": int(owner_id), "original_pid": pid}
+            updated = self._with_listing_text(entry, config)
+            if updated != self.cog.public_profiles.get(pid):
+                self.cog.public_profiles[pid] = updated
+                self._save_public_index()
+        except Exception as e:
+            print(f"Public index: listing text update failed for {owner_id}/{pid} ({e})")
+
+    def _listing(self, owner_id: int, pid: str) -> Dict[str, Any]:
+        entry = self.cog.public_profiles.get(pid)
+        return entry if isinstance(entry, dict) and self._public_entry_owner(entry) == int(owner_id) else {}
 
     def library_search_text(self, owner_id: int, pid: str) -> str:
         """A listing's display name and intro, lower-cased, for the Library's search."""
-        return "\n".join(filter(None, self._library_fields(owner_id, pid))).lower()
+        listing = self._listing(owner_id, pid)
+        return "\n".join(listing[k] for k in self._LISTING_TEXT_KEYS if k in listing).lower()
 
     def library_display_name(self, owner_id: int, pid: str) -> str:
-        """A listing's display name, or "" for none. Blocking, as `_library_fields` is."""
-        return self._library_fields(owner_id, pid)[0]
+        """A listing's display name, or "" for none."""
+        return self._listing(owner_id, pid).get("display_name", "")
 
     def distribution_of(self, owner_id: int, profile_name: str) -> Tuple[bool, int]:
         """(listed in the Public Library, number of users borrowing it), for copy that
@@ -1207,6 +1240,8 @@ class ProfileManager:
         # trailing the profile rather than announcing one that was never written.
         self._write_name_sidecar(user_id, pid, data.get("name"),
                                  self._pid_class(pid, data.get("config")))
+        self._update_card(user_id, pid, data.get("config") or {})
+        self._update_listing(user_id, pid, data.get("config") or {})
 
     # --- The name sidecar ----------------------------------------------------------
     #
@@ -1270,6 +1305,95 @@ class ProfileManager:
         if backfill:
             self._write_name_sidecar(user_id, pid, name, category)
         return name, category
+
+    # --- The catalogue -------------------------------------------------------------
+    #
+    # What a list shows for a profile -- display name and rating verdict, and for a borrow
+    # where its source is -- kept in index.json, so an autocomplete or a dropdown over a
+    # hundred profiles reads one file rather than opening each (~0.07 ms against 8-29 ms
+    # for 100). Keyed by PID: a rename never touches it. A dict in the cached index; one
+    # Fernet token on disk, so display names and verdicts stay encrypted at rest.
+    #
+    # Copies, written by _save_profile_by_pid alone. A card that is missing costs one
+    # profile read, never a wrong answer, and nothing that lets a profile out reads it:
+    # the gates read the profile itself.
+
+    @staticmethod
+    def _source_pointer(config: Dict[str, Any]) -> Optional[list]:
+        """A borrow's [owner, source PID, snapshot name], or None when it names no owner.
+
+        The snapshot is kept only when there is no PID -- the one case `_borrow_source`
+        has nothing else to go on.
+        """
+        owner = config.get("original_owner_id")
+        if not owner:
+            return None
+        pid = config.get("original_pid") or config.get("original_profile_id")
+        if not pid or pid == _UNKNOWN_SOURCE_PID:
+            return [int(owner), None, config.get("original_profile_name")]
+        return [int(owner), pid, None]
+
+    def _card_of(self, pid: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """One profile's catalogue entry, sparse: "d" display name, "r" verdict when not
+        Unrated, "src" for a borrow -- whose name and verdict are its source's card."""
+        if self._pid_class(pid, config) == "borrowed":
+            src = self._source_pointer(config)
+            return {"src": src} if src else {}
+        card: Dict[str, Any] = {}
+        if config.get("custom_display_name"):
+            card["d"] = str(config["custom_display_name"])
+        verdict = self._verdict_of(config)
+        if verdict != CONTENT_RATING_UNRATED:
+            card["r"] = verdict
+        return card
+
+    def _open_catalogue(self, value: Any) -> Dict[str, Any]:
+        """The catalogue as stored -- a token, or a dict with no key configured -- opened.
+        One that will not open is empty: the next repair refills it."""
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and self.cog.fernet:
+            try:
+                opened = json.loads(self.cog.fernet.decrypt(value.encode()))
+                if isinstance(opened, dict):
+                    return opened
+            except Exception:
+                pass
+        return {}
+
+    def _card(self, owner_id: int, pid: Optional[str]) -> Optional[Dict[str, Any]]:
+        """The catalogue entry for a PID in this owner's tree, or None if it has none yet."""
+        if not pid:
+            return None
+        return self._get_user_index(owner_id).get("catalogue", {}).get(pid)
+
+    def _update_card(self, user_id: int, pid: str, config: Dict[str, Any]):
+        """Refresh one card, saving the index only when it changed: this runs on every
+        profile save, and most change nothing a list shows. Best-effort, as the sidecar
+        is -- the shard is already written, and a missing card only costs a read."""
+        try:
+            card = self._card_of(pid, config)
+            index = self._get_user_index(user_id)
+            catalogue = index.setdefault("catalogue", {})
+            if catalogue.get(pid) != card:
+                catalogue[pid] = card
+                self._save_user_index(user_id, index)
+        except Exception as e:
+            print(f"Catalogue: card update failed for {user_id}/{pid} ({e})")
+
+    def catalogue_entry(self, user_id: int, profile_name: str) -> Tuple[Optional[str], str]:
+        """(display name or None, verdict) a list shows for this name -- a borrow's are its
+        source's. Index reads only, bar a profile the catalogue has not caught up with.
+
+        For lists and autocomplete. Never a gate: a path that lets a profile out reads the
+        profile (`settled_capability`).
+        """
+        eff_owner, eff_name = self._resolve_effective_profile(user_id, profile_name)
+        tree_owner, pid = self._resolve_owner_and_pid(eff_owner, eff_name, strict=True)
+        card = self._card(tree_owner, pid)
+        if card is None:
+            card = self._card_of(pid or "", self._get_profile_config(eff_owner, eff_name, False) or {})
+        return card.get("d"), card.get("r", CONTENT_RATING_UNRATED)
 
     #: A minted PID is a class letter plus uuid4().hex[:15].upper() -- 16 characters,
     #: uppercase hex after the first.
@@ -1485,6 +1609,9 @@ class ProfileManager:
         index = IOManager.read_json(os.path.join(USERS_DIR, user_id_str, "index.json")) or {}
         for key in self._DERIVED_INDEX_KEYS:
             index[key] = {}
+        # Kept, and filled for any profile without a card; _save_user_index drops the ones
+        # whose profile has gone.
+        catalogue = index["catalogue"] = self._open_catalogue(index.get("catalogue"))
         profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
 
         if os.path.isdir(profiles_dir):
@@ -1504,6 +1631,13 @@ class ProfileManager:
                     continue
                 p_name, category = described
                 index.setdefault(category, {})[p_name] = pid_folder
+
+                if pid_folder not in catalogue:
+                    # Uncached: a sweep has no business in the turn path's shard cache.
+                    data = IOManager.read_json_gzip(
+                        os.path.join(p_dir, "profile.json.gz"), self.cog.fernet)
+                    if isinstance(data, dict):
+                        catalogue[pid_folder] = self._card_of(pid_folder, data.get("config") or {})
 
         # Runs whether or not there was a profiles directory to scan: a user with no
         # profiles still has a key flag, and the branches that used to bracket this
@@ -1614,6 +1748,12 @@ class ProfileManager:
             if pids_in_index != pids_on_disk:
                 return False
 
+            # A profile with no card predates the catalogue (or a restore dropped it): the
+            # repair is what fills it, which makes the first boot after a deploy the
+            # migration. One small decrypt per user.
+            if set(self._open_catalogue(index.get("catalogue"))) != pids_on_disk:
+                return False
+
             # Nothing clears has_personal_key when a key is deleted -- only a repair
             # does -- so it has to be verified here or a stale True would survive.
             #
@@ -1718,6 +1858,7 @@ class ProfileManager:
         elif not index or not isinstance(index.get("personal"), dict) or not isinstance(index.get("borrowed"), dict):
             index = self._repair_user_index(user_id)
 
+        index["catalogue"] = self._open_catalogue(index.get("catalogue"))
         self.cog.user_indices[user_id_str] = index
         # Cache miss only, and only for an index good enough to skip the repair above
         # -- a repair already saves, which reconciles. This is the path that catches an
@@ -1740,7 +1881,16 @@ class ProfileManager:
         # ordering note on _get_or_create_user_profile), so by the time we get here
         # profiles/ already holds what the index is about to claim.
         data["profiles_stamp"] = self._profiles_dir_stamp(user_id_str)
-        IOManager.write_json(data, path)
+        # Pruned to the profiles on disk: every delete ends here, so no card outlives its
+        # profile. Sealed for disk only -- the cached index keeps the dict.
+        profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
+        on_disk = set(os.listdir(profiles_dir)) if os.path.isdir(profiles_dir) else set()
+        catalogue = data["catalogue"] = {pid: card for pid, card
+                                         in self._open_catalogue(data.get("catalogue")).items()
+                                         if pid in on_disk}
+        sealed = (self.cog.fernet.encrypt(json.dumps(catalogue)).decode()
+                  if self.cog.fernet else catalogue)
+        IOManager.write_json({**data, "catalogue": sealed}, path)
         self.cog.user_indices[user_id_str] = data
         # The appearance cache is keyed by name, and every rename, delete and creation
         # ends here. Kept past one, a name handed to a different profile -- a rename's
@@ -2011,15 +2161,20 @@ class ProfileManager:
 
         PID None is a borrow predating `original_pid` that `_migrate_borrow_pointers`
         could not stamp: the snapshot is the only pointer it has.
+
+        The pointer is read off the catalogue, so resolving a borrow opens nothing; the
+        borrow's own config only for a card not yet written.
         """
-        config = self._get_profile_config(user_id, profile_name, True) or {}
-        owner = config.get("original_owner_id")
-        if not owner:
+        card = self._card(user_id, self._get_user_index(user_id).get("borrowed", {}).get(profile_name))
+        if card is not None:
+            src = card.get("src")
+        else:
+            src = self._source_pointer(self._get_profile_config(user_id, profile_name, True) or {})
+        if not src:
             return None
-        owner = int(owner)
-        pid = config.get("original_pid") or config.get("original_profile_id")
-        if not pid or pid == _UNKNOWN_SOURCE_PID:
-            return owner, None, config.get("original_profile_name", profile_name)
+        owner, pid, snapshot = src
+        if pid is None:
+            return owner, None, snapshot or profile_name
         return owner, pid, self._get_name_from_pid(owner, pid) or pid
 
     def _resolve_effective_profile(self, user_id: int, profile_name: str) -> Tuple[int, str]:
@@ -2815,7 +2970,8 @@ class ProfileManager:
                         "source": "reset",
                     }
                     p_data["config"] = config
-                    IOManager.write_json_gzip(p_data, path, self.cog.fernet)
+                    # Through the one writer, or the catalogue keeps the old verdict.
+                    self._save_profile_by_pid(int(user_id_str), pid, p_data)
                     counts["reset"] += 1
                 except Exception as e:
                     counts["errors"] += 1
@@ -4030,7 +4186,9 @@ class ProfileManager:
         first = (self.get_user_about(owner_id).get("first_published") or {}).get(pid)
         self.cog.public_profiles[pid] = {"owner_id": int(owner_id), "original_pid": pid,
                                          "published_at": first or int(time.time()),
-                                         "updated_at": self._rated_at(owner_id, profile_name)}
+                                         "updated_at": self._rated_at(owner_id, profile_name),
+                                         **self._listing_text(
+                                             self._get_profile_config(owner_id, profile_name, False) or {})}
         return pid
 
     def _rated_at(self, owner_id: int, profile_name: str) -> int:

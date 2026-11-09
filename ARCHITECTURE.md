@@ -210,7 +210,8 @@ is kept. That is why opting in is a judgement about frequency alone.
 
 ```
 users/<user_id>/
-  index.json                          plaintext: name -> pid maps (personal/borrowed/system)
+  index.json                          plaintext: name -> pid maps (personal/borrowed/system);
+                                      its "catalogue" is one Fernet token -- see below
   keys.json.gz                        API key slots + provider assignments
   shares.json.gz                      incoming profile shares
   profiles/<pid>/
@@ -225,7 +226,8 @@ servers/<guild_id>/
   api_keys.json.gz
   webhooks.json.gz
   sessions/<channel_id>/multi/session_log.json.gz
-public_profiles/                      the shared library index
+public_profiles/                      the shared library index: each listing under its PID,
+                                      with its display name and intro (plaintext: public)
 borrows.json                          plaintext reverse index: source PID -> borrow PIDs
 mod/                                  blacklist, global prompt and system model overrides, docs
 ```
@@ -261,6 +263,21 @@ System, `B`/`C` borrowed — `PID_CLASS_PREFIXES`), tested through `_is_pid` on 
 called `Bob` is not a borrow. The name is in `name.json` beside the shard, plaintext for the
 same reason `index.json` is. Rebuilding a 100-profile tree measures ~3.7 ms against ~39 ms
 of decrypts.
+
+What a *list* shows is in the index too: the catalogue, PID -> `{d: display name, r: verdict,
+src: a borrow's [owner, PID, snapshot]}`, sparse. Autocomplete, the Share/Publish dropdown, the
+Library page and `_borrow_source` read it (`catalogue_entry`), so none of them opens a profile:
+listing 100 measures ~0.07 ms against 8-29 ms opening each. One Fernet token on disk, a dict in
+the cached index. `_save_profile_by_pid` writes a card on every save, saving the index only when
+it changed; `_save_user_index` drops a card whose folder is gone; and the consistency check fails
+on a profile with no card, so the boot repair is its migration. It holds copies, and no gate
+reads it: what lets a profile out reads the profile.
+
+The Library keeps its own copy: each listing's display name and intro sit in its public-index
+entry, which is in memory whole, so a search reads no profile either. The same save refreshes a
+listed profile's entry (one dict lookup for the unlisted, so the turn path pays nothing), and the
+boot sweep (`_prune_public_index`), which already opens every listing to check its rating, files
+each under its PID with its text: legacy string entries and non-PID keys are converted there.
 
 The other half is write ordering: **the shard is written before the index, everywhere.** A
 crash then leaves a profile nothing names, which the next rebuild adopts — rather than a

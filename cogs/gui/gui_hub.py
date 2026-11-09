@@ -190,13 +190,12 @@ class HubPublicLibraryView(HubBaseView):
                    style=discord.ButtonStyle.green, emoji="🌐")
 
     async def _load_display_names(self):
-        """The dropdown page's display names, read in a thread: a listing's first read
-        decrypts its profile file (`library_display_name`)."""
+        """The dropdown page's display names, off each listing's entry (`library_display_name`)."""
         start = self.current_page * self.PER_PAGE
         page = [p for p in self.filtered_list[start:start + self.PER_PAGE] if p.get('original_pid')]
         pm = self.cog.profile_manager
-        self._display_names = await asyncio.to_thread(lambda: {
-            p['original_pid']: pm.library_display_name(p['owner_id'], p['original_pid']) for p in page})
+        self._display_names = {
+            p['original_pid']: pm.library_display_name(p['owner_id'], p['original_pid']) for p in page}
 
     async def update_display(self):
         if not self.filtered_list:
@@ -320,8 +319,8 @@ class HubPublicLibraryView(HubBaseView):
         await i.response.send_modal(NewProfileModal(self.cog))
 
     def _matches(self, entry, term: str) -> bool:
-        """The term in the profile's name, its creator's, its display name or its intro.
-        Blocking: the last two can read the profile's file."""
+        """The term in the profile's name, its creator's, its display name or its intro --
+        the last two copied into the listing's entry, so this reads no file."""
         owner = self.cog.bot.get_user(entry['owner_id'])
         return (term in entry['profile_name'].lower()
                 or (owner is not None and term in owner.name.lower())
@@ -336,8 +335,7 @@ class HubPublicLibraryView(HubBaseView):
             await mi.response.defer()
             term = inp.value.lower().strip()
             if term:
-                self.filtered_list = await asyncio.to_thread(
-                    lambda: [p for p in self.all_public if self._matches(p, term)])
+                self.filtered_list = [p for p in self.all_public if self._matches(p, term)]
             else:
                 self.filtered_list = self.all_public
             self.selected_index = self.current_page = 0
@@ -623,12 +621,13 @@ class HubShareManagerView(HubBaseView):
         return "publish" if self.PUBLISH else "share"
 
     def _eligible_profiles(self) -> Tuple[List[str], Set[str]]:
-        """(offered, of those the ones needing a rating). Blocking: one rating read each."""
+        """(offered, of those the ones needing a rating). Verdicts off the catalogue: what is
+        offered, not what is let out -- the press rates for distribution itself."""
         pm = self.cog.profile_manager
         names = sorted(pm._get_user_index(self.user_id).get("personal", []))
         offered, unrated = set(), set()
         for name in names:
-            verdict, _ = pm._content_rating_state(self.user_id, name)
+            verdict = pm.catalogue_entry(self.user_id, name)[1]
             if CONTENT_RATING_CAPABILITIES[verdict][self.capability]:
                 offered.add(name)
             elif verdict in (CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING):
