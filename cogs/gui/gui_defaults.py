@@ -79,7 +79,7 @@ class _SparseSeed(dict):
 
     Only the scalar a text box is built from is blanked. A structured default is handed
     over as the factory asked for it, because the factory reads *through* it rather than
-    printing it: the neuro modal takes `neuro_state` and then asks it for four numbers.
+    printing it: the neuro modal takes `neuro_rest` and then asks it for four numbers.
     """
 
     def get(self, key, default=None):

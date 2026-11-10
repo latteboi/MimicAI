@@ -774,8 +774,8 @@ Two destinations, and the choice is not stylistic.
 
 | Where | Blocks | Why there |
 |---|---|---|
-| system instruction | `server_context` (session toggle), `scene_prompt`, `persona_profile`, `character_instructions`, `lorebook` (keyless entries), `training_data` (fixed examples), `memory_search`, `web_search`, `neuro_endocrine_engine` (what the levels mean), `bond_engine` (what the two scores mean), `session_rules`, then `session_synopsis`, `content_policy` | changes only when someone edits it; the synopsis (once per compaction pass) comes after the rules so it re-bills only what follows; the policy is last |
-| turn context | `current_time` (first), `game_context`, `neuro_state`, `birthday_context`, `bonds` (the last five speakers' scores), `training_data` (training examples matched to the turn), `lorebook` (keyed entries a recent turn mentions), `archive_context`, `negative_constraints` | changes per turn |
+| system instruction | `server_context` (session toggle), `scene_prompt`, `persona_profile`, `character_instructions`, `lorebook` (keyless entries), `training_data` (fixed examples), `follow_up_rules` (a session's Follow-ups switch, a round only), `memory_search`, `web_search`, `neuro_endocrine_engine` (what the levels mean), `bond_engine` (what the two scores mean), `session_rules`, then `session_synopsis`, `content_policy` | changes only when someone edits it; the synopsis (once per compaction pass) comes after the rules so it re-bills only what follows; the policy is last |
+| turn context | `current_time` (first), `game_context`, `follow_ups` (the reminder of one due), `neuro_state`, `birthday_context`, `bonds` (the last five speakers' scores), `training_data` (training examples matched to the turn), `lorebook` (keyed entries a recent turn mentions), `archive_context`, `negative_constraints` | changes per turn |
 
 Providers cache on a shared prefix — system instruction, then transcript — so **the first
 block that changes invalidates every token after it**, the whole transcript included. With

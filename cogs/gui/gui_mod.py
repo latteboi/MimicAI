@@ -968,6 +968,8 @@ MOD_PROMPT_CATEGORIES = [
         ("Kickstart: Idle", "KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE),
         ("Kickstart: Unanswered", "KICKSTART_UNANSWERED", DEFAULT_KICKSTART_UNANSWERED),
         ("AI Director Prompt", "DIRECTOR_USER_PROMPT", DEFAULT_DIRECTOR_USER_PROMPT),
+        ("Follow-ups: Rules", "FOLLOW_UP_RULES", DEFAULT_FOLLOW_UP_RULES),
+        ("Follow-ups: Reminder", "FOLLOW_UP_DUE", DEFAULT_FOLLOW_UP_DUE),
         ("Speak: Re-voice (strict)", "SPEAK_REWRITE_STRICT", DEFAULT_SPEAK_REWRITE_STRICT),
         ("Speak: Re-voice (loose)", "SPEAK_REWRITE_LOOSE", DEFAULT_SPEAK_REWRITE_LOOSE),
         ("Session Synopsis: System", "SESSION_SYNOPSIS", DEFAULT_SESSION_SYNOPSIS_PROMPT),
@@ -1036,6 +1038,7 @@ MOD_PROMPT_PLACEHOLDERS: Dict[str, Tuple[Set[str], str]] = {
     "WHISPER_INJECTION": ({"whisper_content"}, "format"),
     "WHISPER_RECAP": ({"whispers"}, "format"),
     "DIRECTOR_USER_PROMPT": ({"history"}, "format"),
+    "FOLLOW_UP_DUE": ({"name", "id", "note"}, "format"),
     "SPEAK_REWRITE_STRICT": ({"source_text"}, "format"),
     "SPEAK_REWRITE_LOOSE": ({"source_text"}, "format"),
     "SESSION_SYNOPSIS": ({"max_words", "max_facts"}, "format"),
@@ -1303,7 +1306,6 @@ _BY_PROVIDER_CATEGORIES = ("describer", "classifier", "generator")
 #: (tab, wording, description, tier, slot).
 _AUTO_SLOT_TABS = {
     "grounding_rag_model": ("Grounding", "The researcher behind RAG web searches."),
-    "critic_model": ("Critic", "Screens replies for semantic repetition."),
     "ltm_model": ("LTM", "Turns conversations into long-term memories."),
 }
 _AUTO_TABS = tuple(

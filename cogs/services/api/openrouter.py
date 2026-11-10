@@ -45,6 +45,24 @@ def _grounding_metadata(annotations):
     return {"grounding_chunks": chunks} if chunks else None
 
 
+def _mark_cache_breakpoints(messages: List[dict]) -> None:
+    """Claude caches only up to a block marked `cache_control`; the other models OpenRouter
+    serves cache by themselves. Two marks: the system instruction, which survives a step of
+    the history window, and the last message before the final one. Not the final one: it
+    carries the turn context, so a prefix ending there is never sent twice. A request reads
+    back up to ~20 blocks for a prefix an earlier mark wrote, so the last call's mark is the hit.
+    OpenRouter's top-level `cache_control` marks the last block, which is the never-repeated one."""
+    marks = [0] if messages and messages[0]["role"] == "system" else []
+    marks += [i for i in range(len(messages) - 2, 0, -1)
+              if messages[i]["role"] in ("user", "assistant") and messages[i].get("content")][:1]
+    for i in marks:
+        body = messages[i]["content"]
+        if isinstance(body, str):
+            messages[i]["content"] = [{"type": "text", "text": body, "cache_control": {"type": "ephemeral"}}]
+        elif texts := [p for p in body if p.get("type") == "text"]:
+            texts[-1]["cache_control"] = {"type": "ephemeral"}
+
+
 class OpenRouterModel:
     def __init__(self, model_name, api_key, system_instruction=None, thinking_params=None,
                  image_detail=None, service_tier=None, data_collection=None, endpoint=None,
@@ -105,6 +123,9 @@ class OpenRouterModel:
                 for part in body:
                     if part.get("type") == "image_url":
                         part["image_url"]["detail"] = self.image_detail
+
+        if self.model_name.startswith("anthropic/"):
+            _mark_cache_breakpoints(messages)
 
         return await self._dispatch(contents, messages, blob_files, staged_files,
                                     generation_config, safety_settings, stream_state)

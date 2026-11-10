@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 import discord
 
-from ...utils import mem_probe
+from ...utils import follow_ups, mem_probe
 from ...utils.constants import (
     ERR_GENERAL_ERROR, ERR_REASON_EMPTY_RESPONSE, ERR_REASON_EMPTY_STOPPED, ERR_REASON_STALLED,
     ERR_REASON_TIMEOUT_BOTH, ERR_SAFETY_BLOCK, MEDIA_DESCRIBED_NOTE, MEDIA_UNREADABLE_NOTE,
@@ -189,6 +189,9 @@ class ReplyText:
     sources: Optional[List[Dict[str, str]]] = None
     #: The reply ended in `<memory_flag/>`. Only a session round acts on it.
     ltm_flag: bool = False
+    #: The reply's `<follow_up>` as written, unchecked (`follow_ups.take`). Only a session
+    #: round, and a regeneration of one, act on it.
+    follow_up: Optional[Dict[str, str]] = None
 
 
 def reply_gen_config(p_settings: Dict, temperature, top_p, top_k) -> Dict:
@@ -642,6 +645,7 @@ class ReplyMixin:
                 raw_text, reply.neuro_state = self._extract_and_apply_neuro_state(
                     raw_text.strip(), owner_id, profile_name)
                 raw_text, reply.ltm_flag = take_memory_flag(raw_text)
+                raw_text, reply.follow_up = follow_ups.take(raw_text)
                 text = tighten_line_spacing(
                     _scrub_response_text(raw_text, participant_names=participant_names),
                     self.cog.profile_manager.author_config(owner_id, profile_name))

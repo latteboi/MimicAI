@@ -14,13 +14,13 @@ from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
     _estimate_text_tokens, _pf, _pi, _ps, _pb, clean_model_name, is_real_model, is_shipped_ltm_prompt,
     image_model_caps,
-    openrouter_image_ratios, resolve_critic_settings,
+    openrouter_image_ratios,
     google_thinking_caps, check_portrait_upload, grounding_mode_display, ltm_auto_recall_enabled, ltm_creation_mode,
     always_reads_synopsis,
     resolve_grounding_mode, resolve_media_resolution, resolve_thinking_params, resolve_url_mode,
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model, auto_thinking,
-    _format_api_error, speaks_verbatim, stored_google_voice, _get_user_hash,
+    _format_api_error, speaks_verbatim, stored_google_voice, _get_user_hash, neuro_levels,
 )
 from ..utils import fixed_examples, lorebook
 from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, profile_advice, standing_text
@@ -580,9 +580,6 @@ def _gemini_images(view):
 def _gemini_tts(view): return _voice(view) and "gemini" in _providers(view, "speech_model")
 def _own_gemini_tts(view): return _own(view) and _gemini_tts(view)
 def _not_google(view): return bool(_providers(view, "primary_model") - {"gemini"})
-# Lexical is a local scan: only Full sends the prompt.
-def _own_full_critic(view):
-    return _own(view) and resolve_critic_settings(view.config)["mode"] == "full"
 def _own_ltm_creating(view): return _own(view) and bool(view.config.get("ltm_creation_enabled"))
 
 
@@ -744,32 +741,16 @@ def _render_typing(ctx):
     ), True
 
 
-def _render_critic(ctx):
-    critic = resolve_critic_settings(ctx["config"])
-    if critic["mode"] == "off":
-        return "Anti-Repetition Critic", _OFF, True
-    lines = [f"Mode: **`{critic['mode'].upper()}`**",
-             f"Scope: `{critic['scope']}`",
-             f"Strictness: `{critic['strictness']}`",
-             f"Lookback: `{critic['lookback']}` turns",
-             f"Persistence: `{critic['persistence']}` rounds"]
-    if critic["mode"] == "lexical":
-        lines.append("-# Local scan only, no API call.")
-    return "Anti-Repetition Critic", "\n".join(lines), True
-
-
-
-
 def _render_neuro(ctx):
     config = ctx["config"]
     text = _OFF
     if config.get("neuro_engine_enabled", False):
-        state = config.get("neuro_state") or {}
+        state = neuro_levels(config)
         text = (f"{_ON}\n"
-                f"Dopamine: `{state.get('dopamine', 50)}`\n"
-                f"Cortisol: `{state.get('cortisol', 20)}`\n"
-                f"Oxytocin: `{state.get('oxytocin', 50)}`\n"
-                f"Adrenaline: `{state.get('adrenaline', 20)}`")
+                f"Dopamine: `{state['dopamine']}`\n"
+                f"Cortisol: `{state['cortisol']}`\n"
+                f"Oxytocin: `{state['oxytocin']}`\n"
+                f"Adrenaline: `{state['adrenaline']}`")
     if config.get("bond_engine_enabled", False):
         held = ctx.get("bonds")
         text += "\nBonds: On" + (f", `{len(held)}` people known\nWith you: "
@@ -970,7 +951,6 @@ PROFILE_ACTIONS = (
                              "image_generation_model", "image_generation_fallback_model",
                              "speech_model", "speech_fallback_model",
                              "grounding_rag_model", "grounding_rag_fallback_model",
-                             "critic_model", "critic_fallback_model",
                              "ltm_model", "ltm_fallback_model",
                              "ollama_host_url", "openrouter_service_tier",
                              "openrouter_endpoints"))),
@@ -1126,46 +1106,6 @@ PROFILE_ACTIONS = (
             bulk=_Bulk(_bulk_modal("ProfileTypingSettingsModal"), scope="all",
                        keys=("realistic_typing_enabled", "typing_mode", "typing_cps",
                              "typing_max_delay", "typing_cursor"))),
-    _Action("critic", "tools", "Anti-Repetition Critic",
-            "Spots repetition in its recent replies and tells the next ones to avoid it.",
-            _open_screen("critic"), render=_render_critic,
-            screen=_Screen(
-                _Choice("critic_mode", "Mode",
-                        (("Off", "off", "No repetition screening."),
-                         ("Lexical", "lexical", "Checks for repeated phrases locally. No API call, no delay."),
-                         ("Full", "full", "Also asks a model, which catches repeated ideas and tone. One call per reply.")),
-                        read=lambda c: resolve_critic_settings(c)["mode"],
-                        to_payload=lambda v: {"critic_mode": v, "critic_enabled": v != "off"},
-                        placeholder="Critic mode..."),
-                _Choice("critic_scope", "Scope",
-                        (("Self", "self", "Screen against this profile's own recent replies."),
-                         ("Session", "session", "Screen against every participant's replies.")),
-                        read=lambda c: resolve_critic_settings(c)["scope"],
-                        placeholder="Critic scope..."),
-                _Choice("critic_strictness", "Strictness",
-                        (("Lenient", "lenient", "Repeats of 6 or more words count."),
-                         ("Normal", "normal", "Repeats of 4 or more words count."),
-                         ("Strict", "strict", "Repeats of 3 or more words count.")),
-                        read=lambda c: resolve_critic_settings(c)["strictness"],
-                        placeholder="Critic strictness..."),
-                modal="ProfileCriticSettingsModal", modal_label="Edit lookback & persistence…",
-                when=lambda c: resolve_critic_settings(c)["mode"] != "off",
-                note=f"-# **Lookback** is how many recent replies are checked (default "
-                     f"{DEFAULT_CRITIC_LOOKBACK}); **Persistence** is how many more rounds a "
-                     f"ban lasts (default {DEFAULT_CRITIC_PERSISTENCE})."),
-            bulk=_Bulk(_bulk_modal("ProfileCriticSettingsModal"), scope="all",
-                       keys=("critic_mode", "critic_enabled", "critic_scope",
-                             "critic_strictness", "critic_lookback", "critic_persistence"))),
-    _Action("critic_instructions", "tools", "Critic Instructions",
-            "Customise the prompt the critic screens replies with.",
-            _method("_act_critic_instructions", wants_profile=True), _own_full_critic,
-            bulk=_Bulk(_bulk_modal("ProfileCriticInstructionsModal",
-                                   action_key="update_prompts", pass_borrowed=False,
-                                   seed=lambda c: c.profile_manager._default_critic_instructions()),
-                       scope="personal", destructive=True,
-                       prompt_keys=("critic_instructions",),
-                       warning="Every selected profile's **critic prompt** is replaced. "
-                               "Profiles using a customised prompt lose it.")),
     _Action("neuro", "tools", "Neuro-Endocrine Engine", "Simulate hormonal states for dynamic emotions, and feelings about each person.",
             _open_screen("neuro"), render=_render_neuro,
             screen=_Screen(_Toggle("neuro_engine_enabled", "Neuro Engine"),
@@ -1174,12 +1114,14 @@ PROFILE_ACTIONS = (
                            when=lambda c: bool(c.get("neuro_engine_enabled")), always=2,
                            note="-# **Neuro Engine**: four levels from 0 to 100 (dopamine, cortisol, "
                                 "oxytocin, adrenaline) that each reply updates and the next reads, "
-                                "so moods carry over. **Edit hormones…** sets them now.\n"
+                                "so moods carry over, easing halfway back to its resting levels "
+                                f"every {NEURO_HALF_LIFE_HOURS} hours. **Edit hormones…** sets the "
+                                "resting levels and puts the mood back on them.\n"
                                 f"-# **Bonds**: affection and resentment toward each person it talks "
                                 f"to, moving at most {BOND_STEP_MAX} a reply after a first meeting. "
                                 f"Works with or without the Neuro Engine."),
             bulk=_Bulk(_bulk_modal("ProfileNeuroModal"), scope="all",
-                       keys=("neuro_engine_enabled", "neuro_state"))),
+                       keys=("neuro_engine_enabled", "neuro_state", "neuro_rest"))),
     _Action("help_mode", "tools", "Help Mode (Guide RAG)", "Lets it answer questions about MimicAI in character, using the bot's docs.",
             _open_screen("help_mode"), render=_render_help_mode,
             screen=_Screen(_Toggle("help_mode_enabled", "Help Mode"),
@@ -1684,16 +1626,8 @@ class ProfileManageView(BlockedGuard, ui.View):
                               mode='lore', parent_manage_view=self, target_user_id=self.user_id)
         await view.start()
 
-    async def _act_critic_instructions(self, interaction: discord.Interaction, profile: Dict[str, Any]):
-        # Resolved, not read raw: the box has to show what this profile actually screens
-        # with today -- its own prompt, else the instance-wide one, else the default --
-        # or editing it starts from a blank that means something different.
-        instr = self.cog.profile_manager.resolve_critic_instructions(self.user_id, self.profile_name)
-        modal = ProfileCriticInstructionsModal(self.cog, self.profile_name, instr, target_user_id=self.user_id)
-        await interaction.response.send_modal(modal)
-
     async def _act_ltm_summarization(self, interaction: discord.Interaction, profile: Dict[str, Any]):
-        # Resolved, not read raw, exactly as the critic's box is: the text shown has to
+        # Resolved, not read raw: the text shown has to
         # be what this profile actually summarises with today. Reading the stored value
         # would show a seeded copy of a retired default to anyone who never edited it.
         instr = self.cog.profile_manager.resolve_ltm_summarization_instructions(
@@ -1900,14 +1834,12 @@ class GuidanceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
     def _build(self):
         self.clear_items()
-        build_pagination_controls(self, self.current_page, len(self.pages), 0, self._turn(-1), self._turn(1))
+        build_pagination_controls(self, self.current_page, len(self.pages), 0, self._turn)
 
-    def _turn(self, delta: int):
-        async def callback(interaction: discord.Interaction):
-            self.current_page += delta
-            self._build()
-            await interaction.response.edit_message(embed=self.embed(), view=self)
-        return callback
+    async def _turn(self, interaction: discord.Interaction, delta: int):
+        self.current_page += delta
+        self._build()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
 
     def embed(self) -> discord.Embed:
         title, does, text = self.pages[self.current_page]
@@ -2162,7 +2094,6 @@ _MODAL_TAKES_BORROWED = {
     "ProfileTrainingParamsModal": False,
     "ProfileLTMParamsModal": False,
     "ProfileLTMSummarizationModal": False,
-    "ProfileCriticInstructionsModal": False,
 }
 
 
@@ -2353,92 +2284,6 @@ def ProfileLTMSummarizationModal(cog, profile_name: str, current_instructions: s
             ins = ""
         return {"prompts": {"ltm_summarization_instructions": cog.storage_manager._encrypt_data(ins)}}
     return ConfigModal(cog, profile_name, False, "Set LTM Summarization Instructions", fields, parser, callback, target_user_id)
-
-def ProfileCriticSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
-    """The Anti-Repetition Critic's five knobs.
-
-    Mode replaces what was a plain on/off toggle. The lexical scan is in-process and
-    costs nothing, but the boolean only ever bought it together with a model call on
-    every turn, so "lexical" is the setting that gives a profile repetition screening
-    for free -- which matters most on the smallest deployments, where the critic was
-    the first thing the docs told people to switch off.
-    """
-    current = resolve_critic_settings(current_params)
-    fields = [] if values_only else [
-        {"label": "Mode (off/lexical/full)", "custom_id": "critic_mode",
-         "default": current["mode"], "required": True,
-         "placeholder": "lexical = free local scan; full = adds a model call"},
-        {"label": "Scope (self/session)", "custom_id": "critic_scope",
-         "default": current["scope"], "required": False,
-         "placeholder": "session = screen against every participant's lines"},
-        {"label": "Strictness (lenient/normal/strict)", "custom_id": "critic_strictness",
-         "default": current["strictness"], "required": False, "placeholder": "Default: normal"},
-    ]
-    fields.extend([
-        {"label": f"Lookback ({CRITIC_LOOKBACK_MIN}-{CRITIC_LOOKBACK_MAX} turns)", "custom_id": "critic_lookback",
-         "default": str(current["lookback"]), "required": False,
-         "placeholder": f"Default: {DEFAULT_CRITIC_LOOKBACK}"},
-        {"label": f"Persistence ({CRITIC_PERSISTENCE_MIN}-{CRITIC_PERSISTENCE_MAX} rounds)", "custom_id": "critic_persistence",
-         "default": str(current["persistence"]), "required": False,
-         "placeholder": f"Extra rounds a constraint holds. Default: {DEFAULT_CRITIC_PERSISTENCE}"},
-    ])
-
-    def parser(v):
-        c = {}
-        if "critic_mode" in v:
-            mode = (_ps(v["critic_mode"]) or "").lower()
-            if mode not in CRITIC_MODES:
-                raise ValueError(f"Mode must be one of: {', '.join(CRITIC_MODES)}")
-            # critic_enabled is written alongside critic_mode, not retired. Borrowed
-            # copies and exports made on an older build read the boolean, and a profile
-            # round-tripping through one of those must not come back with the critic
-            # silently on.
-            c["critic_mode"] = mode
-            c["critic_enabled"] = mode != "off"
-
-        if "critic_scope" in v:
-            scope = (_ps(v["critic_scope"]) or DEFAULT_CRITIC_SCOPE).lower()
-            if scope not in CRITIC_SCOPES:
-                raise ValueError(f"Scope must be one of: {', '.join(CRITIC_SCOPES)}")
-            c["critic_scope"] = scope
-
-        if "critic_strictness" in v:
-            strictness = (_ps(v["critic_strictness"]) or DEFAULT_CRITIC_STRICTNESS).lower()
-            if strictness not in CRITIC_STRICTNESS_LEVELS:
-                raise ValueError(f"Strictness must be one of: {', '.join(CRITIC_STRICTNESS_LEVELS)}")
-            c["critic_strictness"] = strictness
-
-        c.update(_ranged(v, "critic_lookback", CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX,
-                         "Lookback", _pi))
-        c.update(_ranged(v, "critic_persistence", CRITIC_PERSISTENCE_MIN,
-                         CRITIC_PERSISTENCE_MAX, "Persistence", _pi))
-        return {"config": c}
-
-    return ConfigModal(cog, profile_name, is_borrowed, "Anti-Repetition Critic", fields, parser, callback, target_user_id)
-
-
-def ProfileCriticInstructionsModal(cog, profile_name: str, current_instructions: str, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
-    """Per-profile critic prompt, seeded from whatever the profile resolves to today.
-
-    Submitting blank clears the override rather than storing an empty prompt, so the
-    profile goes back to following /mod's instance-wide ANTI_REPETITION.
-    """
-    fields = [{
-        "label": "Critic Instructions",
-        "custom_id": "critic_instructions",
-        "style": discord.TextStyle.paragraph,
-        "default": current_instructions,
-        "required": False,
-        "max_length": 2000,
-        "placeholder": "{char_name} is substituted. Clear the box to follow the global prompt.",
-    }]
-
-    def parser(v):
-        ins = _ps(v["critic_instructions"])
-        return {"prompts": {"critic_instructions": cog.storage_manager._encrypt_data(ins) if ins else ""}}
-
-    return ConfigModal(cog, profile_name, False, "Critic Instructions", fields, parser, callback, target_user_id)
-
 
 def ProfileTypingSettingsModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
     fields = [] if values_only else [
@@ -3160,8 +3005,6 @@ class ModelPickerMixin(ReportErrorMixin):
                       ("speech_fallback_model", "TTS Fallback", DEFAULT_SPEECH_FALLBACK_MODEL)),
         'grounding': (("grounding_rag_model", "Grounding Summariser", GROUNDING_RESEARCHER_MODEL),
                       ("grounding_rag_fallback_model", "Grounding Fallback", GROUNDING_RESEARCHER_FALLBACK)),
-        'critic':    (("critic_model", "Anti-Repetition Critic", UTILITY_MODEL),
-                      ("critic_fallback_model", "Critic Fallback", UTILITY_FALLBACK_MODEL)),
         'ltm':       (("ltm_model", "LTM Summariser", UTILITY_MODEL),
                       ("ltm_fallback_model", "LTM Fallback", UTILITY_FALLBACK_MODEL)),
         'training':  (("training_analysis_model", "Training Analysis", PRIMARY_MODEL_NAME),
@@ -3173,7 +3016,6 @@ class ModelPickerMixin(ReportErrorMixin):
         ("image", "Image Generation", "The model behind !image and !imagine."),
         ("tts", "TTS Generation", "The speech model used for voice rounds."),
         ("grounding", "Grounding Summariser", "Runs the web searches for RAG and Legacy RAG, and summarises them."),
-        ("critic", "Anti-Repetition Critic", "Screens replies for semantic repetition."),
         ("ltm", "LTM Summariser", "Turns conversations into long-term memories."),
         ("training", "Training Analysis", "Writes a style guide from training examples."),
     )
@@ -4103,8 +3945,8 @@ class OpenRouterHostView(BlockedGuard, ui.View):
 
         # Profile-wide, not per slot, which is only safe because a model whose pool
         # holds no endpoint at the requested tier routes normally at standard rates
-        # rather than failing: a profile on Flex with a critic nobody offers Flex for
-        # still gets its critic. A provider *pin* would not be safe that way, which is
+        # rather than failing: a profile on Flex with a summariser nobody offers Flex for
+        # still gets its summariser. A provider *pin* would not be safe that way, which is
         # why the dropdowns above are per model.
         style, wording = self.parent.tier_wording(self.parent._current_service_tier())
 
@@ -4158,8 +4000,6 @@ class ThinkingPickerMixin:
         ('response', 'fallback'): 'fallback_model',
         ('grounding', 'primary'): 'grounding_rag_model',
         ('grounding', 'fallback'): 'grounding_rag_fallback_model',
-        ('critic', 'primary'): 'critic_model',
-        ('critic', 'fallback'): 'critic_fallback_model',
         ('ltm', 'primary'): 'ltm_model',
         ('ltm', 'fallback'): 'ltm_fallback_model',
         ('training', 'primary'): 'training_analysis_model',
@@ -4562,7 +4402,6 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             'image_generation_model', 'image_generation_fallback_model',
             'speech_model', 'speech_fallback_model',
             'grounding_rag_model', 'grounding_rag_fallback_model',
-            'critic_model', 'critic_fallback_model',
             'ltm_model', 'ltm_fallback_model',
             'ollama_host_url', 'openrouter_service_tier')}
         self.show_fallback_indicator = None
@@ -5485,15 +5324,12 @@ class _TimezonePickerView(BlockedGuard, ui.View):
         select.callback = self.select_callback
         self.add_item(select)
 
-        build_pagination_controls(self, self.current_page, TIMEZONE_TOTAL_PAGES, 1,
-                                  self._turn_page(-1), self._turn_page(1))
+        build_pagination_controls(self, self.current_page, TIMEZONE_TOTAL_PAGES, 1, self._turn_page)
 
-    def _turn_page(self, delta: int):
-        async def cb(i: discord.Interaction):
-            self.current_page = min(TIMEZONE_TOTAL_PAGES - 1, max(0, self.current_page + delta))
-            self._build_view()
-            await i.response.edit_message(content=None, embed=text_embed(self._get_header_content()), view=self)
-        return cb
+    async def _turn_page(self, i: discord.Interaction, delta: int):
+        self.current_page = min(TIMEZONE_TOTAL_PAGES - 1, max(0, self.current_page + delta))
+        self._build_view()
+        await i.response.edit_message(content=None, embed=text_embed(self._get_header_content()), view=self)
 
     async def select_callback(self, interaction: discord.Interaction):
         choice = interaction.data['values'][0]
@@ -6026,7 +5862,9 @@ class LibraryIntroModal(ui.Modal):
         await maybe_prompt_rating_after_edit(self.cog, interaction, self.owner_id, self.profile_name)
 
 def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is_borrowed: bool, values_only: bool = False, callback=None, target_user_id: Optional[int] = None):
-    state = current_params.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
+    # The resting levels: what saving sets, so what the boxes show. Not the live mood,
+    # which a press of Save would otherwise make permanent.
+    state = current_params.get("neuro_rest") or NEURO_DEFAULT_STATE
     fields = [] if values_only else [
         {"label": "Engine Status (on/off)", "custom_id": "neuro_engine_enabled", "default": "on" if current_params.get("neuro_engine_enabled") else "off", "required": False, "placeholder": "Enable or disable the engine."},
     ]
@@ -6047,7 +5885,10 @@ def ProfileNeuroModal(cog, profile_name: str, current_params: Dict[str, Any], is
             val = _ranged(v, k, 0, 100, k.title(), _pi).get(k)
             if val is not None:
                 nstate[k] = val
-        if nstate: c["neuro_state"] = nstate
+        if nstate:
+            # The mood is put on its resting levels, so no stamp is needed: nothing to decay.
+            c["neuro_state"] = nstate
+            c["neuro_rest"] = dict(nstate)
         return {"config": c}
     return ConfigModal(cog, profile_name, is_borrowed, "Neuro-Endocrine Engine Configuration", fields, parser, callback, target_user_id)
 
@@ -6527,15 +6368,11 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
         add_select(self, options, self._anchor_callback,
                    placeholder="Choose the profile to copy from…", row=0)
 
-        async def prev_cb(i: discord.Interaction):
-            self._anchor_page -= 1
+        async def turn(i: discord.Interaction, delta: int):
+            self._anchor_page += delta
             await self.refresh(i)
 
-        async def next_cb(i: discord.Interaction):
-            self._anchor_page += 1
-            await self.refresh(i)
-
-        build_pagination_controls(self, self._anchor_page, pages, 1, prev_cb, next_cb)
+        build_pagination_controls(self, self._anchor_page, pages, 1, turn)
 
         add_button(self, "◀ Profiles", self._nav("targets"), style=discord.ButtonStyle.secondary,
                    row=2)

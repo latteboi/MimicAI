@@ -9,6 +9,7 @@ import discord
 import signal
 import functools
 import datetime
+import time
 from zoneinfo import ZoneInfo
 from typing import List, Dict, Tuple, Any, Optional, Union
 import orjson as json
@@ -24,7 +25,7 @@ from .constants import (
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
     SYSTEM_MODEL_DEFAULTS_BY_PROVIDER, AUTO_MODEL_PREFIX, AUTO_SLOT_PAIRS, AUTO_TIER_KEYS,
     AUTO_ENDPOINTS_KEY, AUTO_SERVICE_TIERS_KEY, AUTO_TIER_TABS,
-    NEURO_AXES, NEURO_DEFAULT_STATE, MOOD_AVATAR_THRESHOLD, MOOD_AVATAR_MARGIN,
+    NEURO_AXES, NEURO_DEFAULT_STATE, NEURO_HALF_LIFE_HOURS, MOOD_AVATAR_THRESHOLD, MOOD_AVATAR_MARGIN,
     IMAGE_COMMAND_PREFIXES, IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
     OPENROUTER_IMAGE_CAPS_UNKNOWN, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
     IMAGE_GROUNDING_TOOL_MODES, DEFAULT_TYPING_CURSOR,
@@ -1856,6 +1857,40 @@ def openrouter_routing(cog, config: Optional[Dict[str, Any]],
     return resolve_openrouter_endpoint(config, model_id), resolve_openrouter_service_tier(config)
 
 
+def _neuro_level(value: Any, default: int) -> int:
+    return max(0, min(100, int(value))) if isinstance(value, (int, float)) else default
+
+
+def neuro_levels(config: Optional[Dict[str, Any]], now: Optional[float] = None) -> Dict[str, int]:
+    """The four levels a profile is at now -- the only way to read `neuro_state`.
+
+    Decay is worked out here, when read, never written on a timer: the stored state eases
+    back toward `neuro_rest` by half every NEURO_HALF_LIFE_HOURS since `neuro_updated_at`.
+    A reader of the raw dict shows a mood the prompt no longer has. No stamp, no decay:
+    a state stored before the stamp existed holds until the next update stamps it.
+    """
+    config = config or {}
+    state = config.get("neuro_state") or {}
+    rest = config.get("neuro_rest") or {}
+    stamped = config.get("neuro_updated_at")
+    factor = 1.0
+    if isinstance(stamped, (int, float)):
+        hours = max(0.0, ((time.time() if now is None else now) - stamped) / 3600)
+        factor = 0.5 ** (hours / NEURO_HALF_LIFE_HOURS)
+    levels = {}
+    for axis in NEURO_AXES:
+        base = _neuro_level(rest.get(axis), NEURO_DEFAULT_STATE[axis])
+        level = _neuro_level(state.get(axis), NEURO_DEFAULT_STATE[axis])
+        levels[axis] = round(base + (level - base) * factor)
+    return levels
+
+
+def store_neuro_levels(config: Dict[str, Any], levels: Dict[str, int]) -> None:
+    """Writes the levels a reply or a game left, stamped now so `neuro_levels` decays them."""
+    config["neuro_state"] = {axis: levels[axis] for axis in NEURO_AXES if axis in levels}
+    config["neuro_updated_at"] = time.time()
+
+
 def pick_mood_avatar(avatars: Optional[Dict[str, str]], threshold: Optional[int],
                      config: Optional[Dict[str, Any]], shown: Optional[str] = None) -> Optional[str]:
     """The neuro axis whose mood avatar the speaking profile's `config` shows, or None for
@@ -1870,8 +1905,8 @@ def pick_mood_avatar(avatars: Optional[Dict[str, str]], threshold: Optional[int]
     config = config or {}
     if not avatars or not config.get("neuro_engine_enabled"):
         return None
-    state = config.get("neuro_state") or {}
-    levels = {a: state.get(a, NEURO_DEFAULT_STATE[a]) for a in NEURO_AXES if avatars.get(a)}
+    state = neuro_levels(config)
+    levels = {a: state[a] for a in NEURO_AXES if avatars.get(a)}
     if not levels:
         return None
     floor = MOOD_AVATAR_THRESHOLD if threshold is None else threshold
@@ -2015,31 +2050,65 @@ def ltm_flag_enabled(config: Optional[Dict[str, Any]]) -> bool:
     return bool(config.get("ltm_creation_enabled")) and ltm_creation_mode(config) == "flag"
 
 
-def resolve_critic_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """The Anti-Repetition Critic's effective settings for one profile.
+def own_replies(history: List[Dict[str, Any]], count: int) -> List[str]:
+    """A character's last `count` replies in its API history, oldest first, as it wrote them.
 
-    Every critic call site reads through here so the legacy flag is folded in exactly
-    once. `critic_enabled` is what older profiles carry and what the boolean toggle
-    wrote; an absent `critic_mode` reads off it, and True means "full", because the
-    model pass is the only thing that boolean ever selected. Both keys are written
-    together by the dashboard, so a profile edited on one version still reads correctly
-    on the other.
+    Both the critic and the variety nudge read these, and a stored turn's envelope
+    (`<Name> [ID: pid] [timestamp]:`) is byte for byte the same on every one, so it is
+    stripped: left in, the scan flags every session after three turns on the scaffolding.
+    Counted before the strip, so a turn that strips to nothing pulls no older one in.
+    """
+    found = []
+    for turn in reversed(history):
+        if isinstance(turn, dict) and turn.get("role") == "model":
+            parts = [p if isinstance(p, str) else p.get("text", "") for p in turn.get("parts", [])]
+            if parts:
+                found.append(" ".join(parts))
+                if len(found) >= count:
+                    break
+    return [t for t in (strip_history_envelope(t) for t in reversed(found)) if t]
+
+
+#: What may close a reply after its last word: quotes, emphasis, a bracket.
+_SHAPE_TAIL = " \t\n\"'\u201c\u201d\u2018\u2019*_)]"
+
+
+def variety_hint(replies: List[str]) -> Optional[str]:
+    """The shape every one of a character's recent replies shares, as a VARIETY_HINTS key:
+    "question" when each ends on one, "opening" when each opens with an *action*, else None.
+
+    Three at least, since two in a row is chance; the first match is the turn's one hint.
+    Python, not `mimic_core.scan_repetition`, which must stay interchangeable with its
+    fallback: this is a dozen short strings at most.
+    """
+    if len(replies) < 3:
+        return None
+    if all(r.rstrip(_SHAPE_TAIL).endswith("?") for r in replies):
+        return "question"
+    if all(r.lstrip()[:1] in ("*", "_") for r in replies):
+        return "opening"
+    return None
+
+
+def resolve_critic_settings(session: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The Anti-Repetition Critic's effective settings for one session (`session['critic']`).
 
     Values out of range are clamped rather than rejected: these arrive from a Discord
     modal, and a critic that silently runs at a sane lookback beats a turn that fails
-    because someone typed 400.
+    because someone typed 400. `skip` is the PIDs of the seats left out: stored that way
+    round so a character seated later is screened without anyone ticking it.
     """
-    config = config or {}
+    config = (session or {}).get("critic") or {}
 
-    mode = str(config.get("critic_mode") or "").strip().lower()
+    mode = str(config.get("mode") or "").strip().lower()
     if mode not in CRITIC_MODES:
-        mode = "full" if config.get("critic_enabled", False) else DEFAULT_CRITIC_MODE
+        mode = DEFAULT_CRITIC_MODE
 
-    scope = str(config.get("critic_scope") or "").strip().lower()
+    scope = str(config.get("scope") or "").strip().lower()
     if scope not in CRITIC_SCOPES:
         scope = DEFAULT_CRITIC_SCOPE
 
-    strictness = str(config.get("critic_strictness") or "").strip().lower()
+    strictness = str(config.get("strictness") or "").strip().lower()
     if strictness not in CRITIC_STRICTNESS_LEVELS:
         strictness = DEFAULT_CRITIC_STRICTNESS
 
@@ -2056,10 +2125,11 @@ def resolve_critic_settings(config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         "scope": scope,
         "strictness": strictness,
         "min_gram": CRITIC_STRICTNESS_MIN_GRAM[strictness],
-        "lookback": _clamp("critic_lookback", DEFAULT_CRITIC_LOOKBACK,
+        "lookback": _clamp("lookback", DEFAULT_CRITIC_LOOKBACK,
                            CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX),
-        "persistence": _clamp("critic_persistence", DEFAULT_CRITIC_PERSISTENCE,
+        "persistence": _clamp("persistence", DEFAULT_CRITIC_PERSISTENCE,
                               CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX),
+        "skip": frozenset(str(pid) for pid in config.get("skip") or ()),
     }
 
 

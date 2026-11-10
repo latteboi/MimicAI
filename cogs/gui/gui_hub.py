@@ -414,7 +414,7 @@ class HubIncomingView(HubBaseView):
                        max_values=1, row=0)
 
         # Row 1: Pagination (if needed)
-        build_pagination_controls(self, self.current_page, num_pages, 1, self.prev_page, self.next_page)
+        build_pagination_controls(self, self.current_page, num_pages, 1, self._turn_page)
 
         # Row 2: Actions
         action_row = 2 if num_pages > 1 else 1 # Move up if no pagination
@@ -666,7 +666,7 @@ class HubShareManagerView(HubBaseView):
         # full page plus the sentinels would be rejected outright.
         num_pages = max(1, (len(self.personal_profiles) - 1) // SHARE_PAGE_SIZE + 1)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        build_pagination_controls(self, self.current_page, num_pages, 0, self.prev_page, self.next_page)
+        build_pagination_controls(self, self.current_page, num_pages, 0, self._turn_page)
 
         start = self.current_page * SHARE_PAGE_SIZE
         page_profiles = self.personal_profiles[start : start + SHARE_PAGE_SIZE]

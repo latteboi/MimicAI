@@ -50,11 +50,13 @@ from .helpers import is_real_model
 #: borrow points at -- overwrite one and the borrow generates with no persona, or
 #: orphans. `neuro_state` is the one that is not identity: it is the *live* hormone vector,
 #: rewritten as a character reacts, so defaulting it would reset a mood mid-session.
-#: Only `neuro_state` is reachable from the table today (the neuro row declares it);
-#: the rest are here so that adding one to a `_Bulk` later cannot quietly expose it.
+#: `neuro_rest` is denied with it: the neuro modal writes both, and defaulting it would
+#: start storing levels this screen has never stored. Only those two are reachable from
+#: the table today (the neuro row declares them); the rest are here so that adding one to
+#: a `_Bulk` later cannot quietly expose it.
 DEFAULT_DENY = frozenset({
     "original_owner_id", "original_pid", "original_profile_name", "original_profile_id",
-    "pointer", "borrowed_at", "created_at", "neuro_state",
+    "pointer", "borrowed_at", "created_at", "neuro_state", "neuro_rest",
 })
 
 #: Keys forced to new-profile-only even though their row is `scope="all"`.
@@ -291,29 +293,12 @@ def model_slot_defaults(preferred: Optional[str]) -> Dict[str, str]:
     return out
 
 
-def cross_provider_model(primary_key: str, primary: str, fallback: Optional[str],
-                         preferred: Optional[str]) -> Optional[str]:
-    """The category's first shipped model on the provider `primary` is not on.
-
-    Keyed to the Primary rather than to the preference: a summariser someone moved onto the
-    other provider by hand is still left with a way out when that provider fails.
-    """
-    side = model_provider(primary)
-    target = other_provider(side if side in MODEL_PROVIDERS else preferred)
-    return next((name for name in _served(primary_key, target)
-                 if name not in (primary, fallback)), None)
-
-
 def model_chain(config: Optional[Dict[str, Any]], primary_key: str,
                 preferred: Optional[str]) -> Tuple[str, Tuple[str, ...]]:
     """(primary, fallbacks) for one category of one profile, as `run_with_fallback` takes them.
 
     The profile's own Primary and Fallback, or the shipped ones where it set none. An
     explicit NO_FALLBACK stops at the Primary: it has always meant "do not retry on anything".
-
-    `cross_provider_fallback` is no profile's setting: the Director puts it in the config it
-    builds, for a chain billed to a server key that may hold either provider
-    (`director_model_config`). It adds `cross_provider_model` behind the Fallback.
 
     `primary_key` may also be a session's own chain (SESSION_SLOT_PAIRS), read the same way.
     """
@@ -324,9 +309,7 @@ def model_chain(config: Optional[Dict[str, Any]], primary_key: str,
     if stored and not is_real_model(stored):
         return primary, ()
     fallback = stored or (shipped[1] if len(shipped) > 1 else None)
-    other = (cross_provider_model(primary_key, primary, fallback, preferred)
-             if config.get("cross_provider_fallback") is True else None)
-    return primary, tuple(name for name in (fallback, other) if name)
+    return primary, (fallback,) if fallback else ()
 
 
 def model_slot_labels() -> Dict[str, str]:
@@ -373,10 +356,6 @@ SETTING_LABELS = {
     "grounding_thinking_budget": "Grounding Summariser \u00b7 Thinking Budget",
     "grounding_fallback_thinking_level": "Grounding Fallback \u00b7 Reasoning Effort",
     "grounding_fallback_thinking_budget": "Grounding Fallback \u00b7 Thinking Budget",
-    "critic_thinking_level": "Anti-Repetition Critic \u00b7 Reasoning Effort",
-    "critic_thinking_budget": "Anti-Repetition Critic \u00b7 Thinking Budget",
-    "critic_fallback_thinking_level": "Critic Fallback \u00b7 Reasoning Effort",
-    "critic_fallback_thinking_budget": "Critic Fallback \u00b7 Thinking Budget",
     "ltm_thinking_level": "LTM Summariser \u00b7 Reasoning Effort",
     "ltm_thinking_budget": "LTM Summariser \u00b7 Thinking Budget",
     "ltm_fallback_thinking_level": "LTM Fallback \u00b7 Reasoning Effort",
@@ -393,12 +372,6 @@ SETTING_LABELS = {
     "url_mode": "URL Context",
     "url_fetching_enabled": "URL Fetching",
     "help_mode_enabled": "Help Mode",
-    "critic_mode": "Critic Mode",
-    "critic_enabled": "Anti-Repetition Critic",
-    "critic_scope": "Critic Scope",
-    "critic_strictness": "Critic Strictness",
-    "critic_lookback": "Critic Lookback",
-    "critic_persistence": "Critic Persistence",
     "neuro_engine_enabled": "Neuro Engine",
     "bond_engine_enabled": "Bonds",
     "image_generation_enabled": "Image Generation",

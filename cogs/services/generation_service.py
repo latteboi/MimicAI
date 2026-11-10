@@ -13,7 +13,7 @@ import datetime
 from typing import Optional
 from zoneinfo import ZoneInfo
 from ..utils.constants import (
-    defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS,
+    defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS, VARIETY_HINTS,
     WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, TYPING_INDICATOR_SECONDS,
     WARN_VOICE_SYNTHESIS_FAILED,
     ERR_REASON_AUDIO_TOO_LARGE, ERR_REASON_AUDIO_NOT_UPLOADED,
@@ -32,13 +32,13 @@ from ..utils.helpers import (
     restamp_turn, turn_posted_at, server_context_guild,
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
     _split_into_sentences_with_abbreviations, generated_image_attachment, sent_file_name,
-    resolve_critic_settings, ltm_flag_enabled,
+    resolve_critic_settings, own_replies, variety_hint, ltm_flag_enabled,
     image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note, whisper_recap,
     resolve_grounding_mode,
     resolve_thinking_params, resolve_url_mode,
     resolve_typing_cursor, URL_FETCH_PATTERN,
 )
-from ..utils import mem_probe
+from ..utils import follow_ups, mem_probe
 from ..utils.attachment_limits import upload_limit_bytes
 
 #: How long a refused send keeps its sender out of that channel's rounds, unless a send
@@ -583,6 +583,25 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                      for t in reversed(recent))
         return "\n\n".join(p for p in parts if p)
 
+    async def _fire_follow_up(self, channel_id: int, session_type: str):
+        """The (seat, follow-up) a proactive round raises, or None; the hint moved on to the
+        next one either way (`follow_ups.fire`)."""
+        session = self.cog.multi_profile_channels.get(channel_id)
+        if not (session or {}).get("is_hydrated"):
+            session = await self.cog.session_manager._ensure_session_hydrated(channel_id, session_type)
+        if not session:
+            return None
+        seats = [(p, p.get("pid") or self.cog.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name']))
+                 for p in session['profiles'] if not p.get('is_skipped')]
+        fired, next_at = follow_ups.fire(session.get("unified_log") or [], seats, time.time())
+        pro = session.setdefault("proactivity", {})
+        if next_at:
+            pro["follow_up_at"] = next_at
+        else:
+            pro.pop("follow_up_at", None)
+        self.cog.session_manager._save_multi_profile_sessions()
+        return fired
+
     async def _director_note(self, channel_id: int, session: dict) -> Optional[str]:
         """The AI Director's note for a proactive round, or None when it is off or fails.
 
@@ -774,6 +793,18 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 batch_start_index = len(session.get("unified_log", []))
 
                 is_proactive_auto_round = False
+                # A due follow-up's round: its character alone speaks, with the reminder, and
+                # the Director is not asked -- Proactivity may be off, and nobody else chose
+                # to come back. Nothing due (raised or replaced since the hint was set) and
+                # the round is dropped, as a missed roll would be.
+                proactive_follow_up = None
+                if ('proactive_trigger', 'follow_up') in all_triggers_for_round:
+                    all_triggers_for_round.remove(('proactive_trigger', 'follow_up'))
+                    proactive_follow_up = await self._fire_follow_up(channel_id, session_type)
+                    if proactive_follow_up:
+                        is_proactive_auto_round = True
+                        all_triggers_for_round.insert(0, ('cue', None, proactive_follow_up[0]))
+                        initial_trigger = all_triggers_for_round[0]
                 for i, t in enumerate(all_triggers_for_round):
                     if isinstance(t, tuple) and t[0] == 'proactive_trigger':
                         is_proactive_auto_round = True
@@ -1011,6 +1042,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             generator_display_name = gen_effective_profile_name
 
                 responses_this_round = []
+                # One follow-up raised per round across the cast, so a round never turns
+                # into everyone's reminders at once.
+                follow_up_raised_this_round = False
                 # [NEW] Track round-specific audio segments for stitching
                 round_audio_segments = []
                 # [FIXED] Populate initial context immediately from batched triggers
@@ -1194,6 +1228,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     critic_constraints = None
                     critic_settings = None
                     critic_source = None
+                    critic_hint = None
                     # Bound per participant, not per round: the teardown paths below sit
                     # outside the generation try/except, so an early failure used to reach
                     # them with the *previous* participant's container -- or, on the first
@@ -1216,6 +1251,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     training_examples_list = []
                     parsed_neuro_state = None
                     parsed_ltm_flag = False
+                    # (setter's turn_id, record) raised in this turn's prompt, and the one
+                    # its reply set, for the meta block -- same hazard as the four above.
+                    raised_follow_up = None
+                    set_follow_up = None
 
                     if not self._may_still_speak(session, participant):
                         await self._abandon_state_container(channel, state_container, session=session)
@@ -1419,12 +1458,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         training_examples_list = gathered_results[1]
                         help_context_text = gathered_results[2] if help_task else None
 
-                        # Critic persistence: how many further rounds a generated
-                        # constraint stays in force is the profile's to set now, where it
-                        # was fixed at one.
-                        critic_settings = resolve_critic_settings(p_settings)
-                        if critic_settings["enabled"]:
-                            # Check for cached constraints in the session
+                        # The session's critic, on every seat it was not told to leave out.
+                        # Persistence is how many further rounds a constraint stays in force.
+                        critic_settings = resolve_critic_settings(session)
+                        if not critic_settings["enabled"] or self.cog.session_manager.participant_identity(
+                                participant)[1] in critic_settings["skip"]:
+                            critic_settings = None
+                        if critic_settings:
                             cache = session.setdefault("critic_cache", {}).get(participant_key)
 
                             if cache and cache.get("rounds", 0) > 0:
@@ -1433,37 +1473,41 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 cache["rounds"] -= 1
                             else:
                                 # "session" scope screens this profile against every
-                                # participant's recent lines instead of only its own.
-                                # Walked backwards and stopped at the quota, not filtered
-                                # over the whole log: this is tail-local state.
+                                # screened seat's recent lines instead of only its own: a
+                                # seat left out is usually there for a catchphrase, which
+                                # would trip everyone else's scan. Walked backwards and
+                                # stopped at the quota, not filtered over the whole log:
+                                # this is tail-local state.
                                 session_transcript = None
                                 if critic_settings["scope"] == "session":
                                     session_transcript = []
                                     for _t in reversed(unified_log):
                                         if (_t.get("is_user") or _t.get("type") or _t.get("is_hidden")
-                                                or (hide_folded and _t.get("compacted"))):
+                                                or (hide_folded and _t.get("compacted"))
+                                                or _t.get("speaker_pid") in critic_settings["skip"]):
                                             continue
                                         session_transcript.append(_t.get("content", ""))
                                         if len(session_transcript) >= critic_settings["lookback"]:
                                             break
                                     session_transcript.reverse()
 
-                                # Generate fresh constraints
                                 # _run_critic scans recent role=='model' turns; contents_for_api_call is
                                 # already the unified_log-derived history for this participant.
                                 critic_constraints, critic_source = await self.cog.tools_service._run_critic(
                                     contents_for_api_call, speaker_display_name, channel.guild.id,
-                                    p_config=p_settings,
-                                    session_transcript=session_transcript,
-                                    instructions=self.cog.profile_manager.resolve_critic_instructions(
-                                        owner_id, profile_name),
-                                    config_owner_id=owner_id,
+                                    session, session_transcript=session_transcript,
                                 )
                                 if critic_constraints and critic_settings["persistence"] > 0:
                                     session["critic_cache"][participant_key] = {
                                         "text": critic_constraints,
                                         "rounds": critic_settings["persistence"],
                                     }
+                            # The variety nudge, in any mode but Off and fresh every turn: a
+                            # cached constraint skips _run_critic, and it would go quiet with
+                            # it. Off this character's own replies whatever the scope -- a
+                            # shape is one character's rut, not the cast's.
+                            critic_hint = variety_hint(
+                                own_replies(contents_for_api_call, max(3, critic_settings["lookback"])))
 
                         # _construct_system_instructions places <negative_constraints>
                         # itself, so the critic has to have run by now. It reads only
@@ -1471,11 +1515,20 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # above, so moving it ahead of this call costs nothing.
                         # One tuple for the prompt and both models -- see tool_loop.
                         functions = functions_for(p_settings)
+                        follow_up_block = None
+                        if follow_ups.enabled(session):
+                            if proactive_follow_up and proactive_follow_up[0] == participant:
+                                raised_follow_up = proactive_follow_up[1]
+                            elif not follow_up_raised_this_round:
+                                raised_follow_up = follow_ups.due(unified_log, bot_pid, owner_id, time.time())
+                            follow_up_block = follow_ups.prompt_block(
+                                self.cog.global_prompts, raised_follow_up, unified_log)
                         full_system_instruction, turn_context, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
                             self._construct_system_instructions,
                             owner_id, profile_name, channel.id, is_multi_profile=True,
                             training_examples_list=training_examples_list, recalled_ltm=ltm_recall.text,
-                            critic_constraints=critic_constraints, functions=functions,
+                            critic_constraints=critic_constraints, variety_hint=VARIETY_HINTS.get(critic_hint),
+                            follow_up_block=follow_up_block, functions=functions,
                         )
 
                         session_key = (channel.id, owner_id, profile_name)
@@ -1590,6 +1643,15 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         parsed_ltm_flag = reply.ltm_flag and not was_blocked and ltm_flag_enabled(p_settings)
                         if parsed_ltm_flag:
                             participant["_ltm_flag"] = True
+                        # Not from a round nobody asked for: set there, one would bring an
+                        # absent person back up every time the channel went quiet.
+                        if (reply.follow_up and not was_blocked and not is_proactive_auto_round
+                                and follow_ups.enabled(session)):
+                            set_follow_up = follow_ups.resolve(
+                                reply.follow_up, session.get("unified_log", []), time.time())
+                            if set_follow_up:
+                                follow_ups.note_set(session, set_follow_up)
+                                self.cog.session_manager._save_multi_profile_sessions()
                         turn_warnings.extend(reply.warnings)
                         if reply.sources is not None:
                             turn_grounding_sources.extend(reply.sources)
@@ -1625,6 +1687,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         print(f"Multi-profile generation error for '{profile_name}': {e}")
                         traceback.print_exc()
                         response_text = f"{custom_main}\n\n-# Blocked due to: **Unknown**."
+                        # `was_blocked` stays False here, and the turn is the error text: a
+                        # follow-up raised to it was never answered, nor one set by it.
+                        raised_follow_up = set_follow_up = None
 
                     participant_key = (participant['owner_id'], participant['profile_name'])
 
@@ -1674,7 +1739,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
                     
                     # Anti-Repetition Critic. Recorded only when the critic was actually
-                    # enabled for this profile, so an absent key reads as "off" rather
+                    # on for this seat, so an absent key reads as "off" rather
                     # than as an empty verdict -- the same contract as neuro_state. The
                     # text is capped because this rides in every turn of a 1000-turn log
                     # that is re-serialised, re-compressed and re-encrypted on flush.
@@ -1687,12 +1752,21 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             "lookback": critic_settings["lookback"],
                             "source": critic_source,
                             "text": (critic_constraints or "")[:CRITIC_AUDIT_TEXT_MAX],
+                            **({"hint": critic_hint} if critic_hint else {}),
                         }
                     meta = reply_meta(
                         attempt, duration=duration, training_examples=training_examples_list,
                         ltm_recall=ltm_recall, sources=turn_grounding_sources,
                         neuro_state=parsed_neuro_state, critic=critic,
                         ltm_flag=parsed_ltm_flag)
+                    if set_follow_up:
+                        meta["follow_up"] = set_follow_up
+                    # Raised means put to the character: answered whether it brought the
+                    # thing up or let it go, as the reminder allows. A blocked reply saw it
+                    # and said nothing, so it stays for the next turn.
+                    if raised_follow_up and not was_blocked:
+                        meta["follow_up_answered"] = raised_follow_up[0]
+                        follow_up_raised_this_round = True
 
                     turn_object = {
                         "turn_id": turn_id,

@@ -333,7 +333,6 @@ UTILITY_FALLBACK_KEYS = {
     'image_generation_model': 'image_generation_fallback_model',
     'speech_model': 'speech_fallback_model',
     'grounding_rag_model': 'grounding_rag_fallback_model',
-    'critic_model': 'critic_fallback_model',
     'ltm_model': 'ltm_fallback_model',
     'training_analysis_model': 'training_analysis_fallback_model',
 }
@@ -508,9 +507,6 @@ THINKING_SLOT_KEYS = {
     'grounding': {'primary':  ('grounding_thinking_level', 'grounding_thinking_budget'),
                   'fallback': ('grounding_fallback_thinking_level',
                                'grounding_fallback_thinking_budget')},
-    'critic':    {'primary':  ('critic_thinking_level', 'critic_thinking_budget'),
-                  'fallback': ('critic_fallback_thinking_level',
-                               'critic_fallback_thinking_budget')},
     'ltm':       {'primary':  ('ltm_thinking_level', 'ltm_thinking_budget'),
                   'fallback': ('ltm_fallback_thinking_level',
                                'ltm_fallback_thinking_budget')},
@@ -534,8 +530,8 @@ THINKING_BUDGET_MAX = defaultConfig.LIMIT_OUTPUT_TOKENS - 4096
 #: memory ever written was billed a full reasoning pass.
 #:
 #: `utility` has no keys in THINKING_SLOT_KEYS and cannot be configured. It is for the
-#: one-shot internal generations with no slot to hang a setting off. `director` and
-#: `compaction` are a session's (SESSION_THINKING_SLOTS). The System Models categories are /mod's to set
+#: one-shot internal generations with no slot to hang a setting off. `director`,
+#: `compaction` and `critic` are a session's (SESSION_THINKING_SLOTS). The System Models categories are /mod's to set
 #: (SYSTEM_THINKING_SLOTS); the classifier's verdict decides who may see a profile, so it
 #: thinks harder than a transcription does.
 THINKING_SLOT_DEFAULTS = {
@@ -558,21 +554,21 @@ THINKING_SLOT_DEFAULTS = {
 #: and so what Override Defaults may default.
 SYSTEM_THINKING_SLOTS = ('describer', 'classifier', 'generator')
 
-#: A session's AI Director and rolling synopsis, likewise under the response slot's keys, in
-#: `session['proactivity']` and `session['compaction']`: `/session config`'s model screens.
-SESSION_THINKING_SLOTS = ('director', 'compaction')
+#: A session's AI Director, rolling synopsis and critic, likewise under the response slot's
+#: keys, in `session['proactivity']`, `['compaction']` and `['critic']`: `/session config`'s
+#: model screens.
+SESSION_THINKING_SLOTS = ('director', 'compaction', 'critic')
 
 #: Each profile slot's Primary model key, for the MimicAI Auto tier the slot runs on
 #: (`helpers.auto_thinking`).
 THINKING_SLOT_MODELS = {'response': 'primary_model', 'grounding': 'grounding_rag_model',
-                        'critic': 'critic_model', 'ltm': 'ltm_model'}
+                        'ltm': 'ltm_model'}
 
 #: How each slot reads, and the order it is offered in. Matches
 #: `ModelPickerMixin._CATEGORY_LABELS` where they overlap: one taxonomy, not two.
 THINKING_SLOT_LABELS = (
     ('response',  'Response', "The profile's own replies."),
     ('grounding', 'Grounding Summariser', 'Runs the web searches for RAG and Legacy RAG, and summarises them.'),
-    ('critic',    'Anti-Repetition Critic', 'Screens replies for semantic repetition.'),
     ('ltm',       'LTM Summariser', 'Turns conversations into long-term memories.'),
     ('training',  'Training Analysis', 'Writes a style guide from training examples.'),
 )
@@ -1074,10 +1070,13 @@ OPENROUTER_SHIPPED_MODELS = {
 }
 
 #: Chains kept per session rather than per profile, so no Models category ships them:
-#: the session synopsis. Google's side here; OpenRouter's is in the table above, which
-#: `user_defaults.model_chain` reads for both. Stored under `session['compaction']`.
-SESSION_SLOT_PAIRS = {'compaction_model': 'compaction_fallback_model'}
-GOOGLE_SESSION_MODELS = {'compaction_model': (UTILITY_MODEL, UTILITY_FALLBACK_MODEL)}
+#: the session synopsis and the critic. Google's side here; OpenRouter's is in the table
+#: above, which `user_defaults.model_chain` reads for both. Stored under
+#: `session['compaction']` and `session['critic']`.
+SESSION_SLOT_PAIRS = {'compaction_model': 'compaction_fallback_model',
+                      'critic_model': 'critic_fallback_model'}
+GOOGLE_SESSION_MODELS = {'compaction_model': (UTILITY_MODEL, UTILITY_FALLBACK_MODEL),
+                         'critic_model': (UTILITY_MODEL, UTILITY_FALLBACK_MODEL)}
 
 #: MimicAI Auto: a text model the bot owner points at models in /mod -> System Models,
 #: per tier and slot, so a profile follows the owner's pick instead of holding the day's id -- a
@@ -1097,8 +1096,8 @@ AUTO_DEFAULT = AUTO_MODEL_PREFIX + 'free'
 #: The profile slots Auto fills, by Primary key -> its Fallback key: the text categories, each
 #: with models of its own per tier, since grounding's must search.
 AUTO_SLOT_PAIRS = {'primary_model': 'fallback_model',
-                   **{key: UTILITY_FALLBACK_KEYS[key] for key in ('grounding_rag_model', 'critic_model', 'ltm_model')}}
-_AUTO_STEMS = dict(zip(AUTO_SLOT_PAIRS, ('', 'grounding_', 'critic_', 'ltm_')))
+                   **{key: UTILITY_FALLBACK_KEYS[key] for key in ('grounding_rag_model', 'ltm_model')}}
+_AUTO_STEMS = dict(zip(AUTO_SLOT_PAIRS, ('', 'grounding_', 'ltm_')))
 #: (tier, slot) -> its System Models keys, Primary then Fallback. Response keeps the bare
 #: `auto_<tier>_model` it shipped with.
 AUTO_TIER_KEYS = {(tier, slot): (f'auto_{tier}_{stem}model', f'auto_{tier}_{stem}fallback_model')
@@ -1693,6 +1692,10 @@ DEFAULT_NEURO_INSTRUCTION = (
 NEURO_AXES = ("dopamine", "cortisol", "oxytocin", "adrenaline")
 #: Where a profile's levels start, and what an axis missing from its state reads as.
 NEURO_DEFAULT_STATE = {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}
+#: Hours for a level to come halfway back to the profile's resting level (`neuro_rest`, set
+#: in the neuro modal, else the default above). Without it a character left furious stays
+#: furious, in every server, until it says otherwise. See `helpers.neuro_levels`.
+NEURO_HALF_LIFE_HOURS = 6
 
 #: Mood avatars, `config["mood_avatars"]` ({axis: url}): the profile speaks under the avatar
 #: of its highest level at or above `mood_avatar_threshold`, else its own. Above every
@@ -1753,6 +1756,10 @@ BOND_FIRST_MEETING = (20, 0)
 
 
 # --- Anti-repetition critic ---------------------------------------------------
+#
+# A session's, in `session['critic']` (`helpers.resolve_critic_settings`): the server's key
+# pays for it and repetition is the scene's. A profile's `critic_*` keys, from before
+# v0.7.9, are left on disk and read by nothing.
 
 #: The critic used to be one boolean, which bought all of it or none: the lexical scan
 #: is free and in-process, but the only way to reach it was to pay for a model call on
@@ -1771,7 +1778,8 @@ CRITIC_STRICTNESS_LEVELS = ("lenient", "normal", "strict")
 CRITIC_STRICTNESS_MIN_GRAM = {"lenient": 6, "normal": 4, "strict": 3}
 
 DEFAULT_CRITIC_MODE = "off"
-DEFAULT_CRITIC_SCOPE = "self"
+#: Session: the cast falling into one rhythm is what a session-wide critic is for.
+DEFAULT_CRITIC_SCOPE = "session"
 DEFAULT_CRITIC_STRICTNESS = "normal"
 
 #: Model turns the critic reads back through. Two is the minimum the lexical scan can
@@ -2348,6 +2356,48 @@ DEFAULT_DIRECTOR_INSTRUCTIONS = (
     "You are an AI Director for a roleplay session. Introduce a sudden event, an "
     "environmental change, or a question to spark conversation among the cast. Keep it "
     "brief (1-2 sentences).")
+
+# --- Follow-ups (`/session config` -> Proactivity -> Follow-ups; cogs/utils/follow_ups.py) ---
+
+#: What a character is told about setting one. Static, so in the system instruction (decided
+#: 2026-11-10), though the probe set them where they belong most from the turn context
+#: (prod_tests/follow_up_live.py, `--placement`). /mod's `FOLLOW_UP_RULES`.
+#:
+#: No topic nouns and no sample time, deliberately: the bounds are in words. A wording that
+#: listed "an exam, an interview" and showed in="40h" had models asking people about exams
+#: and interviews they never had, and copying 40h five times in 90 replies.
+DEFAULT_FOLLOW_UP_RULES = (
+    "<follow_up_rules>\n"
+    "You can come back to someone later: about something they told you that is still ahead of "
+    "them or unresolved between you, or when they ask you to check back. Otherwise rarely, only "
+    "when someone in your place truly would; never for small talk, jokes, goodbyes or settled "
+    "news, nor anything they did not say.\n"
+    'End your reply with <follow_up for="ID" in="TIME">what to raise</follow_up>. ID is their ID '
+    "from their turn header. TIME is a number plus m, h or d, from one minute to seven days; "
+    "asked for sooner, say a minute is the soonest you can. At most one per reply. It is hidden, and you are reminded when it is due.\n"
+    "</follow_up_rules>"
+)
+#: The reminder, in the turn context of the turn that raises one. `{note}` is the character's
+#: own words from the turn that set it; all three are substituted as values. /mod's
+#: `FOLLOW_UP_DUE`.
+DEFAULT_FOLLOW_UP_DUE = (
+    "<follow_ups>\n"
+    "Earlier you meant to come back to {name} [ID: {id}] about this: {note}\n"
+    "Bring it up now if it still fits. If it has already come up, let it go.\n"
+    "</follow_ups>"
+)
+#: Latest a follow-up may fall due; a longer `in=` is cut to this. Models wrote 8d, 10d, 30d.
+FOLLOW_UP_MAX_HOURS = 168
+#: How long one waits, once due, for its person to come back before it is dropped.
+FOLLOW_UP_EXPIRY_HOURS = 168
+#: Live follow-ups one character holds; a newer one drops the oldest. One per person
+#: besides: a newer one for the same person replaces theirs.
+FOLLOW_UP_PER_CHARACTER = 3
+#: A stored note rides in the log and goes back to the model, so it is capped.
+FOLLOW_UP_NOTE_MAX = 300
+#: Quiet a due follow-up waits for before its character raises it unasked, so it never lands
+#: mid-conversation. Its own, not Proactivity's cooldown: a minute's follow-up must not wait five.
+FOLLOW_UP_QUIET_SECONDS = 60
 
 # In-character /speak: re-voicing an author's line as the character rather than posting
 # it verbatim. Injected as the LAST part of the final user turn, after the system
@@ -2983,6 +3033,18 @@ DEFAULT_NEGATIVE_CONSTRAINTS = (
     "</negative_constraints>"
 )
 
+#: The critic's variety nudge: one hint for a turn whose character's recent replies all share
+#: a shape (`helpers.variety_hint`). Worded as what to do and left to the character, so a persona
+#: written as "always ends on a question" is not fought every turn. Trialled with and without on
+#: three models (prod_tests/variety_nudge_live.py, 2026-11-10): the rut broke 27/30 and 22/30
+#: against 18/30 and 13/30, with no reply mentioning the hint.
+VARIETY_HINTS = {
+    "question": ("<variety_hint>\nYour last few replies all ended on a question. End this one on a "
+                 "statement or an action instead, if it suits the character.\n</variety_hint>"),
+    "opening": ("<variety_hint>\nYour last few replies all opened with an action. Open this one with "
+                "speech or narration instead, if it suits the character.\n</variety_hint>"),
+}
+
 # The dashboard tree is generated from the live PROFILE_ACTIONS table by
 # cogs/utils/menu_map.py and substituted for {menu_map} at injection time, because the
 # hand-written copy drifted out of step with the UI it described. An operator override
@@ -3329,7 +3391,7 @@ SYSTEM_XML_TAGS = [
     "whisper_context", "private_whisper", "private_response", "internal_note",
     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
     "technical_manual", "training_data", "session_rules", "image_context",
-    "system_note", "reply_context", "negative_constraints", "content_policy",
+    "system_note", "reply_context", "negative_constraints", "variety_hint", "content_policy",
     "session_synopsis", "game_context", "birthday_context", "attachment_description",
     "memory_search", "web_search", "neuro_state", "memory_capture", "memory_flag", "memory_written",
     # The old names of <session_rules> and <current_time>, which a /mod override saved
@@ -3348,6 +3410,9 @@ SYSTEM_XML_TAGS = [
     "server_context", "lorebook", "character_card",
     # Bonds (prompt_builder, cogs/utils/bonds.py).
     "bond_engine", "bonds", "bond_update",
+    # Follow-ups (cogs/utils/follow_ups.py). `follow_up` is taken off a reply first; this
+    # catches one on a path that never asked for it.
+    "follow_up", "follow_ups", "follow_up_rules",
 ]
 
 _tags_pattern = "|".join(SYSTEM_XML_TAGS)

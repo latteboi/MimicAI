@@ -19,6 +19,7 @@ The operator may edit the on-disk shards via `/mod` -> Docs. `HelpService` track
 which shards it wrote and leaves edited ones alone on upgrade.
 """
 
+from .constants import NEURO_HALF_LIFE_HOURS
 from .news import latest_release_text
 
 HELP_CATEGORIES = {
@@ -158,8 +159,9 @@ HELP_CATEGORIES = {
             "**Three dropdowns.** The first picks the slot; the second sets the **primary** model's effort; the third sets the "
             "**fallback** model's. The token budget button holds both budgets in one modal. A fallback is usually the cheap standby "
             "behind an expensive primary, so tying the two together made the standby waste exactly what it was chosen to save.\n\n"
-            "**The four slots:** Response (the profile's own replies), Grounding Summariser, Anti-Repetition Critic and LTM Summariser. "
-            "The three utility slots default to Low effort with a 512-token budget, which is what a summarising or screening pass needs; "
+            "**The three slots:** Response (the profile's own replies), Grounding Summariser and LTM Summariser. A session's critic, "
+            "AI Director and synopsis set theirs on their own model screens in `/session config`. "
+            "The two utility slots default to Low effort with a 512-token budget, which is what a summarising or screening pass needs; "
             "Response defaults to High. Raise a utility slot only if its output is visibly poor -- it is billed on every round it runs.\n\n"
             "**Unset means inherit.** An untouched slot follows the shipped default, so it tracks the bot when that default changes. "
             "An untouched **fallback** follows its own primary -- set the Response primary to Max and the standby follows until you say "
@@ -196,8 +198,8 @@ HELP_CATEGORIES = {
             "Images, Audio, Memory, Training, Misc -- holding the same settings, and choosing one opens the same form "
             "`/profile bulk manage` opens for it. Nearly every setting a profile has can be given a standing value "
             "this way.\n\n"
-            "**Models.** Models on the Params tab covers every one of the six categories -- Response, Image, TTS, "
-            "Grounding, Critic, LTM -- and both slots of each. Set your Response Primary to an OpenRouter model once, "
+            "**Models.** Models on the Params tab covers every one of the five categories -- Response, Image, TTS, "
+            "Grounding, LTM -- and both slots of each. Set your Response Primary to an OpenRouter model once, "
             "and every profile you make afterwards starts there instead of on your provider's shipped default.\n\n"
             "**Clearing.** *Clear...* takes one group of settings, or all of them, back to Platform default.\n\n"
             "**Anything left on *Platform default* keeps following the bot's own value**, including if that value changes "
@@ -230,8 +232,8 @@ HELP_CATEGORIES = {
         "Making a Profile Faster": (
             "In rough order of effect:\n\n"
             "• **Lower the Reasoning Level**, or cap the token budget.\n"
-            "• **Set the Anti-Repetition Critic to `lexical`, or off.** `full` is an extra model call before every reply; "
-            "`lexical` keeps the free local scan and costs nothing.\n"
+            "• **Set the session's Anti-Repetition Critic to `lexical`, or off** (`/session config` -> Config). `full` is an extra "
+            "model call before most replies; `lexical` keeps the free local scan and costs nothing.\n"
             "• **Set Grounding and URL Context to OFF**, or Grounding to Native if your model supports it. Legacy RAG is an extra call on every round; plain RAG costs nothing until the character reaches for a search.\n"
             "• **Reduce STM Length**, and reduce LTM context size.\n"
             "• **Switch to a lighter primary model.** A flash-lite variant answers near-instantly at some cost in reasoning depth.\n\n"
@@ -294,7 +296,7 @@ HELP_CATEGORIES = {
             "session -- it simply has nobody to answer.\n\n"
             "**Config** sets how the round runs. Its dropdown opens each setting on its own screen: **Execution Mode** (sequential or "
             "random turn order), **Master Prompt** (the scene every participant sees), **Text-to-Speech** (voices the replies of characters "
-            "with speech set up), **Response Limit** (replies per round) and **Settle Window**. Below it, **Cast access** lets an "
+            "with speech set up), **Response Limit** (replies per round), **Settle Window** and **Anti-Repetition Critic**. Below it, **Cast access** lets an "
             "administrator open the channel to **Open casting**.\n\n"
             "**Settle Window** is how long a round waits before it reads the channel, so a few quick messages get one reply rather than one "
             "each. The placeholder is already up while it waits. **Quiet gap** (default 3 seconds) is how long the channel has to be quiet "
@@ -341,7 +343,36 @@ HELP_CATEGORIES = {
             "the wait over; when a roll hits, the **AI Director** -- a separate model -- reads the scene and the recent public conversation and writes a short environmental beat ('a loud noise "
             "outside'), injected as an `<internal_note>` that the cast reacts to.\n\n"
             "Proactivity is the setting most likely to surprise you on the bill: it generates rounds with no user input. Start with a low chance "
-            "and a long cooldown."
+            "and a long cooldown.\n\n"
+            "**Follow-ups**, a switch on the same page and off until you turn it on, let a character choose to come back to someone about "
+            "something they told it: an exam tomorrow, a fight left unresolved. It picks how long to wait, from minutes up to a week, and "
+            "once that has passed it is reminded the next time the person speaks. If they stay away it does not wait for them: once the "
+            "channel has had a minute's quiet, that character alone speaks with the reminder, Proactivity on or "
+            "off, whatever the chance, and the AI Director sits that round out. It brings it up if it still fits, or lets it go if it already came up. It keeps up to three at "
+            "once, one per person, and the cast raises at most one per round. Its rules add about 160 tokens to every reply, in the cached part of the prompt. "
+            "`/session audit` shows a turn's follow-ups."
+        ),
+        "Anti-Repetition Critic": (
+            "`/session config` -> Config -> Anti-Repetition Critic. Off until a mode is chosen.\n\n"
+            "Before each reply, recent replies are screened for structural repetition -- the same opening phrase every turn, the same "
+            "sentence rhythm, a verbatim loop. If a pattern is found, a negative constraint goes into that character's prompt banning it "
+            "for the coming turn.\n\n"
+            "**Mode.** `Lexical` runs only the local n-gram scan: no extra API call, no added latency, and it catches verbatim loops and "
+            "repeated openings. `Full` adds a model pass that also catches the softer cases -- recycled suggestions, a tone a character "
+            "keeps falling back into -- at the cost of one extra call before most replies, on the server's key. `Off` disables both.\n\n"
+            "**Scope.** `Session`, the default, screens each character against the whole cast's recent replies: the repetition a roleplay "
+            "actually falls into is four characters converging on one rhythm, none of them looping alone. `Self` screens each against "
+            "its own.\n\n"
+            "**Variety hint.** In Lexical and Full, a character whose last few replies all ended on a question, or all opened with an "
+            "*action*, gets one line on its next turn suggesting it vary that, if it suits the character. No model call, about 35 tokens "
+            "on that turn alone, and `/session audit` shows it.\n\n"
+            "**Strictness** sets how short a repeated phrase has to be before it counts. **Lookback** is how many replies are read back "
+            "through. **Persistence** is how many further rounds a constraint stays in force after the round that earned it.\n\n"
+            "**Seats.** Every seat is screened, one seated later included. Untick a character to leave it out -- for a deliberate "
+            "catchphrase, say -- and its lines stop counting against the others too.\n\n"
+            "**Full mode** has its own instructions (left at the default, they follow the bot-wide prompt) and its own models and "
+            "Thinking under **Critic Model…**, both greyed in the other modes. Until v0.7.9 the critic was set per profile; those "
+            "settings are no longer read."
         ),
         "Response Modes and Delivery": (
             "**Response Mode** (`/profile manage` -> Tools -> Response Mode) controls how a reply is attached to your message:\n\n"
@@ -453,19 +484,6 @@ HELP_CATEGORIES = {
             "the table sees the description. One call per round however many characters need it. With no key for that provider it "
             "behaves as `Off`."
         ),
-        "Anti-Repetition Critic": (
-            "`/profile manage` -> **Tools** -> Anti-Repetition Critic.\n\n"
-            "Before a reply is sent, recent output is screened for structural repetition -- the same opening phrase every turn, the same "
-            "sentence rhythm, a verbatim loop. If a pattern is found, a negative constraint goes into the prompt banning it for the coming turn.\n\n"
-            "**Mode.** `lexical` runs only the local n-gram scan: no extra API call, no added latency, and it catches verbatim loops and "
-            "repeated openings. `full` adds a model pass that also catches the softer cases -- recycled suggestions, a tone the character keeps "
-            "falling back into -- at the cost of one extra call per message. `off` disables both.\n\n"
-            "**Scope.** `self` screens a profile against its own recent replies. `session` screens it against every participant's, which is the "
-            "repetition a multi-profile roleplay actually falls into: four characters converging on one rhythm, none of them individually looping.\n\n"
-            "**Strictness** sets how short a repeated phrase has to be before it counts. **Lookback** is how many turns are read back through. "
-            "**Persistence** is how many further rounds a constraint stays in force after the round that earned it.\n\n"
-            "The prompt itself is editable per profile at **Tools** -> Critic Instructions, a row shown in Full mode only: Lexical sends no prompt. Leave it blank to follow the bot-wide prompt."
-        ),
         "Neuro-Endocrine Engine": (
             "`/profile manage` -> **Tools** -> Neuro-Endocrine Engine.\n\n"
             "The profile carries four variables between turns, each 0-100: **Dopamine** (joy, motivation), **Cortisol** (stress, frustration), "
@@ -473,6 +491,9 @@ HELP_CATEGORIES = {
             "Its current state is described in the prompt, and at the end of each reply the model emits a hidden update reflecting how the "
             "exchange affected it. The next turn reads that state back. The effect is a character whose mood carries and shifts over a "
             "conversation rather than resetting each message. Nothing about the mechanism is visible in chat.\n\n"
+            f"Left alone, a mood eases back: each level comes halfway back to its **resting level** every {NEURO_HALF_LIFE_HOURS} hours, so a "
+            "character left furious overnight has mostly calmed down by morning. **Edit hormones…** sets the resting levels, "
+            "and puts the mood back on them.\n\n"
             "**Bonds**, a second switch on the same screen, works alone or beside it: the character keeps two scores, 0-100, for each "
             "person it talks to -- **Affection** and **Resentment**, independent, so it can be fond of someone and resent them at once. "
             "Each reply is told where it stands with the last five people to speak, humans and characters alike, and reports what changed. "
@@ -622,7 +643,7 @@ HELP_CATEGORIES = {
             "You can set what users see on failure at `/profile manage` -> Misc -> Custom Error Message."
         ),
         "When a Character Feels Wrong": (
-            "**Repetitive.** Set the Anti-Repetition Critic to `lexical` (free) or `full`, and to `session` scope in a multi-profile session; raise temperature; add repetition penalties on OpenRouter models; add Training "
+            "**Repetitive.** Turn on the session's Anti-Repetition Critic (`/session config` -> Config) at `lexical` (free) or `full`; raise temperature; add repetition penalties on OpenRouter models; add Training "
             "Examples showing variety.\n\n"
             "**Ignoring its persona.** Reduce STM Length -- a very long context dilutes system instructions. Check whether your Instructions "
             "contradict your Persona. On a reasoning model, try cutting instructions down rather than adding more.\n\n"
@@ -889,7 +910,7 @@ DEFAULT_HELP_DOCS = {
     "profiles/personal_vs_borrowed.txt": (
         "Concept: Every profile has a Profile ID (PID) whose first letter is its class. A = Personal Profile, fully editable and owned by you. B = a profile you borrowed through a private share. C = a profile you borrowed from the Public Library. X = a System Profile provided by the bot operator. Borrowed profiles (B and C) are read-only links pointing back to the creator's master profile.\n"
         "B versus C: the letter records where the borrow came from, not what it is now. A PID never changes, so if the owner later unpublishes a profile your borrow keeps its C. Borrows created before the C class existed are all B regardless of origin, so the letter is a hint for reading IDs rather than something the bot decides behaviour from.\n"
-        "What a borrower may change: everything in the profile's config, which a borrow owns outright -- models, sampling, memory settings, timezone, response mode, the custom error message and the generation visual. Persona, instructions, the image prompt, the critic prompt and the LTM summarisation prompt stay with the owner: they are read live from the original and are not stored on your borrow, so there is nothing local to edit. The Persona tab is hidden entirely on a borrowed profile, and the webhook name and avatar stay the author's.\n"
+        "What a borrower may change: everything in the profile's config, which a borrow owns outright -- models, sampling, memory settings, timezone, response mode, the custom error message and the generation visual. Persona, instructions, the image prompt and the LTM summarisation prompt stay with the owner: they are read live from the original and are not stored on your borrow, so there is nothing local to edit. The Persona tab is hidden entirely on a borrowed profile, and the webhook name and avatar stay the author's.\n"
         "What arrives changed: a borrow is a copy of the author's config, so their model choices come with it. If those name a provider you hold no key for, the slots are repointed to the bot defaults and you are told which. Once you have chosen a provider, you are asked whether to use your own defaults -- your provider's models and anything set in `/settings` -> Override Defaults, except the settings that belong to the character's own performance -- or keep the author's. See profiles/default_settings.\n"
         "Mechanism: If the original owner deletes or renames their Personal Profile, the Cascade Deletion Protocol instantly severs all borrowed links. The borrowed variant will be automatically deleted from your list to prevent database corruption.\n"
         "Naming: Your own profiles always win a name clash. If you create a personal profile with the same name as a System Profile, yours is the one that runs; the System Profile is only reached when you have no profile of your own by that name.\n"
@@ -900,8 +921,8 @@ DEFAULT_HELP_DOCS = {
     "profiles/default_settings.txt": (
         "Command: `/settings` -> Override Defaults, open once `/start` has set you up. Sets standing preferences applied to profiles created afterwards and offered on borrows. Existing profiles are not changed; `/profile bulk manage` changes those.\n"
         "Provider: The Provider button beside Clear steps through Google, OpenRouter and None. Google and OpenRouter ship their models to new profiles; None ships none, so a new profile starts on the models set here under Models, and any slot left on 'Platform default' starts with no model. Models opens on the chosen provider's models.\n"
-        "Scope: Nearly every setting a profile has. The screen is the profile dashboard's own tabs (Params, Tools, Images, Audio, Memory, Training, Misc) and rows, and choosing a row opens the same form `/profile bulk manage` opens for it, so a setting reachable in bulk is reachable as a default. What is not: a persona, an instruction block, the LTM summarisation or critic prompts and the image-generation prompt (a borrow stores no prompts, so a default one would never be read), a content rating, and the neuro engine's live hormone levels. A row that has to leave part of what you entered behind says so on the panel it returns to.\n"
-        "Models: Models on the Params tab covers all twelve slots across the six categories (Response, Image, TTS, Grounding, Anti-Repetition Critic, LTM Summariser). Each slot has its own 'Platform default' option, which clears it.\n"
+        "Scope: Nearly every setting a profile has. The screen is the profile dashboard's own tabs (Params, Tools, Images, Audio, Memory, Training, Misc) and rows, and choosing a row opens the same form `/profile bulk manage` opens for it, so a setting reachable in bulk is reachable as a default. What is not: a persona, an instruction block, the LTM summarisation prompt and the image-generation prompt (a borrow stores no prompts, so a default one would never be read), a content rating, and the neuro engine's live hormone levels. A row that has to leave part of what you entered behind says so on the panel it returns to.\n"
+        "Models: Models on the Params tab covers all ten slots across the five categories (Response, Image, TTS, Grounding, LTM Summariser). Each slot has its own 'Platform default' option, which clears it.\n"
         "Clearing: 'Clear...' takes one group of settings, or everything, back to Platform default. Blanking a box inside a form clears that one setting the same way.\n"
         "Platform default: Any setting left on 'Platform default' follows the value the bot ships and keeps following it if that value changes in a later version. Selecting the same model by hand pins it instead.\n"
         "Saving: Values are written the moment they are chosen. This tab has no Save button, unlike the API Keys tab which requires Save Assignments.\n"
@@ -1128,9 +1149,10 @@ DEFAULT_HELP_DOCS = {
     "sessions/proactivity_and_director.txt": (
         "Setup: Enabled via `/session config` -> Proactivity.\n"
         "Mechanism: When Proactivity is active, an asynchronous system loop monitors the channel. Each time the channel has been quiet for the Cooldown, the Trigger Chance (0-100%) is rolled once, and any message starts the wait over. When a roll hits, the cast starts talking with no user message at all; in an empty channel it keeps going (10% every 5 minutes is about 29 rounds a day).\n"
-        "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Its Primary and Fallback are chosen at `/session config` -> Proactivity -> Director Model, which works like Models and has the Director's on/off switch; until you choose, it runs the LTM Summariser's models. It falls back to the next model if the first is busy. Blank instructions (Edit Settings & AI Director) use the default wording.\n"
+        "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Its switch, Director Instructions and Director Model are on the AI Director row of `/session config` -> Proactivity; Director Model works like Models, and until you choose there it runs the LTM Summariser's models. It falls back to the next model if the first is busy. Blank instructions use the default wording. It acts only on proactive rounds, so it is idle while Proactivity is off.\n"
         "Payload: This scene update is injected as an <internal_note> directly to the cast list, forcing the AI characters to dynamically react to the new situation autonomously.\n"
         "Cost: Proactive rounds consume API quota without anyone prompting them, and the Director is an extra call on top. Start with a low chance and a long cooldown.\n"
+        "Follow-ups: A switch on the same page, off by default. With it on, a character may end a reply with a hidden tag naming someone and how long to wait (minutes up to 7 days), to come back to something that person told it. Once that time has passed and the person speaks again, the character's next reply is reminded and raises it if it still fits. If they stay away it does not wait for them: once the channel has had a minute's quiet, that character alone speaks with the reminder, Proactivity on or off, whatever the chance, and the AI Director is not asked. Up to three per character, one per person (a newer one replaces theirs), one raised per round across the cast, dropped a week after falling due. Never set in whispers, `/speak` or Global Chat, nor by a proactive round. Its rules add about 160 tokens to every reply, in the cached part of the prompt, and no extra model call. `/session audit` shows what a turn set or was reminded of.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The bot keeps talking to itself and burning my quota.' Fix: Lower the Trigger Chance or raise the Cooldown under `/session config` -> Proactivity, or toggle Proactivity off entirely."
     ),
@@ -1283,10 +1305,12 @@ DEFAULT_HELP_DOCS = {
         "Concept: The Neuro-Endocrine Engine simulates hormonal states to produce dynamic emotional characterisation that carries between turns.\n"
         "Variables: Four values on a 0-100 scale -- Dopamine (joy, motivation, reward), Cortisol (stress, anxiety, frustration), Oxytocin (bonding, trust, empathy), and Adrenaline (energy, urgency).\n"
         "Execution: The current state is described in the system prompt. At the end of each response the model emits a hidden update tag reflecting how the exchange affected it, and the next turn reads that state back. None of this is visible in chat.\n"
+        f"Settling: Left alone, each level comes halfway back to its resting level every {NEURO_HALF_LIFE_HOURS} hours. The resting levels are the ones set with Edit hormones on the Neuro Engine screen, or 50/20/50/20 if they were never set. Saving there also puts the current mood back on them.\n"
         "Enabling: `/profile manage` -> Tools -> Neuro-Endocrine Engine.\n"
         "Bonds: A second switch on the same screen, on with or without the hormones. The character keeps Affection and Resentment, 0-100 and independent, for each person it talks to, humans and other characters alike, by the ID their messages carry. Each reply sees the scores of the last five people to speak and reports what changed, hidden like the hormones. A first meeting sets both freely; after that a score moves at most 15 a reply, so a request to be liked moves little. Up to 100 people are kept, the one updated longest ago dropped first. Reset bonds on that screen clears them all. Anyone in a session sees how a character feels about them from `/session view` -> select it, in words (warm, a little sarcastic); the Neuro Engine screen shows its owner theirs, with the levels.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'The character is stuck in a bad mood.' Fix: Cortisol has climbed and is carrying forward. Reopen the Neuro settings to reset the values, or `/refresh` the channel.\n"
+        f"- Symptom: 'The character is stuck in a bad mood.' Fix: Cortisol has climbed and each reply keeps it there. Left alone it halves its distance from the resting level every {NEURO_HALF_LIFE_HOURS} hours; Edit hormones on the Neuro Engine screen puts it back at once.\n"
+        "- Symptom: 'The character drifts back to a mood I did not set.' Fix: It settles to its resting levels, which are 50/20/50/20 until set. Save the levels you want once with Edit hormones.\n"
         "- Symptom: 'The character holds a grudge against me.' Fix: Resentment comes down 15 at most a reply, so it takes kindness over several replies, by design. Reset bonds clears every score at once."
     ),
     "features/grounding_and_rag.txt": (
@@ -1326,13 +1350,15 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Line Spacing does nothing on a borrowed profile.' Fix: Expected. A borrow follows the owner's setting; ask the owner to change it."
     ),
     "features/repetition_critic.txt": (
-        "Concept: The Anti-Repetition Critic is a secondary evaluation layer that detects a profile falling into linguistic loops.\n"
-        "Mechanism: Before a message is sent, the Critic reviews recent output for structural repetition -- the same opening phrase every turn, the same sentence rhythm, verbatim loops. If it finds one, it injects an explicit negative constraint banning that pattern for the coming turn.\n"
-        "Modes: 'off' disables it. 'lexical' runs only the local n-gram scan -- no API call, no added latency. 'full' adds a model pass that also catches recycled suggestions and tonal sameness, at one extra API call per message.\n"
-        "Scope: 'self' screens a profile against its own recent replies; 'session' screens it against every participant's, which is what catches a multi-profile session converging on one rhythm.\n"
-        "Tuning: strictness (lenient/normal/strict) sets how short a repeated phrase has to be to count; lookback is how many turns are read; persistence is how many further rounds a constraint stays in force.\n"
-        "Prompt: editable per profile at `/profile manage` -> Tools -> Critic Instructions, shown in Full mode only. Left blank, the profile follows the bot-wide ANTI_REPETITION prompt.\n"
-        "Enabling: `/profile manage` -> Tools -> Anti-Repetition Critic.\n"
+        "Concept: The Anti-Repetition Critic is a session's: it detects the cast falling into linguistic loops.\n"
+        "Where: `/session config` -> Config -> Anti-Repetition Critic (administrators). Off until a mode is chosen. Until v0.7.9 it was set per profile; those settings are no longer read.\n"
+        "Mechanism: Before a reply, recent replies are reviewed for structural repetition -- the same opening phrase every turn, the same sentence rhythm, verbatim loops. If one is found, an explicit negative constraint banning that pattern goes into that character's prompt for the coming turn.\n"
+        "Modes: 'off' disables it. 'lexical' runs only the local n-gram scan -- no API call, no added latency. 'full' adds a model pass, on the server's key, that also catches recycled suggestions and tonal sameness, at one extra call before most replies.\n"
+        "Scope: 'session' (the default) screens each character against the whole cast's recent replies, which catches a cast converging on one rhythm; 'self' screens each against its own.\n"
+        "Seats: every seat is screened, one seated later included. A character unticked is left out, and its lines stop counting against the others: the answer to a deliberate catchphrase.\n"
+        "Variety hint: in lexical and full, a character whose last few replies all ended on a question, or all opened with an *action*, gets one line on its next turn suggesting it vary that, if it suits the character. No model call; about 35 tokens on that turn alone. `/session audit` shows it.\n"
+        "Tuning: strictness (lenient/normal/strict) sets how short a repeated phrase has to be to count; lookback is how many replies are read; persistence is how many further rounds a constraint stays in force.\n"
+        "Full mode: its instructions (blank follows the bot-wide ANTI_REPETITION prompt), models and Thinking are on the same screen, greyed in the other modes.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Replies became noticeably slower.' Fix: 'full' mode is an extra model call per message. Switch to 'lexical' to keep repetition screening at no latency cost."
     ),
@@ -1351,9 +1377,9 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Image-heavy sessions cost far more than I expected.' Fix: Set Media Input Resolution to Low. Each attachment is otherwise read at the model's default resolution, which on Gemini 3 is 1120 tokens per image, every round it stays in the short-term memory window."
     ),
     "models/thinking_and_reasoning.txt": (
-        "Concept: Reasoning effort and token budget are set per model slot AND per model within that slot. The four slots are Response (the profile's own replies), Grounding Summariser, Anti-Repetition Critic and LTM Summariser, and each holds a primary and a fallback with independent settings.\n"
+        "Concept: Reasoning effort and token budget are set per model slot AND per model within that slot. The three slots are Response (the profile's own replies), Grounding Summariser and LTM Summariser, and each holds a primary and a fallback with independent settings. A session's critic, AI Director and synopsis set theirs on their own model screens in `/session config`.\n"
         "Where: `/profile manage` -> Params -> Thinking Parameters, or the Thinking button inside Models, which opens on whichever slot the category dropdown is showing. Three dropdowns: slot, primary effort, fallback effort. The budget button holds both budgets.\n"
-        "Defaults: The three utility slots default to Low effort with a 512-token budget. Response defaults to High. Unset means inherit -- a slot you never touch follows the shipped default, and a fallback you never touch follows its own primary rather than the shipped default.\n"
+        "Defaults: The two utility slots default to Low effort with a 512-token budget. Response defaults to High. Unset means inherit -- a slot you never touch follows the shipped default, and a fallback you never touch follows its own primary rather than the shipped default.\n"
         "Levels: Max, Extra High, High, Medium, Low, Minimal, None. Max is OpenRouter's own top step (~95% of max_tokens), where it and Extra High are the same allocation; nothing else has a step above High, so both collapse onto it on Google.\n"
         "Clearing a value: Submit the budget field empty to put the slot back on its default. That is not the same as 0, which disables thinking outright.\n"
         "Provider and model differences: Gemini 3 takes effort and ignores the budget, and 3 Pro collapses the six steps to two. Gemini 2.5 takes the budget and ignores effort, except Flash Lite which takes neither. Image and speech models take neither. OpenRouter takes both, budget winning where both are set.\n"

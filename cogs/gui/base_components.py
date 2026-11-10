@@ -444,18 +444,13 @@ class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                           [(label, key, nav(factory)) for label, key, factory in cls._tabs_for(source)])
 
     def _add_page_controls(self, num_pages: int, row: int, *, repaint: bool = True):
-        """Attach prev/next page buttons.
+        """Attach the page buttons.
 
         `repaint=True` edits the message in place off the click; `repaint=False`
         defers and repaints through `update_display`.
         """
-        async def p_cb(i: discord.Interaction):
-            await self._turn_page(i, -1, repaint)
-
-        async def n_cb(i: discord.Interaction):
-            await self._turn_page(i, 1, repaint)
-
-        build_pagination_controls(self, self.current_page, num_pages, row, p_cb, n_cb)
+        build_pagination_controls(self, self.current_page, num_pages, row,
+                                  lambda i, delta: self._turn_page(i, delta, repaint))
 
     async def _turn_page(self, i: discord.Interaction, delta: int, repaint: bool = False):
         self.current_page += delta
@@ -465,12 +460,6 @@ class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         else:
             await i.response.defer()
             await self.update_display()
-
-    async def prev_page(self, i: discord.Interaction):
-        await self._turn_page(i, -1)
-
-    async def next_page(self, i: discord.Interaction):
-        await self._turn_page(i, 1)
 
 
 class PageJumpModal(ui.Modal):
@@ -548,17 +537,25 @@ def paged_nav_options(current_page: int, num_pages: int, *, values=PAGE_NAV_VALU
     return options
 
 
-def build_pagination_controls(view: ui.View, current_page: int, num_pages: int, row: int, prev_cb, next_cb, page_cb=None):
-    if num_pages <= 1: return
-    prev_btn = ui.Button(label="◀", style=discord.ButtonStyle.secondary, disabled=(current_page == 0), row=row)
-    page_lbl = ui.Button(label=f"{current_page + 1}/{num_pages}", style=discord.ButtonStyle.grey, disabled=(page_cb is None), row=row)
-    next_btn = ui.Button(label="▶", style=discord.ButtonStyle.secondary, disabled=(current_page >= num_pages - 1), row=row)
-    prev_btn.callback = prev_cb
-    next_btn.callback = next_cb
-    if page_cb: page_lbl.callback = page_cb
-    view.add_item(prev_btn)
-    view.add_item(page_lbl)
-    view.add_item(next_btn)
+def build_pagination_controls(view: ui.View, current_page: int, num_pages: int, row: int,
+                              turn: Callable[[discord.Interaction, int], Awaitable[None]]):
+    """◀ n/m ▶ under a paged list, the middle button asking for a page number.
+
+    `turn(interaction, delta)` moves the page by `delta` and repaints. A jump is a turn by
+    the distance to the page asked for, so a screen writes one callback and gets all three.
+    It may be handed the modal's submission, which edits the same message a click would.
+    """
+    if num_pages <= 1:
+        return
+
+    async def jump(i: discord.Interaction):
+        async def to_page(submitted: discord.Interaction, page: int):
+            await turn(submitted, page - current_page)
+        await i.response.send_modal(PageJumpModal(num_pages, to_page, zero_indexed=True))
+
+    add_button(view, "◀", lambda i: turn(i, -1), row=row, disabled=current_page == 0)
+    add_button(view, f"{current_page + 1}/{num_pages}", jump, row=row)
+    add_button(view, "▶", lambda i: turn(i, 1), row=row, disabled=current_page >= num_pages - 1)
 
 class ConfigModal(ui.Modal):
     def __init__(self, cog, profile_name, is_borrowed, title, fields, parser, callback=None, target_user_id=None):
@@ -779,17 +776,12 @@ class BaseBulkProfileView(BlockedGuard, ui.View):
             add_button(self, f"Source: {self.view_source.title()}", self.toggle_source_callback,
                        style=style, row=btn_row, custom_id="toggle_source")
 
-        async def p_cb(i: discord.Interaction):
-            self.current_page -= 1
+        async def turn(i: discord.Interaction, delta: int):
+            self.current_page += delta
             self._build_view()
             await self._edit(i)
 
-        async def n_cb(i: discord.Interaction):
-            self.current_page += 1
-            self._build_view()
-            await self._edit(i)
-
-        build_pagination_controls(self, self.current_page, num_pages, btn_row, p_cb, n_cb)
+        build_pagination_controls(self, self.current_page, num_pages, btn_row, turn)
 
         # Only when there is something to clear. "Select All" across both sources is
         # one click, and undoing it by paging through every page to unselect is not;

@@ -1,5 +1,5 @@
 """Models for a model pair that is no profile slot: the AI Director, the session
-synopsis and training analysis -- and the session pairs' Thinking.
+synopsis, the session's critic and training analysis -- and the session pairs' Thinking.
 
 Its own module because it adopts `ModelPickerMixin` from `gui_profiles`, which imports
 `gui_sessions` and `gui_data`: each opens its screen lazily, as `/settings` opens its
@@ -250,7 +250,7 @@ class DirectorModelView(_SessionPairView):
     _TITLE = "AI Director Model"
     _DESCRIPTION = ("The model that writes the Director's note for each proactive round. Until "
                     "you choose one it runs the LTM Summariser's models, which follow the session "
-                    "owner's provider. Choosing a model does not turn the Director on.")
+                    "owner's provider. Its switch is on the Proactivity page.")
     _SUBJECT = "The AI Director"
     _SESSION_KEY = "proactivity"
     _THINKING_SLOT = "director"
@@ -282,18 +282,29 @@ class DirectorModelView(_SessionPairView):
         enabled = director_enabled(self.session.get("proactivity"))
         e.add_field(name="Director", value="**`ON`**" if enabled else "`OFF`", inline=True)
 
-    def _add_buttons(self, row: int):
-        enabled = director_enabled(self.session.get("proactivity"))
 
-        async def toggle_cb(i: discord.Interaction):
-            self._pro()["director_enabled"] = not enabled
-            self.cog.session_manager._save_multi_profile_sessions()
-            self._build_view()
-            await i.response.edit_message(**self._picker_render())
+class CriticModelView(_SessionPairView):
+    """`/session config` -> Config -> Anti-Repetition Critic -> Critic Model. Kept in
+    `session['critic']`; until chosen, the critic's own shipped chain for the owner's provider."""
 
-        add_button(self, f"Director: {'ON' if enabled else 'OFF'}", toggle_cb, row=row,
-                   style=discord.ButtonStyle.success if enabled else discord.ButtonStyle.danger)
-        super()._add_buttons(row)
+    _KEYS = (("critic_model", "Primary"), ("critic_fallback_model", "Fallback"))
+    _TITLE = "Anti-Repetition Critic Model"
+    _DESCRIPTION = ("The model Full mode asks about repeated ideas and tone, and the one tried when "
+                    "it fails. Until you choose, they are the critic's own defaults for the session "
+                    "owner's provider. Unused in Off and Lexical.")
+    _SUBJECT = "The critic"
+    _SESSION_KEY = "critic"
+    _THINKING_SLOT = "critic"
+    _WORDING = "Anti-Repetition Critic"
+
+    def _chain(self):
+        return self.cog.api_service.model_chain({}, "critic_model", self.user_id)
+
+    def _chosen(self, key: str) -> Optional[str]:
+        return self._settings().get(key)
+
+    def _write(self, key: str, value: Optional[str]):
+        self._put_settings({key: value})
 
 
 class CompactionModelView(_SessionPairView):

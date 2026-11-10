@@ -46,9 +46,9 @@ from ..utils.constants import (
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED,
     LIMIT_FIXED_EXAMPLES, LIMIT_LORE_ENTRIES, LIMIT_PUBLISHES_PER_DAY, PERSONA_TEXT_INPUT_MAX_LENGTH, )
 from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
-                            ltm_auto_recall_enabled, always_reads_synopsis, resolve_critic_settings,
+                            ltm_auto_recall_enabled, always_reads_synopsis,
                             grounding_mode_display, resolve_image_output_params,
-                            resolve_auto_models, pick_mood_avatar,
+                            resolve_auto_models, pick_mood_avatar, neuro_levels,
                             resolve_image_tools, resolve_thinking_params,
                             resolve_unreadable_media_mode,
                             resolve_url_mode, suppress_link_previews, system_model,
@@ -239,9 +239,6 @@ def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[
     # Resolved, not read: the stored value can be anything an import wrote, and this has
     # to say what the profile will actually do with an attachment.
     unreadable = "**`SIMULATED`**" if resolve_unreadable_media_mode(config) == "simulated" else off
-    # Three modes: "ON" for the lexical scan would report a model call it never makes.
-    critic = resolve_critic_settings(config)["mode"]
-    critic = off if critic == "off" else f"**`{critic.upper()}`**"
     response = str(config.get("response_mode", "regular")).replace("_", " ").title()
 
     image = speech = neuro = ()
@@ -269,10 +266,9 @@ def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[
                    openrouter and speed is not None and f"Speed {speed}\u00d7"),)
     if config.get("neuro_engine_enabled"):
         # Two to a line: a half-width column wraps all four.
-        state = config.get("neuro_state") or {}
-        neuro = tuple(tuple(f"{axis.title()} {state.get(axis, default)}" for axis, default in pair)
-                      for pair in ((("dopamine", 50), ("cortisol", 20)),
-                                   (("oxytocin", 50), ("adrenaline", 20))))
+        state = neuro_levels(config)
+        neuro = tuple(tuple(f"{axis.title()} {state[axis]}" for axis in pair)
+                      for pair in (("dopamine", "cortisol"), ("oxytocin", "adrenaline")))
 
     def feature(name, key, rows):
         details = (" \u00b7 ".join(str(p) for p in row if p) for row in rows)
@@ -281,8 +277,7 @@ def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[
     tools = [f"Grounding: {grounding_mode_display(config)}",
              f"URL Context: {url}",
              f"Unreadable Media: {unreadable}",
-             f"Help Mode: {flag(config.get('help_mode_enabled'))}",
-             f"Critic: {critic}"]
+             f"Help Mode: {flag(config.get('help_mode_enabled'))}"]
     behaviour = [f"Response Mode: `{response}`",
                  f"Realistic Typing: {flag(config.get('realistic_typing_enabled'))}",
                  f"Placeholder: {config.get('placeholder_emoji') or 'Default'}",
@@ -4922,7 +4917,7 @@ class ProfileManager:
         providers = {}
         for label, key in (("Response", "primary_model"), ("Image", "image_generation_model"),
                            ("Audio", "speech_model"), ("Grounding", "grounding_rag_model"),
-                           ("Critic", "critic_model"), ("LTM", "ltm_model"),
+                           ("LTM", "ltm_model"),
                            ("Training", "training_analysis_model")):
             primary, fallbacks = model_chain(resolved, key, preferred)
             providers[key] = {model_provider(m) for m in (primary, *fallbacks)}
@@ -5029,8 +5024,8 @@ class ProfileManager:
                                                profile_name: Optional[str]) -> str:
         """Profile prompt, else /mod's instance-wide override, else the shipped default.
 
-        The same resolution `resolve_critic_instructions` does, and for the reason its
-        docstring gives -- except that this one has history to undo. Profiles used to be
+        Resolved, not seeded, as a shipped default prompt always is -- and this one has
+        history to undo. Profiles used to be
         created with the default *copied* into their prompts, so a better default would
         have reached new profiles only, and every character anyone already had would
         have stayed on the text that shipped the day it was made. Nothing seeds it any
@@ -5054,30 +5049,10 @@ class ProfileManager:
         return stored
 
     def _default_critic_instructions(self) -> str:
-        """The Anti-Repetition Critic prompt a profile gets when it has none of its own."""
+        """The Anti-Repetition Critic prompt a session gets when it has none of its own: /mod's
+        ANTI_REPETITION, else the shipped one. Not seeded, so an edit in /mod reaches every
+        session that never wrote its own."""
         return self.cog.global_prompts.get("ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT)
-
-    def resolve_critic_instructions(self, owner_id: Optional[int], profile_name: Optional[str]) -> str:
-        """Profile prompt, else /mod's instance-wide override, else the shipped default.
-
-        Unlike the LTM summariser this is deliberately *not* seeded into a profile's
-        prompts at creation. An unseeded profile resolves through the global every time,
-        so an operator editing ANTI_REPETITION in /mod changes the behaviour of every
-        profile that never customised it -- which is what an instance-wide prompt is for.
-        Seeding would have frozen a copy at creation and made the global govern nothing
-        but profiles made after it was last edited.
-        """
-        default = self._default_critic_instructions()
-        if not owner_id or not profile_name:
-            return default
-
-        source_owner_id, source_profile_name = self._resolve_effective_profile(owner_id, profile_name)
-        prompts = self._get_profile_prompts(source_owner_id, source_profile_name) or {}
-        encrypted = prompts.get("critic_instructions")
-        if encrypted:
-            # A stored-but-blank value must not yield a blank system instruction.
-            return self.cog.storage_manager._decrypt_data(encrypted).strip() or default
-        return default
 
     async def _build_profile_manage_embed(self, interaction: discord.Interaction, profile_name: str, target_user_id: Optional[int] = None) -> discord.Embed:
         return await self._build_profile_embed(target_user_id or interaction.user.id, profile_name, interaction.channel_id)

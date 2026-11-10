@@ -10,7 +10,7 @@ import urllib.parse
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, _yield_message_chunks,
                              billable_output_tokens, clean_model_name, openrouter_routing, resolve_auto_model,
-                             strip_history_envelope, turn_posted_at)
+                             resolve_critic_settings, strip_history_envelope, turn_posted_at)
 from ..utils.data_policy import may_pick_training_models
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
                               paged_nav_options, send_status, settle_status, update_status,
@@ -548,7 +548,7 @@ class GlobalChatHistoryView(BlockedGuard, ui.View):
             add_select(self, options, self.jump_callback, placeholder="Jump to a round...", row=1)
 
         # Row 2: Buttons
-        build_pagination_controls(self, self.current_page, len(self.rounds), 2, self.prev_callback, self.next_callback)
+        build_pagination_controls(self, self.current_page, len(self.rounds), 2, self._turn)
         add_button(self, "Delete", self.delete_callback, style=discord.ButtonStyle.danger, row=2)
 
     def get_embed(self) -> discord.Embed:
@@ -584,13 +584,8 @@ class GlobalChatHistoryView(BlockedGuard, ui.View):
         self._build_view()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
-    async def prev_callback(self, interaction: discord.Interaction):
-        self.current_page -= 1
-        self._build_view()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-
-    async def next_callback(self, interaction: discord.Interaction):
-        self.current_page += 1
+    async def _turn(self, interaction: discord.Interaction, delta: int):
+        self.current_page += delta
         self._build_view()
         await interaction.response.edit_message(embed=self.get_embed(), view=self)
 
@@ -705,17 +700,12 @@ class WhisperHistoryView(BlockedGuard, ui.View):
                        placeholder="Jump to a whisper...", row=1)
 
         # --- Build Buttons ---
-        async def _prev(i):
-            self.current_page -= 1
-            self._build_view()
-            await i.response.edit_message(embed=self._get_current_embed(), view=self)
-            
-        async def _next(i):
-            self.current_page += 1
+        async def turn(i, delta):
+            self.current_page += delta
             self._build_view()
             await i.response.edit_message(embed=self._get_current_embed(), view=self)
 
-        build_pagination_controls(self, self.current_page, len(self.filtered_whispers), 2, _prev, _next)
+        build_pagination_controls(self, self.current_page, len(self.filtered_whispers), 2, turn)
 
         add_button(self, "Delete", self.delete_callback, style=discord.ButtonStyle.danger, row=2,
                    disabled=not self.filtered_whispers)
@@ -1134,38 +1124,108 @@ class ReactivitySettingsModal(ui.Modal, title="Edit Reactivity"):
         await self.view.update_display()
 
 
-class ProactivitySettingsModal(ui.Modal, title="Proactivity & AI Director"):
+class ProactivitySettingsModal(ui.Modal, title="Chance & Cooldown"):
     chance_input = ui.TextInput(label="Chance of a round, each roll (0-100%)", placeholder="Default: 10", required=True, max_length=3)
     cooldown_input = ui.TextInput(label="Seconds of quiet before each roll (min 60)", placeholder="Default: 300", required=True, max_length=5)
-    instructions_input = ui.TextInput(label="Director Instructions (Blank = Default)", style=discord.TextStyle.paragraph, required=False, max_length=1000)
     def __init__(self, view: 'SessionConfigView'):
         super().__init__()
         self.view = view
         pro = view.session.get("proactivity", {})
         self.chance_input.default = str(pro.get("chance", 10))
         self.cooldown_input.default = str(pro.get("cooldown", 300))
-        self.instructions_input.default = pro.get("director_instructions") or DEFAULT_DIRECTOR_INSTRUCTIONS
     async def on_submit(self, interaction: discord.Interaction):
         try:
             pro = self.view.session.setdefault("proactivity", {})
             pro["chance"] = max(0, min(100, int(self.chance_input.value)))
             pro["cooldown"] = max(60, int(self.cooldown_input.value))
-            self.view.cog.session_manager.arm_proactivity(
-                self.view.original_interaction.channel_id, self.view.session)
-
-            # Blank, or the shipped wording left as it was, is "the default": resolved
-            # when it runs, so a better wording reaches this session too.
-            ins_val = self.instructions_input.value.strip()
-            if ins_val and ins_val != DEFAULT_DIRECTOR_INSTRUCTIONS:
-                pro["director_instructions"] = ins_val
-            else:
-                pro.pop("director_instructions", None)
-            
-            self.view.cog.session_manager._save_multi_profile_sessions()
-            await interaction.response.defer()
-            await self.view.update_display()
         except ValueError:
             await interaction.response.send_message(embed=text_embed("Invalid chance or cooldown."), ephemeral=True)
+            return
+        self.view.cog.session_manager.arm_proactivity(
+            self.view.original_interaction.channel_id, self.view.session)
+        self.view.cog.session_manager._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
+
+
+class DirectorInstructionsModal(ui.Modal, title="AI Director Instructions"):
+    instructions_input = ui.TextInput(label="Instructions (blank = default)", style=discord.TextStyle.paragraph, required=False, max_length=1000)
+    def __init__(self, view: 'SessionConfigView'):
+        super().__init__()
+        self.view = view
+        self.instructions_input.default = (view.session.get("proactivity", {}).get("director_instructions")
+                                           or DEFAULT_DIRECTOR_INSTRUCTIONS)
+    async def on_submit(self, interaction: discord.Interaction):
+        # Blank, or the shipped wording left as it was, is "the default": resolved
+        # when it runs, so a better wording reaches this session too.
+        pro = self.view.session.setdefault("proactivity", {})
+        ins_val = self.instructions_input.value.strip()
+        if ins_val and ins_val != DEFAULT_DIRECTOR_INSTRUCTIONS:
+            pro["director_instructions"] = ins_val
+        else:
+            pro.pop("director_instructions", None)
+        self.view.cog.session_manager._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
+
+class CriticSettingsModal(ui.Modal, title="Lookback & Persistence"):
+    """The critic's two numbers. Blank is the default, and stays blank in storage."""
+    lookback_input = ui.TextInput(label=f"Lookback: replies read ({CRITIC_LOOKBACK_MIN}-{CRITIC_LOOKBACK_MAX})",
+                                  placeholder=f"Blank = default ({DEFAULT_CRITIC_LOOKBACK})",
+                                  required=False, max_length=2)
+    persistence_input = ui.TextInput(
+        label=f"Persistence: extra rounds ({CRITIC_PERSISTENCE_MIN}-{CRITIC_PERSISTENCE_MAX})",
+        placeholder=f"Blank = default ({DEFAULT_CRITIC_PERSISTENCE})", required=False, max_length=2)
+
+    def __init__(self, view: 'SessionConfigView'):
+        super().__init__()
+        self.view = view
+        self.fields = ((self.lookback_input, "lookback", CRITIC_LOOKBACK_MIN, CRITIC_LOOKBACK_MAX),
+                       (self.persistence_input, "persistence", CRITIC_PERSISTENCE_MIN, CRITIC_PERSISTENCE_MAX))
+        stored = view.session.get("critic") or {}
+        for field, key, _low, _high in self.fields:
+            if key in stored:
+                field.default = str(stored[key])
+
+    async def on_submit(self, interaction: discord.Interaction):
+        critic = self.view.session.setdefault("critic", {})
+        for field, key, low, high in self.fields:
+            value = field.value.strip()
+            if not value:
+                critic.pop(key, None)
+            elif value.isdigit():
+                critic[key] = max(low, min(high, int(value)))
+            else:
+                self.view.notice = f"{key.title()} takes a whole number; it was left as it was."
+        self.view.cog.session_manager._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
+
+
+class CriticInstructionsModal(ui.Modal, title="Critic Instructions"):
+    instructions_input = ui.TextInput(label="Instructions (blank = default)", style=discord.TextStyle.paragraph,
+                                      required=False, max_length=2000,
+                                      placeholder="{char_name} becomes the name of the character it screens.")
+
+    def __init__(self, view: 'SessionConfigView'):
+        super().__init__()
+        self.view = view
+        self.default = view.cog.profile_manager._default_critic_instructions()
+        self.instructions_input.default = (view.session.get("critic") or {}).get("instructions") or self.default
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # Blank, or the default left as it was, is "the default": resolved when it runs, so
+        # /mod's wording and a better shipped one reach this session too.
+        critic = self.view.session.setdefault("critic", {})
+        value = self.instructions_input.value.strip()
+        if value and value != self.default.strip():
+            critic["instructions"] = value
+        else:
+            critic.pop("instructions", None)
+        self.view.cog.session_manager._save_multi_profile_sessions()
+        await interaction.response.defer()
+        await self.view.update_display()
+
 
 class CompactionSettingsModal(ui.Modal, title="Compaction"):
     threshold_input = ui.TextInput(label=f"Compact after N turns ({COMPACTION_THRESHOLD_MIN}-{COMPACTION_THRESHOLD_MAX})", placeholder=f"Default: {COMPACTION_THRESHOLD_DEFAULT}", required=True, max_length=3)
@@ -1388,8 +1448,7 @@ class _TurnOrderView(BlockedGuard, ui.View):
             self.current_page += step
             self.update_view()
             await i.response.edit_message(embed=self.embed, view=self)
-        build_pagination_controls(self, self.current_page, self.num_pages, 1,
-                                  lambda i: turn(i, -1), lambda i: turn(i, 1))
+        build_pagination_controls(self, self.current_page, self.num_pages, 1, turn)
         add_button(self, "Refresh", lambda i: turn(i, 0), emoji="🔄", row=2)
 
     def render(self):
@@ -1629,6 +1688,12 @@ class SessionConfigView(BlockedGuard, ui.View):
         """
         return self.cog.session_manager.participant_identity(participant)
 
+    async def _turn_page(self, i: discord.Interaction, delta: int):
+        """The Cast, Reactivity and critic pages' one page control (`build_pagination_controls`)."""
+        self.current_page += delta
+        await i.response.defer()
+        await self.update_display()
+
     async def _save_and_repaint(self, i: discord.Interaction):
         self.cog.session_manager._save_multi_profile_sessions()
         await i.response.defer()
@@ -1652,10 +1717,10 @@ class SessionConfigView(BlockedGuard, ui.View):
         add_button(self, label, callback, style=style, row=row)
 
     def _add_modal_button(self, label: str, modal_cls, row: int = 0,
-                          style: discord.ButtonStyle = discord.ButtonStyle.primary):
+                          style: discord.ButtonStyle = discord.ButtonStyle.primary, disabled: bool = False):
         async def callback(i: discord.Interaction):
             await i.response.send_modal(modal_cls(self))
-        add_button(self, label, callback, style=style, row=row)
+        add_button(self, label, callback, style=style, row=row, disabled=disabled)
 
     def _seated_index(self) -> Dict[tuple, Dict]:
         """`_participant_key` -> the seated participant, built once per render.
@@ -2082,9 +2147,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         self.add_item(src_sel)
 
         if num_pages > 1:
-            async def p_cb(i): self.current_page -= 1; await i.response.defer(); await self.update_display()
-            async def n_cb(i): self.current_page += 1; await i.response.defer(); await self.update_display()
-            build_pagination_controls(self, self.current_page, num_pages, 2, p_cb, n_cb)
+            build_pagination_controls(self, self.current_page, num_pages, 2, self._turn_page)
 
         # Row 2 now holds at most three pagination controls, so there is room for
         # this beside them. Only rendered when the cast is non-empty -- the dropdown
@@ -2330,6 +2393,14 @@ class SessionConfigView(BlockedGuard, ui.View):
                    "Emojis limited to certain roles are left out.\n\n"
                    "While it is on, the characters also see the custom emojis people post, "
                    "up to 4 a round, each once. Off, they read an emoji by its name alone."),
+        "critic": ("Anti-Repetition Critic",
+                   "Spots repetition in the cast's recent replies and tells the next one to avoid "
+                   "it. Off until you choose a mode.\n\n"
+                   "**Lexical** — checks for repeated phrases and openings in-process, and nudges a "
+                   "character whose last few replies all end on a question or open with an action: "
+                   "no model call, no delay.\n"
+                   "**Full** — the same, then asks a model, which also catches repeated ideas and "
+                   "tone: one call before most replies, on the server's key."),
     }
 
     def _config_summary(self, key: str) -> str:
@@ -2344,16 +2415,18 @@ class SessionConfigView(BlockedGuard, ui.View):
             return f"{self.session.get('max_responses', 10)} per round"
         if key == "server":
             return "On" if self.session.get("server_context", True) else "Off"
+        if key == "critic":
+            return resolve_critic_settings(self.session)["mode"].title()
         quiet, burst_cap, typing_cap = self.cog.session_manager.settle_window(self.session)
         typing = f"typing {typing_cap:g}s" if typing_cap else "typing off"
         return f"{quiet:g}s quiet · {burst_cap:g}s max · {typing}"
 
     async def _open_config_screen(self, i: discord.Interaction):
-        self.config_screen = i.data['values'][0]
+        self.config_screen, self.current_page = i.data['values'][0], 0
         await i.response.defer()
         await self.update_display()
 
-    def _screen_button(self, label: str, action, **kwargs):
+    def _screen_button(self, label: str, action, row: int = 0, **kwargs):
         """A button on a setting's screen: `action()` changes the session, then it saves and
         repaints this message. Re-tests the role on the press, as the tab bar does."""
         async def callback(i: discord.Interaction):
@@ -2362,7 +2435,7 @@ class SessionConfigView(BlockedGuard, ui.View):
                 self.cog.session_manager._save_multi_profile_sessions()
             await i.response.defer()
             await self.update_display()
-        add_button(self, label, callback, row=0, **kwargs)
+        add_button(self, label, callback, row=row, **kwargs)
 
     def _render_config_screen(self, embed: discord.Embed):
         """One Config setting on its own: what it does, where it stands, and its controls.
@@ -2418,12 +2491,98 @@ class SessionConfigView(BlockedGuard, ui.View):
             self._add_modal_button("Edit Values…", SettleWindowModal)
             self._screen_button("Reset to Defaults", lambda: session.pop("settle", None),
                                 disabled=not stored)
+        elif key == "critic":
+            self._render_critic_screen(embed)
 
         async def back(i: discord.Interaction):
             self.config_screen = None
             await i.response.defer()
             await self.update_display()
         add_button(self, "◀ Back", back, row=0, style=discord.ButtonStyle.secondary)
+
+    def _render_critic_screen(self, embed: discord.Embed):
+        """The session's critic: its mode beside Back, how it reads, the seats it screens, and
+        Full's prompt and models -- greyed outside Full, with the reason, rather than hidden."""
+        session = self.session
+        critic = resolve_critic_settings(session)
+        full = critic["mode"] == "full"
+
+        def store() -> dict:
+            return session.setdefault("critic", {})
+
+        def identity(seat) -> str:
+            return self.cog.session_manager.participant_identity(seat)[1]
+
+        cast = session.get("profiles", [])
+        left_out = [p["profile_name"] for p in cast if identity(p) in critic["skip"]]
+        embed.add_field(name="Mode", value=f"**`{critic['mode'].upper()}`**" if critic["enabled"] else "`OFF`")
+        embed.add_field(name="Scope", value="`Session` · the whole cast's replies" if critic["scope"] == "session"
+                        else "`Self` · each its own replies")
+        embed.add_field(name="Strictness", value=f"`{critic['strictness'].title()}` · repeats of "
+                        f"{CRITIC_STRICTNESS_MIN_GRAM[critic['strictness']]}+ words")
+        embed.add_field(name="Lookback", value=f"`{critic['lookback']}` replies")
+        embed.add_field(name="Persistence", value=f"`{critic['persistence']}` more rounds")
+        embed.add_field(name="Screens", value=(f"All but {', '.join(left_out)}" if left_out else "Everyone")[:1024])
+        embed.add_field(name="Full mode", value="\n".join([
+            f"Instructions: {'custom' if store().get('instructions') else 'default'}.",
+            *chain_lines("Models", *self.cog.api_service.model_chain(
+                session.get("critic") or {}, "critic_model", session.get("owner_id"))),
+            *([] if full else ["-# Used in Full only."])]), inline=False)
+
+        for mode in CRITIC_MODES:
+            self._screen_button(mode.title(), lambda m=mode: store().__setitem__("mode", m),
+                                style=discord.ButtonStyle.primary if mode == critic["mode"]
+                                else discord.ButtonStyle.secondary, disabled=mode == critic["mode"])
+        scope = "self" if critic["scope"] == "session" else "session"
+        self._screen_button(f"Scope: {critic['scope'].title()}", lambda: store().__setitem__("scope", scope), row=1)
+        levels = CRITIC_STRICTNESS_LEVELS
+        stricter = levels[(levels.index(critic["strictness"]) + 1) % len(levels)]
+        self._screen_button(f"Strictness: {critic['strictness'].title()}",
+                            lambda: store().__setitem__("strictness", stricter), row=1)
+        self._add_modal_button("Lookback & Persistence\u2026", CriticSettingsModal, row=1,
+                               style=discord.ButtonStyle.secondary)
+
+        # Paged as Reactivity is: 20 a page, after Select Page and Select All.
+        pids = [identity(p) for p in cast]
+        num_pages = max(1, (len(cast) - 1) // 20 + 1)
+        self.current_page = max(0, min(self.current_page, num_pages - 1))
+        page = cast[self.current_page * 20:self.current_page * 20 + 20]
+        screened = set(pids) - critic["skip"]
+        if page:
+            async def seats_cb(i: discord.Interaction):
+                if not self._viewer_is_admin():
+                    await i.response.send_message(
+                        embed=text_embed("Only a server administrator can change this session's critic."),
+                        ephemeral=True)
+                    return
+                kept = resolve_bulk_select(i.data["values"], [identity(p) for p in page], pids, screened)
+                # Unseated profiles keep their place on the list: seated again, still left out.
+                skip = sorted((set(pids) - kept) | (critic["skip"] - set(pids)))
+                if skip:
+                    store()["skip"] = skip
+                else:
+                    store().pop("skip", None)
+                await self._save_and_repaint(i)
+            options = bulk_select_options(page, cast, lambda p: identity(p) in screened,
+                                          page_description="Screen, or leave out, everyone on this page.",
+                                          all_description="Screen, or leave out, the whole cast.")
+            options += [discord.SelectOption(label=p["profile_name"][:100], value=identity(p),
+                                             default=identity(p) in screened) for p in page]
+            add_select(self, options, seats_cb, row=2, min_values=0, max_values=len(options),
+                       placeholder="Untick a character to leave it out")
+
+        self._add_modal_button("Critic Instructions\u2026", CriticInstructionsModal, row=3,
+                               style=discord.ButtonStyle.secondary, disabled=not full)
+
+        async def open_models(i: discord.Interaction):
+            # Imported here: gui_slot_models adopts ModelPickerMixin from gui_profiles, which imports this module.
+            from .gui_slot_models import CriticModelView
+            view = CriticModelView(self.cog, self)
+            await i.response.edit_message(embed=view.embed(), view=view)
+        add_button(self, "Critic Model\u2026", open_models, row=3, disabled=not full)
+
+        if num_pages > 1:
+            build_pagination_controls(self, self.current_page, num_pages, 3, self._turn_page)
 
     def _render_reactivity(self, embed: discord.Embed):
         """Per-participant response chance and wakewords."""
@@ -2494,15 +2653,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Reactivity Stats", value=react_list or "*No participants*", inline=False)
 
         if num_pages > 1:
-            async def p_cb(i: discord.Interaction):
-                self.current_page -= 1
-                await i.response.defer()
-                await self.update_display()
-            async def n_cb(i: discord.Interaction):
-                self.current_page += 1
-                await i.response.defer()
-                await self.update_display()
-            build_pagination_controls(self, self.current_page, num_pages, 1, p_cb, n_cb)
+            build_pagination_controls(self, self.current_page, num_pages, 1, self._turn_page)
 
         selected_count = len(self.selected_reactivity_profiles)
         btn_label = "Bulk Edit" if selected_count > 1 else "Edit"
@@ -2536,35 +2687,57 @@ class SessionConfigView(BlockedGuard, ui.View):
                    row=2)
 
     def _render_proactivity(self, embed: discord.Embed):
-        """The timer that lets the cast open a conversation unprompted."""
+        """Characters speaking unprompted: the quiet-channel round, the Director's note for it,
+        and follow-ups. One field and one button row each, its switch first."""
         pro = self.session.get("proactivity", {})
-        enabled = pro.get("enabled", False)
-        embed.description = ("Lets the cast start a conversation when the channel goes quiet. Each "
-                             "time it has been quiet for the cooldown, the chance is rolled once; "
-                             "any message starts the wait over.")
-        embed.add_field(name="Status", value="**`ON`**" if enabled else "`OFF`", inline=True)
-        embed.add_field(name="Chance & Cooldown", value=f"`{pro.get('chance', 10)}%` after every "
-                                                        f"`{quiet_label(pro.get('cooldown', 300))}` of quiet", inline=True)
-        
-        dir_on = director_enabled(pro)
-        dir_ins = pro.get("director_instructions", "(Default)") or "(Default)"
-        embed.add_field(name="AI Director", value=f"{'**`ON`**' if dir_on else '`OFF`'}\n"
-                                                  f"Instructions: ```{dir_ins[:200]}```", inline=False)
-        embed.add_field(name="Models", value="\n".join(chain_lines("AI Director", *self.cog.api_service.model_chain(
-            director_model_config(pro), "ltm_model", self.session.get("owner_id")))), inline=False)
+        enabled, dir_on, follow_ups_on = pro.get("enabled", False), director_enabled(pro), bool(pro.get("follow_ups"))
+        channel_id = self.original_interaction.channel_id
 
-        def set_proactivity(on: bool):
-            self.session.setdefault("proactivity", {})["enabled"] = on
-            self.cog.session_manager.arm_proactivity(self.original_interaction.channel_id, self.session)
-        self._add_toggle("Toggle Proactivity", enabled, set_proactivity, on_off_style=True)
-        self._add_modal_button("Edit Settings & AI Director", ProactivitySettingsModal)
+        def on(flag):
+            return "**`ON`**" if flag else "`OFF`"
+
+        embed.description = "Characters speak up on their own when the channel goes quiet."
+        embed.add_field(name="Proactivity", value=(
+            f"{on(enabled)} · `{pro.get('chance', 10)}%` chance after every "
+            f"`{quiet_label(pro.get('cooldown', 300))}` of quiet.\n-# Any message starts the wait over."),
+            inline=False)
+        embed.add_field(name="AI Director", value="\n".join([
+            f"{on(dir_on)} · Gives each proactive round a scene event to react to. "
+            f"Instructions: {'custom' if pro.get('director_instructions') else 'default'}.",
+            *chain_lines("Models", *self.cog.api_service.model_chain(
+                director_model_config(pro), "ltm_model", self.session.get("owner_id"))),
+            *([] if enabled else ["-# Idle while Proactivity is off."])]), inline=False)
+        embed.add_field(name="Follow-ups", value=(
+            f"{on(follow_ups_on)} · A character may come back to someone later: when they next speak, "
+            "or after a minute's quiet. Works without Proactivity.\n"
+            "-# About 160 tokens of rules on every reply, in the cached part of the prompt."), inline=False)
+
+        def set_proactivity(flag: bool):
+            self.session.setdefault("proactivity", {})["enabled"] = flag
+            self.cog.session_manager.arm_proactivity(channel_id, self.session)
+        self._add_toggle(f"Proactivity: {'ON' if enabled else 'OFF'}", enabled, set_proactivity, row=0, on_off_style=True)
+        self._add_modal_button("Chance & Cooldown\u2026", ProactivitySettingsModal, row=0,
+                               style=discord.ButtonStyle.secondary)
+
+        def set_director(flag: bool):
+            self.session.setdefault("proactivity", {})["director_enabled"] = flag
+        self._add_toggle(f"Director: {'ON' if dir_on else 'OFF'}", dir_on, set_director, row=1, on_off_style=True)
+        self._add_modal_button("Director Instructions\u2026", DirectorInstructionsModal, row=1,
+                               style=discord.ButtonStyle.secondary)
 
         async def open_director_models(i: discord.Interaction):
             # Imported here: gui_slot_models adopts ModelPickerMixin from gui_profiles, which imports this module.
             from .gui_slot_models import DirectorModelView
             view = DirectorModelView(self.cog, self)
             await i.response.edit_message(embed=view.embed(), view=view)
-        add_button(self, "Director Model\u2026", open_director_models)
+        add_button(self, "Director Model\u2026", open_director_models, row=1)
+
+        def set_follow_ups(flag: bool):
+            self.session.setdefault("proactivity", {})["follow_ups"] = flag
+            # A follow-up already waiting keeps the clock with Proactivity off.
+            self.cog.session_manager.arm_proactivity(channel_id, self.session)
+        self._add_toggle(f"Follow-ups: {'ON' if follow_ups_on else 'OFF'}", follow_ups_on, set_follow_ups,
+                         row=2, on_off_style=True)
 
     def _render_compaction(self, embed: discord.Embed):
         """The rolling synopsis: how a long scene is folded down."""
@@ -2822,6 +2995,11 @@ _CRITIC_SOURCE_LABELS = {
 }
 
 
+#: What the variety nudge saw, for the inspector (VARIETY_HINTS keys).
+_VARIETY_HINT_LABELS = {"question": "recent replies all ended on a question",
+                        "opening": "recent replies all opened with an action"}
+
+
 def critic_field(meta: dict) -> Optional[str]:
     """The critic's verdict for one turn, or None if it was not running.
 
@@ -2845,6 +3023,8 @@ def critic_field(meta: dict) -> Optional[str]:
         f"over `{lookback}` turns",
         f"├── Verdict: `{_CRITIC_SOURCE_LABELS.get(source, 'Pass -- no repetition found')}`",
     ]
+    if critic.get("hint") in _VARIETY_HINT_LABELS:
+        lines.append(f"├── Variety hint: `{_VARIETY_HINT_LABELS[critic['hint']]}`")
     if text:
         # The constraint is already capped at CRITIC_AUDIT_TEXT_MAX on write. The
         # trim here is for the field as a whole: the two lines above eat into the
@@ -2946,6 +3126,18 @@ def add_generation_fields(embed: discord.Embed, cog, turn: dict) -> None:
     if meta.get("ltm_flag"):
         embed.add_field(name="Long-Term Memory", value="\u2514\u2500\u2500 Flagged this reply as worth remembering",
                         inline=False)
+
+    follow_up = meta.get("follow_up")
+    if isinstance(follow_up, dict) or meta.get("follow_up_answered"):
+        lines = []
+        if meta.get("follow_up_answered"):
+            lines.append("Was reminded of one it set earlier")
+        if isinstance(follow_up, dict):
+            lines.append(f"Set one for **{follow_up.get('name') or 'someone'}**, due <t:{int(follow_up.get('due', 0))}:R>: "
+                         f"{str(follow_up.get('note', ''))[:300]}")
+        embed.add_field(name="Follow-ups", value="\n".join(
+            ("└── " if n == len(lines) - 1 else "├── ") + line
+            for n, line in enumerate(lines)), inline=False)
 
     neuro = meta.get("neuro_state")
     if isinstance(neuro, dict) and neuro:

@@ -58,6 +58,7 @@ from ..utils.constants import (
     GAME_REACTION_MAX_WORDS, GAME_TABLE_REPOST_MIN_SECONDS,
     GAME_TURN_PACE_SECONDS, GAME_LAST_CALL_WORDS,
 )
+from ..utils.helpers import neuro_levels, store_neuro_levels
 from .games import ledger as ledger_mod, neuro, policy, eights
 from .games import dice, dice_narration, dice_policy
 #: Re-exported: the dataclasses moved to games/table.py, but `from .game_service
@@ -214,13 +215,7 @@ class GameService:
         except Exception:
             config = {}
 
-        state = dict(neuro.BASELINE)
-        stored = config.get("neuro_state")
-        if isinstance(stored, dict):
-            for axis in neuro.AXES:
-                if isinstance(stored.get(axis), (int, float)):
-                    state[axis] = max(0, min(100, int(stored[axis])))
-        return state, self._temperament_for(config, seat.pid or seat.profile_name or "")
+        return neuro_levels(config), self._temperament_for(config, seat.pid or seat.profile_name or "")
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -654,7 +649,7 @@ class GameService:
                 config = pm._get_profile_config(seat.owner_id, name, borrowed)
                 if not config or not config.get("neuro_engine_enabled"):
                     continue
-                config["neuro_state"] = dict(state)
+                store_neuro_levels(config, state)
                 await asyncio.to_thread(pm._save_profile_config, seat.owner_id, name, config, borrowed)
             except Exception:
                 continue

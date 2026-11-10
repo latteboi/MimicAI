@@ -21,7 +21,7 @@ from ...utils.bonds import render as render_bonds, take_updates as take_bond_upd
 from ...utils.birthdays import birthday_offset, describe_birthday
 from ...utils.helpers import (TURN_TIME_FORMAT, Timeout, _get_user_hash, _resolve_zoneinfo,
                               always_reads_synopsis, default_profile_avatar_url, ltm_flag_enabled,
-                              server_context_block)
+                              neuro_levels, server_context_block, store_neuro_levels)
 from ._shared import NEURO_BARE_PATTERN, NEURO_TAG_PATTERN
 from .ltm_capture import memory_written_ago
 
@@ -187,7 +187,7 @@ class PromptBuilderMixin:
                 lines.append(line)
         return lines
 
-    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, functions: Sequence[Any] = (), at: Optional[datetime.datetime] = None) -> Tuple[str, str, bool, float, float, int, str, str]:
+    def _construct_system_instructions(self, profile_owner_id: Optional[int], profile_name_to_use: str, channel_id: int, is_multi_profile: bool = False, training_examples_list: Optional[List[str]] = None, recalled_ltm: Optional[str] = None, critic_constraints: Optional[str] = None, variety_hint: Optional[str] = None, follow_up_block: Optional[Tuple[str, Optional[str]]] = None, present_users: Optional[Sequence[Tuple[int, str]]] = None, functions: Sequence[Any] = (), at: Optional[datetime.datetime] = None) -> Tuple[str, str, bool, float, float, int, str, str]:
         """The system instruction for one profile's generation, the turn context, and its
         sampling values.
 
@@ -234,7 +234,7 @@ class PromptBuilderMixin:
             timezone_str = profile_data.get("timezone", "UTC")
             neuro_enabled = profile_data.get("neuro_engine_enabled", False)
             bond_enabled = profile_data.get("bond_engine_enabled", False)
-            neuro_state = profile_data.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20})
+            neuro_state = neuro_levels(profile_data)
 
         # Split by how often a block changes, and that is a cost decision rather than a
         # stylistic one. Providers cache on a shared prefix -- the system instruction,
@@ -372,6 +372,13 @@ class PromptBuilderMixin:
             if game_block:
                 turn_parts.append(f"<game_context>\n{game_block}\n</game_context>")
 
+        # The caller's (rules, reminder or None): only a session round, and a regeneration of
+        # one, asks for follow-ups. The rules are static; a reminder is one turn's, and goes
+        # ahead of <neuro_state>, whose closing line is written more often from the end.
+        if follow_up_block:
+            stable_parts.append(follow_up_block[0])
+            if follow_up_block[1]:
+                turn_parts.append(follow_up_block[1])
         if neuro_enabled:
             stable_parts.append(self.cog.global_prompts.get("NEURO_DEFINITION", DEFAULT_NEURO_DEFINITION))
             neuro_block = self.cog.global_prompts.get("NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION).format(
@@ -463,6 +470,8 @@ class PromptBuilderMixin:
         if critic_constraints:
             constraints_block = self.cog.global_prompts.get("NEGATIVE_CONSTRAINTS", DEFAULT_NEGATIVE_CONSTRAINTS)
             turn_parts.append(constraints_block.format(constraints=critic_constraints))
+        if variety_hint:
+            turn_parts.append(variety_hint)
 
         rule_block = self.cog.global_prompts.get("CONTEXT_RULES", DEFAULT_SESSION_RULES)
 
@@ -538,9 +547,9 @@ class PromptBuilderMixin:
                                        profile_name: str) -> Tuple[str, Optional[Dict[str, int]]]:
         """The reply with its state marker removed, and the state it left behind.
 
-        An axis the tag leaves out keeps its stored value: a partial update means "the
-        rest did not move". Nothing is written when nothing was reported, which is most
-        turns.
+        An axis the tag leaves out keeps the level the character was shown, decay and all:
+        a partial update means "the rest did not move". Nothing is written when nothing
+        was reported, which is most turns.
 
         A `<bond_update>` is taken out the same way, and applied when the profile's bonds are on.
         """
@@ -556,9 +565,9 @@ class PromptBuilderMixin:
             if bond_updates and p_config and p_config.get("bond_engine_enabled"):
                 self.cog.profile_manager.apply_bonds(owner_id, profile_name, bond_updates)
             if new_state and p_config and p_config.get("neuro_engine_enabled"):
-                current_state = p_config.get("neuro_state", {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20}).copy()
+                current_state = neuro_levels(p_config)
                 current_state.update(new_state)
-                p_config["neuro_state"] = current_state
+                store_neuro_levels(p_config, current_state)
                 self.cog.profile_manager._save_profile_config(owner_id, profile_name, p_config, is_borrowed)
                 final_state = current_state
 

@@ -233,38 +233,30 @@ class ToolsService:
         self.cog = cog
 
     async def _run_critic(self, history: list, char_name: str, guild_id: int,
-                          p_config: Optional[Dict[str, Any]] = None,
-                          session_transcript: Optional[List[str]] = None,
-                          instructions: Optional[str] = None,
-                          config_owner_id: Optional[int] = None
+                          session: Dict[str, Any],
+                          session_transcript: Optional[List[str]] = None
                           ) -> Tuple[Optional[str], Optional[str]]:
         """Finds linguistic loops in recent output and returns a negative constraint.
 
         Returns `(constraint, source)`. `source` is "lexical" when the free in-process
         scan caught it, "model" when the critic model wrote it, and None when nothing
         was produced -- which is what `/session audit` reports per turn. It matters
-        because a profile in "full" mode still short-circuits on the lexical scan, so
-        "full" in the config does not mean a model call was actually paid for.
+        because "full" still short-circuits on the lexical scan, so "full" in the
+        settings does not mean a model call was actually paid for.
 
-        `p_config` is the speaking profile's config, passed in by the caller. It used to
-        be hunted for here by scanning `cog.multi_profile_channels` for a session whose
-        participant matched `char_name` -- but that dict is keyed by channel id and the
-        only caller passed `channel.guild.id`, so the lookup never hit. `critic_model`
-        and `critic_fallback_model` were configurable in three places and had never once
-        been read; every critic call ran on FALLBACK_MODEL_NAME with an empty config,
-        which also cost Ollama-hosted profiles their host URL.
-
-        `session_transcript` is what "session" scope supplies: every participant's recent
-        lines rather than this profile's own. Passed in for the same reason -- the log
-        belongs to the caller, and reaching back into the cog for it is what broke this.
+        All of it is the session's (`session['critic']`): its settings, its prompt (else
+        /mod's, else the shipped one), its models and thinking under the session owner's
+        provider, as the AI Director runs, on the server's key. `session_transcript` is
+        what "session" scope supplies: the screened seats' recent lines, not only this one's.
         """
-        from ..utils.helpers import (_fast_repetition_scan, resolve_critic_settings,
+        from ..utils.helpers import (_fast_repetition_scan, own_replies, resolve_critic_settings,
                                      strip_history_envelope)
 
-        p_config = p_config or {}
-        settings = resolve_critic_settings(p_config)
+        settings = resolve_critic_settings(session)
         if not settings["enabled"]:
             return None, None
+        store = session.get("critic") or {}
+        owner_id = session.get("owner_id")
 
         # Both sources arrive as *stored* turns -- `<Name> [ID: pid] [timestamp]:` around
         # the dialogue, and sometimes a Duration line under it. That envelope is byte
@@ -274,21 +266,9 @@ class ToolsService:
         # for one speaker those words are its name, its pid and the date. The strip is
         # on this transcript only; the log and the generating model keep the envelope.
         if session_transcript is not None:
-            candidates = session_transcript
+            chronological_turns = [c for c in (strip_history_envelope(t) for t in session_transcript) if c]
         else:
-            candidates = []
-            for turn in reversed(history):
-                if isinstance(turn, dict) and turn.get('role') == 'model':
-                    parts = [p if isinstance(p, str) else p.get('text', '') for p in turn.get('parts', [])]
-                    if parts:
-                        candidates.append(" ".join(parts))
-                        # Counted before the strip, so a turn that scrubs down to nothing
-                        # does not silently pull an older one into the window.
-                        if len(candidates) >= settings["lookback"]:
-                            break
-            candidates.reverse()
-
-        chronological_turns = [c for c in (strip_history_envelope(t) for t in candidates) if c]
+            chronological_turns = own_replies(history, settings["lookback"])
         chronological_turns = chronological_turns[-settings["lookback"]:]
 
         if len(chronological_turns) < 2:
@@ -309,19 +289,17 @@ class ToolsService:
 
         transcript = "\n---\n".join(chronological_turns)
 
-        # Resolved by the caller (profile prompt, then /mod's instance-wide override,
-        # then the shipped default), for the same reason p_config is: the prompt lives
-        # encrypted in the profile's `prompts`, which is the caller's to read.
+        # Not seeded: an unset session follows /mod's ANTI_REPETITION, then the shipped one.
         # str.format on user-authored text, so an unknown or stray brace is a ValueError
         # or a KeyError rather than a crashed turn.
-        instructions = instructions or self.cog.profile_manager._default_critic_instructions()
+        instructions = store.get("instructions") or self.cog.profile_manager._default_critic_instructions()
         try:
             system_instruction = instructions.format(char_name=char_name)
         except (KeyError, IndexError, ValueError):
             system_instruction = instructions
 
         critic_model_raw, critic_fallbacks = self.cog.api_service.model_chain(
-            p_config, "critic_model", config_owner_id)
+            store, "critic_model", owner_id)
 
         try:
             critic_cfg = dict(GREEDY_SAMPLING)
@@ -330,10 +308,10 @@ class ToolsService:
                 # Resolved inside the attempt so the retry gets the fallback slot's own
                 # effort rather than the primary's.
                 t_params = resolve_thinking_params(
-                    p_config, "critic", "fallback" if is_fallback else "primary", cog=self.cog)
+                    store, "critic", "fallback" if is_fallback else "primary")
                 model = self.cog.api_service._instantiate_model(
-                    model_name, guild_id, None, system_instruction, None, t_params, None, p_config,
-                    config_owner_id=config_owner_id)
+                    model_name, guild_id, owner_id, system_instruction, None, t_params,
+                    config_owner_id=owner_id)
                 return await model.generate_content_async(
                     [f"Transcript:\n{transcript}"], generation_config=critic_cfg)
 

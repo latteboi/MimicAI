@@ -7,8 +7,9 @@ from typing import Dict, List, Optional
 
 from ...utils.constants import (
     PLACEHOLDER_EMOJI, PROFILE_MESSAGE_MAX_LENGTH,
-    DEFAULT_KICKSTART_START, DEFAULT_IMAGE_PRESENT,
+    DEFAULT_KICKSTART_START, DEFAULT_IMAGE_PRESENT, VARIETY_HINTS,
 )
+from ...utils import follow_ups
 from ...utils.helpers import (_format_history_entry, image_command_prefix,
                              is_citation_subtext, kickstart_note,
                              resolve_critic_settings, server_context_guild, turn_posted_at,
@@ -281,8 +282,22 @@ class RegenerationMixin:
             )
             # The constraints the turn was first written under, as its trace kept them. A
             # regeneration skipped the critic, so it wrote the very patterns it screens out.
+            # Not once the session's critic is off, or has since left this seat out.
+            critic_now = resolve_critic_settings(session)
             critic = ((target_turn.get("meta") or {}).get("critic")
-                      if resolve_critic_settings(p_settings)["enabled"] else None)
+                      if critic_now["enabled"] and target_turn.get("speaker_pid") not in critic_now["skip"]
+                      else None)
+            # Likewise the follow-up it was asked to raise, put to it again. Its answer is
+            # kept below whatever the session says now: a regeneration rewrites the turn,
+            # it does not hand the follow-up back to be raised a second time.
+            answered = (target_turn.get("meta") or {}).get("follow_up_answered")
+            follow_up_block = None
+            if follow_ups.enabled(session):
+                log = session.get("unified_log", [])
+                setter = next((t for t in log if answered and t.get("turn_id") == answered), None)
+                record = (setter or {}).get("meta", {}).get("follow_up")
+                follow_up_block = follow_ups.prompt_block(
+                    self.cog.global_prompts, (answered, record) if record else None, log)
             # One tuple for the prompt and both models -- see tool_loop.
             functions = functions_for(p_settings)
             (system_instruction, turn_context, _, temp, top_p, top_k,
@@ -290,7 +305,9 @@ class RegenerationMixin:
                 self._construct_system_instructions,
                 owner_id, profile_name, channel.id, is_multi_profile=True,
                 training_examples_list=training_examples, recalled_ltm=ltm_recall.text,
-                critic_constraints=(critic or {}).get("text"), functions=functions,
+                critic_constraints=(critic or {}).get("text"),
+                variety_hint=VARIETY_HINTS.get((critic or {}).get("hint")), follow_up_block=follow_up_block,
+                functions=functions,
                 # On the turn's own clock, like its history: told it is now, a turn
                 # regenerated half an hour on wrote about half an hour of silence.
                 at=turn_posted_at(target_turn),
@@ -381,6 +398,16 @@ class RegenerationMixin:
                 attempt, duration=time.monotonic() - t_start, training_examples=training_examples,
                 ltm_recall=ltm_recall, sources=reply.sources, neuro_state=reply.neuro_state,
                 critic=critic)
+            if answered:
+                final_target_turn["meta"]["follow_up_answered"] = answered
+            # Timed from the turn's own moment, as its prompt was.
+            if reply.follow_up and not reply.blocked and follow_ups.enabled(session):
+                record = follow_ups.resolve(reply.follow_up, session.get("unified_log", []),
+                                            original_timestamp.timestamp())
+                if record:
+                    final_target_turn["meta"]["follow_up"] = record
+                    follow_ups.note_set(session, record)
+                    self.cog.session_manager._save_multi_profile_sessions()
             # Clean up legacy signatures from the turn if they exist
             final_target_turn.pop('thought_signature', None)
 

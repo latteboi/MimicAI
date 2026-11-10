@@ -139,9 +139,6 @@ def profile_advice(config: Dict[str, Any], always_on_lore: List[str],
         items.append(Advice(LARGE, f"Grounding: {GROUNDING_MODE_LABELS['rag']}",
                             "A gate model reads the conversation before every round to decide whether to "
                             "search, and a researcher runs when it does.", "grounding"))
-    if resolve_critic_settings(config)["mode"] == "full":
-        items.append(Advice(LARGE, "Anti-Repetition Critic: Full",
-                            "An extra model call before most replies, reading the last few turns.", "critic"))
     if config.get("speech_tts_enabled"):
         items.append(Advice(LARGE, "Speech TTS: On",
                             "In a session with Text-to-Speech on, every reply is voiced too, billed per "
@@ -233,6 +230,11 @@ def session_advice(session: Dict[str, Any], seats: Sequence[Tuple[Dict[str, Any]
                             "for the cast, and they keep coming with nobody there."
                             + (" The AI Director adds a call before each." if director else ""),
                             "proactivity"))
+
+    if resolve_critic_settings(session)["mode"] == "full":
+        items.append(Advice(LARGE, "Anti-Repetition Critic: Full",
+                            "An extra model call before most replies, reading the last few turns.",
+                            "config:critic"))
 
     voiced = [seat for seat, cfg in seats if cfg.get("speech_tts_enabled")]
     if session.get("audio_mode", "off") == "on" and voiced:

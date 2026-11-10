@@ -25,7 +25,9 @@ from ..utils.constants import (
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
     PATTERN_SPEAKER_CLOSE, REPLY_IN_VIEW, REPLY_QUOTE_CHARS, REPLY_UNAVAILABLE,
     ROUND_SETTLE_SECONDS, ROUND_SETTLE_MAX_SECONDS, ROUND_SETTLE_TYPING_SECONDS,
+    FOLLOW_UP_QUIET_SECONDS,
 )
+from ..utils import follow_ups
 from ..utils.discord_cdn import unsigned_attachment_url
 from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, always_reads_synopsis,
                              resolve_grounding_mode, resolve_url_mode, restamp_turn,
@@ -63,14 +65,19 @@ def blueprint_settings(blueprint: Dict[str, Any]) -> Dict[str, Any]:
     The one reading of a blueprint. Boot, hydration, the `/session config` shell and a
     branch each listed these by hand once, and a setting one of them left out saved,
     showed and worked, then reverted on the next restart.
+
+    A copy, as `_blueprint` is: shared with the cached server index, a setting edited in
+    place (`proactivity`, `compaction`, `settle`) changed the index too, so the save saw no
+    difference and wrote nothing. `tests/test_session_persistence.py`.
     """
-    return {
+    return json.loads(json.dumps({
         "type": "multi",
         "owner_id": blueprint.get("owner_id"),
         "session_prompt": blueprint.get("session_prompt"),
         "session_mode": blueprint.get("session_mode", "sequential"),
         "proactivity": blueprint.get("proactivity", {}),
         "compaction": blueprint.get("compaction", {}),
+        "critic": blueprint.get("critic", {}),
         # Absent means CLOSED: a blueprint written before this field existed keeps the
         # admin-only access it was configured under.
         "cast_policy": blueprint.get("cast_policy", DEFAULT_CAST_POLICY),
@@ -80,7 +87,7 @@ def blueprint_settings(blueprint: Dict[str, Any]) -> Dict[str, Any]:
         "settle": blueprint.get("settle", {}),
         "name_wakewords": blueprint.get("name_wakewords", True),
         "server_context": blueprint.get("server_context", True),
-    }
+    }))
 
 
 def session_from_blueprint(blueprint: Dict[str, Any], profiles: List[Dict]) -> Dict[str, Any]:
@@ -245,13 +252,12 @@ def director_enabled(proactivity: Optional[Dict[str, Any]]) -> bool:
 def director_model_config(proactivity: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The Director's choice as LTM slots, None where it made none: it runs the LTM
     summariser's chain, like the session synopsis. "on" and "off" are switches from
-    before the screen, not models, so neither is one. With the cross-provider fallback,
-    for the reason `compaction_model_config` gives."""
+    before the screen, not models, so neither is one. A Primary and a Fallback, never a
+    third model."""
     pro = proactivity or {}
     chosen = str(pro.get("director_model") or "").strip()
     return {"ltm_model": None if chosen.lower() in ("", "on", "off") else chosen,
-            "ltm_fallback_model": pro.get("director_fallback_model") or None,
-            "cross_provider_fallback": True}
+            "ltm_fallback_model": pro.get("director_fallback_model") or None}
 
 
 _TURN_IDENTITY = re.compile(r'<([^>\r\n]+)> \[ID: ([^\]\r\n]+)\]')
@@ -1091,7 +1097,7 @@ class SessionManager:
                     # skip, a chance edit or this repair also changed the cached index,
                     # so _save_multi_profile_sessions compared the two, saw no
                     # difference and wrote nothing -- lost on the next restart.
-                    profiles_data = [dict(p) for p in session_data.get("profiles", [])]
+                    profiles_data = json.loads(json.dumps(session_data.get("profiles", [])))
                     if self._repair_participant_identity(profiles_data):
                         repaired_any = True
 
@@ -1173,7 +1179,8 @@ class SessionManager:
 
     def _blueprint(self, session_data: Dict) -> Dict[str, Any]:
         """What a session saves of itself: its settings and its cast. Read back by
-        `blueprint_settings`."""
+        `blueprint_settings`. A copy, sharing nothing with the live session: the cached
+        server index holds it, and a shared dict edited in place would match itself."""
         profiles_to_save = []
         for p in session_data.get("profiles", []):
             # The stamped PID wins. Re-resolving from the name would overwrite a
@@ -1205,7 +1212,7 @@ class SessionManager:
                     entry["skip_reaction"] = list(p["skip_reaction"])
             profiles_to_save.append(entry)
 
-        return {
+        return json.loads(json.dumps({
             "owner_id": session_data.get("owner_id"),
             "profiles": profiles_to_save,
             "session_prompt": session_data.get("session_prompt"),
@@ -1213,6 +1220,7 @@ class SessionManager:
             "type": "multi",
             "proactivity": session_data.get("proactivity", {}),
             "compaction": session_data.get("compaction", {}),
+            "critic": session_data.get("critic", {}),
             "cast_policy": session_data.get("cast_policy", DEFAULT_CAST_POLICY),
             "started": bool(session_data.get("started", True)),
             "audio_mode": session_data.get("audio_mode", "off"),
@@ -1220,7 +1228,7 @@ class SessionManager:
             "settle": session_data.get("settle", {}),
             "name_wakewords": bool(session_data.get("name_wakewords", True)),
             "server_context": bool(session_data.get("server_context", True)),
-        }
+        }))
 
     def branch_of(self, session: Dict, through: int) -> Tuple[Dict[str, Any], List[Dict]]:
         """A branch of `session` at `unified_log[through]`: the blueprint and log it starts
@@ -1233,7 +1241,7 @@ class SessionManager:
         its reaction is on a message the branch doesn't have, so nothing there could undo it.
         """
         log = branch_log(session.get("unified_log") or [], through)
-        blueprint = json.loads(json.dumps(self._blueprint(session)))
+        blueprint = self._blueprint(session)
         blueprint["started"] = True
         cut = log[-1]
         moment = turn_posted_at(cut)
@@ -1565,7 +1573,8 @@ class SessionManager:
                     session_config = active_sessions.get("freewill", {}).get(str(channel_id))
 
                 if session_config:
-                    profiles = session_config.get("profiles", [])
+                    # A copy, for the reason the boot path gives.
+                    profiles = json.loads(json.dumps(session_config.get("profiles", [])))
                     # Same repair as the boot path: this branch restores a blueprint
                     # that has been on disk, so its names are exactly as stale.
                     self._repair_participant_identity(profiles)
@@ -1804,7 +1813,9 @@ class SessionManager:
         The Director exists to break a silence, so anything the session logs restarts the
         wait (`mark_session_dirty`) -- a round nobody asked for never lands in the middle of
         a conversation. A timer per session rather than a loop's tick, so a roll comes when
-        the cooldown is up and not up to a tick later. Off, unstarted or gone: no clock.
+        the cooldown is up and not up to a tick later. Off, unstarted or gone: no clock --
+        bar a follow-up waiting with Follow-ups on, which needs the clock but not the chance,
+        and keeps its own time: its due moment, once the channel has had a minute's quiet.
         """
         handle = self.cog.proactive_timers.pop(channel_id, None)
         if handle is not None:
@@ -1812,10 +1823,15 @@ class SessionManager:
         if session is None:
             session = self.cog.multi_profile_channels.get(channel_id)
         pro = (session or {}).get("proactivity") or {}
-        if session is None or not pro.get("enabled") or not self.is_started(session):
+        waiting = follow_ups.enabled(session) and pro.get("follow_up_at")
+        if session is None or not (pro.get("enabled") or waiting) or not self.is_started(session):
             return
+        delay = max(60.0, float(pro.get("cooldown", 300))) if pro.get("enabled") else float("inf")
+        if waiting:
+            # A second over, so the roll finds it due by the wall clock.
+            delay = min(delay, max(FOLLOW_UP_QUIET_SECONDS, waiting - time.time() + 1))
         self.cog.proactive_timers[channel_id] = self.cog.bot.loop.call_later(
-            max(60.0, float(pro.get("cooldown", 300))), self._proactive_roll, channel_id)
+            delay, self._proactive_roll, channel_id)
 
     def _proactive_roll(self, channel_id: int) -> None:
         """A proactive session's quiet has lasted its cooldown: the next roll is set, and
@@ -1824,15 +1840,24 @@ class SessionManager:
         self.arm_proactivity(channel_id, session)
         if channel_id not in self.cog.proactive_timers or not self.cog.has_lock:
             return
+        # A round in progress is the opposite of quiet. Queued now, it would be dropped at
+        # the next handoff, or run straight after the round with no quiet at all; the
+        # round's own replies re-arm the clock, so it comes a cooldown after them instead.
+        if session.get('is_running'):
+            return
         # A live game means the channel is anything but silent, and with the cast seated
         # the round it queues would find nobody to speak -- so it would spend a director
         # model call to produce nothing. Skip the channel until the table clears.
         game_service = getattr(self.cog, "game_service", None)
         if game_service and game_service.has_live_game(channel_id):
             return
-        if random.random() >= session["proactivity"].get("chance", 10) / 100.0:
+        # A follow-up past due skips the chance: the character meant to come back then.
+        # Read off the hint, since the log may not be in memory; the worker checks the log.
+        pro = session["proactivity"]
+        follow_up = follow_ups.enabled(session) and 0 < (pro.get("follow_up_at") or 0) <= time.time()
+        if not follow_up and (not pro.get("enabled") or random.random() >= pro.get("chance", 10) / 100.0):
             return
-        session['task_queue'].put_nowait(('proactive_trigger', None))
+        session['task_queue'].put_nowait(('proactive_trigger', 'follow_up' if follow_up else None))
         if not session.get('is_running') and (not session.get('worker_task') or session['worker_task'].done()):
             task = self.cog.bot.loop.create_task(self.cog.generation_service._multi_profile_worker(channel_id))
             session['worker_task'] = task
