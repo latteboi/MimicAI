@@ -12,8 +12,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from ..managers.session_manager import director_enabled, director_model_config
 from ..services.generation.compaction import compaction_model_config
 from ..utils.constants import NO_FALLBACK, THINKING_SLOT_KEYS
+from ..utils.helpers import resolve_openrouter_endpoint
 from .base_components import BlockedGuard, add_button
-from .gui_mod import ModThinkingView
+from .gui_mod import ModHostView, ModThinkingView
 from .gui_profiles import ModelPickerMixin, SingleProfileThinkingView, _keep_wizard_alive
 
 if TYPE_CHECKING:
@@ -96,7 +97,8 @@ class _SlotPairView(BlockedGuard, ModelPickerMixin, ui.View):
         return target_config_key == self._KEYS[1][0]
 
     def _tier_applies(self) -> bool:
-        """No Hosts & Tier: a tier and a pin are a profile's settings, and this has none."""
+        """No Hosts & Tier unless the pair's caller sends its settings as the model's config:
+        a session pair's does (`_SessionPairView`)."""
         return False
 
     def refuse_custom_model(self, key: str, value: str) -> Optional[str]:
@@ -175,8 +177,8 @@ class _SessionPairView(_SlotPairView):
                 or self.parent.session)
 
     def _chain(self):
-        """The LTM summariser's, under the owner's provider: what a session pair runs unchosen."""
-        return self.cog.api_service.model_chain({}, "ltm_model", self.user_id)
+        """The pair's own shipped chain (SESSION_SLOT_PAIRS), under the owner's provider."""
+        return self.cog.api_service.model_chain({}, self._KEYS[0][0], self.user_id)
 
     async def _back(self, i: discord.Interaction):
         await i.response.defer()
@@ -192,10 +194,10 @@ class _SessionPairView(_SlotPairView):
         return self.session.get(self._SESSION_KEY) or {}
 
     def _put_settings(self, changes: Dict):
-        """Sparse, as /mod's: None is no key, and no change writes nothing."""
+        """Sparse, as /mod's: None or an empty mapping is no key, and no change writes nothing."""
         store, before = self._store(), dict(self._store())
         for key, value in changes.items():
-            if value is None:
+            if value is None or value == {}:
                 store.pop(key, None)
             else:
                 store[key] = value
@@ -210,6 +212,25 @@ class _SessionPairView(_SlotPairView):
 
     def _tab_footer(self) -> str:
         return "This session \u00b7 changes save as you make them"
+
+    # --- Hosts & Tier: each pair's caller hands `_settings()` to the model as its config ---
+
+    def _tier_applies(self) -> bool:
+        return True
+
+    def _pinnable_slots(self) -> List[tuple]:
+        return [(key, wording, self._value(key)) for key, wording in self._KEYS]
+
+    def _current_service_tier(self):
+        return self._settings().get("openrouter_service_tier") or ""
+
+    def _set_service_tier(self, value):
+        self._put_settings({"openrouter_service_tier": value or None})
+
+    def _add_openrouter_buttons(self, *, row: int):
+        lit = bool(self._current_service_tier()) or any(
+            resolve_openrouter_endpoint(self._settings(), m) for m in self._pinnable_openrouter_models())
+        self._add_hosts_button(row=row, view_cls=_SessionHostView, lit=lit)
 
     def _add_buttons(self, row: int):
         async def think_cb(i: discord.Interaction):
@@ -242,15 +263,30 @@ class _SessionThinkingView(ModThinkingView):
         return self.parent._value(self.parent._KEYS[role == "fallback"][0])
 
 
+class _SessionHostView(ModHostView):
+    """/mod's Hosts & Tier screen, on a session pair: pins and a Default Tier kept beside its
+    models, which `openrouter_routing` reads when the pair's caller hands it that dict."""
+
+    _TIER_REACH = "Both of this pair's OpenRouter models, wherever one is left on Auto."
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Keeps the pair's timer, and its opener's, alive while this occupies their message."""
+        if not await super().interaction_check(interaction):
+            return False
+        _keep_wizard_alive(self.parent)
+        _keep_wizard_alive(self.parent.parent)
+        return True
+
+
 class DirectorModelView(_SessionPairView):
     """`/session config` -> Proactivity -> Director Model. Written to `session['proactivity']`
-    as chosen; until then the Director follows the LTM summariser (`director_model_config`)."""
+    as chosen; until then the Director runs its own shipped chain (`director_model_config`)."""
 
     _KEYS = (("director_model", "Primary"), ("director_fallback_model", "Fallback"))
     _TITLE = "AI Director Model"
-    _DESCRIPTION = ("The model that writes the Director's note for each proactive round. Until "
-                    "you choose one it runs the LTM Summariser's models, which follow the session "
-                    "owner's provider. Its switch is on the Proactivity page.")
+    _DESCRIPTION = ("The model that writes the Director's note for each proactive round, and the "
+                    "one tried when it fails. Until you choose, they are the Director's own defaults "
+                    "for the session owner's provider. Its switch is on the Proactivity page.")
     _SUBJECT = "The AI Director"
     _SESSION_KEY = "proactivity"
     _THINKING_SLOT = "director"
@@ -267,8 +303,7 @@ class DirectorModelView(_SessionPairView):
     _store = _pro
 
     def _chosen(self, key: str) -> Optional[str]:
-        return director_model_config(self.session.get("proactivity"))[
-            "ltm_model" if key == "director_model" else "ltm_fallback_model"]
+        return director_model_config(self.session.get("proactivity"))[key]
 
     def _write(self, key: str, value: Optional[str]):
         pro = self._pro()
@@ -297,9 +332,6 @@ class CriticModelView(_SessionPairView):
     _THINKING_SLOT = "critic"
     _WORDING = "Anti-Repetition Critic"
 
-    def _chain(self):
-        return self.cog.api_service.model_chain({}, "critic_model", self.user_id)
-
     def _chosen(self, key: str) -> Optional[str]:
         return self._settings().get(key)
 
@@ -322,9 +354,6 @@ class CompactionModelView(_SessionPairView):
     _SESSION_KEY = "compaction"
     _THINKING_SLOT = "compaction"
     _WORDING = "Session Synopsis"
-
-    def _chain(self):
-        return self.cog.api_service.model_chain({}, "compaction_model", self.user_id)
 
     def refuse_custom_model(self, key: str, value: str) -> Optional[str]:
         """Typing an Ollama model stays open, as the field this replaces was: CustomModelModal

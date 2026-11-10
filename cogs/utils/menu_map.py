@@ -126,15 +126,15 @@ _STATIC_DASHBOARDS = [
                 "reads the channel): Edit Values, Reset to Defaults",
                 "Anti-Repetition Critic: Off, Lexical, Full; Scope; Strictness; Lookback & Persistence; "
                 "a dropdown of the cast to leave characters out; Critic Instructions and Critic Model "
-                "(with Thinking), greyed outside Full",
+                "(with Thinking and Hosts & Tier), greyed outside Full",
                 "Cast access (administrators): whether any member may seat characters here",
             ]),
             ("Reactivity", ["Edit Chance & Wakewords (probability rolls and exact-match interjection)"]),
             ("Proactivity", [
                 "Proactivity: ON/OFF (the quiet-channel round), Chance & Cooldown",
                 "Director: ON/OFF, Director Instructions, Director Model (opens Models for the AI Director "
-                "on the same message, with Back: Primary and Fallback, the API button, Browse on OpenRouter, "
-                "Reset to Default)",
+                "on the same message, with Back: Primary and Fallback, the API button, Browse and Hosts & Tier "
+                "on OpenRouter, Thinking, Reset to Default)",
                 "Follow-ups: ON/OFF (characters coming back to someone later; works without Proactivity)",
             ]),
         ],

@@ -238,12 +238,10 @@ VOICE_SAMPLE_TYPES = {
 PRIMARY_MODEL_NAME = 'GOOGLE/gemini-3.5-flash-lite'
 FALLBACK_MODEL_NAME = 'GOOGLE/gemini-3.1-flash-lite'
 
-#: The critic's, the LTM summariser's and the attachment describer's shipped pair on Google:
-#: the cheaper of the two first, for passes that run unattended on every round or every few
-#: messages. Both take a thinking level. The Primary is also the cross-provider fallback
-#: compaction and the Director put behind Ling for anyone who prefers OpenRouter --
-#: `user_defaults` takes the first Google model a category ships. Values, not aliases, for
-#: the reason GROUNDING_RESEARCHER_MODEL gives.
+#: The critic's, the AI Director's, the synopsis's, the LTM summariser's and the attachment
+#: describer's shipped pair on Google: the cheaper of the two first, for passes that run
+#: unattended on every round or every few messages. Both take a thinking level. Values, not
+#: aliases, for the reason GROUNDING_RESEARCHER_MODEL gives.
 UTILITY_MODEL = 'GOOGLE/gemini-3.1-flash-lite'
 UTILITY_FALLBACK_MODEL = 'GOOGLE/gemini-3.5-flash-lite'
 
@@ -537,12 +535,12 @@ THINKING_BUDGET_MAX = defaultConfig.LIMIT_OUTPUT_TOKENS - 4096
 THINKING_SLOT_DEFAULTS = {
     'response':   {'level': 'high',   'budget': -1},
     'grounding':  {'level': 'low',    'budget': 512},
-    'critic':     {'level': 'low',    'budget': 512},
+    'critic':     {'level': 'low',    'budget': -1},
     'ltm':        {'level': 'low',    'budget': 512},
     'training':   {'level': 'medium', 'budget': -1},
     'utility':    {'level': 'low',    'budget': 512},
-    'director':   {'level': 'medium', 'budget': -1},
-    'compaction': {'level': 'medium', 'budget': -1},
+    'director':   {'level': 'low',    'budget': -1},
+    'compaction': {'level': 'low',    'budget': -1},
     'describer':  {'level': 'low',    'budget': 512},
     'classifier': {'level': 'medium', 'budget': -1},
     'generator':  {'level': 'low',    'budget': 512},
@@ -987,7 +985,7 @@ UNREADABLE_MEDIA_DEFAULT = 'off'
 #: is the free router's to place.
 CLAUDE_HAIKU_MODEL = 'OPENROUTER/anthropic/claude-haiku-5.5'
 MEDIA_DESCRIBER_MODEL = CLAUDE_HAIKU_MODEL
-#: What Response, the critic and the LTM summariser ship on OpenRouter, ahead of the free router.
+#: What Response ships on OpenRouter, ahead of the free router.
 OPENROUTER_UTILITY_MODEL = 'OPENROUTER/inclusionai/ling-3.0-flash-vl'
 
 #: OpenRouter's own router over its free models: costs nothing, and picks a model able to
@@ -1062,21 +1060,22 @@ OPENROUTER_SHIPPED_MODELS = {
                                'OPENROUTER/recraft/recraft-v4.1-flash'),
     'speech_model': ('OPENROUTER/fish-audio/s2.1-pro-free:free',
                      'OPENROUTER/deepgram/flux-tts:free'),
-    'critic_model': (OPENROUTER_UTILITY_MODEL, OPENROUTER_FREE_ROUTER),
-    'ltm_model': (OPENROUTER_UTILITY_MODEL, OPENROUTER_FREE_ROUTER),
+    'critic_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
+    'ltm_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
+    'director_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
     'grounding_rag_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
     'training_analysis_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
     'compaction_model': (CLAUDE_HAIKU_MODEL, OPENROUTER_FREE_ROUTER),
 }
 
 #: Chains kept per session rather than per profile, so no Models category ships them:
-#: the session synopsis and the critic. Google's side here; OpenRouter's is in the table
-#: above, which `user_defaults.model_chain` reads for both. Stored under
-#: `session['compaction']` and `session['critic']`.
+#: the session synopsis, the critic and the AI Director. Google's side here; OpenRouter's is
+#: in the table above, which `user_defaults.model_chain` reads for both. Stored under
+#: `session['compaction']`, `session['critic']` and `session['proactivity']`.
 SESSION_SLOT_PAIRS = {'compaction_model': 'compaction_fallback_model',
-                      'critic_model': 'critic_fallback_model'}
-GOOGLE_SESSION_MODELS = {'compaction_model': (UTILITY_MODEL, UTILITY_FALLBACK_MODEL),
-                         'critic_model': (UTILITY_MODEL, UTILITY_FALLBACK_MODEL)}
+                      'critic_model': 'critic_fallback_model',
+                      'director_model': 'director_fallback_model'}
+GOOGLE_SESSION_MODELS = {key: (UTILITY_MODEL, UTILITY_FALLBACK_MODEL) for key in SESSION_SLOT_PAIRS}
 
 #: MimicAI Auto: a text model the bot owner points at models in /mod -> System Models,
 #: per tier and slot, so a profile follows the owner's pick instead of holding the day's id -- a

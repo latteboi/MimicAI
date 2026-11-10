@@ -65,9 +65,9 @@ HELP_CATEGORIES = {
             "**Preferred provider** (`/start`, or `/settings` -> Override Defaults): every model a character uses runs Primary -> Fallback on "
             "this provider. A Fallback you set on the other provider keeps a character speaking through an outage or a spent key on one. "
             "New profiles start on it, and until one is chosen they start with **no models at all**: an API key alone does not choose. "
-            "Google runs Gemini. OpenRouter ships its own: Ling for replies, long-term memories and the critic, "
-            "Ming then Recraft for images, Fish Audio then Deepgram for speech, and Claude Haiku 5.5 for web search, "
-            "session compaction and training analysis, each with OpenRouter's free router behind it -- "
+            "Google runs Gemini. OpenRouter ships its own: Ling for replies, "
+            "Ming then Recraft for images, Fish Audio then Deepgram for speech, and Claude Haiku 5.5 for long-term memories, "
+            "web search, session compaction, the critic, the AI Director and training analysis, each with OpenRouter's free router behind it -- "
             "the free ones free while your free quota lasts."
         ),
         "Profile Classes (PIDs)": (
@@ -370,8 +370,8 @@ HELP_CATEGORIES = {
             "through. **Persistence** is how many further rounds a constraint stays in force after the round that earned it.\n\n"
             "**Seats.** Every seat is screened, one seated later included. Untick a character to leave it out -- for a deliberate "
             "catchphrase, say -- and its lines stop counting against the others too.\n\n"
-            "**Full mode** has its own instructions (left at the default, they follow the bot-wide prompt) and its own models and "
-            "Thinking under **Critic Model…**, both greyed in the other modes. Until v0.7.9 the critic was set per profile; those "
+            "**Full mode** has its own instructions (left at the default, they follow the bot-wide prompt) and its own models, "
+            "Thinking and Hosts & Tier under **Critic Model…**, both greyed in the other modes. Until v0.7.9 the critic was set per profile; those "
             "settings are no longer read."
         ),
         "Response Modes and Delivery": (
@@ -1149,7 +1149,7 @@ DEFAULT_HELP_DOCS = {
     "sessions/proactivity_and_director.txt": (
         "Setup: Enabled via `/session config` -> Proactivity.\n"
         "Mechanism: When Proactivity is active, an asynchronous system loop monitors the channel. Each time the channel has been quiet for the Cooldown, the Trigger Chance (0-100%) is rolled once, and any message starts the wait over. When a roll hits, the cast starts talking with no user message at all; in an empty channel it keeps going (10% every 5 minutes is about 29 rounds a day).\n"
-        "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Its switch, Director Instructions and Director Model are on the AI Director row of `/session config` -> Proactivity; Director Model works like Models, and until you choose there it runs the LTM Summariser's models. It falls back to the next model if the first is busy. Blank instructions use the default wording. It acts only on proactive rounds, so it is idle while Proactivity is off.\n"
+        "AI Director: If configured, the system uses a secondary model to read the scene prompt, the rolling synopsis and the last ten public messages, and generate a brief environmental change or sudden event (e.g., 'A loud noise is heard outside'). It never reads whispers or private replies: its note goes to the whole cast. Its switch, Director Instructions and Director Model are on the AI Director row of `/session config` -> Proactivity; Director Model works like Models, and until you choose there it runs the Director's own defaults for the session owner's provider. It falls back to the next model if the first is busy. Blank instructions use the default wording. It acts only on proactive rounds, so it is idle while Proactivity is off.\n"
         "Payload: This scene update is injected as an <internal_note> directly to the cast list, forcing the AI characters to dynamically react to the new situation autonomously.\n"
         "Cost: Proactive rounds consume API quota without anyone prompting them, and the Director is an extra call on top. Start with a low chance and a long cooldown.\n"
         "Follow-ups: A switch on the same page, off by default. With it on, a character may end a reply with a hidden tag naming someone and how long to wait (minutes up to 7 days), to come back to something that person told it. Once that time has passed and the person speaks again, the character's next reply is reminded and raises it if it still fits. If they stay away it does not wait for them: once the channel has had a minute's quiet, that character alone speaks with the reminder, Proactivity on or off, whatever the chance, and the AI Director is not asked. Up to three per character, one per person (a newer one replaces theirs), one raised per round across the cast, dropped a week after falling due. Never set in whispers, `/speak` or Global Chat, nor by a proactive round. Its rules add about 160 tokens to every reply, in the cached part of the prompt, and no extra model call. `/session audit` shows what a turn set or was reminded of.\n"
@@ -1358,7 +1358,7 @@ DEFAULT_HELP_DOCS = {
         "Seats: every seat is screened, one seated later included. A character unticked is left out, and its lines stop counting against the others: the answer to a deliberate catchphrase.\n"
         "Variety hint: in lexical and full, a character whose last few replies all ended on a question, or all opened with an *action*, gets one line on its next turn suggesting it vary that, if it suits the character. No model call; about 35 tokens on that turn alone. `/session audit` shows it.\n"
         "Tuning: strictness (lenient/normal/strict) sets how short a repeated phrase has to be to count; lookback is how many replies are read; persistence is how many further rounds a constraint stays in force.\n"
-        "Full mode: its instructions (blank follows the bot-wide ANTI_REPETITION prompt), models and Thinking are on the same screen, greyed in the other modes.\n"
+        "Full mode: its instructions (blank follows the bot-wide ANTI_REPETITION prompt), models, Thinking and Hosts & Tier are on the same screen, greyed in the other modes.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Replies became noticeably slower.' Fix: 'full' mode is an extra model call per message. Switch to 'lexical' to keep repetition screening at no latency cost."
     ),

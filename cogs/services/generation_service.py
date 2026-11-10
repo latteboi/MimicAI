@@ -605,8 +605,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
     async def _director_note(self, channel_id: int, session: dict) -> Optional[str]:
         """The AI Director's note for a proactive round, or None when it is off or fails.
 
-        Its model runs the LTM summariser's chain, like the session synopsis: a model the
-        session chose goes first, none chosen means the shipped one, and either falls back
+        Its models are its own, as the session synopsis's are: a model the session chose
+        goes first, none chosen means the shipped one, and either falls back
         rather than leaving the round with no event because one provider was busy.
         """
         pro = session.get("proactivity") or {}
@@ -621,16 +621,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
         async def _attempt(model_name, is_fallback):
             # `{}` reads as "high" in every adapter. Unset, a Director's note thinks at
-            # its slot's default, medium: it has to read a scene to write a beat for it.
+            # its slot's default, low. `pro` carries Director Model's Hosts & Tier.
             model = self.cog.api_service._instantiate_model(
                 model_name, guild_id, owner_id, system_instruction=instructions,
+                profile_settings=pro,
                 config_owner_id=owner_id, thinking_params=resolve_thinking_params(
                     pro, "director", "fallback" if is_fallback else "primary"))
             return await model.generate_content_async([request])
 
         try:
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                *self.cog.api_service.model_chain(director_model_config(pro), "ltm_model", owner_id),
+                *self.cog.api_service.model_chain(director_model_config(pro), "director_model", owner_id),
                 _attempt, label="AI Director")
         except Exception as e:
             print(f"AI Director failed: {e}")

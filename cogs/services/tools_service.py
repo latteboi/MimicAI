@@ -311,7 +311,7 @@ class ToolsService:
                     store, "critic", "fallback" if is_fallback else "primary")
                 model = self.cog.api_service._instantiate_model(
                     model_name, guild_id, owner_id, system_instruction, None, t_params,
-                    config_owner_id=owner_id)
+                    profile_settings=store, config_owner_id=owner_id)
                 return await model.generate_content_async(
                     [f"Transcript:\n{transcript}"], generation_config=critic_cfg)
 

@@ -149,6 +149,18 @@ def fire(log: List[Dict[str, Any]], seats: List[Tuple[Dict[str, Any], str]],
     return first, (rest[0][1][1].get("due") if rest else None)
 
 
+def summary(log: List[Dict[str, Any]], seats: List[Tuple[Dict[str, Any], str]],
+            now: float) -> Tuple[int, int, List[Tuple[Dict[str, Any], Dict[str, Any]]]]:
+    """For `/session audit`: (how many were set, how many raised, and (seat, record) for each
+    still waiting, soonest due first). `seats` as `fire` takes them."""
+    metas = [t.get("meta") or {} for t in log]
+    waiting = sorted(((seat, record) for seat, pid in seats
+                      for _turn_id, record in pending(log, pid, seat["owner_id"], now)),
+                     key=lambda item: item[1].get("due", 0))
+    return (sum(isinstance(m.get("follow_up"), dict) for m in metas),
+            sum(bool(m.get("follow_up_answered")) for m in metas), waiting)
+
+
 def note_set(session: Dict[str, Any], record: Dict[str, Any]) -> None:
     """Moves the session's hint (`fire`) up to a newly set follow-up's due time."""
     pro = session.setdefault("proactivity", {})

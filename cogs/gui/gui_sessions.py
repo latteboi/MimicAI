@@ -12,6 +12,7 @@ from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, _yield_messa
                              billable_output_tokens, clean_model_name, openrouter_routing, resolve_auto_model,
                              resolve_critic_settings, strip_history_envelope, turn_posted_at)
 from ..utils.data_policy import may_pick_training_models
+from ..utils import follow_ups
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
                               paged_nav_options, send_status, settle_status, update_status,
                               add_select, build_pagination_controls,
@@ -2705,7 +2706,7 @@ class SessionConfigView(BlockedGuard, ui.View):
             f"{on(dir_on)} · Gives each proactive round a scene event to react to. "
             f"Instructions: {'custom' if pro.get('director_instructions') else 'default'}.",
             *chain_lines("Models", *self.cog.api_service.model_chain(
-                director_model_config(pro), "ltm_model", self.session.get("owner_id"))),
+                director_model_config(pro), "director_model", self.session.get("owner_id"))),
             *([] if enabled else ["-# Idle while Proactivity is off."])]), inline=False)
         embed.add_field(name="Follow-ups", value=(
             f"{on(follow_ups_on)} · A character may come back to someone later: when they next speak, "
@@ -3496,6 +3497,25 @@ class SessionAuditView(BlockedGuard, ui.View):
         body = text if len(text) <= 1000 else text[:997] + "..."
         embed.add_field(name="Text", value=f"```\n{body}\n```" if body else "`(empty)`", inline=False)
 
+    def _add_follow_ups_field(self, embed: discord.Embed, log: list):
+        """The session's follow-ups: how many were set and raised, and each still waiting --
+        due ones waiting for their person to speak. Shown once the switch or the log has any."""
+        seats = [(p, p.get("pid") or self.cog.profile_manager._get_pid_from_name_any(p['owner_id'], p['profile_name']))
+                 for p in self.session.get("profiles") or []]
+        made, raised, waiting = follow_ups.summary(log, seats, time.time())
+        if not (made or follow_ups.enabled(self.session)):
+            return
+        lines = [f"Set: `{made}` · Raised: `{raised}` · Waiting: `{len(waiting)}`"]
+        for n, (seat, record) in enumerate(waiting):
+            line = (f"**{seat['profile_name']}** → **{record.get('name') or 'someone'}**, due "
+                    f"<t:{int(record.get('due', 0))}:R>: {str(record.get('note', ''))[:80]}")
+            if sum(len(l) + 5 for l in lines) + len(line) > 950:
+                lines.append(f"…and {len(waiting) - n} more")
+                break
+            lines.append(line)
+        embed.add_field(name="3. Follow-ups", value="\n".join(
+            ("└── " if n == len(lines) - 1 else "├── ") + line for n, line in enumerate(lines)), inline=False)
+
     def _build_embed(self) -> discord.Embed:
         try:
             embed = discord.Embed(title=f"Chat Session Diagnostic: #{self.original_interaction.channel.name}", color=discord.Color.brand_green())
@@ -3530,6 +3550,7 @@ class SessionAuditView(BlockedGuard, ui.View):
                 
                 avg_lat = sum(durations) / len(durations) if durations else 0.0
                 embed.add_field(name="2. System Health Checks", value=f"└── Model Latency Average: `{avg_lat:.2f}s`", inline=False)
+                self._add_follow_ups_field(embed, log)
 
             elif self.mode == "inspector":
                 target = next((t for t in log if t.get("turn_id") == self.selected_turn_id), None)

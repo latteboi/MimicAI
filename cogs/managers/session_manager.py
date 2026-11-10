@@ -250,14 +250,14 @@ def director_enabled(proactivity: Optional[Dict[str, Any]]) -> bool:
 
 
 def director_model_config(proactivity: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """The Director's choice as LTM slots, None where it made none: it runs the LTM
-    summariser's chain, like the session synopsis. "on" and "off" are switches from
-    before the screen, not models, so neither is one. A Primary and a Fallback, never a
-    third model."""
+    """The Director's choice, None where it made none, for `model_chain(this, "director_model",
+    ...)`: unchosen, its own shipped chain under the session owner's preference. "on" and
+    "off" are switches from before the screen, not models, so neither is one. A Primary and
+    a Fallback, never a third model."""
     pro = proactivity or {}
     chosen = str(pro.get("director_model") or "").strip()
-    return {"ltm_model": None if chosen.lower() in ("", "on", "off") else chosen,
-            "ltm_fallback_model": pro.get("director_fallback_model") or None}
+    return {"director_model": None if chosen.lower() in ("", "on", "off") else chosen,
+            "director_fallback_model": pro.get("director_fallback_model") or None}
 
 
 _TURN_IDENTITY = re.compile(r'<([^>\r\n]+)> \[ID: ([^\]\r\n]+)\]')

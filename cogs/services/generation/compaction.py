@@ -444,6 +444,8 @@ class SessionCompactionMixin:
                 model_name, guild_id, session.get("owner_id"),
                 system_instruction=system_instruction,
                 config_owner_id=session.get("owner_id"),
+                # Summariser Model's Hosts & Tier.
+                profile_settings=session.get("compaction"),
                 thinking_params=resolve_thinking_params(
                     session.get("compaction"), "compaction", "fallback" if is_fallback else "primary"))
             resp = await model.generate_content_async(
