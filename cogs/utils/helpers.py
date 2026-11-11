@@ -1133,7 +1133,7 @@ def image_model_caps(raw_name: Optional[str]) -> dict:
 def resolve_image_output_params(image_config, raw_name: Optional[str]) -> dict:
     """The aspect ratio, resolution and thinking level `raw_name` will actually take.
 
-    Resolved per model rather than once per request, because the four image models do
+    Resolved per model rather than once per request, because the image models do
     not carry the same options: the two 3.1 models take the extreme banner ratios, 2.5
     Flash has one fixed resolution and rejects imageSize outright, and only the 3.x
     models take a thinkingLevel. A fallback onto a different model therefore needs its
@@ -1167,7 +1167,7 @@ def resolve_image_output_params(image_config, raw_name: Optional[str]) -> dict:
         out["image_size"] = size
 
     level = (cfg.get("image_thinking_level") or "").upper()
-    if caps["thinking"] and level in IMAGE_THINKING_LEVELS:
+    if caps["thinking"] and level in caps.get("thinking_levels", IMAGE_THINKING_LEVELS):
         out["thinking_level"] = level
 
     quality = (cfg.get("image_quality") or "").lower()

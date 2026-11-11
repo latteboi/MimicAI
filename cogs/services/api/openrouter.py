@@ -6,6 +6,7 @@ that `_plan_streamed_body` splices in as the request body streams.
 
 import asyncio
 import base64
+import hashlib
 import os
 from typing import List
 
@@ -61,6 +62,18 @@ def _mark_cache_breakpoints(messages: List[dict]) -> None:
             messages[i]["content"] = [{"type": "text", "text": body, "cache_control": {"type": "ephemeral"}}]
         elif texts := [p for p in body if p.get("type") == "text"]:
             texts[-1]["cache_control"] = {"type": "ephemeral"}
+
+
+def _session_id(system_instruction: str) -> str:
+    """The conversation, for OpenRouter's sticky routing. Left to itself it pins a host only
+    after it has seen a cache hit, and tells conversations apart by the system message plus
+    the first message after it -- which every step of the history window replaces, so the
+    calls after a step could each land on a host holding nothing. Named, it pins from the
+    first reply. The name is the instruction ahead of the synopsis: who is speaking and
+    where, the part a step and a compaction pass both leave alone. A digest of it, so no
+    prompt text travels as an id."""
+    head = system_instruction.partition("<session_synopsis>")[0]
+    return hashlib.sha256(head.encode()).hexdigest()[:32]
 
 
 class OpenRouterModel:
@@ -270,6 +283,9 @@ class OpenRouterModel:
                 include_thoughts = generation_config.thinking_config.include_thoughts
 
         payload = {"model": self.model_name, "messages": messages}
+        # Ahead of the advanced splice, like the tier: an operator's own id wins.
+        if self.system_instruction:
+            payload["session_id"] = _session_id(self.system_instruction)
         if temp is not None:
             payload["temperature"] = temp
         if top_p is not None:

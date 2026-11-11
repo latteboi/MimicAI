@@ -373,8 +373,11 @@ class PromptBuilderMixin:
                 turn_parts.append(f"<game_context>\n{game_block}\n</game_context>")
 
         # The caller's (rules, reminder or None): only a session round, and a regeneration of
-        # one, asks for follow-ups. The rules are static; a reminder is one turn's, and goes
-        # ahead of <neuro_state>, whose closing line is written more often from the end.
+        # one, asks for follow-ups. The rules are static and stay in the instruction: tried
+        # from the turn (2026-11-11, prod_tests/follow_up_live.py) gemini-3.8-flash set them
+        # no differently, and 3.1-flash-lite set more where none belonged, about things
+        # nobody had said. A reminder is one turn's, and goes ahead of <neuro_state>, whose
+        # closing line is written more often from the end.
         if follow_up_block:
             stable_parts.append(follow_up_block[0])
             if follow_up_block[1]:

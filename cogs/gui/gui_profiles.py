@@ -2758,7 +2758,8 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
                                         caps["quality"], IMAGE_QUALITY_NOTES, 2)
             elif caps["thinking"]:
                 self._add_choice_select("image_thinking_level", "Thinking level...",
-                                        IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
+                                        caps.get("thinking_levels", IMAGE_THINKING_LEVELS),
+                                        IMAGE_THINKING_NOTES, 2)
             if caps is not OPENROUTER_IMAGE_CAPS_UNKNOWN:
                 # "Off" is this row's blank, not a value of its own: an empty
                 # image_grounding_mode and a stored "off" both resolve to no search,
@@ -4843,7 +4844,7 @@ class ImageOutputApplyView(_MediaOptionsApplyView):
                                     IMAGE_QUALITY_LEVELS, IMAGE_QUALITY_NOTES, 2)
         else:
             self._add_choice_select("image_thinking_level", "Thinking level...",
-                                    IMAGE_THINKING_LEVELS, IMAGE_THINKING_NOTES, 2)
+                                    IMAGE_THINKING_LEVELS_ALL, IMAGE_THINKING_NOTES, 2)
         # On both pages: Legacy RAG reaches every model, and a web mode is dropped by
         # one that takes no search tool, exactly as the embed says.
         self._add_choice_select("image_grounding_mode", "Search grounding...",

@@ -290,13 +290,13 @@ EMBEDDING_MODEL_NAME = 'GOOGLE/gemini-embedding-001'
 
 # The Google ids offered by name; everything else is typed or browsed.
 ALLOWED_MODELS = Literal[
-    'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.6-flash',
-    'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-robotics-er-1.6-preview',
+    'gemini-pro-latest', 'gemini-flash-latest', 'gemini-flash-lite-latest', 'gemini-4-carbon', 'gemini-4-argon', 'gemini-3.8-flash', 'gemini-3.6-flash',
+    'gemini-3.5-flash', 'gemini-3.5-flash-lite', 'gemini-3.1-pro-preview', 'gemini-3.1-flash-lite', 'gemini-3-flash-preview', 'gemini-robotics-er-2-preview',
     'gemini-2.5-pro', 'gemini-2.5-flash', 'gemini-2.5-flash-lite'
 ]
 
 IMAGE_MODELS = Literal[
-    'gemini-3.1-flash-image', 'gemini-3.1-flash-lite-image', 'gemini-3-pro-image', 'gemini-2.5-flash-image'
+    'gemini-nano-banana-2.1', 'gemini-3.1-flash-image', 'gemini-3.1-flash-lite-image', 'gemini-3-pro-image', 'gemini-2.5-flash-image'
 ]
 
 AUDIO_MODELS = Literal[
@@ -595,7 +595,7 @@ THINKING_LEVELS_TO_GOOGLE_BINARY = {
     'low': 'LOW', 'minimal': 'LOW', 'none': 'LOW',
 }
 
-#: Gemini 4 Argon publishes LOW, MEDIUM and HIGH -- no MINIMAL.
+#: Gemini 4 Argon and Carbon publish LOW, MEDIUM and HIGH -- no MINIMAL.
 THINKING_LEVELS_TO_GOOGLE_NO_MINIMAL = {**THINKING_LEVELS_TO_GOOGLE, 'minimal': 'LOW', 'none': 'LOW'}
 
 #: False means "think: false"; a string is Ollama's own level. None is unreachable
@@ -629,6 +629,10 @@ IMAGE_ASPECT_RATIOS_COMMON = (
 #: `refuse_oversized_upload` -- rather than posted and dropped by Discord.
 IMAGE_SIZES_ALL = ('512', '1K', '2K', '4K')
 
+#: Every thinking level any Gemini image model takes. Most take MINIMAL and HIGH only
+#: (`IMAGE_THINKING_LEVELS`); a model adding MEDIUM says so in its caps as `thinking_levels`.
+IMAGE_THINKING_LEVELS_ALL = ('MINIMAL', 'MEDIUM', 'HIGH')
+
 #: model id -> what it will actually honour, keyed bare because that is what reaches the
 #: API. Empty `sizes` means one fixed resolution and a rejected imageSize; `thinking`
 #: marks the models taking a thinkingLevel on an image request.
@@ -648,6 +652,8 @@ IMAGE_SIZES_ALL = ('512', '1K', '2K', '4K')
 _GOOGLE_IMAGE_CAPS_SHARED = {'quality': (), 'formats': (), 'max_refs': None, 'sampling': True}
 
 IMAGE_MODEL_CAPS = {
+    # 1K, 2K and 4K -- no 512, unlike 3.1 Flash. The only image model taking MEDIUM thinking.
+    'gemini-nano-banana-2.1':      {'sizes': ('1K', '2K', '4K'),  'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'thinking_levels': IMAGE_THINKING_LEVELS_ALL, 'modalities': ('IMAGE',), 'grounding': True,  'image_search': True,  **_GOOGLE_IMAGE_CAPS_SHARED},
     'gemini-3.1-flash-image':      {'sizes': ('512', '1K', '2K', '4K'), 'ratios': IMAGE_ASPECT_RATIOS_FULL,   'thinking': True,  'modalities': ('IMAGE',),          'grounding': True,  'image_search': True,  **_GOOGLE_IMAGE_CAPS_SHARED},
     # 1K and nothing else. It was listed with ('512', '1K') from the 3.1 Flash row; the
     # published table gives the Lite model one resolution, so an empty tuple is the
@@ -694,7 +700,8 @@ IMAGE_SIZE_NOTES = {
 }
 
 IMAGE_THINKING_NOTES = {
-    'MINIMAL': "Draw straight away. The API's own default.",
+    'MINIMAL': 'Draw straight away.',
+    'MEDIUM': 'Plan the composition briefly. Nano Banana 2.1 only.',
     'HIGH': 'Refine the composition first. Slower, and billed for the thinking.',
 }
 
@@ -775,7 +782,7 @@ IMAGE_OUTPUT_KEYS = ('image_aspect_ratio', 'image_size', 'image_thinking_level',
 #: Named rather than repeated across the profile template, the pickers and four
 #: generation call sites -- which had already drifted, one defaulting to an unprefixed
 #: id its own builder prefixed.
-DEFAULT_IMAGE_MODEL = 'GOOGLE/gemini-2.5-flash-image'
+DEFAULT_IMAGE_MODEL = 'GOOGLE/gemini-nano-banana-2.1'
 #: The same price per image as the Primary, on OpenRouter as on Google.
 DEFAULT_IMAGE_FALLBACK_MODEL = 'GOOGLE/gemini-3.1-flash-lite-image'
 
@@ -888,14 +895,13 @@ TTS_SYNTHESIS_PREAMBLE = (
     "never be spoken aloud."
 )
 
-#: Google's replacement for both earlier shipped models, which it deprecated on 2026-09-22,
-#: and the cheapest Gemini speech model yet. Written into every new profile, so a change
-#: here reaches new profiles only.
-DEFAULT_SPEECH_MODEL = 'GOOGLE/gemini-3.8-flash-lite-tts'
+#: Google's replacement for both earlier shipped models, which it deprecated on 2026-09-22.
+#: Written into every new profile, so a change here reaches new profiles only.
+DEFAULT_SPEECH_MODEL = 'GOOGLE/gemini-3.8-flash-tts'
 #: Takes the same voice names, so a line that falls back still sounds like the character.
 #: Never written into a profile, so this is what every profile without one of its own
 #: falls back to -- including those still pinned to a deprecated primary.
-DEFAULT_SPEECH_FALLBACK_MODEL = 'GOOGLE/gemini-3.8-flash-tts'
+DEFAULT_SPEECH_FALLBACK_MODEL = 'GOOGLE/gemini-3.8-flash-lite-tts'
 
 #: Written into every profile created from now on rather than made the fallback, because
 #: a profile with none still reads 1.0 -- existing profiles keep sounding as they do.
@@ -2359,8 +2365,9 @@ DEFAULT_DIRECTOR_INSTRUCTIONS = (
 # --- Follow-ups (`/session config` -> Proactivity -> Follow-ups; cogs/utils/follow_ups.py) ---
 
 #: What a character is told about setting one. Static, so in the system instruction (decided
-#: 2026-11-10), though the probe set them where they belong most from the turn context
-#: (prod_tests/follow_up_live.py, `--placement`). /mod's `FOLLOW_UP_RULES`.
+#: 2026-11-10). On this wording the turn context buys nothing a newer model needs and makes
+#: a cheap one set them for small talk (prod_tests/follow_up_live.py, `--placement`; the
+#: numbers are in FUTURE.md). /mod's `FOLLOW_UP_RULES`.
 #:
 #: No topic nouns and no sample time, deliberately: the bounds are in words. A wording that
 #: listed "an exam, an interview" and showed in="40h" had models asking people about exams
@@ -2949,6 +2956,9 @@ DEFAULT_ENHANCE_AWARENESS = (
 #: here like Enhance Awareness, and sent beside it, ahead of `<character_instructions>`. Each
 #: stands alone and the two compose: beats with no thought, a thought under any style, or both.
 #: `-#` is Discord's subtext line. Style rules (dashes, fonts, capitals) are a persona's own.
+#: Read as well from the system instruction as from the end of the turn: the formatting was
+#: kept 10/10 either way, 41 unformatted turns in, on gemini-3.1-flash-lite and 3.8-flash
+#: alike (prod_tests/prompt_cache_live.py `--phase placement`, 2026-11-11).
 DEFAULT_ROLEPLAY_FORMATTING = (
     "<roleplay_formatting>\n"
     "Write your turn as beats: a line of dialogue, then the action that goes with it on the "
