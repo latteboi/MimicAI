@@ -430,7 +430,10 @@ class ServerManager:
         rotating against a channel nobody can reach.
         """
         suspended = 0
-        for channel_id in [c.id for c in guild.channels]:
+        # Sessions by their filed server as well: `guild.channels` lists no thread.
+        home = self.cog.session_manager._session_server
+        for channel_id in ({c.id for c in guild.channels}
+                           | {ch for ch in list(self.cog.multi_profile_channels) if home(ch) == str(guild.id)}):
             if channel_id in self.cog.multi_profile_channels:
                 try:
                     if await self.cog.session_manager.suspend_channel_session(channel_id):

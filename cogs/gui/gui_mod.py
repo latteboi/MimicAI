@@ -13,7 +13,7 @@ from ..managers.server_manager import record_lifted
 from ..utils.helpers import (_sanitise_filename, birth_time, is_real_model, prune_openrouter_endpoints,
                              resolve_openrouter_endpoint, resolve_thinking_params, system_model,
                              system_settings)
-from ..utils.loop_probe import rss_bytes
+from ..utils.loop_probe import rss_bytes, snapshot as loop_probe_snapshot
 from ..utils.user_defaults import auto_wording, model_slot_defaults, other_provider
 from .base_components import (BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
                               add_select, build_confirm_view, invalidate_model_cache)
@@ -590,8 +590,11 @@ _STARTED_AT = time.time()
 UNREGISTERED_LABEL = "⚠️ Not registered"
 
 
-def _scan_users() -> List[Tuple[int, Optional[str], int, int, Optional[float]]]:
-    """(id, provider, personal, borrowed, joined) for every user directory. Run off the loop.
+UserRow = Tuple[int, Optional[str], int, int, Optional[float]]
+
+
+def _user_row(name: str) -> UserRow:
+    """(id, provider, personal, borrowed, joined) for one user directory. Run off the loop.
 
     `joined` is `about.registered_at`, else the directory's birth time (None if the
     filesystem will not say) -- the case for everyone who registered before the stamp.
@@ -604,70 +607,225 @@ def _scan_users() -> List[Tuple[int, Optional[str], int, int, Optional[float]]]:
     caches each one, pushing every active user out of the LRU, and may repair -- a
     stats screen must not write.
     """
-    rows = []
+    index = IOManager.read_json(os.path.join(USERS_DIR, name, "index.json"))
+    if not isinstance(index, dict):
+        index = {}
+    about = index.get("about")
+    about = about if isinstance(about, dict) else {}
+    provider = about.get("provider")
+    return (int(name), provider if provider in PROVIDER_CHOICES else None,
+            len(index.get("personal") or {}), len(index.get("borrowed") or {}),
+            about.get("registered_at") or birth_time(os.path.join(USERS_DIR, name)))
+
+
+def _scan_users() -> List[UserRow]:
+    """`_user_row` for every user directory. Run off the loop."""
     if not os.path.isdir(USERS_DIR):
-        return rows
-    for name in os.listdir(USERS_DIR):
-        if not name.isdigit():
-            continue
-        index = IOManager.read_json(os.path.join(USERS_DIR, name, "index.json"))
-        if not isinstance(index, dict):
-            index = {}
-        about = index.get("about")
-        about = about if isinstance(about, dict) else {}
-        provider = about.get("provider")
-        rows.append((int(name), provider if provider in PROVIDER_CHOICES else None,
-                     len(index.get("personal") or {}), len(index.get("borrowed") or {}),
-                     about.get("registered_at") or birth_time(os.path.join(USERS_DIR, name))))
-    return rows
+        return []
+    return [_user_row(name) for name in os.listdir(USERS_DIR) if name.isdigit()]
 
 
-def _paginate(lines: List[str], empty: str) -> List[str]:
-    # 20 two-line rows split by a blank line, worst case (100-character server name) ~3.8k of
-    # the embed's 4096.
-    return ["\n\n".join(lines[i:i + 20]) for i in range(0, len(lines), 20)] or [empty]
+def _find_user_row(user_id: int) -> Optional[UserRow]:
+    """One user's row, or None when the instance holds nothing for them. Run off the loop."""
+    return _user_row(str(user_id)) if os.path.isdir(os.path.join(USERS_DIR, str(user_id))) else None
+
+
+def _last_written(dirs: Dict[int, str]) -> Dict[int, float]:
+    """Channel -> when its session log was last written, for each that has one. Run off
+    the loop. The log outlives a restart, where `session_last_accessed` does not."""
+    out = {}
+    for channel_id, folder in dirs.items():
+        times = [os.path.getmtime(p) for p in (os.path.join(folder, "session_log.json.gz"),
+                                                os.path.join(folder, "session_log.hot.json.gz"))
+                 if os.path.exists(p)]
+        if times:
+            out[channel_id] = max(times)
+    return out
+
+
+def _date(snowflake: int) -> str:
+    return discord.utils.snowflake_time(snowflake).strftime("%d/%m/%Y")
+
+
+def _plural(n: int, word: str) -> str:
+    return f"`{n}` {word}{'' if n == 1 else 's'}"
+
+
+def _block_line(entry: Optional[Dict], label: Optional[str]) -> str:
+    """A block record as one line of a detail page; the Blacklist tab has the rest."""
+    if not entry:
+        return "Not blocked"
+    if record_lifted(entry):
+        return "Block lifted, record kept"
+    until = f" until <t:{int(entry['until'])}:R>" if entry.get("until") else ""
+    reason = f" — {entry['reason']}" if entry.get("reason") else ""
+    return f"⛔ **{label or 'Blocked'}**{until}{reason}"
+
+
+#: Rows per Servers/Users page: within a select's 25, and ~3.8k of an embed's 4096 with
+#: every server name at the 100-character maximum.
+_LIST_ROWS = 20
+#: Session lines per page of a server's detail, at ~150 characters a line.
+_SESSION_ROWS = 15
+#: Each list's orders, the first its default. Cycled by the sort button.
+_SORTS = {"Servers": ("Newest", "Most sessions", "Most members"),
+          "Users": ("Most profiles", "Newest")}
+
+
+class ModFindModal(ui.Modal, title="Find by ID"):
+    id_input = ui.TextInput(label="Server, user or channel ID", required=True, max_length=25)
+
+    def __init__(self, view):
+        super().__init__()
+        self.parent_view = view
+
+    async def on_submit(self, i: discord.Interaction):
+        raw = self.id_input.value.strip()
+        found = self.parent_view._resolve_id(int(raw)) if raw.isdigit() else None
+        if found is None:
+            await i.response.send_message(embed=text_embed(
+                f"Nothing on this instance answers to `{raw[:25]}`: not a server the bot is in "
+                "or holds data for, a session's channel, or a user it knows."), ephemeral=True)
+            return
+        await self.parent_view.open_detail(i, *found)
 
 
 class ModStatsView(ModBaseView):
-    CATEGORIES = ("Servers", "Users")
+    """The instance at a glance, its servers and users as lists, and a page for any one of
+    them -- picked from a list, from another detail page, or by ID.
+
+    Detail pages stack in `trail`: Back returns to the page that opened this one, and
+    finally to the list page the first was picked from. Nothing here writes, bar the
+    controls that say so.
+    """
+
+    CATEGORIES = ("Overview", "Servers", "Users")
 
     def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
         super().__init__(cog, interaction, "stats", target_user_id=target_user_id)
-        self.selected_category = "Servers"
+        self.selected_category = "Overview"
         self.current_page = 0
+        self.sort = {category: orders[0] for category, orders in _SORTS.items()}
+        #: ("guild" | "user", id) for each open detail page, the visible one last.
+        self.trail: List[Tuple[str, int]] = []
+        self._list_page = 0
         # Read from disk when Users is first opened, not on every /mod.
-        self._users: Optional[List[Tuple[int, Optional[str], int, int, Optional[float]]]] = None
+        self._users: Optional[List[UserRow]] = None
+        # Read as a detail page opens, so a repaint (a page turn, Back) reads nothing.
+        self._user_rows: Dict[int, Optional[UserRow]] = {}
+        self._names: Dict[int, str] = {}
+        self._last_active: Dict[int, float] = {}
         self._build_view()
 
-    def _pages(self) -> List[str]:
-        if self.selected_category == "Servers":
-            now = datetime.datetime.now(datetime.timezone.utc)
-            guilds = sorted(self.cog.bot.guilds, key=lambda g: (g.me and g.me.joined_at) or now)
-            live = Counter(getattr(getattr(self.cog.bot.get_channel(ch), "guild", None), "id", None)
-                           for ch in self.cog.multi_profile_channels)
-            lines = []
-            for j, guild in enumerate(guilds, start=1):
-                joined = guild.me.joined_at.strftime("%d/%m/%Y") if (guild.me and guild.me.joined_at) else "Unknown"
-                lines.append(f"{j}. **{guild.name}** · `{guild.id}`\n"
-                             f"Members `{guild.member_count or '?'}` · Sessions `{live[guild.id]}` · "
-                             f"Joined `{joined}`")
-            return _paginate(lines, "No server data available.")
+    # --- reading ------------------------------------------------------------------
 
-        rows = sorted(self._users or [], key=lambda r: (r[2], r[3]), reverse=True)
-        lines = []
-        for j, (uid, provider, personal, borrowed, joined) in enumerate(rows, start=1):
-            user = self.cog.bot.get_user(uid)
-            when = (datetime.datetime.fromtimestamp(joined, datetime.timezone.utc).strftime("%d/%m/%Y")
-                    if joined else "Unknown")
-            lines.append(f"{j}. **{user.name if user else 'Unknown User'}** · `{uid}`\n"
-                         f"{PROVIDER_CHOICES.get(provider, UNREGISTERED_LABEL)} · "
-                         f"Personal `{personal}` · Borrowed `{borrowed}` · Joined `{when}`")
-        return _paginate(lines, "No users.")
+    def _name(self, user_id) -> str:
+        if not user_id:
+            return "?"
+        user = self.cog.bot.get_user(int(user_id))
+        return self._names.get(int(user_id)) or (user.name if user else str(user_id))
+
+    def _who(self, user_id) -> str:
+        name = self._name(user_id)
+        return f"**{name}** (`{user_id}`)" if name != str(user_id) else f"`{user_id}`"
+
+    def _sessions_by_guild(self) -> Dict[int, List[int]]:
+        """Server id -> its session channels. Through `_session_server`, so an archived
+        thread counts under the server its blueprint is filed in; `get_channel` loses it."""
+        by_guild: Dict[int, List[int]] = {}
+        for channel_id in self.cog.multi_profile_channels:
+            home = self.cog.session_manager._session_server(channel_id)
+            if home:
+                by_guild.setdefault(int(home), []).append(channel_id)
+        return by_guild
+
+    def _resolve_id(self, ident: int) -> Optional[Tuple[str, int]]:
+        """What a pasted ID names: a server, a session's channel (as its server), a cached
+        channel (likewise), or a user. None when the instance knows none of them."""
+        bot = self.cog.bot
+        if bot.get_guild(ident) or os.path.isdir(os.path.join(SERVERS_DIR, str(ident))):
+            return "guild", ident
+        if ident in self.cog.multi_profile_channels:
+            home = self.cog.session_manager._session_server(ident)
+            if home:
+                return "guild", int(home)
+        guild = getattr(bot.get_channel(ident), "guild", None)
+        if guild:
+            return "guild", guild.id
+        if bot.get_user(ident) or os.path.isdir(os.path.join(USERS_DIR, str(ident))):
+            return "user", ident
+        return None
+
+    async def open_detail(self, i: discord.Interaction, kind: str, ident: int):
+        """Push a detail page and paint it, reading what it shows first, off the loop.
+        A page already on the trail is returned to, so a server → owner → server round
+        trip cannot grow it."""
+        await i.response.defer()
+        if not self.trail:
+            self._list_page = self.current_page
+        if (kind, ident) in self.trail:
+            del self.trail[self.trail.index((kind, ident)):]
+        self.trail.append((kind, ident))
+        self.current_page = 0
+        if kind == "user":
+            await self._load_user(ident)
+            channels = [ch for ch, s in self.cog.multi_profile_channels.items()
+                        if s.get("owner_id") == ident]
+        else:
+            channels = self._sessions_by_guild().get(ident, [])
+        await self._load_last_active(channels)
+        self._build_view()
+        await self.update_display()
+
+    async def _load_user(self, user_id: int):
+        if user_id not in self._user_rows:
+            self._user_rows[user_id] = await asyncio.to_thread(_find_user_row, user_id)
+        if user_id not in self._names and self.cog.bot.get_user(user_id) is None:
+            try:
+                self._names[user_id] = (await self.cog.bot.fetch_user(user_id)).name
+            except discord.HTTPException:
+                pass
+
+    async def _load_last_active(self, channels: List[int]):
+        """The later of the log's last write and the last trigger this process saw."""
+        sm = self.cog.session_manager
+        dirs = {}
+        for channel_id in channels:
+            session = self.cog.multi_profile_channels.get(channel_id) or {}
+            try:
+                dirs[channel_id] = str(sm._get_session_dir_path(
+                    (channel_id, None, None), session.get("type", "multi")))
+            except ValueError:
+                pass
+        written = await asyncio.to_thread(_last_written, dirs)
+        for channel_id in channels:
+            seen = max(written.get(channel_id, 0), self.cog.session_last_accessed.get(channel_id, 0))
+            if seen:
+                self._last_active[channel_id] = seen
+
+    # --- controls -----------------------------------------------------------------
 
     def _build_view(self):
         self.clear_items()
+        if self.trail:
+            self._build_detail()
+        else:
+            self._build_list()
+        self._add_nav_buttons()
 
-        cat_opts = [discord.SelectOption(label=cat, value=cat, default=(cat == self.selected_category)) for cat in self.CATEGORIES]
+    async def _repaint(self, i: discord.Interaction):
+        self._build_view()
+        await i.response.edit_message(embed=self._get_embed(), view=self)
+
+    def _add_find_button(self, row: int):
+        async def find_cb(i: discord.Interaction):
+            await i.response.send_modal(ModFindModal(self))
+        add_button(self, "Find by ID…", find_cb, row=row, emoji="🔎")
+
+    def _build_list(self):
+        cat_opts = [discord.SelectOption(label=cat, value=cat, default=(cat == self.selected_category))
+                    for cat in self.CATEGORIES]
+
         async def cat_cb(i: discord.Interaction):
             await i.response.defer()
             self.selected_category = i.data['values'][0]
@@ -678,14 +836,173 @@ class ModStatsView(ModBaseView):
             await self.update_display()
         add_select(self, cat_opts, cat_cb, placeholder="Select Category...", row=0)
 
-        num_pages = len(self._pages())
-        if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
+        category = self.selected_category
+        if category == "Overview":
+            self._add_find_button(1)
+            self._add_wipe_button(1)
+            return
 
+        rows = self._rows()
+        num_pages = max(1, -(-len(rows) // _LIST_ROWS))
+        self.current_page = min(self.current_page, num_pages - 1)
+        page = rows[self.current_page * _LIST_ROWS:(self.current_page + 1) * _LIST_ROWS]
+        kind = "guild" if category == "Servers" else "user"
+        if page:
+            async def pick_cb(i: discord.Interaction):
+                await self.open_detail(i, kind, int(i.data['values'][0]))
+            add_select(self, [discord.SelectOption(label=label[:100], value=str(rid),
+                                                   description=desc[:100])
+                              for rid, _line, label, desc in page],
+                       pick_cb, row=1, placeholder=f"Inspect a {'server' if kind == 'guild' else 'user'}...")
+
+        self._add_page_controls(num_pages, 2)
+        orders = _SORTS[category]
+        following = orders[(orders.index(self.sort[category]) + 1) % len(orders)]
+
+        async def sort_cb(i: discord.Interaction):
+            self.sort[category] = following
+            self.current_page = 0
+            await self._repaint(i)
+        add_button(self, f"{following} ▶", sort_cb, row=2)
+        self._add_find_button(2)
+
+    def _build_detail(self):
+        kind, ident = self.trail[-1]
+
+        async def back_cb(i: discord.Interaction):
+            self.trail.pop()
+            self.current_page = 0 if self.trail else self._list_page
+            await self._repaint(i)
+        add_button(self, "◀ Back", back_cb, row=0)
+        self._add_find_button(0)
+        if kind == "guild":
+            self._build_guild(ident)
+        else:
+            self._build_user(ident)
+
+    def _blacklist_modal(self, modal_cls, arg, mode: str, ident: int):
+        """A block modal with the ID filled in. Lands on the Blacklist tab with the new
+        record open, where its reason, Ban Effects and Remove already live."""
+        blacklist = ModBlacklistView(self.cog, self.original_interaction,
+                                     target_user_id=self.target_user_id)
+        blacklist.mode = mode
+        modal = modal_cls(blacklist, arg)
+        (modal.guild_id_input if mode == "guilds" else modal.user_id_input).default = str(ident)
+        return modal
+
+    def _build_guild(self, gid: int):
+        guild = self.cog.bot.get_guild(gid)
+        channels = self._sessions_by_guild().get(gid, [])
+        num_pages = max(1, -(-len(channels) // _SESSION_ROWS))
+        self.current_page = min(self.current_page, num_pages - 1)
         self._add_page_controls(num_pages, 1)
-        self._add_wipe_button()
-        self._add_nav_buttons()
 
-    def _add_wipe_button(self):
+        entry = self.cog.server_manager.guild_block_entry(gid)
+        if entry and not record_lifted(entry):
+            async def lift_cb(i: discord.Interaction):
+                self.cog.server_manager.unblock_guild(gid)
+                await self._repaint(i)
+            add_button(self, "Lift Block", lift_cb, row=2, style=discord.ButtonStyle.success)
+        else:
+            for action in GUILD_BLOCK_ACTIONS:
+                async def block_cb(i: discord.Interaction, action=action):
+                    await i.response.send_modal(
+                        self._blacklist_modal(ModBlockGuildModal, action, "guilds", gid))
+                add_button(self, "Block (Leave)" if action == GUILD_BLOCK_LEAVE
+                           else "Block (Quarantine)", block_cb, row=2,
+                           style=discord.ButtonStyle.danger)
+
+        name = guild.name if guild else f"server {gid}"
+
+        async def suspend_cb(i: discord.Interaction):
+            async def confirm(confirm_i: discord.Interaction):
+                await confirm_i.response.edit_message(
+                    content=None, view=None,
+                    embed=text_embed(f"Suspending {_plural(len(channels), 'session')} in **{name}**..."))
+                sm = self.cog.session_manager
+                done = 0
+                for channel_id in channels:
+                    if await sm.suspend_channel_session(channel_id):
+                        done += 1
+                    await asyncio.sleep(0)    # yield between channels, as suspend_all_sessions does
+                sm._save_multi_profile_sessions()    # once: it rewrites every server index
+                await confirm_i.edit_original_response(
+                    content=None, view=None,
+                    embed=dismissible(text_embed(f"**Suspended {_plural(done, 'session')} in {name}.**")))
+                self._build_view()
+                await self.update_display()
+
+            await i.response.send_message(
+                embed=text_embed(f"**Suspend every session in {name}?**\n"
+                                 f"{_plural(len(channels), 'session')} torn down exactly as `/suspend` "
+                                 "does: chat logs deleted, child bots told to drop the channel. "
+                                 "Profiles, memories and settings are untouched.\n\nThis cannot be undone."),
+                view=build_confirm_view("Suspend Sessions", confirm, i), ephemeral=True)
+        add_button(self, f"Suspend Sessions ({len(channels)})", suspend_cb, row=2,
+                   style=discord.ButtonStyle.danger, disabled=not channels)
+
+        roles: Dict[int, List[str]] = {}
+        if guild and guild.owner_id:
+            roles[guild.owner_id] = ["Server owner"]
+        owned = Counter(self.cog.multi_profile_channels[ch].get("owner_id") for ch in channels)
+        for uid, n in owned.most_common():
+            if uid:
+                roles.setdefault(int(uid), []).append(f"owns {n} session{'' if n == 1 else 's'} here")
+        if roles:
+            async def person_cb(i: discord.Interaction):
+                await self.open_detail(i, "user", int(i.data['values'][0]))
+            add_select(self, [discord.SelectOption(label=self._name(uid)[:100], value=str(uid),
+                                                   description=" · ".join(r)[:100])
+                              for uid, r in list(roles.items())[:DROPDOWN_MAX_OPTIONS]],
+                       person_cb, row=3, placeholder="Inspect a person...")
+
+    def _build_user(self, uid: int):
+        known = self._user_rows.get(uid) is not None
+
+        async def profiles_cb(i: discord.Interaction):
+            await i.response.defer()
+            await ModProfilesView(self.cog, self.original_interaction, target_user_id=uid).update_display()
+        add_button(self, "Manage Profiles ▸", profiles_cb, row=2,
+                   style=discord.ButtonStyle.primary, disabled=not known)
+
+        entry = self.cog.server_manager.blacklist_entry(uid)
+        if entry and not record_lifted(entry):
+            async def lift_cb(i: discord.Interaction):
+                self.cog.server_manager.unblock_user(uid)
+                await self._repaint(i)
+            add_button(self, "Lift Block", lift_cb, row=2, style=discord.ButtonStyle.success)
+        else:
+            for scope in BLACKLIST_SCOPES:
+                async def block_cb(i: discord.Interaction, scope=scope):
+                    await i.response.send_modal(
+                        self._blacklist_modal(ModBlockUserModal, scope, "users", uid))
+                add_button(self, f"Block ({BLACKLIST_SCOPE_LABELS[scope]})", block_cb, row=2,
+                           style=discord.ButtonStyle.danger)
+
+        async def effects_cb(i: discord.Interaction):
+            await i.response.send_message(
+                embed=text_embed(f"Effects to apply for `{uid}`. None of these is undone by "
+                                 "unblocking them."),
+                view=ModBanEffectsView(self.cog, uid), ephemeral=True)
+        add_button(self, "Ban Effects...", effects_cb, row=2)
+
+        servers = {g.id: "Server owner" for g in self.cog.bot.guilds if g.owner_id == uid}
+        for gid, chs in self._sessions_by_guild().items():
+            n = sum(self.cog.multi_profile_channels[ch].get("owner_id") == uid for ch in chs)
+            if n:
+                servers[gid] = " · ".join(filter(None, (servers.get(gid),
+                                                        f"owns {n} session{'' if n == 1 else 's'}")))
+        if servers:
+            async def server_cb(i: discord.Interaction):
+                await self.open_detail(i, "guild", int(i.data['values'][0]))
+            options = []
+            for gid, why in list(servers.items())[:DROPDOWN_MAX_OPTIONS]:
+                guild = self.cog.bot.get_guild(gid)
+                options.append(discord.SelectOption(label=(guild.name if guild else str(gid))[:100],
+                                                    value=str(gid), description=why[:100]))
+            add_select(self, options, server_cb, row=3, placeholder="Inspect a server...")
+
+    def _add_wipe_button(self, row: int):
         """Instance-wide `/suspend`.
 
         The per-channel command only reaches the channel it is typed in, so recovering
@@ -722,35 +1039,215 @@ class ModStatsView(ModBaseView):
                 "This cannot be undone."),
                 view=build_confirm_view("Wipe Every Session", confirm, i), ephemeral=True)
         add_button(self, f"Wipe All Sessions ({live})", wipe_cb, style=discord.ButtonStyle.danger,
-                   row=2)
+                   row=row)
+
+    # --- rendering ----------------------------------------------------------------
+
+    def _rows(self) -> List[Tuple[int, str, str, str]]:
+        """(id, line, option label, option description) per row of the open list, in its
+        current order."""
+        out = []
+        if self.selected_category == "Servers":
+            now = discord.utils.utcnow()
+            counts = {gid: len(chs) for gid, chs in self._sessions_by_guild().items()}
+            key = {"Newest": lambda g: (g.me and g.me.joined_at) or now,
+                   "Most sessions": lambda g: counts.get(g.id, 0),
+                   "Most members": lambda g: g.member_count or 0}[self.sort["Servers"]]
+            for j, guild in enumerate(sorted(self.cog.bot.guilds, key=key, reverse=True), start=1):
+                joined = guild.me.joined_at.strftime("%d/%m/%Y") if (guild.me and guild.me.joined_at) else "Unknown"
+                members, sessions = guild.member_count or "?", counts.get(guild.id, 0)
+                out.append((guild.id,
+                            f"{j}. **{guild.name}** · `{guild.id}`\n"
+                            f"Members `{members}` · Sessions `{sessions}` · Joined `{joined}`",
+                            guild.name, f"{sessions} sessions · {members} members · joined {joined}"))
+            return out
+
+        key = ((lambda r: (r[2], r[3])) if self.sort["Users"] == "Most profiles"
+               else (lambda r: r[4] or 0))
+        for j, (uid, provider, personal, borrowed, joined) in enumerate(
+                sorted(self._users or [], key=key, reverse=True), start=1):
+            user = self.cog.bot.get_user(uid)
+            when = (datetime.datetime.fromtimestamp(joined, datetime.timezone.utc).strftime("%d/%m/%Y")
+                    if joined else "Unknown")
+            plan = PROVIDER_CHOICES.get(provider, UNREGISTERED_LABEL)
+            out.append((uid,
+                        f"{j}. **{user.name if user else 'Unknown User'}** · `{uid}`\n"
+                        f"{plan} · Personal `{personal}` · Borrowed `{borrowed}` · Joined `{when}`",
+                        user.name if user else str(uid),
+                        f"{plan} · {personal} personal · {borrowed} borrowed · joined {when}"))
+        return out
 
     def _get_embed(self):
+        if self.trail:
+            kind, ident = self.trail[-1]
+            return self._guild_embed(ident) if kind == "guild" else self._user_embed(ident)
         embed = discord.Embed(title="MimicAI Statistics", color=discord.Color.gold())
-        pages = self._pages()
-        embed.description = pages[self.current_page]
-
-        sessions = self.cog.multi_profile_channels.values()
-        clients = self.cog.child_bot_manager.clients.values()
-        rss = rss_bytes()
-        embed.add_field(name="Instance", inline=False, value=(
-            f"Up since <t:{int(_STARTED_AT)}:R>"
-            + (f" · Memory `{rss / 2**20:.0f} MB`" if rss else "") + "\n"
-            f"Sessions `{len(sessions)}` live, `{sum(map(self.cog.session_manager.is_started, sessions))}` started · "
-            f"Child bots `{sum(c.is_ready() for c in clients)}` online of `{len(self.cog.child_bots)}`"))
-
+        if self.selected_category == "Overview":
+            return self._overview(embed)
+        rows = self._rows()
+        start = self.current_page * _LIST_ROWS
+        embed.description = ("\n\n".join(line for _id, line, _l, _d in rows[start:start + _LIST_ROWS])
+                             or ("No server data available." if self.selected_category == "Servers"
+                                 else "No users."))
+        embed.set_footer(text=f"Sorted by {self.sort[self.selected_category].lower()} · "
+                              "pick one below to inspect it")
         if self.selected_category == "Users" and self._users is not None:
-            by_provider = Counter(r[1] for r in self._users)
-            unregistered = by_provider.pop(None, 0)
-            embed.add_field(name="Users", inline=False, value=(
-                f"Registered `{by_provider.total()}` — "
+            embed.add_field(name="Users", inline=False, value=self._users_summary())
+        return embed
+
+    def _users_summary(self) -> str:
+        by_provider = Counter(r[1] for r in self._users)
+        unregistered = by_provider.pop(None, 0)
+        return (f"Registered `{by_provider.total()}` — "
                 + " · ".join(f"{PROVIDER_CHOICES[p]} `{n}`" for p, n in by_provider.most_common())
                 + (f" · {UNREGISTERED_LABEL} `{unregistered}`" if unregistered else "") + "\n"
                 f"Personal profiles `{sum(r[2] for r in self._users)}` · "
-                f"Borrows `{sum(r[3] for r in self._users)}`"))
+                f"Borrows `{sum(r[3] for r in self._users)}`")
+
+    def _overview(self, embed: discord.Embed) -> discord.Embed:
+        sm = self.cog.session_manager
+        sessions = list(self.cog.multi_profile_channels.values())
+        started = [s for s in sessions if sm.is_started(s)]
+        clients = self.cog.child_bot_manager.clients.values()
+        rss = rss_bytes()
+        probe = loop_probe_snapshot()
+        instance = (f"Up since <t:{int(_STARTED_AT)}:R>"
+                    + (f" · Memory `{rss / 2**20:.0f} MB`" if rss else "")
+                    + (f" (peak `{probe['rss_peak'] / 2**20:.0f} MB`)" if probe["enabled"] and probe["rss_peak"] else "")
+                    + f"\nChild bots `{sum(c.is_ready() for c in clients)}` online of `{len(self.cog.child_bots)}`")
+        if probe["enabled"]:
+            instance += (f"\nLoop: worst stall `{probe['max_lag'] * 1000:.0f} ms`"
+                         + (f" <t:{int(probe['max_lag_at'])}:R>" if probe["max_lag_at"] else "")
+                         + f" · stalls `{probe['stalls']}` · critical `{probe['critical']}`")
+        embed.add_field(name="Instance", inline=False, value=instance)
+
+        embed.add_field(name="Sessions", inline=False, value=(
+            f"`{len(sessions)}` configured · `{len(started)}` started · "
+            f"`{sum(bool(s.get('is_hydrated')) for s in sessions)}` in memory · "
+            f"`{sum(bool((s.get('proactivity') or {}).get('enabled')) for s in started)}` proactive · "
+            f"`{sum(bool(s.get('is_running')) for s in sessions)}` replying now"))
+
+        guilds = self.cog.bot.guilds
+        week_ago = discord.utils.utcnow() - datetime.timedelta(days=7)
+        embed.add_field(name="Reach", inline=False, value=(
+            f"`{len(guilds)}` servers · `{sum(g.member_count or 0 for g in guilds):,}` members · "
+            f"`{sum(bool(g.me and g.me.joined_at and g.me.joined_at > week_ago) for g in guilds)}` "
+            "joined in the last 7 days"))
+
+        busiest = sorted(self._sessions_by_guild().items(), key=lambda kv: len(kv[1]), reverse=True)[:3]
+        if busiest:
+            embed.add_field(name="Most sessions", inline=False, value="\n".join(
+                f"**{getattr(self.cog.bot.get_guild(gid), 'name', gid)}** · `{len(chs)}` sessions · "
+                f"`{getattr(self.cog.bot.get_guild(gid), 'member_count', '?')}` members"
+                for gid, chs in busiest))
+
+        records = self.cog.blacklist_records
+        active = lambda section: sum(not record_lifted(e) for e in records.get(section, {}).values())
+        embed.add_field(name="Moderation", inline=False, value=(
+            f"Blocked users `{active('users')}` · Blocked servers `{active('guilds')}` · "
+            f"Accounts with strikes `{len(records.get('strikes', {}))}`\n"
+            "Review queue: **Profiles** tab"))
+
+        embed.add_field(name="Users", inline=False, value=(
+            self._users_summary() if self._users is not None
+            else "Open **Users** to count them: it reads every account's index."))
+        return embed
+
+    def _guild_embed(self, gid: int) -> discord.Embed:
+        guild = self.cog.bot.get_guild(gid)
+        st = self.cog.storage_manager
+        embed = discord.Embed(title=guild.name if guild else "Server not joined",
+                              color=discord.Color.gold())
+        lines = [f"`{gid}` · Created `{_date(gid)}`"]
+        if guild:
+            joined = guild.me.joined_at if guild.me else None
+            lines.append(f"Owner {self._who(guild.owner_id)} · Members `{guild.member_count or '?'}`"
+                         + (f" · Joined `{joined:%d/%m/%Y}` (<t:{int(joined.timestamp())}:R>)" if joined else ""))
+            here = sum(c.get_guild(gid) is not None for c in self.cog.child_bot_manager.clients.values())
+            lines.append(f"Child bots here `{here}` of `{len(self.cog.child_bots)}`")
+        else:
+            lines.append("The bot is not in this server. What it left on this instance is below.")
+
+        holders = [f"{MODEL_PROVIDERS[p]} from {self._who(pointer[0])}"
+                   for p in MODEL_PROVIDERS if (pointer := st._guild_key_pointer(gid, p))]
+        if st.guild_has_text_key(gid):
+            lines.append("Server key ✅ " + (", ".join(holders) or "assigned"))
+        elif st.gemini_blocked_for_guild(gid):
+            lines.append("Server key ❌ the Google key is held back by its data policy")
+        else:
+            lines.append("Server key ❌ none, so no session here can reply")
+        entry = self.cog.server_manager.guild_block_entry(gid)
+        lines.append(_block_line(entry, GUILD_BLOCK_LABELS.get((entry or {}).get("action"))))
+
+        channels = sorted(self._sessions_by_guild().get(gid, []),
+                          key=lambda ch: self._last_active.get(ch, 0), reverse=True)
+        sessions = [self.cog.multi_profile_channels[ch] for ch in channels]
+        sm = self.cog.session_manager
+        started = [s for s in sessions if sm.is_started(s)]
+        lines.append(f"\n**Sessions** `{len(sessions)}` · `{len(started)}` started · "
+                     f"`{sum(bool(s.get('is_hydrated')) for s in sessions)}` in memory · "
+                     f"`{sum(bool((s.get('proactivity') or {}).get('enabled')) for s in started)}` proactive")
+        start = self.current_page * _SESSION_ROWS
+        for channel_id in channels[start:start + _SESSION_ROWS]:
+            lines.append(self._session_line(channel_id, self.cog.multi_profile_channels[channel_id]))
+        if not sessions:
+            lines.append("*None.*")
+        embed.description = "\n".join(lines)[:4096]
+        embed.set_footer(text="Latest activity first · in memory = log loaded, evicted after 5 idle minutes")
+        return embed
+
+    def _session_line(self, channel_id: int, session: Dict) -> str:
+        channel = self.cog.bot.get_channel(channel_id)
+        where = f"#{channel.name}" if channel else f"`{channel_id}`"
+        cast = ", ".join(p.get("profile_name", "?") for p in session.get("profiles", [])) or "*empty cast*"
+        flags = [word for word, on in (
+            ("draft", not self.cog.session_manager.is_started(session)),
+            ("in memory", session.get("is_hydrated")),
+            ("proactive", (session.get("proactivity") or {}).get("enabled")),
+            ("replying", session.get("is_running"))) if on]
+        seen = self._last_active.get(channel_id)
+        return (f"{where} · {self._name(session.get('owner_id'))} · {cast[:80]}"
+                + (f" · <t:{int(seen)}:R>" if seen else "")
+                + "".join(f" · *{f}*" for f in flags))
+
+    def _user_embed(self, uid: int) -> discord.Embed:
+        row = self._user_rows.get(uid)
+        embed = discord.Embed(title=self._name(uid), color=discord.Color.gold())
+        lines = [f"`{uid}` · Account created `{_date(uid)}`"]
+        if row:
+            _, provider, personal, borrowed, joined = row
+            when = (datetime.datetime.fromtimestamp(joined, datetime.timezone.utc).strftime("%d/%m/%Y")
+                    if joined else "Unknown")
+            lines.append(f"{PROVIDER_CHOICES.get(provider, UNREGISTERED_LABEL)} · Registered `{when}` · "
+                         f"Personal `{personal}` · Borrowed `{borrowed}`")
+        else:
+            lines.append("No data on this instance: never registered, or deleted their data.")
+        sm = self.cog.server_manager
+        entry = sm.blacklist_entry(uid)
+        lines.append(f"Strikes `{len(sm.active_strikes(uid))}` of `{STRIKE_THRESHOLD}` · "
+                     + _block_line(entry, BLACKLIST_SCOPE_LABELS.get((entry or {}).get("scope"))))
+
+        owns = [g for g in self.cog.bot.guilds if g.owner_id == uid]
+        if owns:
+            lines.append("Owns " + ", ".join(f"**{g.name}**" for g in owns[:10])
+                         + (f" and `{len(owns) - 10}` more" if len(owns) > 10 else ""))
+
+        own = [(ch, s) for ch, s in self.cog.multi_profile_channels.items() if s.get("owner_id") == uid]
+        seated = sum(s.get("owner_id") != uid and any(p.get("owner_id") == uid for p in s.get("profiles", []))
+                     for s in self.cog.multi_profile_channels.values())
+        lines.append(f"\n**Sessions** owns `{len(own)}` · has a character seated in `{seated}` more")
+        for channel_id, session in own[:10]:
+            home = self.cog.session_manager._session_server(channel_id)
+            server = getattr(self.cog.bot.get_guild(int(home)) if home else None, "name", home or "?")
+            lines.append(f"**{server}** › {self._session_line(channel_id, session)}")
+        if len(own) > 10:
+            lines.append(f"…and `{len(own) - 10}` more: inspect a server below")
+        embed.description = "\n".join(lines)[:4096]
         return embed
 
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+
 
 class ModProfilesModal(ui.Modal, title="Enter User ID"):
     user_id_input = ui.TextInput(label="Discord User ID", required=True)
