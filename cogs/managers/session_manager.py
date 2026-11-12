@@ -25,7 +25,7 @@ from ..utils.constants import (
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
     PATTERN_SPEAKER_CLOSE, REPLY_IN_VIEW, REPLY_QUOTE_CHARS, REPLY_UNAVAILABLE,
     ROUND_SETTLE_SECONDS, ROUND_SETTLE_MAX_SECONDS, ROUND_SETTLE_TYPING_SECONDS,
-    FOLLOW_UP_QUIET_SECONDS,
+    FOLLOW_UP_QUIET_SECONDS, FEATURE_ACCESS_LABELS, SESSION_FEATURES,
 )
 from ..utils import follow_ups
 from ..utils.discord_cdn import unsigned_attachment_url
@@ -87,7 +87,38 @@ def blueprint_settings(blueprint: Dict[str, Any]) -> Dict[str, Any]:
         "settle": blueprint.get("settle", {}),
         "name_wakewords": blueprint.get("name_wakewords", True),
         "server_context": blueprint.get("server_context", True),
+        "features": blueprint.get("features", {}),
     }))
+
+
+def feature_access(session: Optional[Dict[str, Any]], key: str) -> str:
+    """Who may use `SESSION_FEATURES[key]` here: "off", "admins" or "everyone". Absent is
+    "admins", so a session that never set it follows whatever default ships next."""
+    return ((session or {}).get("features") or {}).get(key, "admins")
+
+
+def feature_allowed(session: Optional[Dict[str, Any]], key: str, is_admin: bool) -> bool:
+    """Whether someone may use a session feature. Disabled holds administrators too.
+
+    A reaction's removal asks this as well as its add: pulling a refused press back off
+    raises a removal for that member, which would otherwise withdraw or undo someone
+    else's press on the same message.
+    """
+    access = feature_access(session, key)
+    return access == "everyone" or (access == "admins" and is_admin)
+
+
+def feature_refusal(session: Optional[Dict[str, Any]], key: str) -> str:
+    """What someone refused a feature is told, and where it is changed."""
+    access = FEATURE_ACCESS_LABELS[feature_access(session, key)]
+    return (f"**{SESSION_FEATURES[key][0]}**: {access} in this session. An administrator can "
+            f"change that in `/session config` → Config → Features.")
+
+
+def may_mute(turn: Dict[str, Any], user_id: int, is_admin: bool) -> bool:
+    """A member mutes a character's turn or their own message, never another member's:
+    nothing in the channel says who did it, so it would quietly write them out of the scene."""
+    return is_admin or turn.get("is_user") is not True or turn.get("speaker_pid") == str(user_id)
 
 
 def session_from_blueprint(blueprint: Dict[str, Any], profiles: List[Dict]) -> Dict[str, Any]:
@@ -1228,6 +1259,7 @@ class SessionManager:
             "settle": session_data.get("settle", {}),
             "name_wakewords": bool(session_data.get("name_wakewords", True)),
             "server_context": bool(session_data.get("server_context", True)),
+            "features": session_data.get("features", {}),
         }))
 
     def branch_of(self, session: Dict, through: int) -> Tuple[Dict[str, Any], List[Dict]]:

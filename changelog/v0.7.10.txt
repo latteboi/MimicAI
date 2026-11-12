@@ -5,9 +5,12 @@ Every message a character posts can be traced to who ran it, without a record of
 - **Characters can ping people.** A character that writes @name to someone who has spoken in the conversation now pings them, where it used to post as plain text. Their username works too, and so does the ID the character knows them by, which no longer shows up in the channel.
 - **Trace Message** in `/mod` → Profiles, for the bot owner: paste a message link to see who ran the character behind it. The bot owner's View Generation Trace shows the same, even once the session is gone.
 ## **Changed**
+- **Session Features: a session's controls are now for administrators until opened.** `/session config` → Config → Features sets who may use whispers, each reaction (🔁 ▶️ ⏯️ 🍿 🔇), `/trigger` and `!image` in a session: Disabled, Admins only or Everyone, several at once. Every session, including the ones you already have, starts with them all Admins only, so an administrator opens to everyone what their server wants. Text-to-Speech has moved onto the same screen.
+- **Mute Turn hides only your own messages and characters' replies.** Muting another member's message takes an administrator.
 - **Terms of Service and Privacy Policy revised, effective 12 November 2026.** The Privacy Policy describes message signatures, and three strikes now suspend an account with no end date, where it said "until we review it".
 - **Content rating verdicts are settled in the bot.** An Adult verdict says to edit the persona and submit it again, and a refused profile's Share, Publish and Global Chat say to open its Content Safety page, where Request Review is. Neither says to contact the bot owner any more.
 - **A message posted before this update at more than 1,869 characters can no longer be edited** with Edit Profile Message: the edit and the signature would not fit.
 ## **Fixed**
+- **A child bot's regenerated reply stays.** It could appear for a moment and then go back to a frozen "Still generating…" placeholder.
 - **A very long sentence with realistic typing on is posted once.** A sentence longer than one Discord message was refused, and the whole reply was then posted again after the part already typed. Long sentences are now split like any other reply, by webhook and by child bot.
 - **Someone mentioned alongside a child bot is read by name.** A message that @mentions a child bot reached its character with every other mention as a raw Discord ID; it now reads as typed, like any other message.

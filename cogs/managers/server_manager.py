@@ -7,6 +7,7 @@ from typing import Dict, Any, List, Optional, Set, Union
 import discord
 
 from .storage_manager import IOManager
+from ..utils import signatures
 from ..utils.constants import (BLACKLIST_FILE_PATH, BLACKLIST_FORMAT_VERSION,
                                BLACKLIST_LIFTED_RETENTION_SECONDS, BLACKLIST_SCOPE_FULL,
                                STRIKE_LIFETIME_SECONDS, STRIKE_THRESHOLD, BLACKLIST_SCOPE_GENERATION,
@@ -22,6 +23,21 @@ from ..utils.constants import (BLACKLIST_FILE_PATH, BLACKLIST_FORMAT_VERSION,
 UNKNOWN_WEBHOOK = 10015
 #: `run_webhook`'s signer was not passed at all, as against passed as None.
 _NO_SIGNER = object()
+#: Set once Discord has returned a message without the signature it was sent with.
+_signature_lost = False
+
+
+def _note_signature_lost(channel, sent, result) -> None:
+    """Print, once a process, that Discord returned a message without the signature it
+    was sent with. The first real send is also the test that it keeps them."""
+    global _signature_lost
+    stored = getattr(result, "content", None)
+    if _signature_lost or not isinstance(stored, str) or signatures.kept(sent, stored):
+        return
+    _signature_lost = True
+    print(f"[Signatures] Discord returned a message in channel {getattr(channel, 'id', '?')} "
+          "without the signature it was sent with. New messages cannot be traced until "
+          "this is fixed: MESSAGE_SIGNATURES.md, 'Before shipping'.")
 
 try:
     import orjson as json
@@ -669,12 +685,15 @@ class ServerManager:
             if webhook is None:
                 return None
             try:
-                return await getattr(webhook, op)(*args, **kwargs)
+                result = await getattr(webhook, op)(*args, **kwargs)
             except discord.HTTPException as e:
                 if attempt or e.code != UNKNOWN_WEBHOOK:
                     raise
                 self.invalidate_webhook(channel)
                 self._rewind_files(args, kwargs)
+                continue
+            _note_signature_lost(channel, kwargs.get("content"), result)
+            return result
         return None
 
     @staticmethod

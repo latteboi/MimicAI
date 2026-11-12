@@ -3,7 +3,7 @@ import io
 import time
 import hashlib
 import re
-import uuid
+import secrets
 import shutil
 import threading
 import base64
@@ -1390,9 +1390,20 @@ class ProfileManager:
             card = self._card_of(pid or "", self._get_profile_config(eff_owner, eff_name, False) or {})
         return card.get("d"), card.get("r", CONTENT_RATING_UNRATED)
 
-    #: A minted PID is a class letter plus uuid4().hex[:15].upper() -- 16 characters,
-    #: uppercase hex after the first.
+    #: A minted PID (`_mint_pid`) is a class letter plus 15 uppercase hex digits.
     _PID_BODY = frozenset("0123456789ABCDEF")
+
+    def _mint_pid(self, owner_id: int, letter: str) -> str:
+        """A new PID of class `letter`, drawn again while `owner_id` already has a folder by
+        that name (`_save_profile_by_pid` would write over that profile) or the Public Library
+        lists it (`public_profiles` is keyed on the bare PID, so publishing would replace that
+        listing). Otherwise a PID is unique across owners by odds alone (60 bits), and
+        `_pid_owners` copes with two."""
+        while True:
+            pid = letter + secrets.token_hex(8)[:15].upper()
+            if (pid not in self.cog.public_profiles
+                    and not os.path.exists(os.path.join(USERS_DIR, str(owner_id), "profiles", pid))):
+                return pid
 
     @classmethod
     def _is_pid(cls, pid: str) -> bool:
@@ -1550,7 +1561,7 @@ class ProfileManager:
         if not source_data:
             return False, "Source profile data not found."
 
-        new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+        new_pid = self._mint_pid(user_id, "A")
         new_data = {
             "name": target_name,
             "config": source_data.get("config", {}).copy(),
@@ -2226,12 +2237,32 @@ class ProfileManager:
             source = self._borrow_source(user_id, name)
             if source and source[1] == pid:
                 return f"**{source[2]}** by <@{source[0]}> ({source[0]}), borrowed as **{name}**."
+        # Not theirs and not among their borrows now: a borrow they have since removed,
+        # whose source is still wherever its folder is.
+        held = [f"**{self._get_name_from_pid(owner, pid) or 'an unindexed profile'}** by <@{owner}> ({owner})"
+                for owner in self._pid_owners(pid) if owner != int(user_id)]
+        if held:
+            return f"{' or '.join(held)}, which they borrowed and have since removed."
         if not os.path.isdir(os.path.join(USERS_DIR, str(user_id))):
-            return ("Nothing, and this bot holds no data for that user: most likely a misread, "
-                    "a token made with a different `ENCRYPTION_KEY` (about 2% of those pass the "
-                    "check), unless they have since deleted their data.")
-        return ("Nothing now: the profile was deleted since, or this is a misread (a token made "
-                "with a different key passes the check about 2% of the time). Not proof either way.")
+            return "Nothing: the profile is gone, and so is all of that account's data here."
+        return "Nothing now: the profile has been deleted since."
+
+    @staticmethod
+    def _pid_owners(pid: str) -> List[int]:
+        """Every account holding a profile folder named `pid`.
+
+        A signature names a borrow by its source's PID alone, with no room for the
+        source's owner. `_mint_pid` keeps a PID unique per owner only, so this can
+        answer with two.
+        """
+        # ponytail: one isdir per account and no shard opened, for an operator's trace.
+        # An index, if this is ever asked per message.
+        try:
+            accounts = os.listdir(USERS_DIR)
+        except OSError:
+            return []
+        return [int(u) for u in accounts
+                if u.isdigit() and os.path.isdir(os.path.join(USERS_DIR, u, "profiles", pid))]
 
     def _resolve_effective_profile(self, user_id: int, profile_name: str) -> Tuple[int, str]:
         index = self._get_user_index(user_id)
@@ -2719,7 +2750,7 @@ class ProfileManager:
                 return None
 
             if isinstance(index.get("personal"), dict):
-                pid = f"A{uuid.uuid4().hex[:15].upper()}"
+                pid = self._mint_pid(user_id, "A")
                 index["personal"][profile_name] = pid
             else:
                 # Pre-PID index: the folder name is the profile name, which is what
@@ -2818,7 +2849,7 @@ class ProfileManager:
             index["system"] = {}
 
         if profile_name not in index["system"]:
-            pid = f"X{uuid.uuid4().hex[:15].upper()}"
+            pid = self._mint_pid(user_id, "X")
             index["system"][profile_name] = pid
 
             config = {
@@ -4603,7 +4634,7 @@ class ProfileManager:
 
                 config = p_data.get("config") if isinstance(p_data.get("config"), dict) else {}
                 prompts = p_data.get("prompts") if isinstance(p_data.get("prompts"), dict) else {}
-                new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+                new_pid = self._mint_pid(user_id, "A")
                 config["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 # Adult and Refused alone cross: dropping either would let the profile run
                 # where it may not, and an export-import round trip must not launder a
@@ -5427,7 +5458,7 @@ class ProfileManager:
             # _find_public_entry_id. Renaming the old folders to match would mean
             # moving directories and rewriting index entries for cosmetics, with
             # orphaned profiles as the failure mode; the mixed population stays.
-            pid = f"{'C' if is_public_borrow else 'B'}{uuid.uuid4().hex[:15].upper()}"
+            pid = self._mint_pid(interaction.user.id, 'C' if is_public_borrow else 'B')
 
             if "borrowed" not in index or not isinstance(index["borrowed"], dict):
                 index["borrowed"] = {}
@@ -5582,7 +5613,7 @@ class ProfileManager:
             if desired_name in index.get("personal", []) or desired_name in index.get("borrowed", []):
                 return False, f"You already have a profile named '{desired_name}'."
 
-            new_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+            new_pid = self._mint_pid(recipient_id, "A")
             recip_dir = os.path.join(self.cog.USERS_DIR, recip_id_str, "profiles", new_pid)
 
             try:
@@ -5643,7 +5674,7 @@ class ProfileManager:
                 if target_name in owner_index.get("system", {}):
                     return False, f"A system profile named '{target_name}' already exists."
                 source_pid = owner_index["personal"][source_name]
-                target_pid = f"X{uuid.uuid4().hex[:15].upper()}"
+                target_pid = self._mint_pid(owner_id, "X")
                 target_category = "system"
             else:
                 if source_name not in owner_index.get("system", {}):
@@ -5651,7 +5682,7 @@ class ProfileManager:
                 if target_name in owner_index.get("personal", {}) or target_name in owner_index.get("borrowed", {}):
                     return False, f"A personal profile named '{target_name}' already exists."
                 source_pid = owner_index["system"][source_name]
-                target_pid = f"A{uuid.uuid4().hex[:15].upper()}"
+                target_pid = self._mint_pid(owner_id, "A")
                 target_category = "personal"
 
             source_dir = os.path.join(self.cog.USERS_DIR, str(owner_id), "profiles", source_pid)

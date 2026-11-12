@@ -120,7 +120,9 @@ _STATIC_DASHBOARDS = [
                 "A dropdown; each setting opens its own screen on the same message, with Back",
                 "Execution Mode (sequential or random turn order)",
                 "Master Prompt (the scene prompt every participant sees): Edit, Clear",
-                "Text-to-Speech (on or off for the channel)",
+                "Features: a multi-select of Whispers, Regenerate, Next Speaker, Speak Again, Continue Round "
+                "(and /trigger), Mute Turn and Image Generation (with Select All); Disabled, Admins only "
+                "(the default) or Everyone sets every ticked one; Text-to-Speech: On/Off",
                 "Response Limit (maximum replies per round)",
                 "Settle Window (quiet gap, maximum wait and typing wait before a round "
                 "reads the channel): Edit Values, Reset to Defaults",

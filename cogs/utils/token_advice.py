@@ -240,7 +240,7 @@ def session_advice(session: Dict[str, Any], seats: Sequence[Tuple[Dict[str, Any]
     if session.get("audio_mode", "off") == "on" and voiced:
         items.append(Advice(LARGE, "Text-to-Speech: On",
                             f"{len(voiced)} of the cast {'is' if len(voiced) == 1 else 'are'} voiced: each of "
-                            "their replies is billed per second of audio, on top of its text.", "config:tts"))
+                            "their replies is billed per second of audio, on top of its text.", "config:features"))
 
     # Only what some seat's window still holds is re-sent.
     window = max((stm_window(cfg)[1] for _seat, cfg in seats), default=0)

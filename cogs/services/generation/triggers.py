@@ -10,10 +10,10 @@ from ...utils.helpers import (
 )
 from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
-from ...managers.session_manager import intern_turn, log_user_turn, reply_quote
+from ...managers.session_manager import feature_allowed, intern_turn, log_user_turn, reply_quote
 from ...utils.constants import (
     defaultConfig, DISCORD_NOTICE_TAG, ROUND_EMOJI_MAX, ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE,
-    ROUND_URL_MESSAGES_MAX, STICKER_TAG,
+    ROUND_URL_MESSAGES_MAX, STICKER_TAG, is_guild_admin,
 )
 from ...utils.discord_cdn import unsigned_attachment_url
 from ...utils.signatures import unsign
@@ -302,6 +302,14 @@ class TriggerIntakeMixin:
     reactions, replies, proactive kicks -- into the round's user-side history.
     """
 
+    def _may_draw(self, session, channel_id: int, author_id: int) -> bool:
+        """Whether this author's `!image` draws here (Config -> Features). Refused, the
+        message is an ordinary turn: it cannot be answered privately, and the cast still
+        hears what was said."""
+        guild = getattr(self.cog.bot.get_channel(channel_id), "guild", None)
+        member = guild.get_member(int(author_id)) if guild else None
+        return feature_allowed(session, "images", is_guild_admin(member))
+
     async def _compose_user_turn(self, typed: str, attachments: Sequence[Any], *,
                                  edited: bool = False) -> UserTurn:
         """A user message's turn content, and the media parts to send with it.
@@ -517,7 +525,8 @@ class TriggerIntakeMixin:
                 # than on the prompt because a prompt this message does not carry may
                 # still arrive in a text file attached to it, folded in below -- which is
                 # also where a round that turns out to have nothing to draw is closed.
-                if image_command_prefix(trigger_content):
+                author_id = message_payload['author_id'] if message_payload else message_trigger.author.id
+                if image_command_prefix(trigger_content) and self._may_draw(session, channel_id, author_id):
                     is_image_gen_round = True
                     image_gen_prompt = image_command_prompt(trigger_content) or ""
                     image_prompt_from_this_trigger = True

@@ -52,6 +52,9 @@ class ChildBotManager:
         # Signature of the profile shards the last _load_child_bots() scan was built
         # from. See _profiles_scan_signature for why this is safe to trust.
         self._child_bot_scan_signature: Optional[Tuple] = None
+        # (bot_id, message_id) -> the newest edit not yet applied (None: one is in flight).
+        # A key is present exactly while _apply_edits runs for it, so it drains itself.
+        self._pending_edits: Dict[Tuple[str, Any], Optional[Dict[str, Any]]] = {}
 
     def _is_borrow_of(self, borrower_id: int, borrow_name: str, owner_id: int, source_pid: Optional[str]) -> bool:
         """Whether borrower_id's borrow `borrow_name` was made from owner_id's profile `source_pid`.
@@ -554,7 +557,7 @@ class ChildBotManager:
                     if child_action == "send_message":
                         asyncio.create_task(self.execute_send(bot_id, payload))
                     elif child_action == "regenerate_message":
-                        asyncio.create_task(self.execute_regenerate(bot_id, payload))
+                        self._queue_edit(bot_id, payload)
                     elif child_action == "delete_message":
                         asyncio.create_task(self.execute_delete(bot_id, payload))
                     elif child_action == "start_typing":
@@ -830,6 +833,27 @@ class ChildBotManager:
             pass
         except Exception as e:
             print(f"[ChildBotManager] Delete error for {bot_id}: {e}")
+
+    def _queue_edit(self, bot_id: str, payload: Dict[str, Any]):
+        """Edits to one message apply in the order queued, and only the newest waiting one.
+
+        A task per edit raced: each fetches twice before editing, so a heartbeat tick queued
+        a moment before a regeneration's text could land after it, and the reply flashed
+        and went back to a frozen "Still generating... (0:20)".
+        """
+        key = (bot_id, payload.get("message_id"))
+        running = key in self._pending_edits
+        self._pending_edits[key] = payload
+        if not running:
+            asyncio.create_task(self._apply_edits(key))
+
+    async def _apply_edits(self, key: Tuple[str, Any]):
+        try:
+            while (payload := self._pending_edits.get(key)) is not None:
+                self._pending_edits[key] = None
+                await self.execute_regenerate(key[0], payload)
+        finally:
+            self._pending_edits.pop(key, None)
 
     async def execute_regenerate(self, bot_id: str, payload: Dict[str, Any]):
         bot = self.clients.get(str(bot_id))

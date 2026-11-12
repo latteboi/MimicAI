@@ -2770,6 +2770,21 @@ CONTINUE_ROUND_EMOJI = "🍿"
 MUTE_TURN_EMOJI = "🔇"
 
 SKIP_PARTICIPANT_EMOJI = "❌"
+
+#: What a session lets people do beyond talking, each set per session under `/session config`
+#: -> Config -> Features: key -> (label, emoji, what it does). `session["features"]` stores
+#: only what differs from Admins only (`"off"` or `"everyone"`): absent is Admins only, for a
+#: session saved before this existed too. Asked through `session_manager.feature_allowed` alone.
+SESSION_FEATURES = {
+    "whispers": ("Whispers", "🤫", "/whisper a character in private; it acts on it in public"),
+    "regenerate": ("Regenerate", REGENERATE_EMOJI, "Discard a character's reply and write a new one"),
+    "next_speaker": ("Next Speaker", NEXT_SPEAKER_EMOJI, "Give the next character one turn"),
+    "speak_again": ("Speak Again", SPEAK_AGAIN_EMOJI, "Give a character one more turn"),
+    "continue_round": ("Continue Round", CONTINUE_ROUND_EMOJI, "Run a round with nobody typing; /trigger too"),
+    "mute": ("Mute Turn", MUTE_TURN_EMOJI, "Hide a message from the cast; a member only their own or a character's"),
+    "images": ("Image Generation", "🎨", "!image or !imagine draws a picture"),
+}
+FEATURE_ACCESS_LABELS = {"off": "Disabled", "admins": "Admins only", "everyone": "Everyone"}
 TRAIN_INPUT_EMOJI = "1️⃣"
 TRAIN_OUTPUT_EMOJI = "2️⃣"
 
@@ -3368,6 +3383,17 @@ def is_owner_in_dm_check():
         if interaction.guild is not None: return False
         return interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)
     return app_commands.check(predicate)
+
+def is_guild_admin(member) -> bool:
+    """A server administrator, or the bot owner. No member (uncached, or a plain User) is
+    neither: a control that fails open is not a control."""
+    try:
+        if member is not None and int(member.id) == int(defaultConfig.DISCORD_OWNER_ID):
+            return True
+    except (TypeError, ValueError):
+        pass
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms and perms.administrator)
 
 def is_admin_or_owner_check(): 
     async def predicate(interaction: discord.Interaction) -> bool:

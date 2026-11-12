@@ -7,7 +7,7 @@ from .utils.constants import (
     GAME_CACHE_MAX_SIZE, MEDIA_DESCRIPTION_CACHE_MAX, PURGED_MESSAGE_ID_CACHE_MAX_SIZE,
     PURGE_BUSY_WAIT_TIMEOUT_SECONDS, SERVERS_DIR, COMPACT_KEEP_DEFAULT, COMPACT_KEEP_MAX,
     SESSIONS_GLOBAL_DIR, SESSION_BUSY_FLAGS, SKIP_PARTICIPANT_EMOJI, TRAIN_ARMED_CACHE_MAX_SIZE, TRAIN_INPUT_EMOJI,
-    TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check,
+    TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check, is_guild_admin,
     cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, LIMIT_FIXED_EXAMPLES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
@@ -43,7 +43,8 @@ from .gui.gui_mod import ModStatsView, trace_signature
 from .services.generation.turn_deletion import is_visible_turn
 from .managers.storage_manager import MasterCipher, StorageManager
 from .managers.profile_manager import ProfileManager
-from .managers.session_manager import NEW_SESSION_COMPACTION, SessionManager, session_from_blueprint
+from .managers.session_manager import (NEW_SESSION_COMPACTION, SessionManager, feature_allowed,
+                                       feature_refusal, session_from_blueprint)
 from .managers.memory_manager import MemoryManager
 from .managers.server_manager import ServerManager
 from .managers.child_bot_manager import ChildBotManager
@@ -110,6 +111,14 @@ def _unregistered(cog, interaction: discord.Interaction) -> bool:
 
 def _no_session_key(cog, interaction: discord.Interaction) -> bool:
     return cog._session_key_block(interaction.guild, interaction.user.id) is not None
+
+
+def _feature_closed(key: str):
+    """A `cooldown_unless_refused` predicate: true while this session refuses the caller `key`."""
+    def refused(cog, interaction: discord.Interaction) -> bool:
+        return not feature_allowed(cog.multi_profile_channels.get(interaction.channel_id), key,
+                                   is_guild_admin(interaction.user))
+    return refused
 
 
 def _no_table_here(cog, interaction: discord.Interaction) -> bool:
@@ -1547,7 +1556,8 @@ class MimicCog(EventListeners, commands.Cog):
     # mid-conversation, alongside /refresh and /cancel, not something they go into a
     # configuration group to find.
     @app_commands.command(name="trigger", description="Manually triggers a new round of the session in this channel.")
-    @cooldown_unless_refused(2, 10.0, _no_session_key)
+    @cooldown_unless_refused(2, 10.0, lambda cog, i: _no_session_key(cog, i)
+                             or _feature_closed("continue_round")(cog, i))
     @app_commands.guild_only()
     @app_commands.describe(profile="Optional: this cast member answers, and only them, whatever their chance.",
                            note="Optional (Admin Only): a note the cast reads this round only. Not kept in the history.")
@@ -1562,10 +1572,11 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.followup.send(embed=text_embed("No active session found in this channel."), ephemeral=True)
             return
 
-        # Ungated on purpose. Anyone who can post in the channel already starts a
-        # round by typing in it, so gating the button that does the same thing only
-        # made the two disagree. Permissions here are none / admin / bot owner, and
-        # there is no session-owner tier for this to fall into.
+        # 🍿's switch: the same round with nobody typing, so the two cannot disagree.
+        if not feature_allowed(session, "continue_round", is_guild_admin(interaction.user)):
+            await interaction.followup.send(embed=text_embed(feature_refusal(session, "continue_round")), ephemeral=True)
+            return
+
         if not self.session_manager.is_started(session):
             await interaction.followup.send(
                 embed=text_embed("This session has not been started. Run `/session config` -> **Start / Update Session**."),
@@ -2983,7 +2994,7 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.response.send_modal(modal)
 
     @app_commands.command(name="whisper", description="Send a private message to a profile in an active multi-profile session.")
-    @app_commands.checks.cooldown(3, 30.0, key=lambda i: i.user.id)
+    @cooldown_unless_refused(3, 30.0, _feature_closed("whispers"))
     @app_commands.guild_only()
     @app_commands.autocomplete(profile=EventListeners.master_autocomplete)
     @app_commands.describe(
@@ -2994,6 +3005,11 @@ class MimicCog(EventListeners, commands.Cog):
         session = self.multi_profile_channels.get(interaction.channel_id)
         if not session or session.get("type") != "multi":
             await interaction.response.send_message(embed=text_embed("This command can only be used in an active multi-profile session."), ephemeral=True)
+            return
+
+        # Sending only: reading back your own whispers stays open whatever this says.
+        if profile and not feature_allowed(session, "whispers", is_guild_admin(interaction.user)):
+            await interaction.response.send_message(embed=text_embed(feature_refusal(session, "whispers")), ephemeral=True)
             return
 
         target_participant = None

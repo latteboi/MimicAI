@@ -26,6 +26,11 @@ from ..services.generation.triggers import (emoji_files, mentioned_seat, referen
                                             said, sticker_files)
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 from ..gui.base_components import text_embed
+from ..managers.session_manager import feature_allowed, may_mute
+
+#: The reactions `/session config` -> Config -> Features opens or closes.
+_REACTION_FEATURES = {SESSION_FEATURES[key][1]: key for key in (
+    "regenerate", "next_speaker", "speak_again", "continue_round", "mute")}
 
 
 class EventListeners:
@@ -548,10 +553,8 @@ class EventListeners:
         if not any([is_regen, is_next, is_again, is_continue, is_mute, is_skip]):
             return
 
-        # Muting is deliberately open: it hides one turn from the transcript, which is
-        # the ordinary repair anyone in a scene needs when a reply lands badly, and it
-        # is reversible from the same place it was done.
-        if is_skip and not self._reaction_user_is_admin(payload):
+        is_admin = self._reaction_user_is_admin(payload)
+        if is_skip and not is_admin:
             # Skipping is not turn-local. It suspends a participant from every round
             # until somebody unskips it, so one press can silence another member's
             # character indefinitely, and nothing in the channel says who did it or
@@ -581,6 +584,15 @@ class EventListeners:
 
         if turn_object:
             turn_id_to_find = turn_object["turn_id"]
+            # Config -> Features, asked only where the press would act: 🍿 or 🔁 on someone's
+            # message is an ordinary emoji there, and stays. Refused, it comes back off
+            # without a word, since a reaction cannot be answered privately.
+            feature = _REACTION_FEATURES.get(emoji_str)
+            acts = is_mute or turn_object.get("is_user") is not True
+            if feature and acts and not (feature_allowed(session, feature, is_admin) and (
+                    not is_mute or may_mute(turn_object, payload.user_id, is_admin))):
+                asyncio.create_task(self._pull_back_reaction(payload))
+                return
             if is_mute:
                 turn_object["is_hidden"] = True
                 
@@ -792,6 +804,13 @@ class EventListeners:
         channel_id = payload.channel_id
         session = self.multi_profile_channels.get(channel_id)
         if not session: return
+
+        # Gated as the add is, for the reason the skip above is: a refused press is pulled
+        # back off, and that removal must not withdraw or undo somebody else's.
+        is_admin = self._reaction_user_is_admin(payload)
+        feature = _REACTION_FEATURES.get(emoji_str)
+        if feature and not feature_allowed(session, feature, is_admin):
+            return
         
         session_type = session.get("type", "multi")
         if not session.get("is_hydrated"):
@@ -828,6 +847,8 @@ class EventListeners:
                 return
 
             elif is_mute:
+                if not may_mute(turn_object, payload.user_id, is_admin):
+                    return
                 turn_object["is_hidden"] = False
                 await self.session_manager._save_session_to_disk((channel_id, None, None), session_type, session["unified_log"])
                 # Same derivation as the mute path above, in reverse.

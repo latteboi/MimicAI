@@ -5,7 +5,8 @@ has the design and why.
 One AES-256 block, its key HKDF'd from the master key per server, written two bits a
 character in four invisible operators: 64 characters, plus the space before them.
 Trust comes from who posted the message, never from the token: a wrong key reads as a
-plausible answer about 2% of the time.
+plausible answer about 2% of the time, which the trace settles by asking Discord whether
+the user ID is an account (`gui_mod.trace_signature`).
 """
 
 import re
@@ -66,6 +67,17 @@ def attach(text: str, token: str) -> str:
     if not token:
         return text
     return f"{text} {token}" if text else token
+
+
+def kept(sent: str, stored: str) -> bool:
+    """Whether Discord stored the token `sent` ended with. True when it carried none.
+
+    Everything here rests on Discord keeping four characters it has never promised to
+    keep. Stripped or trimmed, every later trace fails with nothing else to show for it,
+    so the wire asks once per message it gets back (`ServerManager.run_webhook`).
+    """
+    m = _TRAILING.search(sent or "")
+    return not m or (stored or "").endswith(m.group())
 
 
 def read(root: bytes, guild_id: int, content: str) -> Optional[Tuple[int, str]]:

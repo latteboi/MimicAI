@@ -19,8 +19,10 @@ from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PA
                               bulk_select_options, resolve_bulk_select)
 from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
 from ..utils.user_defaults import chain_lines
-from ..managers.session_manager import (director_enabled, director_model_config, rotated_cast,
-                                        turn_lookup, with_reply)
+from ..managers.session_manager import (director_enabled, director_model_config, feature_access,
+                                        rotated_cast, turn_lookup, with_reply)
+
+
 from ..services.generation.global_chat import build_global_chat_embed
 from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, cast_costs, quiet_label, session_advice
 from ..services.generation.tool_loop import functions_for
@@ -1543,6 +1545,8 @@ class SessionConfigView(BlockedGuard, ui.View):
         self._seated_cache = None
         #: The Config tab setting whose screen is open, or None for the tab itself.
         self.config_screen = None
+        #: The features ticked on the Features screen, which its buttons set together.
+        self.feature_picks = set()
         #: Token Advice is open in place of the tabs.
         self.advice_open = False
         #: One line for the next render only, e.g. a modal value it could not take. Shown
@@ -2225,11 +2229,9 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Current Cast", value=cast_list, inline=False)
 
     def _render_config(self, embed: discord.Embed):
-        """Session-wide behaviour: execution mode, master prompt, TTS, response limit, settle window, cast access."""
+        """Session-wide behaviour: execution mode, master prompt, features, response limit, settle window, cast access."""
         embed.description = "Configure session-wide behavior."
         mp = self.session.get("session_prompt")
-        audio_val = self.session.get("audio_mode", "off")
-        tts_status = "**`ON`**" if audio_val == "on" else "`OFF`"
         response_limit = self.session.get("max_responses", 10)
         policy = self.session.get("cast_policy", DEFAULT_CAST_POLICY)
 
@@ -2237,7 +2239,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Master Prompt", value=f"`{'Set' if mp else 'Not Set'}`", inline=True)
         embed.add_field(name="Cast Access", value=f"`{CAST_POLICY_LABELS.get(policy, policy)}`", inline=True)
 
-        embed.add_field(name="Text-to-Speech", value=f"{tts_status}", inline=True)
+        embed.add_field(name="Features", value=f"`{self._config_summary('features')}`", inline=True)
         embed.add_field(name="Response Limit", value=f"`{response_limit}`", inline=True)
         embed.add_field(name="Settle Window", value=f"`{self._config_summary('settle')}`", inline=True)
         
@@ -2368,9 +2370,15 @@ class SessionConfigView(BlockedGuard, ui.View):
                    "Standing scene direction every character in the cast reads on every "
                    "turn: the setting, the tone, what is going on. The AI Director reads "
                    "it too."),
-        "tts": ("Text-to-Speech",
-                "Voices each reply as an audio clip. Only characters with speech set up on "
-                "their own profile are voiced; while this is off, nobody in this channel is."),
+        "features": ("Features",
+                     "Who may use each of the session's controls. Tick any below, then set them.\n\n"
+                     "**Disabled** — nobody, administrators included.\n"
+                     "**Admins only** — server administrators. Where every control starts.\n"
+                     "**Everyone** — anyone who can post here.\n\n"
+                     "A reaction someone may not use comes straight back off, and `/whisper` and "
+                     "`/trigger` say why. A refused `!image` reaches the cast as an ordinary message.\n\n"
+                     "**Text-to-Speech** voices each reply as an audio clip, for characters with "
+                     "speech set up on their own profile; while it is off, nobody here is voiced."),
         "limit": ("Response Limit",
                   "The most characters that answer in one round, 1 to 10. Anyone past the "
                   "limit sits that round out."),
@@ -2410,8 +2418,11 @@ class SessionConfigView(BlockedGuard, ui.View):
             return self.session.get("session_mode", "sequential").title()
         if key == "prompt":
             return "Set" if self.session.get("session_prompt") else "Not set"
-        if key == "tts":
-            return "On" if self.session.get("audio_mode", "off") == "on" else "Off"
+        if key == "features":
+            access = [feature_access(self.session, k) for k in SESSION_FEATURES]
+            tts = "TTS on" if self.session.get("audio_mode", "off") == "on" else "TTS off"
+            return " · ".join([f"{access.count(a)} {FEATURE_ACCESS_LABELS[a].lower()}"
+                               for a in FEATURE_ACCESS_LABELS if a in access] + [tts])
         if key == "limit":
             return f"{self.session.get('max_responses', 10)} per round"
         if key == "server":
@@ -2465,12 +2476,8 @@ class SessionConfigView(BlockedGuard, ui.View):
             self._add_modal_button("Edit", SessionPromptModal)
             self._screen_button("Clear", lambda: session.__setitem__("session_prompt", None),
                                 style=discord.ButtonStyle.danger, disabled=not mp)
-        elif key == "tts":
-            on = session.get("audio_mode", "off") == "on"
-            self._screen_button(
-                f"Text-to-Speech: {'On' if on else 'Off'}",
-                lambda: session.__setitem__("audio_mode", "off" if on else "on"),
-                style=discord.ButtonStyle.success if on else discord.ButtonStyle.secondary)
+        elif key == "features":
+            self._render_features_screen(embed)
         elif key == "limit":
             embed.add_field(name="Current", value=f"`{session.get('max_responses', 10)}` per round",
                             inline=False)
@@ -2500,6 +2507,57 @@ class SessionConfigView(BlockedGuard, ui.View):
             await i.response.defer()
             await self.update_display()
         add_button(self, "◀ Back", back, row=0, style=discord.ButtonStyle.secondary)
+
+    def _render_features_screen(self, embed: discord.Embed):
+        """Every feature and who may use it. The multi-select ticks any number, the buttons
+        beside Back set them all at once, and Text-to-Speech -- on or off for the channel,
+        not a control anyone uses -- is its own button. Sparse: Admins only is stored as
+        nothing (`feature_access`)."""
+        session = self.session
+        keys = list(SESSION_FEATURES)
+        picks = self.feature_picks & set(keys)
+
+        def state(key: str) -> str:
+            return FEATURE_ACCESS_LABELS[feature_access(session, key)]
+
+        tts_on = session.get("audio_mode", "off") == "on"
+        embed.add_field(name="Now", inline=False, value="\n".join(
+            [f"{emoji} **{label}**: {state(key)}" for key, (label, emoji, _) in SESSION_FEATURES.items()]
+            + [f"🔊 **Text-to-Speech**: {'On' if tts_on else 'Off'}"]))
+
+        def apply(value):
+            features = session.setdefault("features", {})
+            for key in picks:
+                if value == "admins":
+                    features.pop(key, None)
+                else:
+                    features[key] = value
+        # One shared setting is shown as current; a mixed selection has none.
+        shared = {feature_access(session, key) for key in picks}
+        current = next(iter(shared)) if len(shared) == 1 else None
+        for value, label in FEATURE_ACCESS_LABELS.items():
+            self._screen_button(
+                label, lambda v=value: apply(v), disabled=not picks or value == current,
+                style=discord.ButtonStyle.primary if value == current else discord.ButtonStyle.secondary)
+
+        async def picks_cb(i: discord.Interaction):
+            self.feature_picks = resolve_bulk_select(i.data['values'], keys, keys, picks)
+            await i.response.defer()
+            await self.update_display()
+        # Seven fit one page, so only the Select All half of the shared sentinels.
+        select_all = bulk_select_options(keys, keys, picks.__contains__,
+                                         all_description="Tick every feature, or untick them all.")[1]
+        options = [select_all] + [
+            discord.SelectOption(label=label, value=key, emoji=emoji, default=key in picks,
+                                 description=f"{state(key)} · {about}"[:100])
+            for key, (label, emoji, about) in SESSION_FEATURES.items()]
+        add_select(self, options, picks_cb, row=1, min_values=0, max_values=len(options),
+                   placeholder=f"{len(picks)} ticked" if picks else "Tick features to set…")
+
+        self._screen_button(
+            f"Text-to-Speech: {'On' if tts_on else 'Off'}",
+            lambda: session.__setitem__("audio_mode", "off" if tts_on else "on"), row=2, emoji="🔊",
+            style=discord.ButtonStyle.success if tts_on else discord.ButtonStyle.secondary)
 
     def _render_critic_screen(self, embed: discord.Embed):
         """The session's critic: its mode beside Back, how it reads, the seats it screens, and

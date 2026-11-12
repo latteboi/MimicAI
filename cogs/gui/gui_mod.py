@@ -1309,12 +1309,25 @@ async def trace_signature(cog, message: discord.Message) -> str:
                 "signature in it was copied and says nothing about the words beside it.")
     root = getattr(cog.fernet, "signing", None)
     found = root and signatures.read(root, message.guild.id if message.guild else 0, message.content)
+    unreadable = ("That message carries no signature this instance can read: it was sent before "
+                  "signatures, is a placeholder, or was signed with another key.")
     if not found:
-        return ("That message carries no signature this instance can read: it was sent before "
-                "signatures, is a placeholder, or was signed with another key.")
+        return unreadable
     user_id, pid = found
+    # The token carries no check of its own: one made with another key still reads as a
+    # well-formed answer about 2% of the time. Discord settles it. A misread's user ID is
+    # a random number, and about one in a billion of those is an account.
+    note = ""
+    try:
+        cog.bot.get_user(user_id) or await cog.bot.fetch_user(user_id)
+    except discord.NotFound:
+        return unreadable
+    except discord.HTTPException:
+        # No `-# `: this also lands in an embed field, which shows the marker as typed.
+        note = ("\n⚠️ Discord could not confirm that account just now, so this is unverified: "
+                "a signature made with another key reads as an answer about 2% of the time. Try again.")
     what = await asyncio.to_thread(cog.profile_manager.describe_signature, user_id, pid)
-    return f"**Ran by:** <@{user_id}> ({user_id})\n**Profile:** `{pid}` -- {what}"
+    return f"**Ran by:** <@{user_id}> ({user_id})\n**Profile:** `{pid}` -- {what}{note}"
 
 
 class ModTraceModal(ui.Modal, title="Trace a Message"):

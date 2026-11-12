@@ -6,7 +6,7 @@ from typing import Dict, Optional
 
 from ...utils.constants import (
     PLACEHOLDER_EMOJI, DEFAULT_WHISPER_INJECTION,
-    SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, WHISPER_WAITING_NOTICE,
+    SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, WHISPER_WAITING_NOTICE, is_guild_admin,
 )
 from ...utils.helpers import (_format_citation_subtext, _format_history_entry, _get_user_hash,
                              _resolve_zoneinfo, restamp_turn, server_context_guild,
@@ -14,7 +14,7 @@ from ...utils.helpers import (_format_citation_subtext, _format_history_entry, _
 from . import tool_loop
 from .reply import ReplyText, reply_gen_config
 from ...gui.gui_sessions import WhisperActionView, WhisperCancelView
-from ...managers.session_manager import intern_turn
+from ...managers.session_manager import feature_allowed, feature_refusal, intern_turn
 from ...gui.base_components import dismissible, text_embed
 
 
@@ -326,6 +326,10 @@ class WhisperMixin:
 
         if not session:
             await interaction.response.send_message(embed=text_embed("Session not found."), ephemeral=True)
+            return
+        # A regenerated whisper is a new one; /whisper asks the same before sending.
+        if not feature_allowed(session, "whispers", is_guild_admin(interaction.user)):
+            await interaction.response.send_message(embed=text_embed(feature_refusal(session, "whispers")), ephemeral=True)
             return
 
         # Cancelled, the card goes back to the reply it was showing, its buttons with it.

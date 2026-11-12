@@ -2234,7 +2234,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     # image round: the message still reaches the round as
                                     # an ordinary turn.
                                     batched_image_prompt = image_command_prompt(msg.typed)
-                                    if batched_image_prompt:
+                                    if batched_image_prompt and self._may_draw(session, channel_id, msg.author_id):
                                         session['pending_image_gen_data'] = {
                                             'prompt': batched_image_prompt,
                                             'anchor_message': trigger
