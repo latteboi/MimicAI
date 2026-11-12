@@ -20,6 +20,8 @@ from ..utils.constants import (BLACKLIST_FILE_PATH, BLACKLIST_FORMAT_VERSION,
 #: disk. Every webhook path must tell this apart from Unknown Message (10008), which is
 #: an ordinary outcome when editing or deleting and belongs to the caller.
 UNKNOWN_WEBHOOK = 10015
+#: `run_webhook`'s signer was not passed at all, as against passed as None.
+_NO_SIGNER = object()
 
 try:
     import orjson as json
@@ -652,7 +654,16 @@ class ServerManager:
         Unknown Webhook (10015) is the only error retried, and only once, against a
         freshly created one; Unknown Message (10008) is a normal result of editing or
         deleting something a child bot owns and must reach the caller unchanged.
+
+        A send or edit carrying `content` must say whose it is: `signer=(owner_id,
+        profile_name)`, or `signer=None` for a placeholder. Left out, it raises rather
+        than post a message with no signature, or erase one with the edit.
         """
+        signer = kwargs.pop("signer", _NO_SIGNER)
+        if op in ("send", "edit_message") and isinstance(kwargs.get("content"), str):
+            if signer is _NO_SIGNER:
+                raise TypeError(f"run_webhook({op!r}) with content needs signer=")
+            kwargs["content"] = self.cog.profile_manager.signed(channel, signer, kwargs["content"])
         for attempt in (0, 1):
             webhook = await self._get_or_create_webhook(channel, force_refresh=bool(attempt))
             if webhook is None:

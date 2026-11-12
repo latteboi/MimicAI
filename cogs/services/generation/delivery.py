@@ -3,7 +3,7 @@ import uuid
 import asyncio
 import discord
 import traceback
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from ...utils.constants import PLACEHOLDER_EMOJI, PROFILE_MESSAGE_MAX_LENGTH
 from ...utils.helpers import (_split_into_sentences_with_abbreviations, _yield_message_chunks,
@@ -27,7 +27,8 @@ class DeliveryMixin:
                                    profile_owner_id_for_appearance: Optional[int] = None,
                                    profile_name_for_appearance: Optional[str] = None,
                                    file: Optional[discord.File] = None,
-                                   bypass_typing: bool = False
+                                   bypass_typing: bool = False,
+                                   signer: Optional[Tuple[int, str]] = None
                                    ) -> List[discord.Message]:
         """Sends `content` as the profile, and sends it again without `file` if Discord
         refuses the file as too large.
@@ -35,13 +36,18 @@ class DeliveryMixin:
         The file only ever rides the first message, so a refusal means nothing has posted
         and the second send duplicates nothing. Without it the refusal escaped and took the
         text with it: a voice line past the server's upload limit lost the reply it read.
+
+        Every message is signed as `signer`, (owner ID, profile name), which defaults to
+        the appearance profile: a caller showing a borrow's source names the borrow here.
         """
+        if signer is None and profile_owner_id_for_appearance is not None and profile_name_for_appearance:
+            signer = (profile_owner_id_for_appearance, profile_name_for_appearance)
         kwargs = dict(embeds=embeds, reply_to=reply_to, mention_user=mention_user,
                       store_prompt_for_id=store_prompt_for_id,
                       target_message_to_edit=target_message_to_edit,
                       profile_owner_id_for_appearance=profile_owner_id_for_appearance,
                       profile_name_for_appearance=profile_name_for_appearance,
-                      bypass_typing=bypass_typing)
+                      bypass_typing=bypass_typing, signer=signer)
         # Only a character's own line counts: a plain notice the bot is barred from says
         # nothing about the webhook its characters speak through.
         refusal_key = (None, channel.id) if profile_name_for_appearance else None
@@ -71,7 +77,8 @@ class DeliveryMixin:
                                          profile_owner_id_for_appearance: Optional[int] = None,
                                          profile_name_for_appearance: Optional[str] = None,
                                          file: Optional[discord.File] = None,
-                                         bypass_typing: bool = False # [NEW] Flag to skip delays
+                                         bypass_typing: bool = False, # [NEW] Flag to skip delays
+                                         signer: Optional[Tuple[int, str]] = None
                                          ) -> List[discord.Message]:
 
         if not content.strip() and target_message_to_edit:
@@ -82,6 +89,8 @@ class DeliveryMixin:
             return []
 
         is_placeholder = (content == f"{PLACEHOLDER_EMOJI}")
+        if is_placeholder:
+            signer = None   # nothing of the character's: the reply that replaces it is signed
 
         # Seeded before the appearance block, which is the only place they were bound.
         # A caller that passes no profile -- the unrestricted-in-general-channel refusal
@@ -169,9 +178,9 @@ class DeliveryMixin:
                 content += "\n​"
 
         if is_realistic_typing and isinstance(channel, (discord.TextChannel, discord.Thread)) and content != f"{PLACEHOLDER_EMOJI}":
+            webhook = self.cog.server_manager.run_webhook
             try:
-                webhook_to_use = await self.cog.server_manager._get_or_create_webhook(channel)
-                if not webhook_to_use:
+                if not await self.cog.server_manager._get_or_create_webhook(channel):
                     raise ValueError("Could not get webhook for realistic typing.")
 
                 typing_mode = "sentence"
@@ -181,19 +190,8 @@ class DeliveryMixin:
                     p_config = self.cog.profile_manager._get_profile_config(profile_owner_id_for_appearance, profile_name_for_appearance, is_borrowed) or {}
                     typing_mode = p_config.get("typing_mode", "sentence")
 
-                chunks = _split_into_sentences_with_abbreviations(content)
-
-                # The marker rides every chunk except the last, and the last edit is
-                # what removes it. Indexed rather than compared against len(chunks)-1
-                # because the loop skips whitespace-only chunks, and a trailing one
-                # would otherwise leave the emoji on a finished message forever.
-                last_chunk_index = max(
-                    (n for n, c in enumerate(chunks) if c.strip()), default=-1)
                 cursor_room = typing_cursor_cost(cursor_mode, cursor_emoji)
-
-                displayed_text = ""
                 last_edit_time = 0
-                sent_message = None
 
                 try:
                     typing_cps_float = float(typing_cps)
@@ -204,70 +202,63 @@ class DeliveryMixin:
                     typing_max_delay_float = float(typing_max_delay)
                 except: typing_max_delay_float = 2.5
 
-                for i, chunk in enumerate(chunks):
-                    if not chunk.strip():
-                        continue
+                # The standard send's parts, so no sentence outgrows a message: typing paces
+                # the sentences inside each part. The marker rides every step but a part's
+                # last, and that last edit is what removes it.
+                for part in _yield_message_chunks(content, PROFILE_MESSAGE_MAX_LENGTH - cursor_room):
+                    sentences = [s for s in _split_into_sentences_with_abbreviations(part) if s.strip()]
+                    displayed_text = ""
+                    sent_message = None
+                    for n, chunk in enumerate(sentences):
+                        delay = max(0.5, min(len(chunk) / typing_cps_float, typing_max_delay_float))
+                        await asyncio.sleep(delay)
 
-                    delay = max(0.5, min(len(chunk) / typing_cps_float, typing_max_delay_float))
-                    await asyncio.sleep(delay)
-
-                    separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
-
-                    if len(displayed_text) + len(separator) + len(chunk) > PROFILE_MESSAGE_MAX_LENGTH - cursor_room:
-                        # This chunk starts a second message, so the one being left
-                        # behind is finished -- strip its marker now or it keeps a
-                        # "still typing" emoji nothing will ever come back to remove.
-                        if sent_message is not None and cursor_room and displayed_text:
-                            try:
-                                await webhook_to_use.edit_message(sent_message.id,
-                                                                  content=displayed_text)
-                            except Exception:
-                                pass
-                        displayed_text = chunk
-                        sent_message = None
-                    else:
+                        separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
                         displayed_text += separator + chunk
+                        wire_text = displayed_text if n == len(sentences) - 1 else apply_typing_cursor(
+                            displayed_text, cursor_mode, cursor_emoji)
 
-                    wire_text = displayed_text if i == last_chunk_index else apply_typing_cursor(
-                        displayed_text, cursor_mode, cursor_emoji)
+                        if sent_message is None:
+                            first = not sent_messages_list
+                            send_kwargs = {
+                                "content": wire_text,
+                                "username": custom_display_name_to_use,
+                                "avatar_url": custom_avatar_url_to_use,
+                                "embeds": embeds if (first and embeds) else [],
+                                "wait": True
+                            }
+                            if first and file: send_kwargs["file"] = file
+                            if isinstance(channel, discord.Thread): send_kwargs["thread"] = channel
 
-                    if not sent_message:
-                        send_kwargs = {
-                            "content": wire_text,
-                            "username": custom_display_name_to_use,
-                            "avatar_url": custom_avatar_url_to_use,
-                            "embeds": embeds if (i == 0 and embeds) else [],
-                            "wait": True
-                        }
-                        if i == 0 and file: send_kwargs["file"] = file
-                        if isinstance(channel, discord.Thread): send_kwargs["thread"] = channel
+                            if first and target_message_to_edit:
+                                try: await target_message_to_edit.delete()
+                                except: pass
 
-                        if i == 0 and target_message_to_edit:
-                            try: await target_message_to_edit.delete()
-                            except: pass
+                            try:
+                                sent_message = await webhook(channel, "send", signer=signer, **send_kwargs)
+                            except RuntimeError as e:
+                                if "Session is closed" in str(e): return sent_messages_list
+                                raise
+                            if sent_message is None:
+                                raise ValueError("The channel's webhook went away mid-reply.")
+                            sent_messages_list.append(sent_message)
+                            if first and store_prompt_for_id:
+                                self.cog.message_id_to_original_prompt[sent_message.id] = store_prompt_for_id
+                            last_edit_time = time.monotonic()
+                        else:
+                            now = time.monotonic()
+                            if now - last_edit_time < 1.5:
+                                await asyncio.sleep(1.5 - (now - last_edit_time))
 
-                        try:
-                            sent_message = await webhook_to_use.send(**send_kwargs)
-                        except RuntimeError as e:
-                            if "Session is closed" in str(e): return sent_messages_list
-                            raise
-                        sent_messages_list.append(sent_message)
-                        if i == 0 and store_prompt_for_id:
-                            self.cog.message_id_to_original_prompt[sent_message.id] = store_prompt_for_id
-                        last_edit_time = time.monotonic()
-                    else:
-                        now = time.monotonic()
-                        if now - last_edit_time < 1.5:
-                            await asyncio.sleep(1.5 - (now - last_edit_time))
-
-                        try:
-                            await webhook_to_use.edit_message(sent_message.id, content=wire_text)
-                        except RuntimeError as e:
-                            if "Session is closed" in str(e): return sent_messages_list
-                            print(f"Typing edit failed: {e}")
-                        except Exception as e:
-                            print(f"Typing edit failed: {e}")
-                        last_edit_time = time.monotonic()
+                            try:
+                                await webhook(channel, "edit_message", sent_message.id,
+                                              content=wire_text, signer=signer)
+                            except RuntimeError as e:
+                                if "Session is closed" in str(e): return sent_messages_list
+                                print(f"Typing edit failed: {e}")
+                            except Exception as e:
+                                print(f"Typing edit failed: {e}")
+                            last_edit_time = time.monotonic()
 
                 return sent_messages_list
             except asyncio.CancelledError:
@@ -289,23 +280,17 @@ class DeliveryMixin:
 
                     # If we already sent a partial message, edit it to show the full text instead of double sending
                     if sent_messages_list:
-                        await webhook_to_use.edit_message(sent_messages_list[0].id, content=content)
+                        await webhook(channel, "edit_message", sent_messages_list[0].id,
+                                      content=content, signer=signer)
                     else:
-                        sent_msg = await webhook_to_use.send(**send_kwargs)
-                        sent_messages_list.append(sent_msg)
+                        sent_msg = await webhook(channel, "send", signer=signer, **send_kwargs)
+                        if sent_msg:
+                            sent_messages_list.append(sent_msg)
                 except RuntimeError as e:
                     if "Session is closed" not in str(e):
                         print(f"Failed to flush realistic typing on cancel: {e}")
                 except Exception as flush_err:
                     print(f"Failed to flush realistic typing on cancel: {flush_err}")
-                return sent_messages_list
-            except asyncio.CancelledError:
-                # Discard cleanly if cancelled during placeholder setup without forcing un-sent text
-                if not is_placeholder and sent_messages_list and webhook_to_use:
-                    try:
-                        await webhook_to_use.edit_message(sent_messages_list[0].id, content=content)
-                    except Exception:
-                        pass
                 return sent_messages_list
             except Exception as e:
                 if file and upload_too_large(e):
@@ -361,7 +346,7 @@ class DeliveryMixin:
                     # run_webhook, not a bare send: a webhook deleted in the server used to
                     # send every profile here permanently, under the bot's own name.
                     sent_message_part = await self.cog.server_manager.run_webhook(
-                        channel, "send", **send_kwargs)
+                        channel, "send", signer=signer, **send_kwargs)
                 except RuntimeError as e:
                     if "Session is closed" in str(e): return sent_messages_list
                     print(f"Webhook send failed, falling back to regular message. Error: {e}")
@@ -375,6 +360,8 @@ class DeliveryMixin:
                     sent_message_part = None
 
             if not sent_message_part:
+                # Signed here too: run_webhook signs only what it sends.
+                final_content_for_send = self.cog.profile_manager.signed(channel, signer, final_content_for_send)
                 try:
                     if current_target_to_edit:
                         try:
@@ -413,7 +400,7 @@ class DeliveryMixin:
                     "payload": {
                         "action": "send_message", "channel_id": channel.id,
                         "content": warning_text, "realistic_typing": False,
-                        "reply_to_id": None, "ping": False,
+                        "reply_to_id": None, "ping": False, "signer": (owner_id, profile_name),
                         "correlation_id": corr_id if (turn_object and session) else None
                     }
                 })

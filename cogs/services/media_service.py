@@ -596,7 +596,8 @@ class MediaService:
                             "typing_mode": profile_settings.get("typing_mode", "sentence"),
                             "typing_cursor": typing_cursor_mode,
                             "typing_cursor_emoji": typing_cursor_emoji,
-                            "reply_to_id": reply_id, "ping": should_ping
+                            "reply_to_id": reply_id, "ping": should_ping,
+                            "signer": (package['effective_profile_owner_id'], package['effective_profile_name'])
                         }
                         if image_file_to_send:
                             # Hand over the path; execute_send opens it. Encoding a
@@ -630,7 +631,8 @@ class MediaService:
                             source_payload = {
                                 "action": "send_message", "channel_id": channel.id,
                                 "content": source_msg, "realistic_typing": False,
-                                "reply_to_id": None, "ping": False
+                                "reply_to_id": None, "ping": False,
+                                "signer": (package['effective_profile_owner_id'], package['effective_profile_name'])
                             }
                             await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": source_payload})
                         else:

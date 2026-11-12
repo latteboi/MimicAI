@@ -2113,9 +2113,9 @@ CONTENT_CAPABILITY_DENIALS = {
     ("global_chat", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
     ("global_chat", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
     ("global_chat", CONTENT_RATING_ADULT): "A Global Chat can be opened in any channel, and none of them is guaranteed age-restricted, so Adult profiles cannot be used here.",
-    ("share", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Only the bot operator can clear it.",
-    ("publish", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Only the bot operator can clear it.",
-    ("global_chat", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Only the bot operator can clear it.",
+    ("share", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Its Content Safety page in `/profile manage` says why, and what you can do.",
+    ("publish", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Its Content Safety page in `/profile manage` says why, and what you can do.",
+    ("global_chat", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Its Content Safety page in `/profile manage` says why, and what you can do.",
 }
 
 # What the rating means for placement, phrased as the consequence rather than a second
@@ -2799,7 +2799,11 @@ DISCORD_MAX_MESSAGE_LENGTH = 2000
 # "Authored by". Every message a profile sends stops short of Discord's limit by its
 # length at the longest id, so any one of them can be edited and take it.
 EDIT_ATTRIBUTION = "\n\n||-# Edited by <@{id}> ({id}).||"
-PROFILE_MESSAGE_MAX_LENGTH = DISCORD_MAX_MESSAGE_LENGTH - len(EDIT_ATTRIBUTION.format(id=2**64 - 1))
+#: A space and the 64-character message signature (`signatures.attach`), which every
+#: message a profile sends ends with, edited or not.
+SIGNATURE_ROOM = 65
+PROFILE_MESSAGE_MAX_LENGTH = (DISCORD_MAX_MESSAGE_LENGTH - len(EDIT_ATTRIBUTION.format(id=2**64 - 1))
+                              - SIGNATURE_ROOM)
 PERSONA_TEXT_INPUT_MAX_LENGTH = 4000
 AI_INSTRUCTIONS_PART_MAX_LENGTH = 4000
 

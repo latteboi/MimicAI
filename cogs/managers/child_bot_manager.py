@@ -18,7 +18,7 @@ from ..utils.constants import (
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS, PROFILE_MESSAGE_MAX_LENGTH,
 )
 from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
-                             apply_typing_cursor, attachment_mime, image_command_prompt, image_rag_enabled,
+                             _yield_message_chunks, apply_typing_cursor, attachment_mime, image_command_prompt, image_rag_enabled,
                              typing_cursor_cost, upload_too_large)
 from ..utils.attachment_limits import over_attachment_limit
 from ..utils.http_client import get_capped, get_shared_client
@@ -578,6 +578,21 @@ class ChildBotManager:
             self.typing_tasks[task_key].cancel()
             self.typing_tasks.pop(task_key, None)
 
+    def _signer(self, bot_id: str, payload: Dict[str, Any]) -> Optional[Tuple[int, str]]:
+        """Whose a child bot's message is, for its signature: the seat the producer names
+        (`payload["signer"]`, owner ID and profile name -- a borrower's seat on someone
+        else's bot), else the profile the bot speaks as. An explicit `"signer": None` is a
+        placeholder or status line, which says nothing of the character's: unsigned."""
+        if "signer" in payload and payload["signer"] is None:
+            return None
+        owner_id, name = payload.get("signer") or (None, None)
+        if owner_id is not None and name:
+            return int(owner_id), name
+        cfg = self.cog.child_bots.get(str(bot_id)) or {}
+        if cfg.get("owner_id") and cfg.get("profile_name"):
+            return cfg["owner_id"], cfg["profile_name"]
+        return None
+
     async def execute_send(self, bot_id: str, payload: Dict[str, Any]) -> List[discord.Message]:
         channel_id = payload.get("channel_id")
         task_key = (str(bot_id), channel_id)
@@ -613,6 +628,11 @@ class ChildBotManager:
         except Exception:
             return []
 
+        signer = self._signer(bot_id, payload)
+
+        def wire(text: str) -> str:
+            return self.cog.profile_manager.signed(channel, signer, text)
+
         file_to_send = None
         if attachment_data:
             # Three accepted shapes, cheapest first. `path` and `data` exist because
@@ -643,6 +663,8 @@ class ChildBotManager:
             # Handle attachment-only delivery with no text body
             if not content.strip() and file_to_send:
                 kwargs = {"file": file_to_send}
+                if token := wire(""):
+                    kwargs["content"] = token
                 if reply_to_id:
                     try:
                         ref_msg = await channel.fetch_message(reply_to_id)
@@ -655,15 +677,10 @@ class ChildBotManager:
                 return sent_messages
 
             if realistic_typing and content.strip():
-                chunks = _split_into_sentences_with_abbreviations(content)
-                # See DeliveryMixin: the marker rides every chunk but the last, and
-                # the final edit is what removes it.
-                last_chunk_index = max(
-                    (n for n, c in enumerate(chunks) if c.strip()), default=-1)
+                # See DeliveryMixin: the standard send's parts, sentences paced inside each,
+                # the marker on every step but a part's last.
                 cursor_room = typing_cursor_cost(cursor_mode, cursor_emoji)
-                displayed_text = ""
                 last_edit_time = 0
-                sent_message = None
 
                 try:
                     typing_cps_float = float(typing_cps)
@@ -677,72 +694,50 @@ class ChildBotManager:
                 except Exception:
                     typing_max_delay_float = 2.5
 
-                for i, chunk in enumerate(chunks):
-                    if not chunk.strip():
-                        continue
+                for part in _yield_message_chunks(content, PROFILE_MESSAGE_MAX_LENGTH - cursor_room):
+                    sentences = [c for c in _split_into_sentences_with_abbreviations(part) if c.strip()]
+                    displayed_text = ""
+                    sent_message = None
+                    for n, chunk in enumerate(sentences):
+                        delay = max(0.5, min(len(chunk) / typing_cps_float, typing_max_delay_float))
+                        await asyncio.sleep(delay)
 
-                    delay = max(0.5, min(len(chunk) / typing_cps_float, typing_max_delay_float))
-                    await asyncio.sleep(delay)
-
-                    separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
-                    if len(displayed_text) + len(separator) + len(chunk) > PROFILE_MESSAGE_MAX_LENGTH - cursor_room:
-                        # The message being left behind is finished; strip its marker
-                        # or nothing ever comes back to remove it.
-                        if sent_message is not None and cursor_room and displayed_text:
-                            try:
-                                await sent_message.edit(content=displayed_text)
-                            except Exception:
-                                pass
-                        displayed_text = chunk
-                        sent_message = None
-                    else:
+                        separator = "\n" if typing_mode == "line" and displayed_text else (" " if displayed_text else "")
                         displayed_text += separator + chunk
+                        wire_text = wire(displayed_text if n == len(sentences) - 1 else apply_typing_cursor(
+                            displayed_text, cursor_mode, cursor_emoji))
 
-                    wire_text = displayed_text if i == last_chunk_index else apply_typing_cursor(
-                        displayed_text, cursor_mode, cursor_emoji)
-
-                    kwargs = {"content": wire_text}
-                    if not sent_message:
-                        if i == 0:
-                            if file_to_send:
-                                kwargs["file"] = file_to_send
-                            if reply_to_id:
-                                try:
-                                    ref_msg = await channel.fetch_message(reply_to_id)
-                                    sent_message = await ref_msg.reply(mention_author=ping, **kwargs)
-                                except Exception:
+                        kwargs = {"content": wire_text}
+                        if sent_message is None:
+                            if not sent_messages:
+                                if file_to_send:
+                                    kwargs["file"] = file_to_send
+                                if reply_to_id:
+                                    try:
+                                        ref_msg = await channel.fetch_message(reply_to_id)
+                                        sent_message = await ref_msg.reply(mention_author=ping, **kwargs)
+                                    except Exception:
+                                        sent_message = await channel.send(**kwargs)
+                                else:
                                     sent_message = await channel.send(**kwargs)
                             else:
                                 sent_message = await channel.send(**kwargs)
+                            sent_messages.append(sent_message)
+                            last_edit_time = asyncio.get_running_loop().time()
                         else:
-                            sent_message = await channel.send(**kwargs)
-                        sent_messages.append(sent_message)
-                        last_edit_time = asyncio.get_running_loop().time()
-                    else:
-                        now = asyncio.get_running_loop().time()
-                        if now - last_edit_time < 1.5:
-                            await asyncio.sleep(1.5 - (now - last_edit_time))
-                        try:
-                            await sent_message.edit(content=wire_text)
-                        except Exception:
-                            pass
-                        last_edit_time = asyncio.get_running_loop().time()
+                            now = asyncio.get_running_loop().time()
+                            if now - last_edit_time < 1.5:
+                                await asyncio.sleep(1.5 - (now - last_edit_time))
+                            try:
+                                await sent_message.edit(content=wire_text)
+                            except Exception:
+                                pass
+                            last_edit_time = asyncio.get_running_loop().time()
             else:
-                remaining_content = content
                 first_chunk = True
-                while remaining_content:
-                    # Short of 2000 on purpose, as DeliveryMixin: room for an edit's line.
-                    if len(remaining_content) <= PROFILE_MESSAGE_MAX_LENGTH:
-                        chunk = remaining_content
-                        remaining_content = ""
-                    else:
-                        split_pos = remaining_content.rfind('\n', 0, PROFILE_MESSAGE_MAX_LENGTH)
-                        if split_pos == -1:
-                            split_pos = PROFILE_MESSAGE_MAX_LENGTH
-                        chunk = remaining_content[:split_pos]
-                        remaining_content = remaining_content[split_pos:]
-
-                    kwargs = {"content": chunk}
+                # Short of 2000 on purpose, as DeliveryMixin: room for an edit's line.
+                for chunk in _yield_message_chunks(content, PROFILE_MESSAGE_MAX_LENGTH):
+                    kwargs = {"content": wire(chunk)}
                     if first_chunk:
                         if file_to_send:
                             kwargs["file"] = file_to_send
@@ -850,6 +845,7 @@ class ChildBotManager:
             message = await channel.fetch_message(message_id)
             if not message:
                 return
+            content = self.cog.profile_manager.signed(channel, self._signer(bot_id, payload), content)
             if message.attachments:
                 kept = [a for a in message.attachments if a.content_type and a.content_type.startswith("image/")]
                 await message.edit(content=content, attachments=kept)

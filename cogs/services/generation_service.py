@@ -1976,7 +1976,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             "typing_mode": profile_settings.get("typing_mode", "sentence"),
                             "typing_cursor": typing_cursor_mode,
                             "typing_cursor_emoji": typing_cursor_emoji,
-                            "reply_to_id": reply_id, "ping": should_ping
+                            "reply_to_id": reply_id, "ping": should_ping,
+                            # The seat, which on a borrow is not the bot's own profile.
+                            "signer": (owner_id, profile_name)
                         }
 
                         if file_to_send:
@@ -2018,7 +2020,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if sources_text_list:
                             for source_msg in sources_text_list:
                                 s_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
-                                    "channel_id": channel.id, "content": source_msg,
+                                    "channel_id": channel.id, "content": source_msg, "signer": (owner_id, profile_name),
                                     "realistic_typing": False, "reply_to_id": None, "ping": False
                                 })
                                 if s_msgs:
@@ -2032,6 +2034,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             extra_audio_file.close()
                             a_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
                                 "channel_id": channel.id, "content": "", "realistic_typing": False,
+                                "signer": (owner_id, profile_name),
                                 "attachment": {"filename": extra_audio_file.filename, "path": turn_audio_path}
                             })
                             audio_carriers.extend(a_msgs or [])
@@ -2043,6 +2046,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if thought_file_to_send and thought_text:
                             t_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
                                 "channel_id": channel.id, "content": "", "realistic_typing": False,
+                                "signer": (owner_id, profile_name),
                                 "attachment": {"filename": "thinking_summary.txt", "data": thought_text.encode('utf-8')}
                             })
                             if t_msgs:

@@ -16,6 +16,7 @@ from ...utils.constants import (
     ROUND_URL_MESSAGES_MAX, STICKER_TAG,
 )
 from ...utils.discord_cdn import unsigned_attachment_url
+from ...utils.signatures import unsign
 
 
 def said(message: Any) -> str:
@@ -27,9 +28,12 @@ def said(message: Any) -> str:
     someone's name -- a pin, a join, a boost -- has nothing typed: it says Discord's own
     line for it, tagged as Discord's. Read as typed, it reached the cast as an empty
     message from that person, replying to nothing they could see.
+
+    Without any message signature: ours, on a profile's message replied to, and one
+    pasted into a person's, which a character would otherwise read and repeat.
     """
     if message.type in (discord.MessageType.default, discord.MessageType.reply):
-        text = message.clean_content
+        text = unsign(message.clean_content)
     else:
         try:
             notice = message.system_content

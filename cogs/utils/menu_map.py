@@ -179,7 +179,9 @@ _STATIC_DASHBOARDS = [
         [
             ("Stats", ["Instance-wide usage and model statistics"]),
             ("Profiles", ["Inspect any user's profiles; clear classifier verdicts",
-                          "Reset All Content Ratings (instance-wide, one-off baseline reset)"]),
+                          "Reset All Content Ratings (instance-wide, one-off baseline reset)",
+                          "Trace Message: who ran the character behind a message link, from its signature "
+                          "(the bot owner's View Generation Trace shows it too)"]),
             ("Prompts", ["Override the global system prompts, including CONTENT_POLICY and HELP_MODE_INJECTION",
                          "System Models: the attachment describer, content classifier and profile "
                          "generator (per provider preference), embeddings, System profiles and Gemini "

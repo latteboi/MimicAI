@@ -26,7 +26,7 @@ from ..utils.user_defaults import (
 from ..utils.helpers import is_real_model
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, BORROW_INDEX_FILE, PROFILE_NAME_SIDECAR, CLASSIFIER_KEYS,
-    PID_CLASS_PREFIXES, defaultConfig,
+    PID_CLASS_PREFIXES, PROFILE_MESSAGE_MAX_LENGTH, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
     DEFAULT_ANTI_REPETITION_PROMPT, UTILITY_FALLBACK_KEYS, NO_FALLBACK,
     TTS_VOICE_GENDER, TTS_VOICE_CHARACTER,
@@ -45,7 +45,7 @@ from ..utils.constants import (
     SYSTEM_PROFILE_FALLBACK_MODEL,
     MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED,
     LIMIT_FIXED_EXAMPLES, LIMIT_LORE_ENTRIES, LIMIT_PUBLISHES_PER_DAY, PERSONA_TEXT_INPUT_MAX_LENGTH, )
-from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt,
+from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_model, is_shipped_ltm_prompt, ping_people,
                             ltm_auto_recall_enabled, always_reads_synopsis,
                             grounding_mode_display, resolve_image_output_params,
                             resolve_auto_models, pick_mood_avatar, neuro_levels,
@@ -55,7 +55,7 @@ from ..utils.helpers import (auto_tier, birth_time, image_rag_enabled, is_real_m
                             system_settings, resolve_openrouter_endpoint,
                             resolve_openrouter_service_tier,
                             clean_imported_text, _get_user_hash)
-from ..utils import fixed_examples, lorebook
+from ..utils import fixed_examples, lorebook, signatures
 from ..utils.bonds import apply_updates as apply_bond_updates, describe as describe_bond
 from ..utils.discord_cdn import is_web_url, signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
@@ -2171,6 +2171,67 @@ class ProfileManager:
         if pid is None:
             return owner, None, snapshot or profile_name
         return owner, pid, self._get_name_from_pid(owner, pid) or pid
+
+    def signature_token(self, guild_id: int, owner_id: int, profile_name: str) -> str:
+        """The message signature for `owner_id` running `profile_name` in this server, or
+        "" when there is nothing to sign with (no key, or a pre-PID profile).
+
+        Who ran it, and what: a borrow names its source's PID, which is what would
+        otherwise be lost with the borrow; the borrower is the user ID beside it.
+        """
+        root = getattr(self.cog.fernet, "signing", None)
+        if root is None:
+            return ""
+        pid = self._get_pid_from_name(owner_id, profile_name)
+        if pid and pid[0] in "BC":
+            source = self._borrow_source(owner_id, profile_name)
+            if source and source[1]:
+                pid = source[1]
+        if not self._is_pid(pid):
+            return ""
+        return signatures.sign(root, guild_id, owner_id, pid)
+
+    def signed(self, channel: Any, signer: Optional[Tuple[int, str]], text: Any) -> Any:
+        """`text` as it goes on the wire as `signer`, an (owner ID, profile name) pair: any
+        token in it stripped and that profile's appended. None for a placeholder or status
+        line, which says nothing of the character's and is replaced once the reply lands.
+        """
+        if not isinstance(text, str):
+            return text
+        if signer is None or signer[0] is None or not signer[1]:
+            return signatures.strip(text)
+        guild = getattr(channel, "guild", None)
+        # Its pings too, here and never in the log (`ping_people`); left as typed when a
+        # mention's extra characters would not fit the room every part was cut to.
+        session = self.cog.multi_profile_channels.get(getattr(channel, "id", None)) or {}
+        text = signatures.strip(text)
+        pinged = ping_people(text, session.get("unified_log"), guild)
+        if len(pinged) <= max(len(text), PROFILE_MESSAGE_MAX_LENGTH):
+            text = pinged
+        return signatures.attach(text, self.signature_token(
+            guild.id if guild else 0, int(signer[0]), signer[1]))
+
+    def describe_signature(self, user_id: int, pid: str) -> str:
+        """What a decoded signature's PID names now, for the operator: the runner's own
+        profile, a System profile, the source of one of their borrows, or nothing."""
+        index = self._get_user_index(user_id)
+        for category in ("personal", "borrowed"):
+            for name, own_pid in (index.get(category) or {}).items():
+                if own_pid == pid:
+                    return f"**{name}**, their own ({category})."
+        for name, own_pid in self._system_index().items():
+            if own_pid == pid:
+                return f"**{name}**, a System profile."
+        for name in index.get("borrowed") or {}:
+            source = self._borrow_source(user_id, name)
+            if source and source[1] == pid:
+                return f"**{source[2]}** by <@{source[0]}> ({source[0]}), borrowed as **{name}**."
+        if not os.path.isdir(os.path.join(USERS_DIR, str(user_id))):
+            return ("Nothing, and this bot holds no data for that user: most likely a misread, "
+                    "a token made with a different `ENCRYPTION_KEY` (about 2% of those pass the "
+                    "check), unless they have since deleted their data.")
+        return ("Nothing now: the profile was deleted since, or this is a misread (a token made "
+                "with a different key passes the check about 2% of the time). Not proof either way.")
 
     def _resolve_effective_profile(self, user_id: int, profile_name: str) -> Tuple[int, str]:
         index = self._get_user_index(user_id)
@@ -4895,9 +4956,8 @@ class ProfileManager:
                                  + CONTENT_RATING_REASON_LABELS.get(
                                      verdict_reason, CONTENT_RATING_REASON_FALLBACK) +
                                  ".** This profile is limited to age-restricted channels. "
-                                 "Edit the persona and submit it again from Content Safety, "
-                                 "or contact the bot operator to dispute the "
-                                 "result.").strip()
+                                 "To have it rated again, edit the persona and submit it "
+                                 "from Content Safety.").strip()
 
         # No stale-rating check here: this renders on every dashboard repaint, including
         # the one straight after an edit, where it raced the post-edit prompt and

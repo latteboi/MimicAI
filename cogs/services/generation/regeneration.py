@@ -52,6 +52,8 @@ class RegenerationMixin:
         if not content:
             return
 
+        signer = (participant.get('owner_id'), participant.get('profile_name'))
+
         async def _restore():
             try:
                 if participant.get('method') == 'child_bot':
@@ -59,12 +61,12 @@ class RegenerationMixin:
                         "action": "send_to_child", "bot_id": participant['bot_id'],
                         "payload": {
                             "action": "regenerate_message", "channel_id": channel.id,
-                            "message_id": message_id, "content": content
+                            "message_id": message_id, "content": content, "signer": signer
                         }
                     })
                     return
                 await self.cog.server_manager.run_webhook(
-                    channel, "edit_message", message_id, content=content,
+                    channel, "edit_message", message_id, content=content, signer=signer,
                     attachments=attachments or [])
             except Exception:
                 pass
@@ -222,14 +224,14 @@ class RegenerationMixin:
                     "action": "send_to_child", "bot_id": bot_id,
                     "payload": {
                         "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": payload.message_id, "content": child_emoji
+                        "message_id": payload.message_id, "content": child_emoji, "signer": None
                     }
                 })
             else:
                 try:
                     await self.cog.server_manager.run_webhook(
                         channel, "edit_message", payload.message_id, content=custom_emoji,
-                        attachments=original_attachments)
+                        signer=None, attachments=original_attachments)
                 except Exception: pass
 
             surviving_message_ids = await self._drop_regenerated_follow_ups(
@@ -421,14 +423,15 @@ class RegenerationMixin:
                     "action": "send_to_child", "bot_id": bot_id,
                     "payload": {
                         "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": payload.message_id, "content": safe_text
+                        "message_id": payload.message_id, "content": safe_text,
+                        "signer": (owner_id, profile_name)
                     }
                 })
             else:
                 try:
                     await self.cog.server_manager.run_webhook(
-                        channel, "edit_message", payload.message_id,
-                        content=safe_text, attachments=original_attachments)
+                        channel, "edit_message", payload.message_id, content=safe_text,
+                        signer=(owner_id, profile_name), attachments=original_attachments)
                 except Exception: pass
 
             delivered = True

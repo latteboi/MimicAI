@@ -19,6 +19,7 @@ from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError,
 from .utils.character_card import (CardError, card_portrait, prompt_text, profile_name_for, read_card,
                                    read_examples, read_lorebook)
 from .utils.memory_tuning import low_memory
+from .utils.signatures import unsign
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import (ActionTextInputModal, DropdownContentView, build_confirm_view,
                                   refuse_unregistered, text_embed,
@@ -38,7 +39,7 @@ from .gui.gui_resolve import (
     autocorrect_profile, gather_owned_candidates, gather_participant_candidates,
     suggest_profile,
 )
-from .gui.gui_mod import ModStatsView
+from .gui.gui_mod import ModStatsView, trace_signature
 from .services.generation.turn_deletion import is_visible_turn
 from .managers.storage_manager import MasterCipher, StorageManager
 from .managers.profile_manager import ProfileManager
@@ -2189,7 +2190,14 @@ class MimicCog(EventListeners, commands.Cog):
     async def view_generation_trace(self, interaction: discord.Interaction, message: discord.Message):
         if not self.has_lock or self._refused_by_blacklist(interaction): return
         await interaction.response.defer(ephemeral=True)
-            
+        # The bot owner also reads the message's signature, which outlives the session.
+        signature = (await trace_signature(self, message)
+                     if interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID) else None)
+
+        async def refuse(text: str):
+            await interaction.followup.send(
+                embed=text_embed(f"{signature}\n\n-# {text}" if signature else text), ephemeral=True)
+
         channel_id = message.channel.id
         session = self.multi_profile_channels.get(channel_id)
         unified_log = None
@@ -2206,23 +2214,23 @@ class MimicCog(EventListeners, commands.Cog):
                     break
                     
         if not isinstance(unified_log, list) or not unified_log:
-            await interaction.followup.send(embed=text_embed("Could not find session data for this channel."), ephemeral=True)
+            await refuse("Could not find session data for this channel.")
             return
 
         idx = next((i for i, t in enumerate(unified_log) if message.id in t.get("message_ids", [])), None)
         target_turn = unified_log[idx] if idx is not None else None
 
         if not target_turn or target_turn.get("is_user") is not False:
-            await interaction.followup.send(embed=text_embed("This command can only be used on generated bot messages."), ephemeral=True)
+            await refuse("This command can only be used on generated bot messages.")
             return
 
         if not target_turn.get("meta"):
-            await interaction.followup.send(embed=text_embed("No generation trace data is available for this older message."), ephemeral=True)
+            await refuse("No generation trace data is available for this older message.")
             return
 
         prompt_id = last_user_message_id(unified_log, idx)
         prompt_url = message.channel.get_partial_message(prompt_id).jump_url if prompt_id else None
-        view = GenerationTraceView(self, interaction, target_turn, prompt_url)
+        view = GenerationTraceView(self, interaction, target_turn, prompt_url, signature)
         await interaction.followup.send(embed=view.build_embed(), view=view, ephemeral=True)
 
     # Not `cooldown_unless_refused`: a context menu has no `binding` for it to hand the
@@ -2255,7 +2263,7 @@ class MimicCog(EventListeners, commands.Cog):
             return
         blueprint, branch = self.session_manager.branch_of(session, through)
 
-        name = " ".join(message.clean_content.split())[:80]
+        name = " ".join(unsign(message.clean_content).split())[:80]
         name = f"Branch: {name}" if name else "Branch"
         try:
             thread = None
@@ -2498,7 +2506,10 @@ class MimicCog(EventListeners, commands.Cog):
 
         view = GlobalChatPlayView(self, interaction, user_id, profile_name_lower)
         await view.initialize()
-        await interaction.followup.send(embed=view.get_embed(), view=view)
+        # The card's replies are in its embed, so its signature is the message's whole
+        # content: every later edit rewrites the embed alone, and the token stays.
+        token = self.profile_manager.signed(interaction.channel, (user_id, profile_name_lower), "")
+        await interaction.followup.send(content=token or None, embed=view.get_embed(), view=view)
 
     @app_commands.command(name="viewavatar", description="Displays the avatar of a specified user.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)

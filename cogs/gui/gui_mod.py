@@ -1,6 +1,7 @@
 from ..utils.constants import *
 
 import asyncio
+import re
 import time
 import discord
 from discord import ui
@@ -14,6 +15,7 @@ from ..utils.helpers import (_sanitise_filename, birth_time, is_real_model, prun
                              resolve_openrouter_endpoint, resolve_thinking_params, system_model,
                              system_settings)
 from ..utils.loop_probe import rss_bytes, snapshot as loop_probe_snapshot
+from ..utils import signatures
 from ..utils.user_defaults import auto_wording, model_slot_defaults, other_provider
 from .base_components import (BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
                               add_select, build_confirm_view, invalidate_model_cache)
@@ -1266,6 +1268,69 @@ class ModProfilesModal(ui.Modal, title="Enter User ID"):
         self.parent_view._build_view()
         await i.response.edit_message(embed=self.parent_view._get_embed(), view=self.parent_view)
 
+_MESSAGE_LINK = re.compile(r"https://(?:\w+\.)?discord(?:app)?\.com/channels/(?:\d+|@me)/(\d+)/(\d+)")
+
+
+async def _posted_by_us(cog, message: discord.Message) -> bool:
+    """Whether this bot, one of its channel webhooks or one of its child bots posted
+    `message`. A signature is trusted for that alone: in anyone else's message it was
+    copied, and says nothing about the words beside it."""
+    if message.author.id == cog.bot.user.id or str(message.author.id) in cog.child_bots:
+        return True
+    if not message.webhook_id:
+        return False
+    if message.application_id and message.application_id == cog.bot.application_id:
+        return True
+    try:
+        webhook = await cog.bot.fetch_webhook(message.webhook_id)
+    except discord.HTTPException:
+        return False
+    return webhook.user is not None and webhook.user.id == cog.bot.user.id
+
+
+async def trace_message(cog, link: str) -> str:
+    """`trace_signature` for a pasted message link."""
+    m = _MESSAGE_LINK.search(link or "")
+    if not m:
+        return "That is not a message link. In Discord, open the message's menu and choose Copy Message Link."
+    try:
+        channel = cog.bot.get_channel(int(m[1])) or await cog.bot.fetch_channel(int(m[1]))
+        message = await channel.fetch_message(int(m[2]))
+    except (discord.HTTPException, AttributeError) as e:
+        return f"Could not fetch that message: {e}"
+    return await trace_signature(cog, message)
+
+
+async def trace_signature(cog, message: discord.Message) -> str:
+    """Who ran the character behind `message`, and which profile, from its signature.
+    The bot owner's alone: `/mod` -> Trace Message, or the owner's View Generation Trace."""
+    if not await _posted_by_us(cog, message):
+        return ("That message was not posted by this bot, its webhooks or its child bots. Any "
+                "signature in it was copied and says nothing about the words beside it.")
+    root = getattr(cog.fernet, "signing", None)
+    found = root and signatures.read(root, message.guild.id if message.guild else 0, message.content)
+    if not found:
+        return ("That message carries no signature this instance can read: it was sent before "
+                "signatures, is a placeholder, or was signed with another key.")
+    user_id, pid = found
+    what = await asyncio.to_thread(cog.profile_manager.describe_signature, user_id, pid)
+    return f"**Ran by:** <@{user_id}> ({user_id})\n**Profile:** `{pid}` -- {what}"
+
+
+class ModTraceModal(ui.Modal, title="Trace a Message"):
+    link_input = ui.TextInput(label="Message link", placeholder="https://discord.com/channels/...",
+                              max_length=200)
+
+    def __init__(self, cog):
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, i: discord.Interaction):
+        await i.response.defer(ephemeral=True, thinking=True)
+        await i.followup.send(embed=text_embed(await trace_message(self.cog, self.link_input.value)),
+                              ephemeral=True)
+
+
 #: Why a refusal waits on the operator, as the Review Queue says it.
 _REVIEW_WORDING = {"disputed": "second model disagreed", "unconfirmed": "second model could not answer",
                    "appealed": "owner appealed"}
@@ -1351,6 +1416,11 @@ class ModProfilesView(ModBaseView):
             await i.edit_original_response(embed=self._get_embed(), view=self)
         add_button(self, "Review Queue", refused_cb, style=discord.ButtonStyle.secondary,
                    row=0, emoji="⛔")
+
+        # Who ran the character behind a message, from its signature (MESSAGE_SIGNATURES.md).
+        async def trace_cb(i: discord.Interaction):
+            await i.response.send_modal(ModTraceModal(self.cog))
+        add_button(self, "Trace Message", trace_cb, row=0, emoji="🔍")
 
         if self.refused_rows:
             async def refused_sel(i: discord.Interaction):

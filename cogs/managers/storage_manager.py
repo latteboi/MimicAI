@@ -84,20 +84,24 @@ class MasterCipher:
     Both come from the one ENCRYPTION_KEY, so no deployment changes: HKDF gives the
     AEAD its own independent key from the same 32 bytes rather than borrowing one of
     Fernet's two halves for a second purpose.
+
+    `signing` is those 32 bytes, which `signatures` derives a key per server from. A new
+    ENCRYPTION_KEY leaves every message already posted unreadable to the operator.
     """
 
-    __slots__ = ("fernet", "aead")
+    __slots__ = ("fernet", "aead", "signing")
 
     def __init__(self, key):
         if isinstance(key, str):
             key = key.encode()
         self.fernet = Fernet(key)
+        self.signing = base64.urlsafe_b64decode(key)
         self.aead = AESGCM(HKDF(
             algorithm=hashes.SHA256(),
             length=32,
             salt=None,
             info=b"mimicai:blob:aes256gcm:v1",
-        ).derive(base64.urlsafe_b64decode(key)))
+        ).derive(self.signing))
 
     def encrypt(self, data: bytes) -> bytes:
         return self.fernet.encrypt(data)

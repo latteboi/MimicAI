@@ -6872,8 +6872,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
                 reason = CONTENT_RATING_REASON_LABELS.get(
                     rating.get("reason"), CONTENT_RATING_REASON_FALLBACK)
                 embed.add_field(
-                    name="Reason", value=f"{reason}.\nOnly the bot operator can clear this. "
-                                         "Editing the persona lets you submit again.", inline=False)
+                    name="Reason", value=f"{reason}.\nTo have it rated again, edit the persona "
+                                         "and submit it.", inline=False)
 
         # Why a Pending profile is still pending.
         if verdict == CONTENT_RATING_PENDING:

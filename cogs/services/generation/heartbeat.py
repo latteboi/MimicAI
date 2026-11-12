@@ -77,7 +77,7 @@ class HeartbeatMixin:
         sent = await self.cog.child_bot_manager.execute_send(bot_id, {
             "channel_id": channel_id,
             "content": f"{custom_emoji}\n\n{text}" if text else custom_emoji,
-            "realistic_typing": False
+            "realistic_typing": False, "signer": None,
         })
         if sent:
             return sent[-1].id
@@ -192,7 +192,7 @@ class HeartbeatMixin:
                     "action": "send_to_child", "bot_id": bot_id,
                     "payload": {
                         "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": msg_a_id, "content": f"{child_emoji}\n\n{text}"
+                        "message_id": msg_a_id, "content": f"{child_emoji}\n\n{text}", "signer": None
                     }
                 })
         elif state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
@@ -206,7 +206,7 @@ class HeartbeatMixin:
         elif msg_a_id:
             await self.cog.server_manager.run_webhook(
                 channel, "edit_message", msg_a_id,
-                content=f"{custom_emoji}\n\n{text}")
+                content=f"{custom_emoji}\n\n{text}", signer=None)
 
     async def _await_with_status(self, awaitable, label, channel, participant, state_container):
         """Awaits `awaitable`, naming the step on the turn's placeholder once it passes ten seconds.
@@ -458,12 +458,14 @@ class HeartbeatMixin:
                                 "action": "send_to_child", "bot_id": bot_id,
                                 "payload": {
                                     "action": "regenerate_message", "channel_id": channel.id,
-                                    "message_id": target_msg_id, "content": f"{emoji}\n\n{text}"
+                                    "message_id": target_msg_id, "content": f"{emoji}\n\n{text}",
+                                    "signer": None,
                                 }
                             })
                         else:
                             await self.cog.server_manager.run_webhook(
-                                channel, "edit_message", target_msg_id, content=f"{emoji}\n\n{text}")
+                                channel, "edit_message", target_msg_id, content=f"{emoji}\n\n{text}",
+                                signer=None)
                     except Exception:
                         pass
 

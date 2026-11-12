@@ -19,11 +19,11 @@ from ..utils.content import (
     WELCOME_CHANNEL_HINTS,
 )
 from ..utils.helpers import (
-    _format_history_entry, _get_user_hash, CUSTOM_EMOJI_PATTERN, image_command_prompt,
+    _format_history_entry, _get_user_hash, image_command_prompt,
     is_media_attachment, is_text_attachment,
 )
 from ..services.generation.triggers import (emoji_files, mentioned_seat, referenced_message, reply_record,
-                                            said, sticker_files, sticker_tags)
+                                            said, sticker_files)
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 from ..gui.base_components import text_embed
 
@@ -379,9 +379,9 @@ class EventListeners:
             
             payload = {
                 "id": message.id,
-                "content": "\n".join(part for part in (
-                    CUSTOM_EMOJI_PATTERN.sub(r":\1:", message.content.replace(f"<@{self.bot.user.id}>", "")).strip(),
-                    sticker_tags(message)) if part),
+                # `said`, as every other turn: raw `content` carried each mention as a
+                # Discord ID (`<@123...>`) to the model.
+                "content": said(message),
                 "channel_id": message.channel.id, "guild_id": message.guild.id,
                 "author_id": message.author.id, "author_name": message.author.display_name,
                 "timestamp": message.created_at.isoformat(), "attachments": attachments_data,
@@ -926,7 +926,7 @@ class EventListeners:
             if ch is None:
                 return None, None
             msg = await ch.fetch_message(payload.message_id)
-            return msg.content, None
+            return said(msg), None
         except (discord.NotFound, discord.Forbidden, discord.HTTPException):
             return None, None
 

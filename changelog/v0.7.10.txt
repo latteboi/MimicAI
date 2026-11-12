@@ -1,0 +1,13 @@
+v0.7.10 Beta — 2026-11-12 (UTC)
+Every message a character posts can be traced to who ran it, without a record of who sent what.
+## **Added**
+- **Message signatures.** Every message a character posts now ends with an invisible code that only whoever runs the bot can read, naming the account that ran the character and which profile it was (for a borrowed profile, the original). A reported message can be traced after its session is gone, and nothing is stored to make that possible. It takes 65 of each message's 2,000 characters, so long replies split a little sooner.
+- **Characters can ping people.** A character that writes @name to someone who has spoken in the conversation now pings them, where it used to post as plain text. Their username works too, and so does the ID the character knows them by, which no longer shows up in the channel.
+- **Trace Message** in `/mod` → Profiles, for the bot owner: paste a message link to see who ran the character behind it. The bot owner's View Generation Trace shows the same, even once the session is gone.
+## **Changed**
+- **Terms of Service and Privacy Policy revised, effective 12 November 2026.** The Privacy Policy describes message signatures, and three strikes now suspend an account with no end date, where it said "until we review it".
+- **Content rating verdicts are settled in the bot.** An Adult verdict says to edit the persona and submit it again, and a refused profile's Share, Publish and Global Chat say to open its Content Safety page, where Request Review is. Neither says to contact the bot owner any more.
+- **A message posted before this update at more than 1,869 characters can no longer be edited** with Edit Profile Message: the edit and the signature would not fit.
+## **Fixed**
+- **A very long sentence with realistic typing on is posted once.** A sentence longer than one Discord message was refused, and the whole reply was then posted again after the part already typed. Long sentences are now split like any other reply, by webhook and by child bot.
+- **Someone mentioned alongside a child bot is read by name.** A message that @mentions a child bot reached its character with every other mention as a raw Discord ID; it now reads as typed, like any other message.

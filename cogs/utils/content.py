@@ -584,8 +584,7 @@ HELP_CATEGORIES = {
             "three minutes, a listed or borrowed profile is re-checked automatically and any other is set to Unrated. "
             "Making several edits? Press **Still Editing**: each edit then waits ten minutes instead, so the rating is "
             "settled once, after the last. A bulk edit applies that rule at once rather than asking per profile.\n\n"
-            "**Disputes.** A classifier Adult verdict can only be cleared by the bot operator. Editing the persona lets you "
-            "submit again, which is usually faster."
+            "**Disagree with an Adult verdict?** Edit the persona and submit it again: the new verdict replaces it."
         ),
         "Export, Import and Deletion": (
             "**`/export`** writes selected profiles, and optionally their memories and training examples, to an encrypted "
@@ -981,11 +980,11 @@ DEFAULT_HELP_DOCS = {
         "Declaring 18+ yourself: The Content Safety dashboard has a Declare Adult 18+ action that sets the Adult rating directly. The classifier then checks the profile, on the owner's own API key, for a minor or a real person sexualised -- not to rate it, since a declaration is already Adult -- and the profile runs nowhere until that check is in, and again after each edit. A check that finds one refuses the profile. Like any Adult rating it keeps the profile to age-restricted channels and out of sharing. Withdrawing it returns the profile to Unrated.\n"
         "Refused: A profile the classifier finds sexualises a minor (category MINOR_SAFETY) or a real, identifiable person alive or within living memory (REAL_PERSON) is Refused, which the Terms of Service forbid. A real person counts when the profile names them, describes them unmistakably or uses a photograph of them as its avatar; a fictional character an actor plays does not, nor does satire without sexual content. It runs in no channel, age-restricted included, and cannot be shared, published or used in Global Chat. No edit, 18+ declaration, import or failed re-check moves it; Submit for Re-rating keeps it Refused until a new verdict lands, and is refused while the text is unchanged since the refusal. A second model, the classifier's Fallback (Gemini 3.8 Flash as shipped), is asked whether each such finding holds, with a question for that category alone. If it agrees, the refusal settles itself and strikes the owner. If it disagrees or cannot answer, the profile stays Refused with no strike. A REAL_PERSON refusal then joins the bot operator's Review Queue (/mod -> Profiles), where Uphold strikes it and Clear restores the classifier's own Adult or General verdict for exactly that content, and an owner can send a settled one there with Request Review, once per refusal. A MINOR_SAFETY refusal is never put to a person, and cannot be sent for review: its owner edits the profile and submits it again.\n"
         "No verdict: When the rating model answers with nothing usable -- it blocks the profile, returns no text, or answers in words instead of a verdict -- the classifier's Fallback is asked instead. When no model gives a verdict, the profile is never treated as General or Refused. It stays Pending (a declared 18+ stays unchecked, so it runs nowhere), leaves the Public Library, and joins the bot operator's Review Queue with the reason the model gave, if any. The operator rates it General or Adult, or refuses it, which counts as a strike; a new verdict from the model also settles it. When the provider refused to read the profile at all (Google's block that no setting reaches, or an OpenRouter moderator flagging minors), it joins no queue: it runs nowhere until its owner edits it and a model gives a verdict.\n"
-        "Strikes: Each refusal both models agree on, or the bot operator upholds, is a strike against its owner's account -- once per profile, however often it is resubmitted -- that counts for a year. A refusal awaiting review is none yet. At three, the account is blocked automatically with no end date, until the bot operator lifts it under /mod -> Blacklist. Clearing a refusal removes its strike, not a block it caused. /settings -> About Me shows the account's strike count and when the oldest expires.\n"
+        "Strikes: Each refusal both models agree on, or the bot operator upholds, is a strike against its owner's account -- once per profile, however often it is resubmitted -- that counts for a year. A refusal awaiting review is none yet. At three, the account is blocked automatically with no end date. Clearing a refusal removes its strike, not a block it caused. /settings -> About Me shows the account's strike count and when the oldest expires.\n"
         "What is judged: The profile name, display name, avatar and mood avatar images, library intro, persona, AI instructions, image prompt and lorebook. Never long-term memories, training examples or conversation logs. The avatar is judged as an image; if it cannot be downloaded the text is judged alone rather than the profile being refused.\n"
         "Editing a rated profile: The rating no longer describes the profile, so you are asked whether to re-check it or set it back to Unrated; Unrated also takes it out of the Public Library. If you do not choose within three minutes, a listed or borrowed profile is re-checked automatically and any other is set to Unrated. Still Editing makes each edit wait ten minutes instead, so several edits are rated once, after the last. Every edit of judged text asks: persona, instructions, appearance, mood avatars, intro, image prompt, lorebook entries written, deleted or imported, and a rename. A bulk edit applies the rule at once instead of asking per profile. Publishing, sharing, cloning and opening Global Chat settle a stale rating before trusting it.\n"
         "Why a profile was rated Adult: The dashboard shows a broad category -- 'Explicit sexual content', 'Sexually-focused persona', 'Graphic violence', 'Real-world atrocity' (a real dictator, war criminal or terrorist known for mass killing, such as Hitler), 'Self-harm encouragement', 'Hatred of a real group', 'Abusive towards the user', 'Drug glorification', 'Minor safety' or 'Sexualises a real person' (both Refused), or a generic 'Adult themes' -- and never a description of the persona itself.\n"
-        "Disputing a verdict: Only the bot operator can clear a classifier Adult or Refused verdict, from the mod view of the profile. A refused profile's owner can ask for that review with Request Review on Content Safety, once per refusal -- except a refusal for sexualising a minor, which no person reviews: edit the profile and submit it again. An Adult rating you declared yourself is different -- you can always withdraw that. A clearance is tied to the exact content that was flagged, so it lapses if the persona is edited afterwards.\n"
+        "Disputing a verdict: A classifier Adult verdict is not reviewed on request: edit the profile and submit it again, and the new verdict replaces it. Contacting the bot operator is not a way to dispute a verdict. A refused profile's owner can ask for a review with Request Review on Content Safety, once per refusal -- except a refusal for sexualising a minor, which no person reviews: edit the profile and submit it again. An Adult rating you declared yourself is different -- you can always withdraw that. A clearance is tied to the exact content that was flagged, so it lapses if the persona is edited afterwards.\n"
         "NSFW Gating: A profile rated Adult 18+ is checked against the destination channel before the prompt is sent. For a borrowed profile the rating is taken from the original owner's profile, so a borrower cannot downgrade it.\n"
         "Channel Content Policy: In any channel that is NOT age-restricted, a content policy note is appended to the system instruction asking the model to keep the response suitable for a general audience. This applies to every provider, including OpenRouter, and is editable by the bot operator via `/mod`.\n"
         "Provider Filters: On Google models the harm thresholds follow the destination channel, not the profile: an age-restricted channel sends OFF (the filter stood down), every other channel sends BLOCK_ONLY_HIGH. Google also keeps non-configurable protections against core harms such as child safety, which no threshold reaches. Non-Google providers ignore these thresholds entirely, which is why the content policy note exists.\n"
@@ -1474,7 +1473,7 @@ WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")
 #: Keep this in step with the site. It is the same document, not a summary of one:
 #: shortening a clause here would leave the bot and the website disagreeing about what
 #: the operator has undertaken.
-LEGAL_EFFECTIVE_DATE = "7 November, 2026 (UTC)"
+LEGAL_EFFECTIVE_DATE = "12 November, 2026 (UTC)"
 
 LEGAL_DOCUMENTS = {
     "Terms of Service": {
@@ -1612,7 +1611,7 @@ LEGAL_DOCUMENTS = {
             "A profile refused under Section 7 also counts as a strike against its "
             "owner's account, once per profile, for one year, once the second model "
             "confirms the refusal or the instance owner's review upholds it. At three "
-            "strikes, access is suspended automatically until we review it. Your strike"
+            "strikes, access is suspended automatically, with no end date. Your strike"
             " count is shown in /settings.\n"
             "\n"
             "Access may be suspended for a fixed period or permanently. Whatever the "
@@ -1683,7 +1682,14 @@ LEGAL_DOCUMENTS = {
             "the date, on the review list while it awaits review and, once a refusal is"
             " confirmed or upheld, as a strike.\n"
             "• **Diagnostic Logs:** Status and error lines written by the instance, "
-            "which can include Discord IDs and profile names."
+            "which can include Discord IDs and profile names.\n"
+            "• **Message Signatures:** Every message a profile posts ends with an "
+            "invisible code that only the instance owner can read. It names the Discord "
+            "account that ran the profile and the profile's ID (for a borrowed profile, "
+            "the original's), so a reported message can be traced without a record of "
+            "who sent what. The Software stores nothing for it: the code is part of the "
+            "message in Discord, and stays there until the message is deleted, including "
+            "after you delete your profiles or your account."
         ),
         "4. Third-Party Data Processing": (
             "**AI Providers:** To generate a reply, the Software sends the profile, the "

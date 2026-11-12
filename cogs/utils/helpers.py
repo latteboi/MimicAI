@@ -755,35 +755,6 @@ def is_citation_subtext(content: str) -> bool:
     """
     return bool(content) and bool(_CITATION_SUBTEXT_RE.match(content))
 
-def _format_and_chunk_thought_summary(thought_text: str) -> List[str]:
-    if not thought_text:
-        return []
-
-    header = "> -# Thoughts\n"
-    wrapper_start = "||```\n"
-    wrapper_end = "\n```||"
-
-    # Max length for the raw text inside the block, accounting for wrappers
-    max_len_first = 2000 - len(header) - len(wrapper_start) - len(wrapper_end)
-    max_len_subsequent = 2000 - len(wrapper_start) - len(wrapper_end)
-
-    chunks = []
-    remaining_text = thought_text
-
-    # Handle the first chunk which includes the header
-    if remaining_text:
-        chunk = remaining_text[:max_len_first]
-        remaining_text = remaining_text[max_len_first:]
-        chunks.append(f"{header}{wrapper_start}{chunk}{wrapper_end}")
-
-    # Handle any subsequent chunks without the header
-    while remaining_text:
-        chunk = remaining_text[:max_len_subsequent]
-        remaining_text = remaining_text[max_len_subsequent:]
-        chunks.append(f"{wrapper_start}{chunk}{wrapper_end}")
-
-    return chunks
-
 #: A link URL Context opens: a scheme or a bare `www.`. Also what decides that a message
 #: counts against ROUND_URL_MESSAGES_MAX, so the two cannot disagree.
 URL_FETCH_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+')
@@ -2174,6 +2145,47 @@ def expand_server_emojis(text: str, guild) -> str:
     if not emojis:
         return text
     return _EMOJI_SHORTCODE.sub(lambda m: emojis.get(m.group(1), m.group(0)), text)
+
+
+#: How a transcript shows a person (`_get_user_hash`), as a character may write it to them:
+#: `<@id>`, `@id` or bare. A profile's PID has the same shape and is never in the table.
+_PERSON_ID = re.compile(r"<@!?(A[0-9A-F]{15})>|@?\b(A[0-9A-F]{15})\b")
+_SPEAKER_NAME = re.compile(r"<([^>\r\n]+)> \[ID: ")
+
+
+def ping_people(text: str, log: Optional[List[Dict[str, Any]]], guild=None) -> str:
+    """Each person `text` names the way a character can -- `@name`, `<@name>`, or the ID its
+    transcript shows them by -- written as a Discord mention, the only form that pings.
+
+    Only people who have spoken in `log`: a character pings no one outside the conversation.
+    A name two of them share is left as typed. For the wire alone (`ProfileManager.signed`):
+    stored, `<@id>` would hand the model a Discord ID in every later prompt.
+    """
+    if not text or ("@" not in text and not _PERSON_ID.search(text)):
+        return text
+    uids: Dict[int, Optional[str]] = {}
+    # ponytail: walks the whole log, and only for a message holding an @ or an ID.
+    for turn in reversed(log or ()):
+        pid = str(turn.get("speaker_pid") or "")
+        if turn.get("is_user") and pid.isdigit() and int(pid) not in uids:
+            name = _SPEAKER_NAME.match(turn.get("content") or "")
+            uids[int(pid)] = name.group(1) if name else None
+    if not uids:
+        return text
+    hashes = {_get_user_hash(uid): uid for uid in uids}
+    text = _PERSON_ID.sub(lambda m: f"<@{hashes[m[1] or m[2]]}>" if (m[1] or m[2]) in hashes else m[0], text)
+    people: Dict[str, Optional[int]] = {}
+    for uid, shown in uids.items():
+        member = guild.get_member(uid) if guild is not None else None
+        aliases = {shown} | ({member.name, member.global_name, member.nick, member.display_name} if member else set())
+        for alias in {a.lower() for a in aliases if a}:
+            people[alias] = uid if people.get(alias, uid) == uid else None
+    names = sorted((a for a, uid in people.items() if uid), key=len, reverse=True)
+    if not names:
+        return text
+    alt = "|".join(map(re.escape, names))
+    return re.sub(rf"<@!?({alt})>|(?<![\w<])@({alt})(?!\w)",
+                  lambda m: f"<@{people[(m[1] or m[2]).lower()]}>", text, flags=re.IGNORECASE)
 
 
 def server_context_block(channel) -> Optional[str]:

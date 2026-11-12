@@ -3182,12 +3182,14 @@ class GenerationTraceView(BlockedGuard, ui.View):
     _PAGE_ROOM = 3900
 
     def __init__(self, cog, interaction: discord.Interaction, turn: dict,
-                 prompt_url: Optional[str] = None):
+                 prompt_url: Optional[str] = None, signature: Optional[str] = None):
         super().__init__(timeout=300)
         self.cog = cog
         self.original_interaction = interaction
         self.turn = turn
         self.prompt_url = prompt_url
+        #: `trace_signature`'s answer, handed in only when the bot owner opened the trace.
+        self.signature = signature
         owner = turn.get("owner_id")
         self.is_owner = owner is not None and str(owner) == str(interaction.user.id)
         self.page = "summary"
@@ -3263,6 +3265,8 @@ class GenerationTraceView(BlockedGuard, ui.View):
             if self.prompt_url:
                 embed.description = f"[Latest user message before this reply]({self.prompt_url})"
             add_generation_fields(embed, self.cog, self.turn)
+            if self.signature:
+                embed.add_field(name="Signature (bot owner only)", value=self.signature[:1024], inline=False)
         return embed
 
 

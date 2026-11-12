@@ -16,6 +16,7 @@ from ...utils.helpers import (
     split_turn, suppress_link_previews, tighten_line_spacing,
 )
 from ...managers.session_manager import intern_turn
+from ...utils.signatures import unsign
 from . import tool_loop
 from ...gui.base_components import text_embed
 
@@ -23,6 +24,7 @@ from ...gui.base_components import text_embed
 #: What the channel shows around a message's share of a reply but the log does not keep:
 #: the mention a "mention" response mode puts first, and a /speak or edit credit line.
 _LEADING_MENTION = re.compile(r'<@!?\d+> ')
+_MENTION = re.compile(r'<@!?(\d+)>')
 _TRAILING_CREDIT = re.compile(r'\n\n\|\|-# (?:Authored|Directed|Edited) by <@\d+> \(\d+\)\.\|\|\Z')
 
 
@@ -405,14 +407,17 @@ class SpeakAsMixin:
                 "realistic_typing": profile_data_source.get("realistic_typing_enabled", False),
                 "typing_cps": profile_data_source.get("typing_cps", 30.0),
                 "typing_max_delay": profile_data_source.get("typing_max_delay", 2.5),
-                "typing_mode": profile_data_source.get("typing_mode", "sentence")
+                "typing_mode": profile_data_source.get("typing_mode", "sentence"),
+                "signer": (ctx["user_id"], ctx["profile_name"]),
             }
             sent_messages = await self.cog.child_bot_manager.execute_send(ctx["child_bot_id"], payload)
         else:
             sent_messages = await self._send_channel_message(
                 channel, display_message,
                 profile_owner_id_for_appearance=ctx["effective_owner_id"],
-                profile_name_for_appearance=ctx["effective_profile_name"]
+                profile_name_for_appearance=ctx["effective_profile_name"],
+                # Shown as a borrow's source, signed as the borrow: who ran it.
+                signer=(ctx["user_id"], ctx["profile_name"])
             )
 
         if sent_messages and turn_object and session:
@@ -453,13 +458,17 @@ class SpeakAsMixin:
             return None, "That reply is stored in an older format and cannot be edited."
         # Less the spacer a message carrying a file is sent with (`_send_channel_message_once`):
         # str.split() keeps a zero-width space as a word the stored reply never said.
-        shown = _TRAILING_CREDIT.sub("", (message.content or "").removesuffix("\n​"))
-        mention = _LEADING_MENTION.match(shown)
+        posted = _TRAILING_CREDIT.sub("", unsign(message.content or "").removesuffix("\n​"))
+        mention = _LEADING_MENTION.match(posted)
         prefix = mention.group(0) if mention else ""
-        shown = shown[len(prefix):].strip()
-        words = shown.split()
+        posted = posted[len(prefix):].strip()
+        # A ping was written on the way out (`ping_people`): the log holds it as the
+        # character typed it, so it matches any words, and the form shows it by name.
+        names = {user.id: user.display_name for user in message.mentions}
+        shown = _MENTION.sub(lambda m: f"@{names[int(m[1])]}" if int(m[1]) in names else m[0], posted)
+        words = [_MENTION.sub(".+?", re.escape(word)) for word in posted.split()]
         # The first place the reply says these words, should it say them twice.
-        span = re.search(r"\s+".join(map(re.escape, words)), parts[1]) if words else None
+        span = re.search(r"\s+".join(words), parts[1]) if words else None
         if not span:
             return None, "That message holds none of what the character said (a source line or a file), so there is nothing to edit."
         if len(shown) > PROFILE_MESSAGE_MAX_LENGTH:
@@ -492,16 +501,20 @@ class SpeakAsMixin:
             return
 
         display = target["prefix"] + text + edit_attribution(interaction.user.id)
+        # Signed again as the turn's speaker: an edit replaces the whole message, token too.
+        signer = (target["turn"].get("owner_id"), target["turn"].get("profile_name"))
         try:
             if message.webhook_id:
-                if await self.cog.server_manager.run_webhook(channel, "edit_message", message.id, content=display) is None:
+                if await self.cog.server_manager.run_webhook(channel, "edit_message", message.id,
+                                                             content=display, signer=signer) is None:
                     raise RuntimeError("no webhook in this channel")
             elif str(message.author.id) in self.cog.child_bots:
                 # Reports nothing back: a failure is printed by the child bot's manager.
                 await self.cog.child_bot_manager.execute_regenerate(
-                    str(message.author.id), {"channel_id": channel.id, "message_id": message.id, "content": display})
+                    str(message.author.id), {"channel_id": channel.id, "message_id": message.id,
+                                             "content": display, "signer": signer})
             elif message.author.id == self.cog.bot.user.id:
-                await message.edit(content=display)
+                await message.edit(content=self.cog.profile_manager.signed(channel, signer, display))
             else:
                 raise RuntimeError("it was not sent by this bot")
         except (discord.HTTPException, RuntimeError) as e:
