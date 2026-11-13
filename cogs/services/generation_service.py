@@ -11,7 +11,6 @@ import collections
 import itertools
 import datetime
 from typing import Optional
-from zoneinfo import ZoneInfo
 from ..utils.constants import (
     defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS, VARIETY_HINTS,
     WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, TYPING_INDICATOR_SECONDS,
@@ -702,6 +701,18 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             return "Discord refused its last message here"
         return None
 
+    def _grounding_history(self, session, seat, settings, cast_size) -> list:
+        """What a grounding search reads beside its query: the seat's own view of the log,
+        its last ten exchanges at most. From unified_log, never a shadow copy."""
+        stm = min(10, int(settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH)))
+        if stm <= 0:
+            return []
+        pid = self.cog.profile_manager._get_pid_from_name_any(seat['owner_id'], seat['profile_name'])
+        return self.cog.session_manager._build_history_for_participant(
+            session.get("unified_log", []), pid, settings, cast_size or 1,
+            hide_folded=self.cog.session_manager.compaction_enabled(session),
+        )[-(stm * 2):]
+
     async def _multi_profile_worker(self, channel_id: int):
         session = self.cog.multi_profile_channels.get(channel_id)
         if not session: return
@@ -819,7 +830,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if not session.get("is_hydrated"):
                     session = await self.cog.session_manager._ensure_session_hydrated(channel_id, session_type)
 
+                # Bound once for the whole round: discord.py updates a cached channel in
+                # place, so a re-fetch only ever adds the chance of None. None means it left
+                # the cache (deleted, or an archived thread); the round is dropped, the
+                # session kept -- ending one is `_drop_departed_sessions`'s call alone.
                 channel = self.cog.bot.get_channel(channel_id)
+                if channel is None:
+                    print(f"Channel {channel_id} is not in the cache; dropping the round.")
+                    for trigger in all_triggers_for_round:
+                        if trigger is not None: session['task_queue'].task_done()
+                    continue
                 has_gemini = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "gemini")
                 has_openrouter = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "openrouter")
                 
@@ -846,17 +866,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 primary_eager_placeholder = None
                 is_image_gen_round = False
                 image_gen_prompt = ""
-                image_gen_anchor_message = None
                 generated_image_path_for_round = None
                 # [UPDATED] Store tuples of (base_text, url_context_text, media_parts) 
                 new_round_turn_data = [] 
                 round_author_name = "A user"
                 starting_profile_override = None
                 triggering_user_id = session.get("owner_id")
-                
-                # Bind channel for the entire round early to prevent UnboundLocalErrors
-                channel = self.cog.bot.get_channel(channel_id)
-                
+
                 # [NEW] Standardized initialization to prevent UnboundLocalErrors
                 url_media_parts = []
                 pre_generation_warnings = []
@@ -1088,17 +1104,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     wants_rag = (image_rag_enabled(g_profile_settings) if is_image_gen_round
                                  else grounding_mode == "rag")
                     if wants_rag:
-                        g_participant_key = (g_owner_id, g_profile_name)
-                        # Derived from unified_log rather than the shadow chat_sessions copy.
-                        g_stm_length = int(g_profile_settings.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
-                        g_stm_capped = min(10, g_stm_length)
-                        history_for_grounding = []
-                        if g_stm_capped > 0:
-                            g_bot_pid = self.cog.profile_manager._get_pid_from_name_any(g_owner_id, g_profile_name)
-                            history_for_grounding = self.cog.session_manager._build_history_for_participant(
-                                session.get("unified_log", []), g_bot_pid, g_profile_settings, len(profile_order) or 1,
-                                hide_folded=self.cog.session_manager.compaction_enabled(session),
-                            )[-(g_stm_capped * 2):]
+                        history_for_grounding = self._grounding_history(
+                            session, grounding_target_participant, g_profile_settings, len(profile_order))
 
                         # Safety Logic for Grounding
                         g_dynamic_safety_settings = _resolve_safety_settings(channel)
@@ -1206,8 +1213,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     turn_warnings = []
                     if i == 0:
                         turn_warnings.extend(pre_generation_warnings)
-                    
-                    channel = self.cog.bot.get_channel(channel_id)
+
                     api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "gemini")
                     or_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "openrouter")
                     
@@ -1289,19 +1295,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     # Check Image Gen intent vs Profile Toggle
                     if is_image_gen_round and participant_key == generator_profile_key:
-                        if p_settings.get("image_generation_enabled", True):
-                            is_generator = True
-                        else:
-                            # Re-inject prefix if toggle is OFF for the target generator
-                            is_generator = False
-                            initial_round_context = f"!image {image_gen_prompt}\n{initial_round_context}"
+                        is_generator = p_settings.get("image_generation_enabled", False)
 
                     placeholder_message = None
                     response_text = ""
 
                     profile_settings = {} # Initialize to prevent UnboundLocalError
                     t1_start_mono = time.monotonic()
-                    t1_start_utc = datetime.datetime.now(datetime.timezone.utc)
                     self.cog.session_manager._mark_session_accessed(channel_id)
                     participant_key = (participant['owner_id'], participant['profile_name'])
                     
@@ -1320,7 +1320,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     owner_id = participant['owner_id']
                     profile_name = participant['profile_name']
-                    channel = self.cog.bot.get_channel(channel_id)
                     session_key = (channel_id, owner_id, profile_name)
                     attempt = ReplyAttempt()
 
@@ -1353,51 +1352,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     placeholder_message = None
                     response_text = ""
-                    
-                    if session.get('pending_image_gen_data'):
-                        is_image_gen_round = True
-                        image_gen_prompt = session['pending_image_gen_data']['prompt']
-                        image_gen_anchor_message = session['pending_image_gen_data']['anchor_message']
-                        generator_profile_key = participant_key
-                        session['pending_image_gen_data'] = None
-
-                        # This block is crucial to define the generator's variables when triggered mid-round
-                        gen_owner_id, gen_profile_name = generator_profile_key
-                        gen_effective_owner_id, gen_effective_profile_name = self.cog.profile_manager._resolve_effective_profile(gen_owner_id, gen_profile_name)
-                        
-                        gen_appearance_data = self.cog.profile_manager._get_user_appearance(gen_owner_id, gen_profile_name)
-                        if gen_appearance_data.get("custom_display_name"):
-                            generator_display_name = gen_appearance_data["custom_display_name"]
-                        else:
-                            generator_display_name = gen_effective_profile_name
-                    
-                    # Resolve Real-time settings
-                        p_owner_id = participant['owner_id']
-                        p_name = participant['profile_name']
-                        p_index = self.cog.profile_manager._get_user_index(p_owner_id)
-                        p_is_b = p_name in p_index.get("borrowed", [])
-                        p_settings = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_b) or {}
-
-                        if not contents_for_api_call:
-                            contents_for_api_call.append({'role': 'user', 'parts':[self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
-
-                        dynamic_context_for_turn = image_gen_prompt
-
-                        # _get_relevant_ltm_for_prompt reads the recall hold and cooldown off
-                        # this, so it is unified_log itself and never a windowed history.
-                        ltm_recall = await self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, session.get("unified_log", []), owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id,
-                                                                                                   threshold=ltm_auto_threshold(p_settings))
-
-                        # [NEW] Check Image Gen intent vs Profile Toggle
-                        turn_is_image_gen = False
-                        if is_image_gen_round:
-                            if p_settings.get("image_generation_enabled", False):
-                                turn_is_image_gen = True
-                            else:
-                                # Re-inject prefix if toggle is OFF
-                                initial_round_context = f"!image {image_gen_prompt}\n{initial_round_context}"
-
-                        is_generator = turn_is_image_gen and participant_key == generator_profile_key
 
                     try:
                         # No key gate here. The provider-aware gate above already broke out
@@ -1416,7 +1370,42 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             state_container = await self._open_turn_feedback(
                                 session, channel, participant, p_settings)
 
-                        image_gen_error_msg = None
+                        # A `!image` taken in mid-round is drawn here, by the seat it reached,
+                        # as the opening one is before the loop: the seats after see this image.
+                        # Not by a seat that cannot draw: the request stays an ordinary message.
+                        mid_round_image = session.pop('pending_image_gen_data', None)
+                        if mid_round_image and p_settings.get("image_generation_enabled", False):
+                            if generated_image_path_for_round:
+                                # The round's earlier image, posted by its seat already.
+                                try: os.remove(generated_image_path_for_round)
+                                except OSError: pass
+                            is_image_gen_round = is_generator = True
+                            image_gen_prompt = mid_round_image['prompt']
+                            generator_profile_key = participant_key
+                            generator_display_name = speaker_display_name
+                            # Its search, as the opening image's: into the image prompt alone.
+                            if image_rag_enabled(p_settings):
+                                grounded = await self._await_with_status(
+                                    self.cog.tools_service._get_hybrid_grounding_context(
+                                        image_gen_prompt, channel.guild.id,
+                                        self._grounding_history(session, participant, p_settings, len(profile_order)),
+                                        p_settings, owner_id, safety_settings=_resolve_safety_settings(channel),
+                                        is_for_image=True, warning_channel=channel),
+                                    STATUS_SEARCHING_WEB, channel, participant, state_container)
+                                if grounded:
+                                    g_context, g_sources, _, g_warning = grounded
+                                    if g_warning:
+                                        turn_warnings.append(g_warning)
+                                    if g_context:
+                                        image_gen_prompt = self.cog.global_prompts.get(
+                                            "IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING).format(
+                                                prompt=image_gen_prompt, grounding=g_context)
+                                        turn_grounding_sources.extend(g_sources or [])
+                            (generated_image_path_for_round, _,
+                             image_gen_error_msg) = await self._run_image_generation_round(
+                                session, channel, participant_key, image_gen_prompt,
+                                speaker_display_name, participant, state_container,
+                                new_round_turn_data)
 
                         # [NEW] Hybrid STM: Rebuild history dynamically from unified_log.
                         # Whatever this round appended is reserved, so a batch of user
@@ -1436,7 +1425,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         )
 
                         round_context_text = "\n".join([t[0] for t in new_round_turn_data])
-                        dynamic_context_for_turn = (round_context_text + "\n" + "\n".join(responses_this_round)).strip()
+                        dynamic_context_for_turn = (round_context_text + "\n" + "\n".join(
+                            text for _, text in responses_this_round)).strip()
                         
                         if not dynamic_context_for_turn and session.get("unified_log"):
                             # Fallback to the last available turn for vector search context
@@ -1669,21 +1659,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             # its typing indicator expires nine seconds in.
                             await self._update_sending_placeholder(channel, participant.get('method', 'webhook'), participant.get('bot_id'), state_container, t1_start_mono, spawn_after=10.0)
 
-                        t2_end_mono = time.monotonic()
-                        duration = t2_end_mono - t1_start_mono
-                        sent_timestamp = datetime.datetime.now(datetime.timezone.utc) # Approximation
-
-                        timezone_str = profile_settings.get("timezone", "UTC")
-                        main_history_line = _format_history_entry(
-                            speaker_display_name, sent_timestamp, response_text, timezone_str,
-                            entity_id=self.cog.profile_manager._get_profile_id(owner_id, profile_name))
-                        try:
-                            t1_formatted = t1_start_utc.astimezone(ZoneInfo(timezone_str)).strftime('%I:%M:%S %p %Z')
-                        except Exception:
-                            t1_formatted = t1_start_utc.strftime('%I:%M:%S %p UTC')
-                        metadata_line = f"(Thought Initiated: {t1_formatted} | Duration: {duration:.2f}s)"
-                        history_line = f"{main_history_line.strip()}\n{metadata_line}\n"
-
                     except Exception as e:
                         print(f"Multi-profile generation error for '{profile_name}': {e}")
                         traceback.print_exc()
@@ -1785,6 +1760,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     
                     session.setdefault("unified_log", []).append(intern_turn(turn_object))
                     session['last_speaker_key'] = participant_key
+                    # What the seats after this one search their memories with, and the
+                    # speech that voices them hears as the round so far.
+                    if not was_blocked:
+                        responses_this_round.append((speaker_display_name, response_text))
 
                     # Append only. The delivery branches below flush as soon as the
                     # message_ids are known, and the round-end flush backs that up.
@@ -1808,10 +1787,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         if s_model and "none" not in s_model.lower():
                             # 1. Build Contextual Round Transcript
                             round_transcript = ""
-                            for idx, prev_resp in enumerate(responses_this_round[:-1]):
-                                prev_p = profile_order[idx]
-                                prev_app = self.cog.user_appearances.get(str(prev_p['owner_id']), {}).get(prev_p['profile_name'], {})
-                                prev_name = prev_app.get("custom_display_name") or prev_p['profile_name']
+                            for prev_name, prev_resp in responses_this_round[:-1]:
                                 round_transcript += f"{prev_name}: {prev_resp}\n\n"
 
                             # 2. Construct Conditional Markdown Prompt
@@ -2235,10 +2211,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     # an ordinary turn.
                                     batched_image_prompt = image_command_prompt(msg.typed)
                                     if batched_image_prompt and self._may_draw(session, channel_id, msg.author_id):
-                                        session['pending_image_gen_data'] = {
-                                            'prompt': batched_image_prompt,
-                                            'anchor_message': trigger
-                                        }
+                                        session['pending_image_gen_data'] = {'prompt': batched_image_prompt}
 
                                     author_name = msg.author_name
                                     reply_to, reply_media = reply_record(
@@ -2345,34 +2318,33 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         except OSError: pass
                     generated_image_path_for_round = None
 
-                guild_id = self.cog.bot.get_channel(channel_id).guild.id
+                guild_id = channel.guild.id
                 
-                if not was_blocked:
-                    # Each seat that spoke this round, due once it has replied its
-                    # `ltm_creation_interval` since its last memory (LtmCaptureMixin).
-                    for participant in profile_order:
-                        owner_id = participant['owner_id']
-                        profile_name = participant['profile_name']
-                        p_index = self.cog.profile_manager._get_user_index(owner_id)
-                        p_is_borrowed = profile_name in p_index.get("borrowed", [])
-                        p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
+                # Each seat that spoke this round, due once it has replied its
+                # `ltm_creation_interval` since its last memory (LtmCaptureMixin).
+                for participant in profile_order:
+                    owner_id = participant['owner_id']
+                    profile_name = participant['profile_name']
+                    p_index = self.cog.profile_manager._get_user_index(owner_id)
+                    p_is_borrowed = profile_name in p_index.get("borrowed", [])
+                    p_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
 
-                        if not p_settings.get("ltm_creation_enabled", False): continue
-                        if not self._ltm_due(session, participant, p_settings): continue
+                    if not p_settings.get("ltm_creation_enabled", False): continue
+                    if not self._ltm_due(session, participant, p_settings): continue
 
-                        # Offloaded to a background task so a slow summary doesn't block the
-                        # queue. The flag keeps a slow one from being started twice.
-                        async def background_ltm_gen(seat, p_stgs, r_author, g_id, t_user_id):
-                            try:
-                                await self._summarize_and_store_ltm(
-                                    session, seat, p_stgs, g_id, r_author, t_user_id)
-                            except Exception as e:
-                                print(f"Background LTM generation failed for {seat['profile_name']}: {e}")
-                            finally:
-                                seat.pop("_ltm_running", None)
+                    # Offloaded to a background task so a slow summary doesn't block the
+                    # queue. The flag keeps a slow one from being started twice.
+                    async def background_ltm_gen(seat, p_stgs, r_author, g_id, t_user_id):
+                        try:
+                            await self._summarize_and_store_ltm(
+                                session, seat, p_stgs, g_id, r_author, t_user_id)
+                        except Exception as e:
+                            print(f"Background LTM generation failed for {seat['profile_name']}: {e}")
+                        finally:
+                            seat.pop("_ltm_running", None)
 
-                        participant["_ltm_running"] = True
-                        asyncio.create_task(background_ltm_gen(participant, p_settings, round_author_name, guild_id, triggering_user_id))
+                    participant["_ltm_running"] = True
+                    asyncio.create_task(background_ltm_gen(participant, p_settings, round_author_name, guild_id, triggering_user_id))
 
                 # AGGRESSIVE GC: Clear references
                 if 'new_round_content_objects' in locals(): del new_round_content_objects

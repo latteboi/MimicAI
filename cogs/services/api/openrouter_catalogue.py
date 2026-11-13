@@ -26,7 +26,9 @@ Four ways to browse, plus one per model author:
   daily snapshot inside a week. It needs two snapshots to say anything.
 - **Cheapest** is input plus output price per million tokens, free first. Router models
   that price per request (-1) go last.
-- **By author** is each author's models in popularity order.
+- **By author** is each author's models, newest first.
+
+A `:batch` variant is never listed: OpenRouter queues it for later, and a reply cannot wait.
 
 The sync runs in a thread: the full listing is ~700 KB and parses to several MB of dicts,
 of which only a slim record per model is kept.
@@ -52,7 +54,8 @@ TRENDING_MAX_RANK = 150
 USAGE_FLUSH_INTERVAL_SECONDS = 300.0
 
 #: Bumped when ModelInfo's fields change; a saved catalogue in another format is ignored
-#: until the next sync rewrites it, rather than misread positionally.
+#: until the next sync rewrites it, rather than misread positionally. A field appended with
+#: a default needs no bump: an older record reads as the default.
 CATALOGUE_FORMAT = 3
 
 BROWSE_POPULAR = "popular"
@@ -84,6 +87,8 @@ class ModelInfo(NamedTuple):
     #: False for a model that also outputs images or audio. Kept for its price and label,
     #: never listed -- see the module docstring.
     text_only: bool
+    #: Unix time OpenRouter listed it; 0 in a record saved before this was kept.
+    created: int = 0
 
 
 class AuthorInfo(NamedTuple):
@@ -153,9 +158,9 @@ def _open_to_all(info: ModelInfo) -> bool:
 
 
 def _listable(info: ModelInfo) -> bool:
-    """Whether a browse list may show this model: not an alias of one already shown, and
-    text is all it outputs."""
-    return not info.alias_of and info.text_only
+    """Whether a browse list may show this model: not an alias of one already shown, not
+    a batch variant, and text is all it outputs."""
+    return not info.alias_of and info.text_only and not info.id.endswith(":batch")
 
 
 def _author_rows(models: Dict[str, ModelInfo], ids: Iterable[str]) -> List[AuthorInfo]:
@@ -310,6 +315,7 @@ class OpenRouterCatalogue:
                 trains=trains,
                 # Absent reads as text: the listing asked for text output.
                 text_only=set(architecture.get("output_modalities") or ["text"]) == {"text"},
+                created=int(raw.get("created") or 0),
             )
             models[model_id] = info
             popular.append(model_id)
@@ -356,7 +362,8 @@ class OpenRouterCatalogue:
         trending, days = _trending(visible, history)
 
         by_author: Dict[str, List[str]] = {}
-        for model_id in visible:
+        # Newest first; `visible` is in popularity order, so a tie stays in that.
+        for model_id in sorted(visible, key=lambda m: -models[m].created):
             by_author.setdefault(models[model_id].author, []).append(model_id)
         open_ids = frozenset(m for m in visible if _open_to_all(models[m]))
         authors = _author_rows(models, visible)

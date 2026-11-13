@@ -31,7 +31,7 @@ from ..utils import follow_ups
 from ..utils.discord_cdn import unsigned_attachment_url
 from ..utils.helpers import (TURN_TIME_FORMAT, _resolve_zoneinfo, always_reads_synopsis,
                              resolve_grounding_mode, resolve_url_mode, restamp_turn,
-                             turn_posted_at)
+                             split_turn, turn_posted_at)
 from ..services.generation.turn_deletion import branch_log
 from .storage_manager import (UNDECODABLE, IOManager, _atomic_write, _delete_file_shard,
                               _get_compressor, _get_decompressor, quarantine, seal_blob,
@@ -289,6 +289,14 @@ def director_model_config(proactivity: Optional[Dict[str, Any]]) -> Dict[str, An
     chosen = str(pro.get("director_model") or "").strip()
     return {"director_model": None if chosen.lower() in ("", "on", "off") else chosen,
             "director_fallback_model": pro.get("director_fallback_model") or None}
+
+
+def _wrap_private(content: str, tag: str) -> str:
+    """A whisper or private reply with `tag` around its words, inside the speaker's own
+    tags. Split at the first newline instead, `</Name>` stayed in the body and closed
+    ahead of `</tag>`, so the model read (and could echo) crossed tags."""
+    header, body, close = split_turn(content) or ("", content, "\n")
+    return f"{header}<{tag}>\n{body.strip()}\n</{tag}>{close}"
 
 
 _TURN_IDENTITY = re.compile(r'<([^>\r\n]+)> \[ID: ([^\]\r\n]+)\]')
@@ -2134,9 +2142,7 @@ class SessionManager:
                     
             elif turn_type == "whisper":
                 if turn.get("target_pid") == bot_pid:
-                    clean_content = content
-                    header, body = clean_content.split('\n', 1) if '\n' in clean_content else ("", clean_content)
-                    wrapped = f"{header}\n<private_whisper>\n{body.strip()}\n</private_whisper>\n"
+                    wrapped = _wrap_private(content, "private_whisper")
                     if participant_history and participant_history[-1]['role'] == 'user':
                         participant_history[-1]['parts'].append(wrapped)
                     else:
@@ -2144,9 +2150,7 @@ class SessionManager:
                         
             elif turn_type == "private_response":
                 if turn.get("speaker_pid") == bot_pid:
-                    clean_content = content
-                    header, body = clean_content.split('\n', 1) if '\n' in clean_content else ("", clean_content)
-                    wrapped = f"{header}\n<private_response>\n{body.strip()}\n</private_response>\n"
+                    wrapped = _wrap_private(content, "private_response")
                     if participant_history and participant_history[-1]['role'] == 'model':
                         participant_history[-1]['parts'].append(wrapped)
                     else:

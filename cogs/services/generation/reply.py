@@ -39,7 +39,7 @@ _ADVANCED_SAMPLING_KEYS = ("frequency_penalty", "presence_penalty", "repetition_
 
 #: The tags a whispered reply comes back wrapped in, echoing its history. Stripped before
 #: the scrub, which drops these blocks contents and all -- the whole reply, in a whisper.
-_PRIVATE_WRAPPERS = re.compile(r'</?(?:private_response|whisper_context|private_context)>', re.IGNORECASE)
+_PRIVATE_WRAPPERS = re.compile(r'</?(?:private_response|whisper_context|private_whisper)>', re.IGNORECASE)
 
 
 @dataclass
