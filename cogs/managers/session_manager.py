@@ -1754,6 +1754,13 @@ class SessionManager:
         # concurrent users. Rehydration is one shard read; idling on RAM is not free.
         inactive_threshold = 300
 
+        # Only the heap is read below, and most hydration paths (/session config, an
+        # edit or delete in the channel, a reaction) never mark access: such a session
+        # sat hydrated until restart. Queue any hydrated session the heap has never seen.
+        for key, session in self.cog.multi_profile_channels.items():
+            if session.get("is_hydrated") and key not in self.cog.session_last_accessed:
+                self._mark_session_accessed(key)
+
         keys_to_evict = set()
         # Popped but not evicted yet: pushed back once the walk is done, so a later tick
         # looks again. Dropped, the session stayed hydrated until something touched it.

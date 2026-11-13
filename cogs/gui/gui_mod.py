@@ -589,6 +589,9 @@ class ModBlacklistView(ModBaseView):
 #: Read at import, which is boot: close enough for an uptime line.
 _STARTED_AT = time.time()
 
+#: How often an open Stats → Overview repaints itself.
+_OVERVIEW_REFRESH_SECONDS = 30
+
 UNREGISTERED_LABEL = "⚠️ Not registered"
 
 
@@ -717,6 +720,7 @@ class ModStatsView(ModBaseView):
         self._user_rows: Dict[int, Optional[UserRow]] = {}
         self._names: Dict[int, str] = {}
         self._last_active: Dict[int, float] = {}
+        self._refresher: Optional[asyncio.Task] = None
         self._build_view()
 
     # --- reading ------------------------------------------------------------------
@@ -1249,6 +1253,20 @@ class ModStatsView(ModBaseView):
 
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
+        if self._refresher is None:
+            self._refresher = asyncio.create_task(self._refresh_overview())
+
+    async def _refresh_overview(self):
+        """Repaints Overview while it is on screen, until the view stops (timeout, or a tab
+        switch). Everything Overview shows is in memory, so a tick reads no disk."""
+        while not self.is_finished():
+            await asyncio.sleep(_OVERVIEW_REFRESH_SECONDS)
+            if self.is_finished() or self.trail or self.selected_category != "Overview":
+                continue
+            try:
+                await self.original_interaction.edit_original_response(embed=self._get_embed())
+            except discord.HTTPException:
+                return  # the interaction token lapsed (15 minutes) or the panel was dismissed
 
 
 class ModProfilesModal(ui.Modal, title="Enter User ID"):

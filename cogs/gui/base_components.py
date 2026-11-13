@@ -438,6 +438,9 @@ class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             async def callback(i: discord.Interaction):
                 await i.response.defer()
                 await factory(source).update_display()
+                # The view left behind is still live, on the same interaction: unstopped,
+                # its timeout (or a timer, like Stats' refresh) later edits the new tab.
+                target_view.stop()
             return callback
 
         build_tab_nav_bar(target_view, current_tab,
