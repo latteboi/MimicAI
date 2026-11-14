@@ -296,8 +296,8 @@ HELP_CATEGORIES = {
             "session -- it simply has nobody to answer.\n\n"
             "**Config** sets how the round runs. Its dropdown opens each setting on its own screen: **Execution Mode** (sequential or "
             "random turn order), **Master Prompt** (the scene every participant sees), **Features** (who may use whispers, "
-            "the reactions below, `/trigger` and `!image` -- Disabled, Admins only or Everyone, each Admins only until an administrator "
-            "changes it -- and Text-to-Speech, which voices the replies of characters with speech set up), **Response Limit** (replies per round), **Settle Window** and **Anti-Repetition Critic**. Below it, **Cast access** lets an "
+            "the reactions below, `/trigger`, `!image` and Read Reactions -- Disabled, Admins only or Everyone, each Admins only until an administrator "
+            "changes it, bar Read Reactions (Everyone) -- and Text-to-Speech, which voices the replies of characters with speech set up), **Response Limit** (replies per round), **Settle Window** and **Anti-Repetition Critic**. Below it, **Cast access** lets an "
             "administrator open the channel to **Open casting**.\n\n"
             "**Settle Window** is how long a round waits before it reads the channel, so a few quick messages get one reply rather than one "
             "each. The placeholder is already up while it waits. **Quiet gap** (default 3 seconds) is how long the channel has to be quiet "
@@ -329,7 +329,8 @@ HELP_CATEGORIES = {
             "▶️, ⏯️ or 🍿 while the session is a draft -- is taken back off, and so is one the session's Features do not allow you.\n\n"
             "Mute is the useful one for repair work: if a reply took the scene somewhere you did not want, mute it and the characters will "
             "carry on as though it never happened. Skip is the one that is administrators only: it is not turn-local, it silences that "
-            "character in every round until somebody unskips it, and if your reaction comes straight back off, that is why."
+            "character in every round until somebody unskips it, and if your reaction comes straight back off, that is why.\n\n"
+            "**Read Reactions** (on, for everyone, unless Features says otherwise): any other emoji you leave on a message in the session is read by the characters on the next character's turn -- `Sam, Jo reacted 😂 to #38`. It never starts a turn, and nothing is taken back off. Admins only reads administrators' emoji alone; Disabled stops it and clears the reactions already read. Taking a reaction back off before then leaves nothing; after it, the characters have already seen it."
         ),
         "Reactivity and Proactivity": (
             "**Reactivity** decides whether a profile interjects when it is not its turn. Each participant has a **Chance** percentage rolled "
@@ -1124,7 +1125,8 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'I added a profile and it still does not reply.' Fix: If the session was built on the Cast tab it is a draft until 'Start / Update Session' is pressed -- the dashboard footer says which. A session created by `/session swap` is live immediately, so check the profile's reactivity and chance instead."
     ),
     "sessions/session_controls.txt": (
-        "Capabilities: Users can dynamically control the flow of a chat session using specific message reactions, each only where the session's Features allow it (`/session config` -> Config -> Features: Disabled, Admins only or Everyone; Admins only until an administrator changes it, including in sessions made before v0.7.10).\n"
+        "Capabilities: Users can dynamically control the flow of a chat session using specific message reactions, each only where the session's Features allow it (`/session config` -> Config -> Features: Disabled, Admins only or Everyone; Admins only until an administrator changes it, including in sessions made before v0.7.10, bar Read Reactions (Everyone)).\n"
+        "- Read Reactions (any other emoji): The characters read it on the next character's turn, as a line naming who reacted, the emoji and the message's number -- never a turn of its own, and never taken back off. On for everyone by default, in sessions made before it too. Admins only reads administrators' emoji alone; Disabled stops it and clears the reactions already read. A reaction removed before then is never read; one removed after it stays read. Reactions on a regenerated reply are dropped with the old reply.\n"
         "- Regenerate (🔁): Discards that reply and generates a new one from the same context.\n"
         "- Next Speaker (▶️): Gives the participant after that message's author in the cast list one turn.\n"
         "- Speak Again (⏯️): Gives that message's own author one more turn.\n"
@@ -1136,7 +1138,9 @@ DEFAULT_HELP_DOCS = {
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'A reply took the scene in a direction I did not want.' Fix: React with 🔇 to mute that turn. The characters carry on as though it never happened, without deleting the message.\n"
         "- Symptom: 'One character keeps dominating the round.' Fix: React with ❌ on one of its messages to skip it for a while. Administrators only -- if the reaction disappears again, ask one.\n"
-        "- Symptom: 'I reacted and my reaction just disappeared.' Fix: It could not do anything. The session is still a draft (press 'Start / Update Session'), nobody is seated, the profile that wrote the message has left the cast, which 🔁 and ❌ need, or that profile is already skipped by an earlier ❌."
+        "- Symptom: 'I reacted and my reaction just disappeared.' Fix: It could not do anything. The session is still a draft (press 'Start / Update Session'), nobody is seated, the profile that wrote the message has left the cast, which 🔁 and ❌ need, or that profile is already skipped by an earlier ❌.\n"
+        "- Symptom: 'A character mentioned my reaction.' Fix: Read Reactions is on, as it is by default. An administrator can set it to Admins only or Disabled in `/session config` -> Config -> Features.\n"
+        "- Symptom: 'Characters never notice reactions.' Fix: Read Reactions is Disabled, or Admins only and you are not one, or no character has had a turn since. They are read on the next one, 🍿 and `/trigger` rounds included."
         "\n- Symptom: 'A character is still skipped and I cannot unskip it.' Fix: Remove the ❌ that skipped it -- the first one, which the bot copied. Only that one unskips, and someone with Manage Messages can remove another member's. Deleting the message it is on unskips the character too. A skip lasts through a restart; if its message was deleted while the bot was offline, a new ❌ on one of the character's messages takes its place, and removing that one unskips."
         "\n- Symptom: 'A character remembered something that only happened in a branch.' Fix: That is how branches work. A branch forks the conversation, not the character: long-term memories, mood and bonds belong to the profile, in every channel it is seated in."
         "\n- Symptom: 'Branch from Here says I can't create threads.' Fix: It needs what Discord asks of anyone opening a thread there, the Create Public Threads permission in that channel. A forum post can't be branched; a thread inside a text channel can."
@@ -1481,7 +1485,7 @@ WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")
 #: Keep this in step with the site. It is the same document, not a summary of one:
 #: shortening a clause here would leave the bot and the website disagreeing about what
 #: the operator has undertaken.
-LEGAL_EFFECTIVE_DATE = "12 November, 2026 (UTC)"
+LEGAL_EFFECTIVE_DATE = "15 November, 2026 (UTC)"
 
 LEGAL_DOCUMENTS = {
     "Terms of Service": {
@@ -1673,7 +1677,8 @@ LEGAL_DOCUMENTS = {
             "• **Conversation Context:** Unified Chat Session logs, holding the "
             "messages sent in a channel with an active session, by anyone, with the "
             "sender's display name, Discord ID and timestamps; the profiles' replies; "
-            "whispers; and text read from linked pages. Global Chat logs. Both are "
+            "the emoji reactions left on its messages, with the reacting person's "
+            "display name; whispers; and text read from linked pages. Global Chat logs. Both are "
             "retained temporarily to maintain conversation history (Section 5).\n"
             "• **About Me:** Your provider choice, registration date, timezone, "
             "birthday (day and month only), sharing preferences, blocked sharers, "
@@ -1764,8 +1769,9 @@ LEGAL_DOCUMENTS = {
             "Data held in a server's session logs or in other people's profiles cannot "
             "be deleted through /privacy. Deleting one of your messages in Discord "
             "while the bot is online removes it from the session log too, though not "
-            "any long-term memory already written from it. To ask for the removal of "
-            "anything else, contact us (Section 8).\n"
+            "any long-term memory already written from it. Removing a reaction removes "
+            "it from the log only if the characters have not yet read it. To ask for "
+            "the removal of anything else, contact us (Section 8).\n"
             "\n"
             "Users may also export profiles, with their memories and training examples,"
             " as encrypted .mimic files through /export. A passphrase export can be "

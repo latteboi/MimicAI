@@ -24,7 +24,7 @@ from ..utils.attachment_limits import over_attachment_limit
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from .session_manager import NEW_SESSION_COMPACTION
-from ..gui.base_components import text_embed
+from ..gui.base_components import refuse_unregistered, text_embed
 
 MAX_EMOJI_SIZE_BYTES = 256 * 1024  # Discord's limit on an uploaded emoji, app or guild.
 # The placeholder to fall back to when a custom one cannot be made to render on a child.
@@ -79,6 +79,36 @@ class ChildBotManager:
             if self._is_borrow_of(author_id, b_name, original_owner_id, source_pid):
                 return b_name
         return None
+
+    #: What a child bot tells someone it may not speak for here (`_speaker_for`): sent
+    #: to the hub only when the hub lists it (`_refusal`).
+    BORROW_FIRST = ("The owner of this bot's profile is not in this server, and you have not "
+                    "borrowed the profile. Borrow it from `/profile hub` first.")
+    NOT_BORROWABLE = ("The owner of this bot's profile is not in this server, and the profile is "
+                      "not available to borrow, so the bot cannot speak here.")
+
+    def _refusal(self, bot_config: Dict) -> str:
+        listed = self.cog.profile_manager._find_public_entry_id(bot_config['owner_id'], bot_config.get('pid'))
+        return self.BORROW_FIRST if listed else self.NOT_BORROWABLE
+
+    def _speaker_for(self, bot_config: Dict, guild_id: Optional[int],
+                     user_id: Optional[int]) -> Optional[Tuple[int, str]]:
+        """(owner, profile name) this bot speaks as for `user_id` in this server, or None.
+
+        Its owner's own profile while the owner is a member here, or a System profile,
+        which is everyone's. Anywhere else, only `user_id`'s own borrow of it: inviting
+        a child bot must not hand a stranger's server the character it speaks for. A
+        server the parent cannot see counts as one the owner is not in.
+        """
+        owner, name = bot_config['owner_id'], bot_config['profile_name']
+        guild = self.cog.bot.get_guild(guild_id) if guild_id else None
+        if ((guild is not None and guild.get_member(owner))
+                or self.cog.profile_manager._pid_class(bot_config.get('pid')) == "system"):
+            return owner, name
+        if user_id is None:
+            return None
+        borrowed = self._find_borrowed_name_for_owner(user_id, owner, bot_config.get('pid'))
+        return (user_id, borrowed) if borrowed else None
 
     def _profiles_scan_signature(self) -> Tuple:
         """A cheap fingerprint of every profile shard on disk.
@@ -231,6 +261,22 @@ class ChildBotManager:
             except (discord.NotFound, discord.HTTPException):
                 pass
 
+        # The parent's command block lives on its cog, which this tree is outside of: a
+        # blocked user gets nothing here either (`_refused_by_blacklist`).
+        async def refuse_blocked(interaction: discord.Interaction) -> bool:
+            return interaction.user.id not in self.cog.generation_blocked
+        child.tree.interaction_check = refuse_blocked
+
+        # A child invited to a blocked server without the parent never meets
+        # `leave_blocked_guild`, which walks the parent's servers.
+        async def leave_if_blocked(guild: discord.Guild):
+            if guild.id in self.cog.blocked_guilds_leave:
+                try:
+                    await guild.leave()
+                except discord.HTTPException as e:
+                    print(f"[GuildBlock] Child bot {bot_id} could not leave {guild.id}: {e}")
+        child.add_listener(leave_if_blocked, "on_guild_join")
+
         # --- Register Commands ---
         @child.tree.command(name="whoami", description="Displays information about this bot's identity.")
         async def whoami(interaction: discord.Interaction):
@@ -338,6 +384,9 @@ class ChildBotManager:
                 except Exception:
                     await interaction.response.send_message(embed=text_embed("An error occurred while verifying parent bot presence."), ephemeral=True)
                     return
+            # It writes a session the toggling admin owns.
+            if await refuse_unregistered(self.cog, interaction):
+                return
 
             await interaction.response.defer(ephemeral=True)
             correlation_id = str(uuid.uuid4())
@@ -375,6 +424,8 @@ class ChildBotManager:
 
                 async def on_ready_sync():
                     await child.wait_until_ready()
+                    for guild in list(child.guilds):
+                        await leave_if_blocked(guild)
                     try:
                         if presence:
                             status_val = presence.get("status", "online")
@@ -941,38 +992,21 @@ class ChildBotManager:
             if not bot_config:
                 return
 
-            original_owner_id = bot_config['owner_id']
-            original_profile_name = bot_config['profile_name']
-            effective_owner_id = original_owner_id
-            effective_profile_name = original_profile_name
-
-            guild = self.cog.bot.get_guild(guild_id) if guild_id else None
-            if guild and not guild.get_member(original_owner_id):
-                author_id = message_payload.get("author_id")
-                borrowed_name = self._find_borrowed_name_for_owner(author_id, original_owner_id, bot_config.get('pid'))
-
-                if borrowed_name:
-                    effective_owner_id = author_id
-                    effective_profile_name = borrowed_name
-                else:
-                    session = self.cog.multi_profile_channels.get(channel_id)
-                    found_in_session = False
-                    if session:
-                        for p in session.get("profiles", []):
-                            p_index = self.cog.profile_manager._get_user_index(p['owner_id'])
-                            if p['profile_name'] in p_index.get("borrowed", []):
-                                if self._is_borrow_of(p['owner_id'], p['profile_name'], original_owner_id, bot_config.get('pid')):
-                                    effective_owner_id = p['owner_id']
-                                    effective_profile_name = p['profile_name']
-                                    found_in_session = True
-                                    break
-
-                    if not found_in_session:
-                        await self.execute_send(bot_id, {
-                            "channel_id": channel_id,
-                            "content": "My original owner is not in this server, and you have not borrowed my profile. Use `/profile hub` to find and borrow me first!"
-                        })
-                        return
+            speaker = self._speaker_for(bot_config, guild_id, message_payload.get("author_id"))
+            if speaker is None:
+                # Someone else's borrow of it, seated here, answers for anyone.
+                session = self.cog.multi_profile_channels.get(channel_id)
+                for p in (session or {}).get("profiles", []):
+                    p_index = self.cog.profile_manager._get_user_index(p['owner_id'])
+                    if (p['profile_name'] in p_index.get("borrowed", [])
+                            and self._is_borrow_of(p['owner_id'], p['profile_name'],
+                                                   bot_config['owner_id'], bot_config.get('pid'))):
+                        speaker = p['owner_id'], p['profile_name']
+                        break
+            if speaker is None:
+                await self.execute_send(bot_id, {"channel_id": channel_id, "content": self._refusal(bot_config)})
+                return
+            effective_owner_id, effective_profile_name = speaker
 
             session = self.cog.multi_profile_channels.get(channel_id)
             ephemeral_participant = self._child_bot_participant(
@@ -980,11 +1014,14 @@ class ChildBotManager:
                 profile_name=effective_profile_name, ephemeral=True)
 
             if not session:
+                # Only a vehicle for this one answer: a draft, so the channel is not left
+                # live with nobody seated, and nothing is saved (`is_started`).
                 session = {
                     "type": "multi", "unified_log": [], "is_hydrated": False,
                     "last_bot_message_id": None, "owner_id": message_payload.get("author_id"), "is_running": False,
                     "task_queue": asyncio.Queue(), "worker_task": None,
-                    "session_prompt": None, "session_mode": "sequential", "profiles": []
+                    "session_prompt": None, "session_mode": "sequential", "profiles": [],
+                    "started": False,
                 }
                 self.cog.multi_profile_channels[channel_id] = session
 
@@ -1044,22 +1081,11 @@ class ChildBotManager:
             if not bot_config:
                 return
 
-            guild_id = message_data.get("guild_id")
-            original_owner_id = bot_config['owner_id']
-            original_profile_name = bot_config['profile_name']
-            owner_id = original_owner_id
-            profile_name = original_profile_name
-
-            guild = self.cog.bot.get_guild(guild_id) if guild_id else None
-            if guild and not guild.get_member(original_owner_id):
-                author_id = message_data.get("author_id")
-                borrowed_name = self._find_borrowed_name_for_owner(author_id, original_owner_id, bot_config.get('pid'))
-                if borrowed_name:
-                    owner_id = author_id
-                    profile_name = borrowed_name
-                else:
-                    await send_notification_to_child("My original owner is not in this server, and you have not borrowed my profile. Use `/profile hub` to find and borrow me first!")
-                    return
+            speaker = self._speaker_for(bot_config, message_data.get("guild_id"), message_data.get("author_id"))
+            if speaker is None:
+                await send_notification_to_child(self._refusal(bot_config))
+                return
+            owner_id, profile_name = speaker
 
             index = self.cog.profile_manager._get_user_index(owner_id)
             is_borrowed = profile_name in index.get("borrowed", [])
@@ -1188,8 +1214,15 @@ class ChildBotManager:
         session = self.cog.multi_profile_channels.get(channel_id)
         result_msg = ""
 
+        def seat():
+            speaker = self._speaker_for(bot_config, event_data.get("guild_id"), event_data.get("user_id"))
+            return speaker and self._child_bot_participant(
+                bot_id, bot_config, owner_id=speaker[0], profile_name=speaker[1])
+
         if not session:
-            participant = self._child_bot_participant(bot_id, bot_config)
+            participant = seat()
+            if not participant:
+                return self._refusal(bot_config)
             session = {
                 "type": "multi", "profiles": [participant],
                 "unified_log": [], "is_hydrated": False, "last_bot_message_id": None,
@@ -1218,7 +1251,13 @@ class ChildBotManager:
                 if len(session['profiles']) >= 200:
                     return "The current Chat Session contains the maximum of 200 participating profiles. Please remove a profile and try again."
 
-                participant = self._child_bot_participant(bot_id, bot_config)
+                participant = seat()
+                if not participant:
+                    return self._refusal(bot_config)
+                # Seating the first profile in an empty channel starts it, as creating one
+                # does: an empty draft is a standalone answer's vehicle or an unused editor.
+                if not session['profiles']:
+                    session['started'] = True
                 session['profiles'].append(participant)
                 result_msg = "Added to the current Chat Session."
 

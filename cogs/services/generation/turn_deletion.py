@@ -162,7 +162,7 @@ class TurnDeletionMixin:
         session_type = session.get("type", "multi")
         key = (channel_id, None, None)
         effectively_empty = not session.get("unified_log") or all(
-            turn.get("type") in ("whisper", "private_response") for turn in session["unified_log"])
+            turn.get("type") in ("whisper", "private_response", "reaction") for turn in session["unified_log"])
         if effectively_empty:
             await self.cog.session_manager._delete_session_from_disk(key, session_type)
         else:

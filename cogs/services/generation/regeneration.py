@@ -14,7 +14,7 @@ from ...utils.helpers import (_format_history_entry, image_command_prefix,
                              is_citation_subtext, kickstart_note,
                              resolve_critic_settings, server_context_guild, turn_posted_at,
                              whisper_recap)
-from ...managers.session_manager import round_reserve
+from ...managers.session_manager import drop_reactions_to, round_reserve
 from ...utils.attachment_limits import over_attachment_limit
 from .reply import reply_gen_config, reply_meta
 from .triggers import referenced_message, reply_record
@@ -257,7 +257,9 @@ class RegenerationMixin:
             # note a live round would get for the same silence -- `kickstart_note` owns
             # which one that is, so a regenerate cannot answer it differently.
             follow_up = kickstart_note(history, self.cog.global_prompts, earlier)
-            if follow_up:
+            if follow_up and history[-1]['role'] == 'user':
+                history[-1]['parts'].append(follow_up)  # after <reactions>
+            elif follow_up:
                 history.append({'role': 'user', 'parts': [follow_up]})
             elif not history:
                 history.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
@@ -391,6 +393,8 @@ class RegenerationMixin:
                 session.setdefault("unified_log", []).append(final_target_turn)
 
             final_target_turn["content"] = new_history_line
+            # Before message_ids is replaced: pending reactions are keyed by the old ones.
+            drop_reactions_to(session, turn_id, final_target_turn.get("message_ids"))
             # Written out rather than left to the message id it was read from, so the
             # turn's moment survives its messages being deleted from under it.
             final_target_turn["timestamp"] = original_timestamp.isoformat()

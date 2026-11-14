@@ -28,9 +28,15 @@ from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 from ..gui.base_components import text_embed
 from ..managers.session_manager import feature_allowed, may_mute
 
-#: The reactions `/session config` -> Config -> Features opens or closes.
+#: The reactions `/session config` -> Config -> Features opens or closes. Named, not every
+#: feature: Read Reactions' 👀 is a label, and a 👀 is read like any other emoji.
 _REACTION_FEATURES = {SESSION_FEATURES[key][1]: key for key in (
     "regenerate", "next_speaker", "speak_again", "continue_round", "mute")}
+
+
+def reaction_label(emoji: discord.PartialEmoji) -> str:
+    """A reaction as the log names it: a custom emoji by `:name:`, as Server Context lists it."""
+    return f":{emoji.name or 'emoji'}:" if emoji.is_custom_emoji() else str(emoji)
 
 
 class EventListeners:
@@ -523,6 +529,21 @@ class EventListeners:
             return False
         return False
 
+    def _note_reaction(self, payload: discord.RawReactionActionEvent) -> None:
+        """Read Reactions: an ordinary emoji is held on the session until the next
+        character's turn commits it (`commit_reactions`). No hydration, no queue, no disk. One
+        the session does not read stays on the message: pulling back is for controls."""
+        session = self.multi_profile_channels.get(payload.channel_id)
+        member = payload.member  # None in a DM
+        if (not session or member is None or member.bot
+                or not self.session_manager.is_started(session)
+                or not feature_allowed(session, "read_reactions", self._reaction_user_is_admin(payload))):
+            return
+        pending = session.setdefault("pending_reactions", {})
+        if len(pending) >= REACTION_PENDING_MAX:
+            del pending[next(iter(pending))]  # oldest first
+        pending[(payload.message_id, payload.user_id, reaction_label(payload.emoji))] = member.display_name
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         # Regeneration, /train capture and the purge controls all hang off this, and
@@ -551,6 +572,7 @@ class EventListeners:
         is_skip = (emoji_str == SKIP_PARTICIPANT_EMOJI)
 
         if not any([is_regen, is_next, is_again, is_continue, is_mute, is_skip]):
+            self._note_reaction(payload)
             return
 
         is_admin = self._reaction_user_is_admin(payload)
@@ -771,7 +793,14 @@ class EventListeners:
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
         # The bot taking its own copy off raises this too, and must not withdraw a press.
         if not self.has_lock or payload.user_id == self.bot.user.id: return
-        
+
+        # A reaction taken back before a round read it is never read. Popping one that was
+        # never held -- a control, a refused press pulled back -- does nothing.
+        session = self.multi_profile_channels.get(payload.channel_id)
+        if session and session.get("pending_reactions"):
+            session["pending_reactions"].pop(
+                (payload.message_id, payload.user_id, reaction_label(payload.emoji)), None)
+
         emoji_str = str(payload.emoji)
 
         if TRAIN_COMMAND_ENABLED and emoji_str in (TRAIN_INPUT_EMOJI, TRAIN_OUTPUT_EMOJI):

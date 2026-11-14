@@ -233,14 +233,13 @@ class _Toggle:
     has to drag its legacy companion flag along with it.
     """
 
-    __slots__ = ("key", "label", "read", "to_payload", "owner_only")
+    __slots__ = ("key", "label", "read", "to_payload", "child_bot_only")
 
-    def __init__(self, key, label, *, read=None, to_payload=None, owner_only=False):
+    def __init__(self, key, label, *, read=None, to_payload=None, child_bot_only=False):
         self.key = key
         self.label = label
-        #: Shown only where the profile's owner is the bot owner: the setting steers
-        #: something only the bot owner can have (a child bot).
-        self.owner_only = owner_only
+        #: Shown only where a child bot speaks as this profile (`_has_child_bot`).
+        self.child_bot_only = child_bot_only
         self.read = read or (lambda config: bool(config.get(key, False)))
         self.to_payload = to_payload or (lambda on: {key: on})
 
@@ -838,15 +837,22 @@ _MEMORY_BULK_PAYLOADS = {
 
 
 
-def _is_bot_owner(user_id) -> bool:
-    return int(user_id) == int(defaultConfig.DISCORD_OWNER_ID)
+def _has_child_bot(cog, user_id, profile_name=None) -> bool:
+    """Whether a child bot speaks as this profile -- a borrow through its source's -- or,
+    with no profile (a bulk form), whether the user has one at all. Child-bot settings show
+    only then: everyone else has nothing they could steer."""
+    if profile_name is None:
+        return any(b.get("owner_id") == int(user_id) for b in cog.child_bots.values())
+    return (cog.profile_manager._resolve_effective_profile(int(user_id), profile_name)
+            in cog.child_bots_by_owner_profile)
 
 
 def _render_generation_visual(ctx):
     config = ctx["config"]
     text = f"Placeholder: {config.get('placeholder_emoji') or '`Default`'}"
-    if _is_bot_owner(ctx["owner_id"]):
-        text += f"\nChild Bot Placeholder: {_flag(config.get('child_bot_placeholder', False))}"
+    if ctx.get("child_bot"):
+        text += (f"\nChild Bot Placeholder: {_flag(config.get('child_bot_placeholder', False))}"
+                 "\n-# The child bot posts this placeholder instead of showing *is typing…*.")
     return "Generation Visual", text, True
 
 
@@ -1324,11 +1330,9 @@ PROFILE_ACTIONS = (
     _Action("generation_visual", "misc", "Generation Visual", "The emoji posted as a placeholder while a reply is generated.",
             _open_screen("generation_visual"),
             render=_render_generation_visual,
-            screen=_Screen(_Toggle("child_bot_placeholder", "Child Bot Placeholder", owner_only=True),
+            screen=_Screen(_Toggle("child_bot_placeholder", "Child Bot Placeholder", child_bot_only=True),
                            modal="ProfileGenerationVisualModal", modal_label="Edit emoji…",
-                           note=lambda cog, owner_id: "-# Also the Realistic Typing cursor." + (
-                               "\n-# **Child Bot Placeholder**: a child bot posts this placeholder "
-                               "instead of showing *is typing…*." if _is_bot_owner(owner_id) else "")),
+                           note="-# Also the Realistic Typing cursor."),
             bulk=_Bulk(_bulk_modal("ProfileGenerationVisualModal"), scope="all",
                        keys=("placeholder_emoji", "child_bot_placeholder"))),
     # `_own` and scope="personal" because a borrow follows its author's spacing
@@ -1955,6 +1959,7 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         field = self.action.render and self.action.render({
             "config": self._config, "is_borrowed": self.parent.is_borrowed,
             "owner_id": self.parent.user_id,
+            "child_bot": _has_child_bot(self.cog, self.parent.user_id, self.parent.profile_name),
             "voice_sample": await self.cog.profile_manager.voice_sample_summary(
                 self.parent.user_id, self.parent.profile_name),
             "bonds": await asyncio.to_thread(
@@ -1980,8 +1985,8 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         config = self._config
         live = self.screen.when is None or self.screen.when(config)
         controls = self.screen.controls if live else self.screen.controls[:self.screen.always]
-        if not _is_bot_owner(self.parent.user_id):
-            controls = tuple(c for c in controls if not getattr(c, "owner_only", False))
+        if not _has_child_bot(self.cog, self.parent.user_id, self.parent.profile_name):
+            controls = tuple(c for c in controls if not getattr(c, "child_bot_only", False))
 
         row = 0
         for choice in (c for c in controls if isinstance(c, _Choice)):
@@ -5501,7 +5506,8 @@ def ProfileGenerationVisualModal(cog, profile_name: str, current_params: Dict[st
         {"label": "Emote Name (or Native Emote)", "custom_id": "name", "default": name_val, "required": False, "max_length": 100, "placeholder": "e.g. mimic_thinking or 🤔"},
         {"label": "Emote ID (Blank if native)", "custom_id": "id", "default": id_val, "required": False, "max_length": 30, "placeholder": "e.g. 1441782350752120874"},
     ]
-    if not values_only and target_user_id is not None and _is_bot_owner(target_user_id):
+    if not values_only and target_user_id is not None and _has_child_bot(
+            cog, target_user_id, None if profile_name == "BULK_APPLY" else profile_name):
         fields.append(
             {"label": "Placeholder for Child Bot (on/off)", "custom_id": "child_bot_placeholder", "default": "on" if current_params.get("child_bot_placeholder") else "off", "required": True, "max_length": 10}
         )

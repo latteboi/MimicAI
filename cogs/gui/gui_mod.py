@@ -330,6 +330,8 @@ class ModBlockGuildModal(ui.Modal):
             guild = cog.bot.get_guild(gid)
             if guild:
                 await cog.server_manager.leave_blocked_guild(guild)
+            else:
+                await cog.server_manager.children_leave(gid)
 
 
 class ModBanEffectsView(BlockedGuard, ui.View):

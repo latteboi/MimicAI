@@ -20,7 +20,8 @@ from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PA
 from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
 from ..utils.user_defaults import chain_lines
 from ..managers.session_manager import (director_enabled, director_model_config, feature_access,
-                                        rotated_cast, turn_lookup, with_reply)
+                                        reaction_lines, rotated_cast, turn_lookup, turn_numbers,
+                                        with_reply)
 
 
 from ..services.generation.global_chat import build_global_chat_embed
@@ -2373,10 +2374,15 @@ class SessionConfigView(BlockedGuard, ui.View):
         "features": ("Features",
                      "Who may use each of the session's controls. Tick any below, then set them.\n\n"
                      "**Disabled** — nobody, administrators included.\n"
-                     "**Admins only** — server administrators. Where every control starts.\n"
+                     "**Admins only** — server administrators. Where every control starts, "
+                     "bar Read Reactions, which starts at Everyone.\n"
                      "**Everyone** — anyone who can post here.\n\n"
                      "A reaction someone may not use comes straight back off, and `/whisper` and "
-                     "`/trigger` say why. A refused `!image` reaches the cast as an ordinary message.\n\n"
+                     "`/trigger` say why. A refused `!image` reaches the cast as an ordinary message. "
+                     "Read Reactions takes nothing off: an emoji it does not read stays where it is.\n\n"
+                     "**Read Reactions** lets characters see the emoji people leave on messages, on the "
+                     "next character's turn. It never starts a turn. Admins only reads "
+                     "administrators' alone; Disabled also clears the reactions already read.\n\n"
                      "**Text-to-Speech** voices each reply as an audio clip, for characters with "
                      "speech set up on their own profile; while it is off, nobody here is voiced."),
         "limit": ("Response Limit",
@@ -2511,8 +2517,8 @@ class SessionConfigView(BlockedGuard, ui.View):
     def _render_features_screen(self, embed: discord.Embed):
         """Every feature and who may use it. The multi-select ticks any number, the buttons
         beside Back set them all at once, and Text-to-Speech -- on or off for the channel,
-        not a control anyone uses -- is its own button. Sparse: Admins only is stored as
-        nothing (`feature_access`)."""
+        not a control anyone uses -- is its own button. Sparse: each feature's own default
+        (`FEATURE_DEFAULT_ACCESS`) is stored as nothing, so "unset" survives a new default."""
         session = self.session
         keys = list(SESSION_FEATURES)
         picks = self.feature_picks & set(keys)
@@ -2527,11 +2533,16 @@ class SessionConfigView(BlockedGuard, ui.View):
 
         def apply(value):
             features = session.setdefault("features", {})
+            reading = feature_access(session, "read_reactions")
             for key in picks:
-                if value == "admins":
+                if value == FEATURE_DEFAULT_ACCESS.get(key, "admins"):
                     features.pop(key, None)
                 else:
                     features[key] = value
+            # A reaction held under the old setting never commits under one that would not
+            # have caught it.
+            if feature_access(session, "read_reactions") != reading:
+                session.pop("pending_reactions", None)
         # One shared setting is shown as current; a mixed selection has none.
         shared = {feature_access(session, key) for key in picks}
         current = next(iter(shared)) if len(shared) == 1 else None
@@ -2544,7 +2555,7 @@ class SessionConfigView(BlockedGuard, ui.View):
             self.feature_picks = resolve_bulk_select(i.data['values'], keys, keys, picks)
             await i.response.defer()
             await self.update_display()
-        # Seven fit one page, so only the Select All half of the shared sentinels.
+        # Eight fit one page, so only the Select All half of the shared sentinels.
         select_all = bulk_select_options(keys, keys, picks.__contains__,
                                          all_description="Tick every feature, or untick them all.")[1]
         options = [select_all] + [
@@ -3356,18 +3367,19 @@ class SessionAuditView(BlockedGuard, ui.View):
 
         self._build_view()
 
-    _SYSTEM_KIND_LABELS = {"synopsis": "Synopsis", "director": "Director's Note", "note": "System note"}
+    _SYSTEM_KIND_LABELS = {"synopsis": "Synopsis", "director": "Director's Note", "note": "System note",
+                           "reaction": "Reactions"}
 
     @staticmethod
     def _system_kind(turn: dict) -> Optional[str]:
-        """"synopsis", "director" or "note" for a turn nobody spoke, else None.
+        """"synopsis", "director", "note" or "reaction" for a turn nobody spoke, else None.
 
         These carry no profile name, so they were listed as "Bot" with a preview of "No text
         content" -- the preview strips everything inside `<system_note>`, which is all a note
         is -- and inspected as a model reply with no model and no tokens.
         """
-        if turn.get("type") == "synopsis":
-            return "synopsis"
+        if turn.get("type") in ("synopsis", "reaction"):
+            return turn["type"]
         if turn.get("speaker_pid") == "SYSTEM" and not turn.get("type"):
             return "director" if "Director's Note:" in (turn.get("content") or "") else "note"
         return None
@@ -3393,6 +3405,10 @@ class SessionAuditView(BlockedGuard, ui.View):
     def _extract_turn_preview(self, turn: dict) -> str:
         content = turn.get("content", "")
         import re
+        if turn.get("type") == "reaction":
+            # `😂 ×2 · :partyblob:`: a reaction turn has no content, only its entries.
+            content = " · ".join(f"{emoji} ×{len(names)}" if len(names) > 1 else emoji
+                                 for _, emoji, names in turn.get("reactions") or ())
         if self._system_kind(turn):
             # A note is its tags' contents, so only the tags go.
             content = re.sub(r"</?[^>]+>", "", content).replace("Director's Note:", "")
@@ -3544,6 +3560,10 @@ class SessionAuditView(BlockedGuard, ui.View):
                       f"├── Sent: {sent}",
                       f"└── Adds per reply: `~{_estimate_text_tokens(content):,}` tokens"]
             text = content
+        elif kind == "reaction":
+            lines.append("└── Sent: In the conversation, each line while the message it names "
+                         "is inside a profile's Short-Term Memory")
+            text = "\n".join(reaction_lines(turn, turn_numbers(log)))
         else:
             if turn.get("is_hidden"):
                 sent = "No -- muted"

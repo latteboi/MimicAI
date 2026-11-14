@@ -290,20 +290,27 @@ def kickstart_note(history: List[Dict[str, Any]],
     after it was being written sits above that reply (`log_user_turn`), so the round it
     opens ends on the character's own turn -- and told nobody had spoken, the character
     talked to an empty room over a question still waiting. That round is **Unanswered**.
+
+    A history ending on nothing but `<reactions>` after the character's own turn still
+    earns a note, and the caller adds it to that entry: someone reacted, nobody spoke.
+    Continue, since an Idle note would tell the character nobody is there.
     """
-    if not history or history[-1].get('role', 'user') != 'model':
+    reacted = len(history) > 1 and history[-1].get('role') == 'user' and all(
+        isinstance(p, str) and p.startswith("<reactions>") for p in history[-1].get('parts') or ())
+    if not history or history[-1 - reacted].get('role', 'user') != 'model':
         return None
     prompts = global_prompts or {}
     log = log or []
     last_user = next((i for i in range(len(log) - 1, -1, -1) if log[i].get("is_user") is True), None)
-    if last_user is not None and 0 < len(log) - 1 - last_user <= log[last_user].get("sent_during", 0):
+    if last_user is not None and 0 < sum(t.get("type") != "reaction" for t in log[last_user + 1:]) \
+            <= log[last_user].get("sent_during", 0):
         return prompts.get("KICKSTART_UNANSWERED", DEFAULT_KICKSTART_UNANSWERED)
-    parts = history[-1].get('parts') or []
+    parts = history[-1 - reacted].get('parts') or []
     text = "".join(p if isinstance(p, str) else p.get('text', '') if isinstance(p, dict) else ''
                    for p in parts)
     # A private reply nobody else saw leaves the public conversation exactly where it
     # was, however long the run: what it is owed is Continue, not a note about silence.
-    if "<private_response>" in text or len(parts) % KICKSTART_FOLLOW_UP_CYCLE == 1:
+    if reacted or "<private_response>" in text or len(parts) % KICKSTART_FOLLOW_UP_CYCLE == 1:
         return prompts.get("KICKSTART_CONTINUE", DEFAULT_KICKSTART_CONTINUE)
     return prompts.get("KICKSTART_IDLE", DEFAULT_KICKSTART_IDLE)
 

@@ -463,19 +463,24 @@ class ServerManager:
             # Once for the guild, not once per channel: this rewrites every server index.
             self.cog.session_manager._save_multi_profile_sessions()
 
-        for bot_id, client in list(self.cog.child_bot_manager.clients.items()):
-            child_guild = client.get_guild(guild.id)
-            if child_guild is None:
-                continue
-            try:
-                await child_guild.leave()
-            except Exception as e:
-                print(f"[GuildBlock] Child bot {bot_id} could not leave {guild.id}: {e}")
+        await self.children_leave(guild.id)
 
         try:
             await guild.leave()
         except Exception as e:
             print(f"[GuildBlock] Could not leave guild {guild.id}: {e}")
+
+    async def children_leave(self, guild_id: int):
+        """Every child bot in this guild leaves it -- where the parent is not, too: a
+        child can be invited on its own, and is its own gateway connection."""
+        for bot_id, client in list(self.cog.child_bot_manager.clients.items()):
+            child_guild = client.get_guild(guild_id)
+            if child_guild is None:
+                continue
+            try:
+                await child_guild.leave()
+            except Exception as e:
+                print(f"[GuildBlock] Child bot {bot_id} could not leave {guild_id}: {e}")
 
     async def enforce_guild_blocks(self):
         """Leaves every blocked guild this instance is still in. Boot sweep.

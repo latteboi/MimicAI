@@ -43,7 +43,8 @@ from ..utils.attachment_limits import upload_limit_bytes
 #: How long a refused send keeps its sender out of that channel's rounds, unless a send
 #: lands first. Long enough to stop a run of paid replies, short enough to notice a fix.
 SEND_REFUSAL_HOLD_SECONDS = 600
-from ..managers.session_manager import (director_enabled, director_model_config, intern_turn,
+from ..managers.session_manager import (commit_reactions, director_enabled, director_model_config,
+                                        drop_reaction_turns, feature_access, intern_turn,
                                         keep_url_context, log_user_turn, pin_grounding,
                                         rotated_cast)
 
@@ -800,6 +801,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     session["_log_cold_len"] = 0
                     self.cog.session_manager.mark_session_dirty(
                         (channel_id, None, None), session_type, structural=True)
+                # Read Reactions Disabled takes back what the cast already read. Here for the
+                # same reason as the trim: the batch start below indexes the filtered log.
+                if (feature_access(session, "read_reactions") == "off"
+                        and drop_reaction_turns(session)):
+                    self.cog.session_manager.mark_session_dirty(
+                        (channel_id, None, None), session_type, structural=True)
 
                 # [NEW] Record the start of this batch for Hybrid STM
                 batch_start_index = len(session.get("unified_log", []))
@@ -999,6 +1006,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     is_image_gen_round, image_gen_prompt, starting_profile_override,
                     round_author_name, triggering_user_id, batch_start_index,
                 )
+                # The reactions caught since the last commit, just above the round's first
+                # message. The insert moves the round's turns down one, so nothing gathered
+                # above may hold a log index past batch_start_index: pending_url_fetches
+                # holds turn objects, new_round_turn_data positions in itself.
+                if commit_reactions(session, batch_start_index):
+                    self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
                 seen_blocked = set()
                 for p in blocked_participants:
@@ -1415,6 +1428,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # are both re-applied below, from supplementary_parts.
                         bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
 
+                        # Read Reactions caught since the last seat spoke, appended for this
+                        # one. The first seat's were committed with the round.
+                        if i and commit_reactions(session, len(session.get("unified_log", []))):
+                            self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
+
                         unified_log = session.get("unified_log", [])
                         hide_folded = self.cog.session_manager.compaction_enabled(session)
                         contents_for_api_call = self.cog.session_manager._build_history_for_participant(
@@ -1527,7 +1545,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         # The history ends on this character's own turn when nobody has
                         # answered it -- which note that earns is `kickstart_note`.
                         follow_up = kickstart_note(contents_for_api_call, self.cog.global_prompts, unified_log)
-                        if follow_up:
+                        if follow_up and contents_for_api_call[-1]['role'] == 'user':
+                            contents_for_api_call[-1]['parts'].append(follow_up)  # after <reactions>
+                        elif follow_up:
                             contents_for_api_call.append({'role': 'user', 'parts': [follow_up]})
 
                         # Collect all supplementary context to inject into the final user turn.
@@ -2272,6 +2292,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                     insert_index = log_user_turn(
                                         session, new_turn_object, msg.created_at)
                                     batch_start_index = min(batch_start_index, insert_index)
+                                    # Read Reactions, as at the round's opening. Without it a
+                                    # reaction then a message sent while a seat was still
+                                    # writing -- the usual order -- waited for a round that
+                                    # opens on a message, and the seats left never read it.
+                                    if commit_reactions(session, insert_index):
+                                        self.cog.session_manager.mark_session_dirty(
+                                            (channel_id, None, None), session_type)
                                     # Into the round's turn data as well, or its pictures reach
                                     # no one: the log keeps text only, and the characters still
                                     # to speak take their media from here.

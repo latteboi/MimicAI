@@ -25,7 +25,8 @@ from ..utils.constants import (
     ROUND_EXEMPT_USER_TURNS, ROUND_EXEMPT_USER_CHARS, SESSION_BUSY_FLAGS,
     PATTERN_SPEAKER_CLOSE, REPLY_IN_VIEW, REPLY_QUOTE_CHARS, REPLY_UNAVAILABLE,
     ROUND_SETTLE_SECONDS, ROUND_SETTLE_MAX_SECONDS, ROUND_SETTLE_TYPING_SECONDS,
-    FOLLOW_UP_QUIET_SECONDS, FEATURE_ACCESS_LABELS, SESSION_FEATURES,
+    FOLLOW_UP_QUIET_SECONDS, FEATURE_ACCESS_LABELS, SESSION_FEATURES, FEATURE_DEFAULT_ACCESS,
+    REACTION_LINES_MAX, REACTION_NAMES_SHOWN,
 )
 from ..utils import follow_ups
 from ..utils.discord_cdn import unsigned_attachment_url
@@ -92,9 +93,10 @@ def blueprint_settings(blueprint: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def feature_access(session: Optional[Dict[str, Any]], key: str) -> str:
-    """Who may use `SESSION_FEATURES[key]` here: "off", "admins" or "everyone". Absent is
-    "admins", so a session that never set it follows whatever default ships next."""
-    return ((session or {}).get("features") or {}).get(key, "admins")
+    """Who may use `SESSION_FEATURES[key]` here: "off", "admins" or "everyone". Absent is the
+    feature's own default (`FEATURE_DEFAULT_ACCESS`, else "admins"), so a session that never
+    set it follows whatever default ships next."""
+    return ((session or {}).get("features") or {}).get(key, FEATURE_DEFAULT_ACCESS.get(key, "admins"))
 
 
 def feature_allowed(session: Optional[Dict[str, Any]], key: str, is_admin: bool) -> bool:
@@ -227,6 +229,91 @@ def log_user_turn(session: Dict[str, Any], turn: Dict[str, Any],
     return index
 
 
+# --- Read Reactions (`tests/REACTIONS.md`) ---------------------------------------------
+# `session["pending_reactions"]` maps (message id, user id, emoji) -> display name: caught
+# by the listener, never written to disk. `commit_reactions` turns them into one typed turn,
+# {"type": "reaction", "reactions": [[target turn_id, emoji, [names]], ...]}, which the
+# history builder renders per reader. It has no content, speaker, is_user or message_ids.
+
+def commit_reactions(session: Dict[str, Any], start: int) -> bool:
+    """The pending reactions, as one turn just above the round's first message at `start`.
+    True if one was written: the caller marks the session dirty, a tail write.
+
+    Above the round's first message, not after it: after it, an Unanswered round answers
+    the 😂 instead of the question. `start` at the log's end appends -- a round nobody's
+    message opened (🍿, the cast carrying on), or the next seat's turn -- and `kickstart_note`
+    reads past a history ending on it. Holding them for a message instead, a scene with
+    nobody typing never read one. A reaction on one of the round's own messages waits a round,
+    so every target sits above its reaction turn and a later edit of it rewrites nothing
+    already cached. Only a public turn in the log is a target; anything else is dropped.
+    """
+    pending = session.get("pending_reactions")
+    log = session.get("unified_log", [])
+    if not pending:
+        return False
+    above = {mid: t["turn_id"] for t in log[:start] if not t.get("type") and t.get("turn_id")
+             for mid in t.get("message_ids") or ()}
+    this_round = {mid for t in log[start:] for mid in t.get("message_ids") or ()}
+    # By person within a target, so a reply posted in chunks names one reaction once.
+    grouped: Dict[Tuple[str, str], Dict[int, str]] = {}
+    for (mid, uid, emoji), name in pending.items():
+        if mid not in this_round and (tid := above.get(mid)):
+            grouped.setdefault((tid, emoji), {})[uid] = name
+    session["pending_reactions"] = {k: v for k, v in pending.items() if k[0] in this_round}
+    if not grouped:
+        return False
+    entries = [[tid, emoji, list(names.values())] for (tid, emoji), names in grouped.items()]
+    log.insert(start, intern_turn({
+        "turn_id": str(uuid.uuid4()), "type": "reaction",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "reactions": entries[-REACTION_LINES_MAX:]}))
+    # A flush while the round's messages were logged can seal past `start`: pulled back as
+    # log_user_turn does, so the insert stays a tail write.
+    if start < session.get("_log_cold_len", 0):
+        session["_log_cold_len"] = start
+    return True
+
+
+def drop_reaction_turns(session: Dict[str, Any]) -> bool:
+    """Read Reactions set to Disabled: every reaction turn leaves the log, the ones already
+    read included. True if any went, which the caller saves as structural, once."""
+    log = session.get("unified_log") or []
+    if not any(t.get("type") == "reaction" for t in log):
+        return False
+    session["unified_log"] = [t for t in log if t.get("type") != "reaction"]
+    session["_log_cold_len"] = 0
+    return True
+
+
+def drop_reactions_to(session: Dict[str, Any], turn_id: str, message_ids) -> None:
+    """A regenerated turn's reactions, committed and pending, go: a 😂 on the old reply is not
+    one on the new. A reaction turn left empty stays and renders nothing, since removing it
+    would shift the indices a regeneration holds. Rides on the regeneration's own save: a
+    reaction turn sits below its target, so it is sealed only if the target is."""
+    for t in session.get("unified_log") or ():
+        if t.get("type") == "reaction" and any(e[0] == turn_id for e in t.get("reactions") or ()):
+            t["reactions"] = [e for e in t["reactions"] if e[0] != turn_id]
+    pending = session.get("pending_reactions")
+    if pending:
+        gone = set(message_ids or ())
+        for key in [k for k in pending if k[0] in gone]:
+            del pending[key]
+
+
+def reactors(names: List[str]) -> str:
+    """`Ibby, Sam` or `Jo, Ash, Kim and 4 others`, the same from the same list every time."""
+    extra = len(names) - REACTION_NAMES_SHOWN
+    shown = ", ".join(names[:REACTION_NAMES_SHOWN])
+    return f"{shown} and {extra} other{'s' if extra > 1 else ''}" if extra > 0 else shown
+
+
+def reaction_lines(turn: Dict[str, Any], tags: Dict[str, int]) -> List[str]:
+    """A reaction turn's lines, each naming its target by its `#n` in `tags`. A target `tags`
+    does not hold -- out of view, muted, folded, gone -- drops its line: never quoted."""
+    return [f"{reactors(names)} reacted {emoji} to #{tags[tid]}"
+            for tid, emoji, names in turn.get("reactions") or () if tid in tags]
+
+
 def round_reserve(earlier: List[Dict[str, Any]], speaker_pid: str) -> int:
     """How many of `earlier`'s trailing turns the round that wrote the next turn had in it:
     a regeneration's `reserved_tail`, so it sees what the live round exempted from STM.
@@ -330,6 +417,14 @@ def has_header(content: str) -> bool:
     every turn in the log per prompt, so it copies nothing: `partition` copied each body."""
     end = content.find("\n")
     return end > 0 and content.endswith(":", 0, end)
+
+
+def turn_numbers(unified_log: List[Dict[str, Any]]) -> Dict[str, int]:
+    """Every public turn's `#n`, counted from the log's start -- why, in
+    `_build_history_for_participant`. Typed turns take none."""
+    numbered = (t for t in unified_log if not t.get("type") and t.get("turn_id")
+                and has_header(t.get("content") or ""))
+    return {t["turn_id"]: n for n, t in enumerate(numbered, 1)}
 
 
 def reply_tags(turns: List[Dict[str, Any]]) -> Dict[str, int]:
@@ -1988,34 +2083,50 @@ class SessionManager:
 
     @staticmethod
     def _select_history_window(full_log: List[Dict], window: int, hide_folded: bool,
-                               step: int = 1) -> List[Dict]:
-        """The trailing slice of `full_log` holding `window` turns that will actually
-        be shown -- which counts folded turns only while `hide_folded` is off.
+                               step: int = 1, *, reader: str) -> List[Dict]:
+        """The trailing slice of `full_log` holding `window` turns that `reader` will
+        actually be shown -- which counts folded turns only while `hide_folded` is off,
+        and a whisper or private response only for the character it belongs to.
 
         Counting raw turns instead would let muted and compacted turns eat the window:
         `full_log[-40:]` on a log whose oldest 25 turns were compacted yields 40 turns
         of which only 35 survive the emit loop -- so compacting a session, which exists
-        to give a profile *more* usable context, silently gave it less.
+        to give a profile *more* usable context, silently gave it less. A whisper counted
+        for everyone took two slots from every other character and showed them nothing.
 
-        Walks backwards and stops as soon as the quota is met, so it costs O(window)
-        plus whatever hidden turns it steps over, not O(log).
+        Walks backwards and stops as soon as the quota is met; only `step` then reads
+        the turns above it.
 
-        `step` rounds the start down to a multiple of itself, in the log's own index, so
-        it holds still while the log grows that many turns -- see
-        `_build_history_for_participant`.
+        `step` rounds the start down to a multiple of itself, counted in untyped turns,
+        so it holds still while the conversation grows that many turns -- see
+        `_build_history_for_participant`. Not in the log's own index: every typed turn
+        (a whisper, a synopsis) moved every character's start towards its next step, a
+        full re-bill, including the characters it shows nothing. Typed turns take no
+        `#n` for the same reason. `tests/test_round_limits.py`.
         """
         if window <= 0:
             return []
         kept = 0
         for index in range(len(full_log) - 1, -1, -1):
             turn = full_log[index]
+            kind = turn.get("type")
             if (turn.get("is_hidden") or (hide_folded and turn.get("compacted"))
-                    or turn.get("type") == "synopsis"):
+                    or kind in ("synopsis", "reaction")
+                    or (kind == "whisper" and turn.get("target_pid") != reader)
+                    or (kind == "private_response" and turn.get("speaker_pid") != reader)):
                 continue
             kept += 1
             if kept >= window:
-                return full_log[index - index % step:]
-        return list(full_log)
+                break
+        else:
+            return list(full_log)
+        # Rounded from the untyped turn at or above the oldest kept, so the start never
+        # passes a whisper that is the oldest turn this reader sees.
+        untyped = [i for i in range(index + 1) if not full_log[i].get("type")] if step > 1 else ()
+        if untyped:
+            n = len(untyped) - 1
+            index = untyped[n - n % step]
+        return full_log[index:]
 
     @staticmethod
     def _bound_reserved_tail(full_log: List[Dict], reserved_tail: int) -> int:
@@ -2075,7 +2186,7 @@ class SessionManager:
         # still, one prefix serves the next STM/2 turns; the price is up to STM/2 - 1 older
         # turns in each prompt, billed at the cached rate when they hit.
         step = max(1, effective_stm // 2) if stepped else 1
-        log_slice = self._select_history_window(full_log, window, hide_folded, step)
+        log_slice = self._select_history_window(full_log, window, hide_folded, step, reader=bot_pid)
         # Every turn on this character's own clock, the one its <current_time> reads.
         clock, _ = _resolve_zoneinfo(p_settings.get("timezone"))
 
@@ -2093,9 +2204,7 @@ class SessionManager:
         # `tags` holds only what is shown -- `render_reply` reads it as "in view".
         shown = {t.get("turn_id") for t in log_slice if not t.get("is_hidden")
                  and not (hide_folded and t.get("compacted"))}
-        numbered = (t for t in full_log if not t.get("type") and t.get("turn_id")
-                    and has_header(t.get("content") or ""))
-        tags = {tid: n for n, t in enumerate(numbered, 1) if (tid := t["turn_id"]) in shown}
+        tags = {tid: n for tid, n in turn_numbers(full_log).items() if tid in shown}
         find = turn_lookup(full_log)
         # A profile that does not always read the synopsis reads it here instead, where it
         # was written, while the window still reaches it. The newest only: each carries
@@ -2156,7 +2265,19 @@ class SessionManager:
                     else:
                         obj = {'role': 'model', 'parts': [wrapped]}
                         participant_history.append(obj)
-                        
+
+            # Read Reactions. In the same user message as the round's first message, which
+            # follows it, so the model still reads what it answers last. Nothing at all once
+            # every target has left this reader's view: no empty block.
+            elif turn_type == "reaction":
+                lines = reaction_lines(turn, tags)
+                if lines:
+                    block = "<reactions>\n" + "\n".join(lines) + "\n</reactions>"
+                    if participant_history and participant_history[-1]['role'] == 'user':
+                        participant_history[-1]['parts'].append(block)
+                    else:
+                        participant_history.append({'role': 'user', 'parts': [block]})
+
         return participant_history
 
     @staticmethod
@@ -2169,8 +2290,9 @@ class SessionManager:
         makes the channel live. Every path that would run a round asks this first.
 
         Absent means started, and that is load-bearing: `_ensure_session_shell` is now
-        the only path that deliberately seats without starting, and the only writer of
-        False. (`/session swap` used to be the second: creating a session that way
+        the only path that deliberately seats without starting, and with a child bot's
+        standalone answer (`handle_child_bot_event`, which seats nobody) the only writers
+        of False. (`/session swap` used to be another: creating a session that way
         starts it, because naming the first profile for an empty channel says what it
         means.) A blueprint saved before this flag existed, and every session an older
         code path built, keeps running untouched.
