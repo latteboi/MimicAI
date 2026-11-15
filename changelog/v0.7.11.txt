@@ -1,12 +1,12 @@
 v0.7.11 Beta — 2026-11-15 (UTC)
 Characters notice the emoji you leave, and a child bot speaks for its owner only where its owner is.
 ## **Added**
-- **Characters read reactions.** Any emoji you leave on a message in a session, other than the session's own controls, is read by the characters on the next character's turn, as who reacted with what to which message. It never starts a turn, and nothing is taken back off. It is on for everyone, in the sessions you already have too: `/session config` → Config → Features → Read Reactions sets it to Admins only or Disabled, and Disabled also clears the reactions already read. A reaction removed before a character has read it is never read.
+- **Characters read reactions.** Any emoji you leave on a message in a session, other than the session's own controls, is read by the characters on the next character's turn, as who reacted with what to which message. It never starts a turn, and nothing is taken back off. It is on for everyone, in the sessions you already have too: `/session config` → Config → Features → Read Reactions sets it to Admins only or Disabled, and Disabled also clears the reactions already read. A reaction removed before a character has read it is never read, and one removed after leaves the log.
 ## **Changed**
 - **A child bot in a server its owner is not in speaks only as your own borrow of its profile**, `/toggle` included. Without a borrow it refuses, and points you to `/profile hub` when the profile is listed there. A child bot of a System profile answers anyone, anywhere.
 - **`/toggle` on a child bot needs the server's administrator to have used `/start` first.**
 - **Child bots follow server and user blocks on their own.** A child bot leaves a blocked server when invited, at startup and when the block is placed, even where MimicAI itself is not, and a blocked user gets no answer from its `/toggle` or `/whoami`.
 - **Child Bot Placeholder** (Edit Profile → Generation Visual) shows only on profiles with a child bot linked, and on borrows of them. Editing several profiles at once shows it only if you own a child bot.
-- **Privacy Policy revised, effective 15 November 2026.** Session logs now hold the emoji reactions left on their messages, with the reacting person's display name, and removing a reaction after a character has read it does not remove it from the log.
+- **Privacy Policy revised, effective 15 November 2026.** Session logs now hold the emoji reactions left on their messages, with the reacting person's display name, and removing a reaction while the bot is online removes it from the log.
 ## **Fixed**
 - **Replying to an old child-bot message no longer leaves the channel looking like a live session with nobody in it**, so an @ of MimicAI there is answered again.

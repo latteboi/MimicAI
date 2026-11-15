@@ -5,7 +5,7 @@ import uuid
 import random
 import asyncio
 import traceback
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import discord
 from discord import app_commands
@@ -26,7 +26,7 @@ from ..services.generation.triggers import (emoji_files, mentioned_seat, referen
                                             said, sticker_files)
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 from ..gui.base_components import text_embed
-from ..managers.session_manager import feature_allowed, may_mute
+from ..managers.session_manager import feature_access, feature_allowed, may_mute, retract_reaction
 
 #: The reactions `/session config` -> Config -> Features opens or closes. Named, not every
 #: feature: Read Reactions' 👀 is a label, and a 👀 is read like any other emoji.
@@ -544,6 +544,28 @@ class EventListeners:
             del pending[next(iter(pending))]  # oldest first
         pending[(payload.message_id, payload.user_id, reaction_label(payload.emoji))] = member.display_name
 
+    async def _unnote_reaction(self, payload, user_id: Optional[int] = None, emoji: Optional[str] = None) -> None:
+        """Read Reactions, taken back: one still pending is forgotten, one a round already
+        committed leaves its reaction turn (`retract_reaction`). That is an in-place edit of
+        a turn that may be sealed, so it is written in full, now. No `user_id` is a
+        moderator's clear, of `emoji` or of every emoji on the message."""
+        session = self.multi_profile_channels.get(payload.channel_id)
+        if not session:
+            return
+        pending = session.get("pending_reactions") or {}
+        held = [k for k in pending if k[0] == payload.message_id
+                and user_id in (None, k[1]) and emoji in (None, k[2])]
+        for k in held:
+            del pending[k]
+        # One person's reaction is pending or committed, never both; a clear may hit both.
+        if (held and user_id is not None) or feature_access(session, "read_reactions") == "off":
+            return
+        session_type = session.get("type", "multi")
+        if not session.get("is_hydrated"):
+            session = await self.session_manager._ensure_session_hydrated(payload.channel_id, session_type)
+        if session and retract_reaction(session, payload.message_id, user_id, emoji):
+            await self.session_manager.flush_session((payload.channel_id, None, None), session_type, structural=True)
+
     @commands.Cog.listener()
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         # Regeneration, /train capture and the purge controls all hang off this, and
@@ -790,16 +812,21 @@ class EventListeners:
             asyncio.create_task(self._pull_back_reaction(payload))
 
     @commands.Cog.listener()
+    async def on_raw_reaction_clear(self, payload: discord.RawReactionClearEvent):
+        # A moderator's Remove All Reactions: Read Reactions forgets them as one removal each.
+        if self.has_lock:
+            await self._unnote_reaction(payload)
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_clear_emoji(self, payload: discord.RawReactionClearEmojiEvent):
+        # The bot clears only its controls, which are never held: this then finds nothing.
+        if self.has_lock:
+            await self._unnote_reaction(payload, emoji=reaction_label(payload.emoji))
+
+    @commands.Cog.listener()
     async def on_raw_reaction_remove(self, payload: discord.RawReactionActionEvent):
         # The bot taking its own copy off raises this too, and must not withdraw a press.
         if not self.has_lock or payload.user_id == self.bot.user.id: return
-
-        # A reaction taken back before a round read it is never read. Popping one that was
-        # never held -- a control, a refused press pulled back -- does nothing.
-        session = self.multi_profile_channels.get(payload.channel_id)
-        if session and session.get("pending_reactions"):
-            session["pending_reactions"].pop(
-                (payload.message_id, payload.user_id, reaction_label(payload.emoji)), None)
 
         emoji_str = str(payload.emoji)
 
@@ -828,7 +855,9 @@ class EventListeners:
         if is_skip and not self._reaction_user_is_admin(payload):
             return
 
-        if not any([is_mute, is_skip, is_regen, is_next, is_continue]): return
+        if not any([is_mute, is_skip, is_regen, is_next, is_continue]):
+            await self._unnote_reaction(payload, payload.user_id, reaction_label(payload.emoji))
+            return
 
         channel_id = payload.channel_id
         session = self.multi_profile_channels.get(channel_id)

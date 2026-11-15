@@ -13,7 +13,7 @@ from ...utils.constants import (
 from ...utils.helpers import (
     _format_citation_subtext, _format_history_entry, _get_user_hash, _resolve_safety_settings,
     default_profile_avatar_url, resolve_grounding_mode, resolve_url_mode,
-    suppress_link_previews,
+    suppress_link_previews, turn_posted_at,
 )
 from . import tool_loop
 from .reply import _merge_sources, reply_gen_config
@@ -64,7 +64,8 @@ def build_global_chat_embed(cog, host_user_id: int, profile_name: str,
                             description: Optional[str] = None,
                             incoming: Optional[List[Dict]] = None,
                             footer: Optional[str] = None,
-                            colour: Optional[discord.Colour] = None) -> discord.Embed:
+                            colour: Optional[discord.Colour] = None,
+                            replied_at: Optional[datetime.datetime] = None) -> discord.Embed:
     """The Global Chat card, drawn one way wherever it is drawn.
 
     The view and the generator had each grown their own version and they disagreed: one
@@ -78,6 +79,11 @@ def build_global_chat_embed(cog, host_user_id: int, profile_name: str,
     `description` and `incoming` override what the log says, for the placeholder and for
     the round being generated -- its turns are not in the log yet. `footer` replaces the
     status line, which means nothing on a history browser looking at an old round.
+
+    The card is edited in place round after round, so its message's own time says when it
+    was opened, nothing more. The reply's time is the embed's timestamp, drawn in the footer
+    in each reader's zone -- `replied_at`, or the log's when `description` is not overridden --
+    and each incoming line carries its own.
     """
     session_data = session_data or {}
     log = session_data.get("unified_log") or []
@@ -93,9 +99,12 @@ def build_global_chat_embed(cog, host_user_id: int, profile_name: str,
     if not has_reply:
         body = "Nothing said here yet. Press **Reply** to start."
 
+    if replied_at is None and description is None and last_model:
+        replied_at = turn_posted_at(last_model)
     embed = discord.Embed(
         description=body[:4096],
         colour=colour or (discord.Colour.blue() if has_reply else discord.Colour.dark_grey()),
+        timestamp=replied_at,
     )
     embed.set_author(name=display_name[:256], icon_url=avatar_url)
 
@@ -104,15 +113,19 @@ def build_global_chat_embed(cog, host_user_id: int, profile_name: str,
 
     if incoming:
         # Budgeted per line, not truncated as a whole: one long message from the first
-        # speaker would otherwise push everyone else's out of the field entirely.
+        # speaker would otherwise push everyone else's out of the field entirely. The name
+        # and time come out of the line's budget, so the field's cap never cuts a `<t:>`.
         per_line = max(60, 1000 // len(incoming))
         lines = []
         for turn in incoming[:MAX_NAMED_SPEAKERS * 2]:
-            speaker = (turn.get("display_name") or "Someone")[:32]
+            sent_at = turn_posted_at(turn)
+            prefix = f"**{(turn.get('display_name') or 'Someone')[:32]}** " + (
+                f"{discord.utils.format_dt(sent_at, 't')} " if sent_at else "")
+            budget = max(20, per_line - len(prefix))
             text = " ".join((turn.get("content") or "").split()) or "—"
-            if len(text) > per_line:
-                text = text[:per_line - 1] + "…"
-            lines.append(f"**{speaker}** {text}")
+            if len(text) > budget:
+                text = text[:budget - 1] + "…"
+            lines.append(prefix + text)
         title = ("In reply to" if len(incoming) == 1
                  else f"In reply to {_name_list([t.get('display_name') for t in incoming])}")
         embed.add_field(name=title[:256], value="\n".join(lines)[:1024], inline=False)
@@ -428,7 +441,7 @@ class GlobalChatMixin:
             # redraws an identical card instead of flipping colour and footer.
             embed = build_global_chat_embed(
                 self.cog, host_user_id, profile_name, session_data,
-                description=text_for_embed, incoming=queued_turns)
+                description=text_for_embed, incoming=queued_turns, replied_at=turn_posted_at(model_log))
 
             if state_container.get('sending_task'):
                 state_container['sending_task'].cancel()

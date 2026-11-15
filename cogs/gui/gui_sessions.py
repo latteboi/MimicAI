@@ -569,7 +569,7 @@ class GlobalChatHistoryView(BlockedGuard, ui.View):
             self.cog, self.user_id, self.selected_profile, session_data,
             description=model_turn.get("content"), incoming=user_turns,
             footer=f"Round {self.current_page + 1} of {len(self.rounds)}",
-            colour=discord.Colour.dark_grey())
+            colour=discord.Colour.dark_grey(), replied_at=turn_posted_at(model_turn))
 
     # Reply and Play used to live here too, on a second lock implementation
     # (`lock_expiry`/`lock_resets`) that had drifted from GlobalChatPlayView's
@@ -747,7 +747,13 @@ class WhisperHistoryView(BlockedGuard, ui.View):
             display_name = appearance.get("custom_display_name") or display_name
             avatar_url = appearance.get("custom_avatar_url") or avatar_url
 
-        embed = discord.Embed(description=response_content, color=discord.Color.dark_grey())
+        # Times as the whisper card draws them (WhisperMixin._whisper_embed): the whisper's
+        # beside it in the footer, the reply's as a line under the name.
+        replied_at = turn_posted_at(response_turn)
+        if replied_at:
+            response_content = f"-# {discord.utils.format_dt(replied_at, 't')}\n{response_content}"
+        embed = discord.Embed(description=response_content[:4096], color=discord.Color.dark_grey(),
+                              timestamp=turn_posted_at(whisper_turn))
         embed.set_author(name=display_name, icon_url=avatar_url)
         embed.set_footer(text=f"{whisper_content}", icon_url=self.original_interaction.user.display_avatar.url)
         
@@ -3408,7 +3414,7 @@ class SessionAuditView(BlockedGuard, ui.View):
         if turn.get("type") == "reaction":
             # `😂 ×2 · :partyblob:`: a reaction turn has no content, only its entries.
             content = " · ".join(f"{emoji} ×{len(names)}" if len(names) > 1 else emoji
-                                 for _, emoji, names in turn.get("reactions") or ())
+                                 for _, emoji, names, *_ in turn.get("reactions") or ())
         if self._system_kind(turn):
             # A note is its tags' contents, so only the tags go.
             content = re.sub(r"</?[^>]+>", "", content).replace("Director's Note:", "")

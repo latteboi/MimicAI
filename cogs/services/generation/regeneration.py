@@ -237,8 +237,8 @@ class RegenerationMixin:
             surviving_message_ids = await self._drop_regenerated_follow_ups(
                 channel, target_turn, payload.message_id)
 
-            # The history as it stood when the turn was first written.
-            earlier = log[:turn_index]
+            # The history as it stood when the turn was first written, folds since undone.
+            earlier = self.cog.session_manager.log_as_of(log, turn_index, turn_posted_at(target_turn))
             # The turn's own round is what it answered, and all the live round exempted
             # from STM. Its user message, not merely the last one above: a whisper is
             # is_user too, and a message several 🍿 rounds back was answered long ago.

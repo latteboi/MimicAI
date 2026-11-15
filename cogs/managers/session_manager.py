@@ -232,8 +232,8 @@ def log_user_turn(session: Dict[str, Any], turn: Dict[str, Any],
 # --- Read Reactions (`tests/REACTIONS.md`) ---------------------------------------------
 # `session["pending_reactions"]` maps (message id, user id, emoji) -> display name: caught
 # by the listener, never written to disk. `commit_reactions` turns them into one typed turn,
-# {"type": "reaction", "reactions": [[target turn_id, emoji, [names]], ...]}, which the
-# history builder renders per reader. It has no content, speaker, is_user or message_ids.
+# {"type": "reaction", "reactions": [[target turn_id, emoji, [names], [user ids]], ...]}, which
+# the history builder renders per reader. It has no content, speaker, is_user or message_ids.
 
 def commit_reactions(session: Dict[str, Any], start: int) -> bool:
     """The pending reactions, as one turn just above the round's first message at `start`.
@@ -262,7 +262,8 @@ def commit_reactions(session: Dict[str, Any], start: int) -> bool:
     session["pending_reactions"] = {k: v for k, v in pending.items() if k[0] in this_round}
     if not grouped:
         return False
-    entries = [[tid, emoji, list(names.values())] for (tid, emoji), names in grouped.items()]
+    # The ids beside the names, so taking a reaction off after the commit finds its person.
+    entries = [[tid, emoji, list(names.values()), list(names)] for (tid, emoji), names in grouped.items()]
     log.insert(start, intern_turn({
         "turn_id": str(uuid.uuid4()), "type": "reaction",
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -300,6 +301,39 @@ def drop_reactions_to(session: Dict[str, Any], turn_id: str, message_ids) -> Non
             del pending[key]
 
 
+def retract_reaction(session: Dict[str, Any], message_id: int, user_id: Optional[int] = None,
+                     emoji: Optional[str] = None) -> bool:
+    """A reaction taken off after a round read it: its person leaves the line, and a line left
+    with nobody goes. No `user_id` is a moderator's clear: everyone's `emoji`, or with no
+    `emoji`, every line on the message. True if anything changed, which the caller saves as structural: the
+    reaction turn may be sealed. Re-bills each reader from that turn on, once, as an edit does.
+    A reaction turn left empty stays and renders nothing, as in `drop_reactions_to`."""
+    log = session.get("unified_log") or ()
+    tid = next((t["turn_id"] for t in log if not t.get("type") and t.get("turn_id")
+                and message_id in (t.get("message_ids") or ())), None)
+    changed = False
+    for t in log:
+        if tid is None or t.get("type") != "reaction":
+            continue
+        hit = False
+        for e in t.get("reactions") or ():
+            # ponytail: one person's emoji on two chunks of a reply is one entry, so taking it
+            # off either chunk retracts it; tracking it per message is the upgrade if that bites.
+            if e[0] != tid or emoji not in (None, e[1]):
+                continue
+            if user_id is None:
+                del e[2][:]
+                hit = True
+            elif len(e) > 3 and user_id in e[3]:
+                n = e[3].index(user_id)
+                del e[2][n], e[3][n]
+                hit = True
+        if hit:
+            t["reactions"] = [e for e in t["reactions"] if e[2]]
+            changed = True
+    return changed
+
+
 def reactors(names: List[str]) -> str:
     """`Ibby, Sam` or `Jo, Ash, Kim and 4 others`, the same from the same list every time."""
     extra = len(names) - REACTION_NAMES_SHOWN
@@ -311,7 +345,13 @@ def reaction_lines(turn: Dict[str, Any], tags: Dict[str, int]) -> List[str]:
     """A reaction turn's lines, each naming its target by its `#n` in `tags`. A target `tags`
     does not hold -- out of view, muted, folded, gone -- drops its line: never quoted."""
     return [f"{reactors(names)} reacted {emoji} to #{tags[tid]}"
-            for tid, emoji, names in turn.get("reactions") or () if tid in tags]
+            for tid, emoji, names, *_ in turn.get("reactions") or () if tid in tags]
+
+
+def _written_after(turn: Dict[str, Any], at: Optional[datetime.datetime]) -> bool:
+    """Whether `turn` was written after `at`; never when either moment is unknown."""
+    posted = turn_posted_at(turn) if at else None
+    return bool(posted and posted > at)
 
 
 def round_reserve(earlier: List[Dict[str, Any]], speaker_pid: str) -> int:
@@ -2064,12 +2104,16 @@ class SessionManager:
         return bool(((session or {}).get("compaction") or {}).get("enabled", False))
 
     @staticmethod
-    def get_latest_synopsis(session: Optional[Dict]) -> Optional[str]:
+    def get_latest_synopsis(session: Optional[Dict],
+                            at: Optional[datetime.datetime] = None) -> Optional[str]:
         """The synopsis to send with this session's replies, or None.
 
         None while the rolling synopsis is off. Turning it off brings the folded turns
         back into history, and sending the synopsis as well would hand the model the
         same events twice.
+
+        `at` is a regeneration's moment: a synopsis written since summarises what came
+        after the turn, so the one before it stands (`log_as_of`).
 
         Read by _construct_system_instructions on every turn, so it walks backwards and
         stops at the first hit rather than scanning the log.
@@ -2077,9 +2121,31 @@ class SessionManager:
         if not SessionManager.compaction_enabled(session):
             return None
         for turn in reversed(session.get("unified_log") or []):
-            if turn.get("type") == "synopsis":
+            if turn.get("type") == "synopsis" and not _written_after(turn, at):
                 return (turn.get("content") or "").strip() or None
         return None
+
+    @staticmethod
+    def log_as_of(full_log: List[Dict], end: int, at: Optional[datetime.datetime]) -> List[Dict]:
+        """`full_log[:end]` as it read at `at`, for a regeneration: a synopsis written since
+        is dropped and the turns it folded are live again (as copies).
+
+        A fold's synopsis sits just below the last turn it covers, so a folded turn
+        belongs to the first synopsis under it. Read as it is now, a fold landing after
+        the turn hid every turn above it: the regeneration got the synopsis alone, which
+        also told it what came next.
+        """
+        view, late = [], False
+        for index in range(len(full_log) - 1, -1, -1):
+            turn = full_log[index]
+            if turn.get("type") == "synopsis":
+                late = _written_after(turn, at)
+                if late:
+                    continue
+            if index < end:
+                view.append({**turn, "compacted": False} if late and turn.get("compacted") else turn)
+        view.reverse()
+        return view
 
     @staticmethod
     def _select_history_window(full_log: List[Dict], window: int, hide_folded: bool,

@@ -465,12 +465,15 @@ def _scrub_response_text(text: str, participant_names: Optional[List[str]] = Non
             scrubbed_text = PATTERN_MESSAGE_LINK.sub('', scrubbed_text).strip()
             scrubbed_text = PATTERN_WHITESPACE_CLEANUP.sub('\n\n', scrubbed_text).strip()
 
-            # Diagnostic Safeguard: If scrubbing wiped out non-empty content, log and recover
+            # Recovers prose a looser pattern ate, never what was nothing but system blocks
+            # and turn envelope: that reply is empty. Handing back the raw text posted a
+            # `<private_response>` written into a public round -- the whispered text, tags
+            # and all -- or, with a header beside it, an empty header as the turn.
             if not scrubbed_text and raw_original:
-                print(f"[SCRUBBER DIAGNOSTIC] Warning: Aggressive scrubbing deleted response text. Falling back to sanitized raw text.")
-                fallback_text = PATTERN_SYSTEM_XML_BLOCKS.sub('', raw_original)
-                fallback_text = PATTERN_SYSTEM_XML_ORPHANS.sub('', fallback_text).strip()
-                return fallback_text if fallback_text else raw_original
+                fallback_text = strip_history_envelope(PATTERN_SYSTEM_XML_BLOCKS.sub('', raw_original))
+                if fallback_text:
+                    print("[SCRUBBER DIAGNOSTIC] Warning: Aggressive scrubbing deleted response text. Falling back to sanitized raw text.")
+                return fallback_text
 
             return scrubbed_text
     except TimeoutError as e:

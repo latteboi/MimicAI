@@ -153,9 +153,13 @@ class WhisperMixin:
                                 guild=server_context_guild(session, interaction.channel))
 
     @staticmethod
-    def _whisper_display(reply: ReplyText) -> str:
-        """The reply as the whisperer's embed shows it: the text, its sources, the warnings."""
+    def _whisper_display(reply: ReplyText, replied_at: Optional[datetime.datetime] = None) -> str:
+        """The reply as the whisperer's embed shows it: when it was written, the text, its
+        sources, the warnings. The time is a line of its own, as `<t:>` renders in each
+        reader's zone in a description and nowhere else in an embed."""
         text = reply.text
+        if replied_at:
+            text = f"-# {discord.utils.format_dt(replied_at, 't')}\n{text}"
         sources = _format_citation_subtext(reply.sources or [])
         if sources:
             text += "\n\n" + "\n".join(sources)
@@ -203,8 +207,12 @@ class WhisperMixin:
         return effective_owner_id, effective_profile_name, display_name, avatar_url, custom_emoji
 
     def _whisper_embed(self, interaction: discord.Interaction, description: str, display_name: str,
-                       avatar_url, whisper_message: str) -> discord.Embed:
-        embed = discord.Embed(description=description, color=discord.Color.dark_grey())
+                       avatar_url, whisper_message: str,
+                       whispered_at: Optional[datetime.datetime] = None) -> discord.Embed:
+        """`whispered_at` is the embed's timestamp, which Discord draws in the footer beside
+        the whisper it holds; the reply's own time is `_whisper_display`'s."""
+        embed = discord.Embed(description=description, color=discord.Color.dark_grey(),
+                              timestamp=whispered_at)
         embed.set_author(name=display_name, icon_url=avatar_url)
         embed.set_footer(text=f"{whisper_message}"[:1000], icon_url=interaction.user.display_avatar.url)
         return embed
@@ -239,7 +247,8 @@ class WhisperMixin:
         contents_for_api_call = self._whisper_history(
             session, session.get("unified_log", []), bot_pid, p_settings, whisper_turn)
 
-        placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url, whisper_message)
+        placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url,
+                                                whisper_message, interaction.created_at)
         if waiting_msg is not None:
             placeholder_msg = await waiting_msg.edit(content=None, embed=placeholder_embed)
         else:
@@ -256,7 +265,8 @@ class WhisperMixin:
         if reply.blocked:
             # Nothing is logged: the character said nothing, and the whisper is theirs to send again.
             await placeholder_msg.edit(embed=self._whisper_embed(
-                interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message), view=None)
+                interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message,
+                interaction.created_at), view=None)
             return
 
         # Recorded with its citations, as a session turn is; the warnings are shown, never
@@ -303,7 +313,8 @@ class WhisperMixin:
         # failed" -- which is why Delete and Regenerate did nothing at all.
         view = WhisperActionView(self.cog, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
         resp_msg = await placeholder_msg.edit(
-            embed=self._whisper_embed(interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message),
+            embed=self._whisper_embed(interaction, self._whisper_display(reply, now), display_name, avatar_url,
+                                      whisper_message, interaction.created_at),
             view=view)
 
         # Inject the message ID back into the log turn
@@ -374,7 +385,11 @@ class WhisperMixin:
         effective_owner_id, effective_profile_name, display_name, avatar_url, custom_emoji = \
             self._whisper_appearance(owner_id, profile_name, p_settings)
 
-        placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url, whisper_message)
+        # When the whisper was sent, not this press: from the log, which the card was drawn from.
+        whispered_at = next((turn_posted_at(t) for t in session.get("unified_log", [])
+                             if t.get("turn_id") == whisper_turn_id), None)
+        placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url,
+                                                whisper_message, whispered_at)
         if answered:
             # The waiting notice already consumed the interaction response.
             await interaction.edit_original_response(content=None, embed=placeholder_embed, view=cancel)
@@ -408,7 +423,7 @@ class WhisperMixin:
             # The old reply stays in the log; this one only says why it was not replaced.
             await interaction.edit_original_response(embed=self._whisper_embed(
                 interaction, ("Regeneration failed.\n\n" + self._whisper_display(reply))[:4096],
-                display_name, avatar_url, whisper_message), view=cancel.restore_view)
+                display_name, avatar_url, whisper_message, whispered_at), view=cancel.restore_view)
             return
 
         response_text = reply.text
@@ -418,13 +433,14 @@ class WhisperMixin:
 
         # Update log
         profile_id = self.cog.profile_manager._get_profile_id(effective_owner_id, effective_profile_name)
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = replied_at = datetime.datetime.now(datetime.timezone.utc)
         for turn in log:
             if turn.get("turn_id") == response_turn_id:
                 # Rewrites what the reply says, not when: the same as a session turn's
                 # regeneration (see _execute_regeneration).
+                replied_at = turn_posted_at(turn) or now
                 turn["content"] = _format_history_entry(
-                    profile_name, turn_posted_at(turn) or now, response_text,
+                    profile_name, replied_at, response_text,
                     p_settings.get("timezone", "UTC"), entity_id=profile_id)
                 turn["edited_at"] = now.isoformat()
                 turn.pop('thought_signature', None) # Clean up legacy signature
@@ -438,5 +454,6 @@ class WhisperMixin:
 
         view = WhisperActionView(self.cog, interaction, whisper_turn_id, response_turn_id, target_participant, whisper_message)
         await interaction.edit_original_response(
-            embed=self._whisper_embed(interaction, self._whisper_display(reply), display_name, avatar_url, whisper_message),
+            embed=self._whisper_embed(interaction, self._whisper_display(reply, replied_at), display_name,
+                                      avatar_url, whisper_message, whispered_at),
             view=view)

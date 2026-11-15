@@ -357,7 +357,7 @@ class PromptBuilderMixin:
             #
             # Unless the profile reads it only inside its STM: then it is a turn, and
             # `_build_history_for_participant` places it.
-            synopsis = (self.cog.session_manager.get_latest_synopsis(session)
+            synopsis = (self.cog.session_manager.get_latest_synopsis(session, at)
                         if always_reads_synopsis(profile_data) else None)
             if synopsis:
                 slow_parts.append(f"<session_synopsis>\n{synopsis}\n</session_synopsis>")

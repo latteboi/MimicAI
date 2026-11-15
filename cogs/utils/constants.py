@@ -2328,8 +2328,7 @@ DELIVERY_HARD_TIMEOUT_SECONDS = 420.0
 
 DEFAULT_WHISPER_INJECTION = (
     "<whisper_context>\n"
-    "The following is a private whisper directed only to you. Reply to it directly. "
-    "Neither it nor your reply is seen by anyone else.\n\n"
+    "A whisper to you alone. Answer it; nobody else sees it or your answer.\n\n"
     "{whisper_content}\n"
     "</whisper_context>\n"
 )
@@ -2349,7 +2348,9 @@ DEFAULT_WHISPER_RECAP = (
 # alternates rather than always reading Idle, is `helpers.kickstart_note`.
 DEFAULT_KICKSTART_START = "<internal_note>Start the conversation.</internal_note>"
 
-DEFAULT_KICKSTART_CONTINUE = "<internal_note>Continue the conversation.</internal_note>"
+#: "Public" is load-bearing: after a private reply, "the conversation" read as the whisper,
+#: and the character answered in another `<private_response>`, which the scrub deletes.
+DEFAULT_KICKSTART_CONTINUE = "<internal_note>Continue the public conversation.</internal_note>"
 DEFAULT_KICKSTART_IDLE = "<internal_note>No response from anyone, or no user is present.</internal_note>"
 DEFAULT_KICKSTART_UNANSWERED = ("<internal_note>The newest message above arrived while you were still "
                                 "writing the reply after it, so it has not been answered yet.</internal_note>")

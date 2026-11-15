@@ -330,7 +330,7 @@ HELP_CATEGORIES = {
             "Mute is the useful one for repair work: if a reply took the scene somewhere you did not want, mute it and the characters will "
             "carry on as though it never happened. Skip is the one that is administrators only: it is not turn-local, it silences that "
             "character in every round until somebody unskips it, and if your reaction comes straight back off, that is why.\n\n"
-            "**Read Reactions** (on, for everyone, unless Features says otherwise): any other emoji you leave on a message in the session is read by the characters on the next character's turn -- `Sam, Jo reacted 😂 to #38`. It never starts a turn, and nothing is taken back off. Admins only reads administrators' emoji alone; Disabled stops it and clears the reactions already read. Taking a reaction back off before then leaves nothing; after it, the characters have already seen it."
+            "**Read Reactions** (on, for everyone, unless Features says otherwise): any other emoji you leave on a message in the session is read by the characters on the next character's turn -- `Sam, Jo reacted 😂 to #38`. It never starts a turn, and nothing is taken back off. Admins only reads administrators' emoji alone; Disabled stops it and clears the reactions already read. Taking a reaction back off before then leaves nothing; after it, it leaves the log, though a reply already written may have answered it."
         ),
         "Reactivity and Proactivity": (
             "**Reactivity** decides whether a profile interjects when it is not its turn. Each participant has a **Chance** percentage rolled "
@@ -1126,7 +1126,7 @@ DEFAULT_HELP_DOCS = {
     ),
     "sessions/session_controls.txt": (
         "Capabilities: Users can dynamically control the flow of a chat session using specific message reactions, each only where the session's Features allow it (`/session config` -> Config -> Features: Disabled, Admins only or Everyone; Admins only until an administrator changes it, including in sessions made before v0.7.10, bar Read Reactions (Everyone)).\n"
-        "- Read Reactions (any other emoji): The characters read it on the next character's turn, as a line naming who reacted, the emoji and the message's number -- never a turn of its own, and never taken back off. On for everyone by default, in sessions made before it too. Admins only reads administrators' emoji alone; Disabled stops it and clears the reactions already read. A reaction removed before then is never read; one removed after it stays read. Reactions on a regenerated reply are dropped with the old reply.\n"
+        "- Read Reactions (any other emoji): The characters read it on the next character's turn, as a line naming who reacted, the emoji and the message's number -- never a turn of its own, and never taken back off. On for everyone by default, in sessions made before it too. Admins only reads administrators' emoji alone; Disabled stops it and clears the reactions already read. A reaction removed before then is never read; one removed after it leaves the log, though a reply already written may mention it. Reactions on a regenerated reply are dropped with the old reply.\n"
         "- Regenerate (🔁): Discards that reply and generates a new one from the same context.\n"
         "- Next Speaker (▶️): Gives the participant after that message's author in the cast list one turn.\n"
         "- Speak Again (⏯️): Gives that message's own author one more turn.\n"
@@ -1769,8 +1769,8 @@ LEGAL_DOCUMENTS = {
             "Data held in a server's session logs or in other people's profiles cannot "
             "be deleted through /privacy. Deleting one of your messages in Discord "
             "while the bot is online removes it from the session log too, though not "
-            "any long-term memory already written from it. Removing a reaction removes "
-            "it from the log only if the characters have not yet read it. To ask for "
+            "any long-term memory already written from it. Removing a reaction while "
+            "the bot is online removes it from the log too. To ask for "
             "the removal of anything else, contact us (Section 8).\n"
             "\n"
             "Users may also export profiles, with their memories and training examples,"
