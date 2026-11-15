@@ -377,13 +377,22 @@ GEMINI_FREE_TIER_BLOCKED = (
     "Global Chat. Assign a billing-enabled (paid) key in `/settings`."
 )
 
-#: How a server gets a key, as it actually works: only an administrator of that server
-#: can assign one, and a key saved but never assigned to the server -- or assigned
-#: without Save Assignments -- reaches nothing.
+#: How a server gets a key: only an administrator of it can give it one, and a key they add
+#: while in a server with none becomes its key (`KeyScopeMixin._claim_server`).
 _SERVER_KEY_HOW = (
-    "A server administrator can assign one: run `/settings`, open **API Keys**, "
-    "submit an OpenRouter key or a billing-enabled Google Gemini key, choose "
-    "**Server: {server}** under *Assign this key to...*, and press **Save Assignments**."
+    "A server administrator can run `/start` here and add an OpenRouter key or a "
+    "billing-enabled Google Gemini key: added here, it becomes **{server}**'s key."
+)
+
+#: Said instead to an administrator who holds a key that would work here, only not
+#: assigned to it (`StorageManager.admin_key_unassigned`): `/start` offers the button.
+_UNASSIGNED_KEY_HOW = "Run `/start` here and press **Use it in {server}**."
+UNASSIGNED_KEY_NOTICE = (
+    "{mention} Your API key isn't assigned to this server yet, so nobody here can reply. "
+    + _UNASSIGNED_KEY_HOW
+)
+UNASSIGNED_KEY_GATE = (
+    "Sessions need an API key assigned to this server, and yours isn't yet. " + _UNASSIGNED_KEY_HOW
 )
 
 #: Posted once per server, addressed to whoever ran into it -- see

@@ -64,8 +64,9 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         self.slot_id = slot_id
         self.provider = provider
         self.view = view
-        # `/start` pastes a key to make it work, and a key nothing points at does
-        # nothing; `/settings` leaves where it goes to the dropdown.
+        # `/start` pastes a key to make it work, so it is always Personal. `/settings` makes
+        # it Personal only where there is none (`save_api_key`): a key nothing points at
+        # does nothing. Either way a server is claimed by `KeyScopeMixin._claim_server`.
         self.assign_personal = assign_personal
 
     async def on_submit(self, interaction: discord.Interaction):
@@ -78,6 +79,13 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
 
         saved, msg = await save_api_key(self.cog, interaction.user.id, self.slot_id, self.provider,
                                         raw_key, self.assign_personal)
+        if saved and isinstance(self.view, KeyScopeMixin):
+            msg += self.view._claim_server(self.slot_id, interaction.guild)
+            if not self.view._saved_scopes(self.provider, self.slot_id):
+                msg += ("\nIt isn't used anywhere yet: pick where under *Assign this key to...*, "
+                        "then press **Save Assignments**.")
+            # What is saved may have just changed under the ticks this view staged.
+            self.view._load_scopes()
         if saved and self.view:
             await self.view._repaint()
 
@@ -87,7 +95,8 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
 async def save_api_key(cog: 'MimicCog', user_id: int, slot_id: str, provider: str, raw_key: str,
                        assign_personal: bool) -> Tuple[bool, str]:
     """Validates a key and saves it to a slot: where a pasted key and an OpenRouter sign-in
-    both end. Returns (saved, the line to tell the user)."""
+    both end. Returns (saved, the line to tell the user). A caller then adds
+    `KeyScopeMixin._claim_server`'s line: skipped, a key added in a server stays off it."""
     is_valid, err, tier = await cog.api_service._validate_api_keys(
         raw_key if provider == "gemini" else None,
         raw_key if provider == "openrouter" else None
@@ -106,8 +115,11 @@ async def save_api_key(cog: 'MimicCog', user_id: int, slot_id: str, provider: st
         "provider": provider,
         "tier": tier
     }
-    if assign_personal:
-        user_data.setdefault("personal_assignments", {})[provider] = slot_id
+    personal = user_data.setdefault("personal_assignments", {})
+    # Asked for, or the first key of its provider: a key nothing points at does nothing.
+    made_personal = (assign_personal or not personal.get(provider)) and personal.get(provider) != slot_id
+    if made_personal:
+        personal[provider] = slot_id
     cog.storage_manager._save_user_keys_data(user_id, user_data)
 
     cog.decrypted_key_cache[(user_id, slot_id)] = raw_key
@@ -118,7 +130,7 @@ async def save_api_key(cog: 'MimicCog', user_id: int, slot_id: str, provider: st
     # repair on the next hourly pass.
 
     msg = f"✅ {provider.title()} key saved to slot `{slot_id}` ({tier.title()} Tier)."
-    if assign_personal:
+    if made_personal:
         msg += "\nIt is now your **Personal** key."
     if provider == "gemini" and not is_paid_gemini_slot({"tier": tier}):
         msg += "\nGoogle may train on what a free-tier key is sent, so it is not used in servers or Global Chat."
@@ -462,18 +474,35 @@ class KeyScopeMixin:
         # Sorted, so a server stays on the same page and can be found by name.
         self.admin_guilds.sort(key=lambda g: g.name.casefold())
 
-    def _saved_scopes(self, provider: str) -> set:
-        """Where the selected slot is assigned now, as dropdown values."""
+    def _saved_scopes(self, provider: str, slot: Optional[str] = None) -> set:
+        """Where `slot` (the selected one by default) is assigned now, as dropdown values."""
+        slot = slot or self.selected_slot
         user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
         scopes = set()
-        if user_data.get("personal_assignments", {}).get(provider) == self.selected_slot:
+        if user_data.get("personal_assignments", {}).get(provider) == slot:
             scopes.add("personal")
         for g in self.admin_guilds:
             idx = self.cog.server_manager._get_server_index(str(g.id))
             assigned = idx.get("assigned_keys", {}).get(provider)
-            if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == self.selected_slot:
+            if assigned and assigned.get("user_id") == self.user_id and assigned.get("slot") == slot:
                 scopes.add(str(g.id))
         return scopes
+
+    def _claim_server(self, slot: str, guild: Optional[discord.Guild]) -> str:
+        """A key added in a server you run that has none becomes its key too, unasked: a key
+        saved and never assigned was the commonest way a server ended up with none. Never
+        takes a server from another key, nor gives it one its data policy would hold back.
+        The line to tell the user, or ''."""
+        provider = SLOT_PROVIDER[slot]
+        st = self.cog.storage_manager
+        if (guild is None or not any(g.id == guild.id for g in self.admin_guilds)
+                or st.guild_has_text_key(guild.id)
+                or (provider == "gemini" and not st._gemini_slot_allowed_in_guild(guild.id, self.user_id, slot))
+                or self._assignment_conflicts(slot, {str(guild.id)})):
+            return ""
+        self._apply_assignments(slot, self._saved_scopes(provider, slot) | {str(guild.id)})
+        return (f"\nIt is now **{guild.name}**'s key too, so everyone there can talk to the characters "
+                "on it. `/settings` → API Keys changes where it applies.")
 
     def _load_scopes(self):
         """Resets the staged ticks to what is saved.

@@ -608,6 +608,26 @@ class StorageManager:
         slot = (self._get_user_keys_data(user_id).get("slots") or {}).get(slot_id)
         return bool(slot and slot.get("key")) and not self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id)
 
+    def usable_key_slot(self, user_id: int, guild_id: int) -> Optional[str]:
+        """A slot of this user's that would carry this server's messages once assigned there,
+        their Personal one first: any OpenRouter key, or a Gemini key the data policy lets in."""
+        data = self._get_user_keys_data(user_id)
+        personal = set((data.get("personal_assignments") or {}).values())
+        for slot_id, slot in sorted((data.get("slots") or {}).items(), key=lambda kv: kv[0] not in personal):
+            if isinstance(slot, dict) and slot.get("key") and (
+                    slot.get("provider") == "openrouter"
+                    or (slot.get("provider") == "gemini"
+                        and self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id))):
+                return slot_id
+        return None
+
+    def admin_key_unassigned(self, guild, user_id: int) -> bool:
+        """Whether this administrator of `guild` holds a key that would work there, only not
+        assigned to it: the no-key messages then say so, rather than "add one"."""
+        member = guild.get_member(user_id)
+        return bool(member and member.guild_permissions.administrator
+                    and self.usable_key_slot(user_id, guild.id))
+
     def guild_has_text_key(self, guild_id: Optional[int]) -> bool:
         """Whether a key a conversation here could run on reaches this server.
 

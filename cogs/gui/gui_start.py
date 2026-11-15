@@ -37,7 +37,7 @@ from ..utils.constants import (BOT_PERMISSIONS, CAST_POLICY_OPEN, CHILD_BOT_PERM
 from ..utils import openrouter_signin
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, PERMISSION_EFFECTS,
-                             SERVER_KEY_PITCH, WIZARD_COPY, WIZARD_TOUR)
+                             SERVER_KEY_PITCH, SERVER_KEY_UNASSIGNED, WIZARD_COPY, WIZARD_TOUR)
 from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
                               add_select)
 from .gui_settings import (KEY_SLOTS, SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
@@ -138,7 +138,9 @@ WIZARD_STEPS = (
           done_detail=lambda s: PROVIDER_CHOICES.get(s["provider"], s["provider"])),
     _Step("key", "Add your API key",
           ("1. Getting Started", "API Keys and Where They Apply"),
-          lambda s: s["has_key"], requires="provider",
+          # In a server you run, not done until it has a key: Personal alone runs no session
+          # here, and step 4 would refuse with nothing pointing back to this one.
+          lambda s: s["has_key"] and (s["server_key"] or not s["is_admin"]), requires="provider",
           actions=("_act_get_key", "_act_paste_key"),
           done_detail=lambda s: s["key_detail"] or "using this server's key"),
     # Done once a character has something written: a borrow and a Generate draft arrive
@@ -336,6 +338,9 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
                 "provider": (index.get("about") or {}).get("provider"),
                 "has_key": usable_key, "key_detail": key_detail,
                 "server_has_key": server_has_key, "server_key_held": server_key_held,
+                # A key of yours that would work here: Use it in <server> assigns it.
+                "usable_slot": (cog.storage_manager.usable_key_slot(user_id, guild.id)
+                                if guild is not None else None),
                 "seated_disk": seated_disk,
                 "cast_policy": cast_policy}
 
@@ -485,7 +490,9 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
 
         if s["is_admin"]:
             # In the banner, not the key step: that field is near Discord's 1024 cap.
-            pitch = "" if s["server_has_key"] else f"\n\n{SERVER_KEY_PITCH}"
+            pitch = ("" if s["server_has_key"]
+                     else "\n\n" + (SERVER_KEY_UNASSIGNED.format(server=guild.name)
+                                    if s.get("usable_slot") else SERVER_KEY_PITCH))
             return f"{where}🛡️ **Your role** Server administrator\n{key_line}{pitch}"
         role = "👤 **Your role** Member (not an administrator)\n"
         # Who may seat a character, said only on the step that seats one.
@@ -650,6 +657,12 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         providers = self._key_providers()
         named = len(providers) > 1
         buttons = []
+        s = self.state
+        if s.get("usable_slot") and s["is_admin"] and not s["server_key"]:
+            use = ui.Button(label=f"Use it in {s['guild'].name}"[:80],
+                            style=discord.ButtonStyle.primary, row=0)
+            use.callback = self._act_use_here
+            buttons.append(use)
         for provider in providers:
             name = MODEL_PROVIDERS[provider]
             # A link: Discord opens it, and no interaction reaches us.
@@ -709,6 +722,16 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         # An empty slot first; with both full, the first is replaced, as Edit Key would.
         return next((s for s in mine if s not in filled), mine[0])
 
+    async def _act_use_here(self, interaction: discord.Interaction):
+        """A key you already hold, made this server's: one added before it was automatic."""
+        await interaction.response.defer()
+        guild = self.state["guild"]
+        told = self._claim_server(self.state["usable_slot"], guild).strip()
+        await self._repaint()
+        await interaction.followup.send(embed=text_embed(told or (
+            f"**{guild.name}** kept the key it has: `/settings` → API Keys can replace it.")),
+            ephemeral=True)
+
     async def _act_paste_key(self, interaction: discord.Interaction, provider: str):
         if self.admin_guilds:
             # Stay on this step once it is done: the server picker appears under it.
@@ -735,11 +758,13 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             return
         try:
             key = await openrouter_signin.exchange(code, verifier)
-            saved, message = await save_api_key(self.cog, self.user_id, self._slot_for("openrouter"),
+            slot = self._slot_for("openrouter")
+            saved, message = await save_api_key(self.cog, self.user_id, slot,
                                                 "openrouter", key, assign_personal=True)
         except openrouter_signin.SignInFailed as e:
             saved, message = False, f"❌ {e}"
         if saved:
+            message += self._claim_server(slot, self.original_interaction.guild)
             message += ("\n\nFree models work now. For the rest, add credit at "
                         "<https://openrouter.ai/settings/credits>.")
             if self.admin_guilds:

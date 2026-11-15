@@ -10,7 +10,7 @@ from .utils.constants import (
     TRAIN_COMMAND_ENABLED, TRAIN_OUTPUT_EMOJI, USERS_DIR, defaultConfig, is_admin_or_owner_check, is_guild_admin,
     cooldown_unless_refused, is_owner_in_dm_check, VOICE_SAMPLE_NOT_AUDIO, VOICE_SAMPLE_NOT_OWN, VOICE_SAMPLE_TOO_LARGE,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
-    IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, LIMIT_FIXED_EXAMPLES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
+    IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, LIMIT_FIXED_EXAMPLES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, UNASSIGNED_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
     PERSONA_TEXT_INPUT_MAX_LENGTH,
     BOT_PERMISSIONS, CHILD_BOT_PERMISSIONS, invite_url, KOFI_URL, TOPGG_URL,
 )
@@ -1040,7 +1040,7 @@ class MimicCog(EventListeners, commands.Cog):
     def _session_key_block(self, guild: Optional[discord.Guild], user_id: int) -> Optional[str]:
         """Why nobody can set up a session in this server, or None when they can.
 
-        One answer for `/session config`, `/session swap` and `/start`'s cast step: a
+        One answer for `/session config`, `/session swap`, `/start`'s cast step and `/help`: a
         cast seated on a server with no key could never say anything, and the round
         worker would only say so once. The bot owner is let through, because the
         Ollama profiles only they may run need no server key.
@@ -1049,6 +1049,8 @@ class MimicCog(EventListeners, commands.Cog):
             return None
         if self.profile_manager.may_use_ollama(user_id):
             return None
+        if self.storage_manager.admin_key_unassigned(guild, user_id):
+            return UNASSIGNED_KEY_GATE.format(server=guild.name)
         if self.storage_manager.gemini_blocked_for_guild(guild.id):
             return GEMINI_FREE_TIER_BLOCKED
         return NO_SERVER_KEY_GATE.format(server=guild.name)
@@ -2716,6 +2718,12 @@ class MimicCog(EventListeners, commands.Cog):
             self.profile_manager._get_or_create_system_profile("mimicguide")
             
             session = self.multi_profile_channels.get(interaction.channel_id)
+            seated = session and any(p.get('owner_id') == owner_id and p.get('profile_name') == "mimicguide"
+                                     for p in session['profiles'])
+            # Leaving needs no key; joining a server with none seats a guide that can never answer.
+            if not seated and (block := self._session_key_block(interaction.guild, interaction.user.id)):
+                await interaction.followup.send(embed=text_embed(block), ephemeral=True)
+                return
             action_taken = None
             result_msg = ""
             

@@ -23,7 +23,7 @@ from ..utils.constants import (
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
     LOG_TRIM_TARGET, LOG_TRIM_HIGH_WATER,
     PLACEMENT_REFUSALS,
-    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE,
+    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE, UNASSIGNED_KEY_NOTICE,
     ROUND_URL_MESSAGES_MAX, ROUND_URLS_SKIPPED_NOTE, SPEAK_AGAIN_EMOJI,
 )
 from ..utils.helpers import (
@@ -237,9 +237,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         mention = f"<@{user_id}>"
         # A free-tier Gemini key held back by the server's data policy is not a missing
         # key, and saying so would send someone to add one they have.
-        text = (f"{mention} {GEMINI_FREE_TIER_BLOCKED}"
-                if self.cog.storage_manager.gemini_blocked_for_guild(guild.id)
-                else NO_SERVER_KEY_NOTICE.format(mention=mention, server=guild.name))
+        if self.cog.storage_manager.admin_key_unassigned(guild, int(user_id)):
+            text = UNASSIGNED_KEY_NOTICE.format(mention=mention, server=guild.name)
+        elif self.cog.storage_manager.gemini_blocked_for_guild(guild.id):
+            text = f"{mention} {GEMINI_FREE_TIER_BLOCKED}"
+        else:
+            text = NO_SERVER_KEY_NOTICE.format(mention=mention, server=guild.name)
         if bot_id:
             await self.cog.manager_queue.put({
                 "action": "send_to_child", "bot_id": bot_id,

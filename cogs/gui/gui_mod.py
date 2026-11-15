@@ -651,7 +651,8 @@ def _last_written(dirs: Dict[int, str]) -> Dict[int, float]:
 
 
 def _date(snowflake: int) -> str:
-    return discord.utils.snowflake_time(snowflake).strftime("%d/%m/%Y")
+    # The viewer's date, as the <t:R> beside it is: a strftime here is UTC's, a day out for half the world.
+    return f"<t:{int(discord.utils.snowflake_time(snowflake).timestamp())}:d>"
 
 
 def _plural(n: int, word: str) -> str:
@@ -1166,11 +1167,11 @@ class ModStatsView(ModBaseView):
         st = self.cog.storage_manager
         embed = discord.Embed(title=guild.name if guild else "Server not joined",
                               color=discord.Color.gold())
-        lines = [f"`{gid}` · Created `{_date(gid)}`"]
+        lines = [f"`{gid}` · Created {_date(gid)}"]
         if guild:
             joined = guild.me.joined_at if guild.me else None
             lines.append(f"Owner {self._who(guild.owner_id)} · Members `{guild.member_count or '?'}`"
-                         + (f" · Joined `{joined:%d/%m/%Y}` (<t:{int(joined.timestamp())}:R>)" if joined else ""))
+                         + (f" · Joined <t:{int(joined.timestamp())}:d> (<t:{int(joined.timestamp())}:R>)" if joined else ""))
             here = sum(c.get_guild(gid) is not None for c in self.cog.child_bot_manager.clients.values())
             lines.append(f"Child bots here `{here}` of `{len(self.cog.child_bots)}`")
         else:
@@ -1180,10 +1181,12 @@ class ModStatsView(ModBaseView):
                    for p in MODEL_PROVIDERS if (pointer := st._guild_key_pointer(gid, p))]
         if st.guild_has_text_key(gid):
             lines.append("Server key ✅ " + (", ".join(holders) or "assigned"))
-        elif st.gemini_blocked_for_guild(gid):
-            lines.append("Server key ❌ the Google key is held back by its data policy")
         else:
-            lines.append("Server key ❌ none, so no session here can reply")
+            lines.append(("Server key ❌ the Google key is held back by its data policy"
+                          if st.gemini_blocked_for_guild(gid) else "Server key ❌ none, so no session here can reply")
+                         # A key saved and never assigned here: how often that is the cause.
+                         + (" · the owner holds one, unassigned"
+                            if guild and st.usable_key_slot(guild.owner_id, gid) else ""))
         entry = self.cog.server_manager.guild_block_entry(gid)
         lines.append(_block_line(entry, GUILD_BLOCK_LABELS.get((entry or {}).get("action"))))
 
@@ -1206,7 +1209,8 @@ class ModStatsView(ModBaseView):
 
     def _session_line(self, channel_id: int, session: Dict) -> str:
         channel = self.cog.bot.get_channel(channel_id)
-        where = f"#{channel.name}" if channel else f"`{channel_id}`"
+        # Bold: a name like `🤖・┆chat` otherwise reads as two fields of this line.
+        where = f"**#{channel.name}**" if channel else f"`{channel_id}`"
         cast = ", ".join(p.get("profile_name", "?") for p in session.get("profiles", [])) or "*empty cast*"
         flags = [word for word, on in (
             ("draft", not self.cog.session_manager.is_started(session)),
@@ -1221,12 +1225,11 @@ class ModStatsView(ModBaseView):
     def _user_embed(self, uid: int) -> discord.Embed:
         row = self._user_rows.get(uid)
         embed = discord.Embed(title=self._name(uid), color=discord.Color.gold())
-        lines = [f"`{uid}` · Account created `{_date(uid)}`"]
+        lines = [f"`{uid}` · Account created {_date(uid)}"]
         if row:
             _, provider, personal, borrowed, joined = row
-            when = (datetime.datetime.fromtimestamp(joined, datetime.timezone.utc).strftime("%d/%m/%Y")
-                    if joined else "Unknown")
-            lines.append(f"{PROVIDER_CHOICES.get(provider, UNREGISTERED_LABEL)} · Registered `{when}` · "
+            when = f"<t:{int(joined)}:d>" if joined else "`Unknown`"
+            lines.append(f"{PROVIDER_CHOICES.get(provider, UNREGISTERED_LABEL)} · Registered {when} · "
                          f"Personal `{personal}` · Borrowed `{borrowed}`")
         else:
             lines.append("No data on this instance: never registered, or deleted their data.")

@@ -35,10 +35,10 @@ HELP_CATEGORIES = {
         "First Steps": (
             "**The short version: run `/start`.** It works out what you have already done, shows you what is left, "
             "and opens the right screen for each step. Everything below is the same path done by hand.\n\n"
-            "**1. Add an API key.** Run `/settings` -> **API Keys**, anywhere. Pick an empty slot, click **Submit Key**, "
-            "then use the assignment dropdown to point it at **Personal** (your own Global Chat, wherever you run it) and at any server "
-            "you administrate. "
-            "Click **Save Assignments** -- nothing is stored until you do.\n\n"
+            "**1. Add an API key.** Run `/settings` -> **API Keys**, anywhere. Pick an empty slot and click **Submit Key**. "
+            "It becomes your **Personal** key (your own Global Chat, wherever you run it) if you have none, and the server's key "
+            "if you add it in a server you administrate that has none. For anywhere else, use the assignment dropdown and click "
+            "**Save Assignments** -- ticks are not stored until you do.\n\n"
             "**2. Create a profile.** `/profile create profile_name:detective`. If you would rather start from a concept or a picture than a blank form, "
             "`/profile generate` drafts a whole profile for you.\n\n"
             "**3. Shape it.** `/profile manage profile_name:detective` opens the dashboard. **Persona** -> Persona for backstory and traits; "
@@ -54,6 +54,8 @@ HELP_CATEGORIES = {
             "and for your own profiles' background work.\n"
             "• **A server:** used for every session in that server. Only administrators of that server can assign a key to it.\n\n"
             "A server needs *someone* to have assigned a key to it, otherwise its profiles cannot generate at all. "
+            "A key an administrator adds while in a server with none becomes that server's key on its own, and a key "
+            "is your Personal one when you have none for its provider. "
             "If several people assign keys, the server index records the pointer -- the last assignment wins.\n\n"
             "**A Google key carrying conversations has to be a paid one.** Google may train its models on what a free-tier key is sent, so a "
             "free-tier key is not used for a server's messages -- sessions, memories, images or speech -- nor for Global Chat, "
@@ -620,8 +622,8 @@ HELP_CATEGORIES = {
         ),
         "When a Profile Says Nothing": (
             "In order of likelihood:\n\n"
-            "**No API key reaches this server.** An administrator must assign a key to it via `/settings` -> API Keys. Check that "
-            "**Save Assignments** was clicked. The bot says so once, pinging whoever ran into it, and is silent after that; "
+            "**No API key reaches this server.** An administrator must give it one: `/start` in the server, adding a key or pressing "
+            "**Use it in** for one they already hold. The bot says so once, pinging whoever ran into it, and is silent after that; "
             "`/session config` and `/session swap` refuse until a key is assigned.\n\n"
             "**The profile is rated Adult 18+ and the channel is not age-restricted.** It is blocked before generation. Mark the channel NSFW "
             "in Discord's settings, or use a different profile.\n\n"
@@ -691,8 +693,14 @@ HELP_CATEGORIES = {
 #: Most servers stall before anyone adds a key, not on members lacking one. Said in the
 #: welcome and in an administrator's `/start` banner until the server has one, in the same words.
 SERVER_KEY_PITCH = (
-    "**One API key covers the whole server.** Once an administrator adds theirs and assigns "
-    "it to this server, everyone here can talk to the characters, with no key of their own."
+    "**One API key covers the whole server.** An administrator's key added here becomes this "
+    "server's, and everyone here can talk to the characters, with no key of their own."
+)
+
+#: The banner's line instead, to an administrator holding a key that would work here.
+SERVER_KEY_UNASSIGNED = (
+    "**Your key isn't assigned here yet.** Press **Use it in {server}** and everyone here can "
+    "talk to the characters on it, with no key of their own."
 )
 
 WIZARD_COPY = {
@@ -733,7 +741,7 @@ WIZARD_COPY = {
             "**1.** Press **Get a key ↗**, sign in to OpenRouter and create a key. It starts with `sk-or-`.\n"
             "**2.** Press **Paste key** and paste it into the form. It becomes your **Personal** key, "
             "and only you can see it.\n"
-            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
+            "**3.** Added here in a server you run that has no key, it becomes that server's key too. Tick other servers in the dropdown that appears.\n\n"
             "Free models cost nothing; for the rest you buy credit on OpenRouter. "
             "**Never paste a key into the chat.**"
         ),
@@ -742,7 +750,7 @@ WIZARD_COPY = {
             "**1.** Press **Sign in with OpenRouter ↗** and approve MimicAI. Your key arrives here by "
             "itself as your **Personal** key, and only you can see it. Have a key already? "
             "**Paste key** takes it.\n"
-            "**2.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
+            "**2.** Added here in a server you run that has no key, it becomes that server's key too. Tick other servers in the dropdown that appears.\n\n"
             "Free models cost nothing; for the rest you buy credit on OpenRouter. "
             "**Never paste a key into the chat.**"
         ),
@@ -751,7 +759,7 @@ WIZARD_COPY = {
             "project. Google may train on what a free key sends, so only keys with billing on are accepted.\n"
             "**2.** Press **Paste key** and paste it into the form. It becomes your **Personal** key, "
             "and only you can see it.\n"
-            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
+            "**3.** Added here in a server you run that has no key, it becomes that server's key too. Tick other servers in the dropdown that appears.\n\n"
             "**Never paste a key into the chat.**"
         ),
         # No provider chosen: either key will do, and both are offered.
@@ -762,7 +770,7 @@ WIZARD_COPY = {
             "on **billing** for the key's project: only keys with billing on are accepted).\n"
             "**2.** Press the matching **Paste** button and paste the key into the form. It becomes your "
             "**Personal** key, and only you can see it.\n"
-            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
+            "**3.** Added here in a server you run that has no key, it becomes that server's key too. Tick other servers in the dropdown that appears.\n\n"
             "**Never paste a key into the chat.**"
         ),
         "none_signin": (
@@ -772,7 +780,7 @@ WIZARD_COPY = {
             "For Google, press **Get Google key ↗** (turn on **billing** for the key's project: only keys "
             "with billing on are accepted), then **Paste Google key**.\n"
             "**2.** Either becomes your **Personal** key, and only you can see it.\n"
-            "**3.** Run a server? Tick it in the dropdown that appears, and its channels use your key too.\n\n"
+            "**3.** Added here in a server you run that has no key, it becomes that server's key too. Tick other servers in the dropdown that appears.\n\n"
             "**Never paste a key into the chat.**"
         ),
     },
@@ -1012,13 +1020,14 @@ DEFAULT_HELP_DOCS = {
         "Command: `/settings` -> API Keys, or `/start`'s key step\n"
         "Concept: You hold four key slots -- Google Gemini 1 and 2, OpenRouter 1 and 2. Select a slot, click 'Submit Key' to store a key in it, then use the assignment dropdown to choose where that slot applies.\n"
         "Scopes: 'Personal' applies the key to your own Global Chat (`/profile global_chat`) wherever you run it -- a server channel or a DM -- and to your own profiles' background work. A server entry applies it to every session in that server, and only appears for servers where you hold administrator permission.\n"
-        "Important: An assignment is not saved until 'Save Assignments' is clicked. Selecting scopes in the dropdown alone changes nothing.\n"
+        "Automatic: A key you add while in a server you administer that has no key becomes that server's key, and a key is your Personal one when you hold none for its provider. Nothing is taken from another key. `/start` also offers 'Use it in <server>' for a key you added before.\n"
+        "Important: Any other assignment is not saved until 'Save Assignments' is clicked. Selecting scopes in the dropdown alone changes nothing.\n"
         "Pages: The dropdown lists 21 servers at a time, with Previous, Next and a jump-to-page entry at the top. Ticks on every page are kept until Save Assignments, and the panel lists what saving will add and remove.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'I added a key but the bot still will not respond in my server.' Fix: Storing a key and assigning it are two separate steps. Select the slot, tick the server in the assignment dropdown, then click Save Assignments.\n"
+        "- Symptom: 'I added a key but the bot still will not respond in my server.' Fix: The key was added somewhere else, or the server already pointed at another key. Run `/start` in that server and press 'Use it in <server>', or tick the server in `/settings` -> API Keys and click Save Assignments.\n"
         "- Symptom: 'The server I want is not in the assignment dropdown.' Fix: Only servers where you have administrator permission are listed. Ask an administrator of that server to assign their own key.\n"
         "- Symptom: 'Where do I run this?' or 'Is it safe to add a key in a channel?' Fix: Anywhere. `/settings` and `/start` answer only you, and the key is typed into a private form -- never paste one into the chat.\n"
-        "- Symptom: 'I added a key in /start; do I still need to assign it?' Fix: No. `/start` makes it your Personal key, and its key step lists the servers you administer to tick; each tick is saved as you make it."
+        "- Symptom: 'I added a key in /start; do I still need to assign it?' Fix: No. `/start` makes it your Personal key, and the server you ran it in takes it when it has none. Its key step lists the other servers you administer to tick; each tick is saved as you make it."
     ),
     "apis/google_gemini.txt": (
         "Requirements: A Google API key from Google AI Studio, submitted via `/start` or `/settings` -> API Keys.\n"

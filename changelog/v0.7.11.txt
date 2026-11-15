@@ -8,5 +8,9 @@ Characters notice the emoji you leave, and a child bot speaks for its owner only
 - **Child bots follow server and user blocks on their own.** A child bot leaves a blocked server when invited, at startup and when the block is placed, even where MimicAI itself is not, and a blocked user gets no answer from its `/toggle` or `/whoami`.
 - **Child Bot Placeholder** (Edit Profile → Generation Visual) shows only on profiles with a child bot linked, and on borrows of them. Editing several profiles at once shows it only if you own a child bot.
 - **Privacy Policy revised, effective 15 November 2026.** Session logs now hold the emoji reactions left on their messages, with the reacting person's display name, and removing a reaction while the bot is online removes it from the log.
+- **A key you add in a server you run that has no key becomes that server's key**, in `/start` (pasted, or by signing in with OpenRouter) and in `/settings`. A server that already has a key keeps it. `/settings` also makes a key your Personal one when you have none for its provider, and says when a key you saved isn't used anywhere.
+- **`/start`'s key step, in a server you run, is done once the server has a key**, not just you. A key you added before gets a **Use it in** button for the server.
+- **An administrator who already has a key is told it isn't assigned to the server**, rather than to add one, when the server has none.
 ## **Fixed**
 - **Replying to an old child-bot message no longer leaves the channel looking like a live session with nobody in it**, so an @ of MimicAI there is answered again.
+- **`/help` no longer brings MimicGuide into a server with no API key**, where it could never answer. It says how to get one, as `/session config` does; taking MimicGuide back out still works.
