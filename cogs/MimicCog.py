@@ -1702,6 +1702,9 @@ class MimicCog(EventListeners, commands.Cog):
 
         session['is_hydrated'] = True
         session['unified_log'] = []
+        # Derived from the log, and popped into the next reply: left, a whisper from
+        # before the refresh reaches the first turn after it.
+        session['pending_whispers'] = {}
         # The queue is emptied below without a round, so no reaction it held is waiting.
         self.session_manager.forget_queued_reactions(session)
 

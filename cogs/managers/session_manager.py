@@ -1972,8 +1972,9 @@ class SessionManager:
                     session_to_evict.pop('deleted_unlogged_messages', None)
                     session_to_evict.pop('pending_whispers', None)
 
-                    # If it's a completely empty dormant session, pop it entirely to save memory.
-                    if not session_to_evict.get("profiles"):
+                    # A draft nobody was seated in goes entirely. A started empty cast is a
+                    # session: popped, /suspend finds nothing and the next save erases it.
+                    if not session_to_evict.get("profiles") and not self.is_started(session_to_evict):
                         self.cog.multi_profile_channels.pop(key, None)
 
             # Handle global chat sessions (key is a tuple)
