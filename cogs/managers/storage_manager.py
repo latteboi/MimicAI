@@ -773,7 +773,8 @@ class StorageManager:
                 continue
             try:
                 members = await asyncio.wait_for(g.chunk(), timeout=60)
-            except Exception:
+            except Exception as e:
+                print(f"[Cleanup] Guild {g.id} re-chunk failed: {type(e).__name__}: {e}")
                 continue
             if members:
                 rechunked.add(g.id)

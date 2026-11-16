@@ -2,6 +2,7 @@ from ..utils.constants import *
 
 import asyncio
 import re
+import aiohttp
 import time
 import discord
 from discord import ui
@@ -1270,6 +1271,8 @@ class ModStatsView(ModBaseView):
                 continue
             try:
                 await self.original_interaction.edit_original_response(embed=self._get_embed())
+            except aiohttp.ClientError:
+                continue  # a dropped connection, not an HTTP answer: the next tick tries again
             except discord.HTTPException:
                 return  # the interaction token lapsed (15 minutes) or the panel was dismissed
 

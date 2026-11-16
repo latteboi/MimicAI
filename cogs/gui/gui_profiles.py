@@ -6962,7 +6962,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
 
         return embed
 
-    async def _refresh(self, i: discord.Interaction):
+    async def _rerender(self, i: discord.Interaction):
         await self.refresh_state()
         self._build_view()
         await i.edit_original_response(embed=self.get_embed(), view=self)
@@ -6987,7 +6987,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
         """
         await self._repaint(i)
         await self.cog.profile_manager.await_classification(self.user_id, self.profile_name)
-        await self._refresh(i)
+        await self._rerender(i)
 
     # --- actions --------------------------------------------------------------
 
@@ -7005,7 +7005,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
         if ok:
             await self._await_verdict(i)
         else:
-            await self._refresh(i)
+            await self._rerender(i)
 
     async def recheck_cb(self, i: discord.Interaction):
         """Refreshes a Pending profile, re-queueing it if nothing is actually running.
@@ -7027,7 +7027,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
             # to return the same Pending unless it had queued the job itself.
             await self._await_verdict(i)
         else:
-            await self._refresh(i)
+            await self._rerender(i)
 
     async def declare_cb(self, i: discord.Interaction):
         pm = self.cog.profile_manager
@@ -7040,7 +7040,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
             pm.schedule_content_classification(self.user_id, self.profile_name)
             await self._await_verdict(i)
             return
-        await self._refresh(i)
+        await self._rerender(i)
 
     async def clear_cb(self, i: discord.Interaction):
         await i.response.defer()
@@ -7053,7 +7053,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
             # stays until lifted under Blacklist, which the operator decides.
             self.cog.server_manager.remove_strikes(
                 self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name))
-        await self._refresh(i)
+        await self._rerender(i)
 
     async def appeal_cb(self, i: discord.Interaction):
         await i.response.defer()
@@ -7061,7 +7061,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
             self.cog.profile_manager.appeal_refusal, self.user_id, self.profile_name)
         await i.followup.send(embed=text_embed("Sent to the bot operator for review." if appealed
                               else "This refusal cannot be appealed again."), ephemeral=True)
-        await self._refresh(i)
+        await self._rerender(i)
 
     async def uphold_cb(self, i: discord.Interaction):
         await i.response.defer()
@@ -7069,7 +7069,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
         if await asyncio.to_thread(pm.uphold_refusal, self.user_id, self.profile_name, i.user.id):
             self.cog.server_manager.add_strike(
                 self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name), self.profile_name)
-        await self._refresh(i)
+        await self._rerender(i)
 
     def _review_cb(self, verdict: str):
         async def callback(i: discord.Interaction):
@@ -7081,7 +7081,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
                 self.cog.server_manager.add_strike(
                     self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name),
                     self.profile_name)
-            await self._refresh(i)
+            await self._rerender(i)
         return callback
 
     async def force_cb(self, i: discord.Interaction):

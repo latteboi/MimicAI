@@ -4,7 +4,8 @@ copies. https://openrouter.ai/docs/guides/overview/auth/oauth
 OpenRouter sends the browser back to `OPENROUTER_SIGNIN_URL` with `?code=&state=`. That
 URL is a Cloudflare Worker (`cloudflare/openrouter_signin.js`), not this process, so the
 VM opens no port: the Worker posts `"<state> <code>"` through a webhook into a channel
-the bot can read, and the bot, already on the gateway, takes it with `wait_for`. A code
+the bot can read, and the bot, already on the gateway, takes it with `wait_for` and deletes
+it in `on_message`. A code
 is worthless without its verifier, which never leaves this process, works once, and dies
 ten minutes after it is issued.
 """
@@ -52,7 +53,7 @@ async def receive_code(bot: discord.Client, state: str, timeout: float) -> Optio
     """The code the Worker relays for `state`, or None if none arrives in `timeout`.
 
     Matched on the relay webhook's id, never the channel alone, so nobody else posting
-    there can answer a sign-in. The post is deleted once read.
+    there can answer a sign-in. The post is deleted by `clear_relay_post`, not here.
     """
     relay, prefix = defaultConfig.OPENROUTER_RELAY_WEBHOOK_ID, f"{state} "
     try:
@@ -61,11 +62,23 @@ async def receive_code(bot: discord.Client, state: str, timeout: float) -> Optio
             check=lambda m: m.webhook_id == relay and m.content.startswith(prefix))
     except asyncio.TimeoutError:
         return None
+    return message.content[len(prefix):].strip()
+
+
+async def clear_relay_post(message: discord.Message) -> bool:
+    """Deletes every relay post on arrival, whether or not a sign-in waits for it. A post
+    for a wait that is gone (the wizard timed out, a restart, the link opened twice) is
+    matched by nobody, and deleted only after a match it would stay in the channel for good."""
+    if message.webhook_id != defaultConfig.OPENROUTER_RELAY_WEBHOOK_ID:
+        return False
     try:
         await message.delete()
-    except discord.HTTPException:
+    except discord.NotFound:
         pass
-    return message.content[len(prefix):].strip()
+    except discord.HTTPException as e:
+        # 403: the bot lacks Manage Messages in the relay channel.
+        print(f"OpenRouter sign-in: could not delete relay post {message.id}: {e}")
+    return True
 
 
 async def exchange(code: str, verifier: str) -> str:

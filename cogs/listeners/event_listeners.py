@@ -13,7 +13,7 @@ from discord.ext import commands
 
 from ..utils.constants import *
 from ..utils.member_probe import start_member_probe
-from ..utils import data_policy, mem_probe
+from ..utils import data_policy, mem_probe, openrouter_signin
 from ..utils.content import (
     MENTION_POINTER_REGISTERED, MENTION_POINTER_UNREGISTERED, WELCOME_MESSAGE,
     WELCOME_CHANNEL_HINTS,
@@ -244,6 +244,11 @@ class EventListeners:
         # it to on the overwhelmingly common no-game path.
         if self.active_games:
             self.game_service.nudge_table(message.channel.id, message.id)
+
+        # A sign-in's relayed code, read by its own `wait_for`: above the `author.bot`
+        # return, since a webhook post is a bot's.
+        if await openrouter_signin.clear_relay_post(message):
+            return
 
         if message.id in self.processed_child_messages:
             return

@@ -560,7 +560,7 @@ class DataManageView(BlockedGuard, ui.View):
         await self._reload()
         await self._show(self.original_interaction)
 
-    async def _refresh(self):
+    async def _rerender(self):
         """After a change made through a modal or a confirmation: re-read, then repaint
         the screen itself, which belongs to the interaction that opened it."""
         await self._reload()
@@ -640,7 +640,7 @@ class DataManageView(BlockedGuard, ui.View):
             self.page, self.open_id, self.search_term = 0, None, None
             if self.mode == 'ltm' and modal.file_under:
                 self.server_id = str(modal.file_under)
-            await self._refresh()
+            await self._rerender()
         modal.on_submit = on_submit_refresh
         await interaction.response.send_modal(modal)
 
@@ -662,7 +662,7 @@ class DataManageView(BlockedGuard, ui.View):
         original_on_submit = modal.on_submit
         async def on_submit_refresh(i: discord.Interaction):
             await original_on_submit(i)
-            await self._refresh()
+            await self._rerender()
         modal.on_submit = on_submit_refresh
         await interaction.response.send_modal(modal)
 
@@ -682,7 +682,7 @@ class DataManageView(BlockedGuard, ui.View):
                 gone = await mm.delete_training_examples(self.user_id, self.profile_name, ids)
             await i.response.edit_message(content=None,
                                           view=None, embed=dismissible(text_embed(f"Deleted {gone} item(s)." if gone else "Nothing was found to delete.")))
-            await self._refresh()
+            await self._rerender()
             if self.mode in ('lore', 'examples') and gone:
                 from .gui_profiles import maybe_prompt_rating_after_edit
                 await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, self.profile_name)
