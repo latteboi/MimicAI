@@ -28,11 +28,13 @@ from .base_components import dismissible, text_embed
 class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
     summary_field = ui.TextInput(label="Memory Summary", style=discord.TextStyle.paragraph, required=True, max_length=2000)
 
-    def __init__(self, cog, profile_owner_id: int, profile_name: str, ltm_id: str, current_summary: str):
+    def __init__(self, cog, profile_owner_id: int, profile_name: str, server_id, ltm_id: str,
+                 current_summary: str):
         super().__init__()
         self.cog: MimicCog = cog
         self.profile_owner_id = profile_owner_id
         self.profile_name = profile_name
+        self.server_id = server_id
         self.ltm_id = ltm_id
         self.summary_field.default = current_summary
 
@@ -55,7 +57,8 @@ class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
             return
 
         b64_emb = encode_embedding_b64(new_embedding)
-        success = await self.cog.memory_manager.update_ltm(self.profile_owner_id, self.profile_name, self.ltm_id, new_summary, b64_emb)
+        success = await self.cog.memory_manager.update_ltm(self.profile_owner_id, self.profile_name, self.server_id,
+                                                           self.ltm_id, new_summary, b64_emb)
         if success:
             await i.followup.send(embed=text_embed(f"LTM entry `{self.ltm_id}` for profile '{self.profile_name}' has been updated."), ephemeral=True)
         else:
@@ -100,12 +103,14 @@ class AddLtmModal(ui.Modal, title="Add Long-Term Memory"):
 
         # Refused at the limit rather than rolled over: automatic creation drops the
         # oldest to make room, but a memory typed by hand should not silently cost one.
+        # The limit is each server's own, so it is that server's count.
         limit = defaultConfig.LIMIT_LTM
-        current_count = len(await self.cog.memory_manager.load_ltms(self.profile_owner_id, self.profile_name))
+        current_count = len(await self.cog.memory_manager.load_ltms(
+            self.profile_owner_id, self.profile_name, self.file_under))
         if current_count >= limit:
             await i.followup.send(
-                embed=text_embed(f"**Limit Reached.**\nYou have **{current_count}** memories (Limit: {limit}).\n"
-                "You cannot manually add more memories while at or above the limit. "
+                embed=text_embed(f"**Limit Reached.**\nThis server has **{current_count}** memories (Limit: {limit} per server).\n"
+                "You cannot manually add more memories here while at or above the limit. "
                 "Please delete old memories first."), ephemeral=True)
             return
 
@@ -393,13 +398,19 @@ class DataManageView(BlockedGuard, ui.View):
         if opened:
             return self._detail_embed(opened)
         noun, limit, unit = {
-            'ltm': ("Long-Term Memories", defaultConfig.LIMIT_LTM, "memories across every server"),
+            'ltm': ("Long-Term Memories", defaultConfig.LIMIT_LTM, "memories in this server"),
             'training': ("Training Examples", defaultConfig.LIMIT_TRAINING, "examples"),
             'lore': ("Lorebook", LIMIT_LORE_ENTRIES, "entries"),
             'examples': ("Fixed Examples", LIMIT_FIXED_EXAMPLES, "examples"),
         }[self.mode]
         embed = discord.Embed(title=f"{noun} · {self.profile_name}", color=discord.Color.dark_teal())
-        embed.set_footer(text=f"{len(self.entries)} / {limit} {unit}")
+        if self.mode == 'ltm':
+            # The limit is each server's own, so the footer counts the server on screen.
+            here = next((n for sid, _, n in self.servers if sid == self.server_id), None)
+            embed.set_footer(text=f"{here} / {limit} {unit}" if here is not None
+                             else f"{len(self.entries)} memories · {limit} per server")
+        else:
+            embed.set_footer(text=f"{len(self.entries)} / {limit} {unit}")
 
         if self.mode == 'ltm' and not self.server_id:
             embed.description = ("Choose a server. A memory is only ever recalled in the server it formed in."
@@ -646,7 +657,8 @@ class DataManageView(BlockedGuard, ui.View):
         elif self.mode == 'examples':
             modal = FixedExampleModal(self.cog, self.user_id, self.profile_name, item)
         else:
-            modal = EditLtmModal(self.cog, self.user_id, self.profile_name, item["id"], item.get("sum", ""))
+            modal = EditLtmModal(self.cog, self.user_id, self.profile_name, item.get("context_id"),
+                                 item["id"], item.get("sum", ""))
         original_on_submit = modal.on_submit
         async def on_submit_refresh(i: discord.Interaction):
             await original_on_submit(i)
@@ -663,9 +675,11 @@ class DataManageView(BlockedGuard, ui.View):
             elif self.mode == 'examples':
                 gone = await asyncio.to_thread(self.cog.profile_manager.delete_fixed_examples,
                                                self.user_id, self.profile_name, ids)
+            elif self.mode == 'ltm':
+                # Every LTM the screen can pick is in the server it is showing.
+                gone = await mm.delete_ltms(self.user_id, self.profile_name, self.server_id, ids)
             else:
-                delete = mm.delete_ltms if self.mode == 'ltm' else mm.delete_training_examples
-                gone = await delete(self.user_id, self.profile_name, ids)
+                gone = await mm.delete_training_examples(self.user_id, self.profile_name, ids)
             await i.response.edit_message(content=None,
                                           view=None, embed=dismissible(text_embed(f"Deleted {gone} item(s)." if gone else "Nothing was found to delete.")))
             await self._refresh()

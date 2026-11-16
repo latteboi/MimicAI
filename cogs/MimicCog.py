@@ -258,6 +258,9 @@ class MimicCog(EventListeners, commands.Cog):
         self.borrow_index: Dict[str, Dict[str, List[str]]] = {}
         self.borrow_index_inverse: Dict[str, Dict[str, str]] = {}
         self.profile_manager._load_borrow_index()
+        # Before the gateway, so no turn reads or writes a memory while files move.
+        self.memory_manager.load_embedding_baseline()
+        self.memory_manager.migrate_ltm_files()
         # Sweep tombstones once at boot. Deletion normally cascades, so a survivor
         # here came from a crash mid-delete or an older build; left alone it renders
         # in the hub as an unborrowable "Unknown" entry forever. A listing whose rating
@@ -582,9 +585,18 @@ class MimicCog(EventListeners, commands.Cog):
     @app_commands.describe(profile_name="The name of the personal or borrowed profile to manage.")
     @app_commands.autocomplete(profile_name=EventListeners.master_autocomplete)
     async def manage_profile_slash(self, interaction: discord.Interaction, profile_name: str):
-        await interaction.response.defer(ephemeral=True)
+        # Acknowledged while the dashboard is built, not before it: the build no longer waits
+        # out a round trip. Awaited on every exit, or an error would answer a live defer.
+        deferral = asyncio.create_task(interaction.response.defer(ephemeral=True))
+        try:
+            await self._manage_profile(interaction, profile_name, deferral)
+        finally:
+            await deferral
 
+    async def _manage_profile(self, interaction: discord.Interaction, profile_name: str,
+                              deferral: asyncio.Task):
         if not self._owns_profile_name(interaction.user.id, profile_name):
+            await deferral
             candidates = gather_owned_candidates(self, interaction.user.id)
 
             # Names are stored lowercase, so "Alice" is not a typo -- it is the same
@@ -615,7 +627,7 @@ class MimicCog(EventListeners, commands.Cog):
                                   on_create=on_create if creatable else None)
             return
 
-        await self._open_profile_manage(interaction, profile_name)
+        await self._open_profile_manage(interaction, profile_name, deferral=deferral)
 
     def command_mention(self, name: str) -> str:
         """`</name:id>` if the id is known, otherwise a plain `/name` code span.
@@ -635,27 +647,31 @@ class MimicCog(EventListeners, commands.Cog):
         return profile_name in self.profile_manager._system_index()
 
     async def _open_profile_manage(self, interaction: discord.Interaction, profile_name: str,
-                                   *, repaint: bool = False):
+                                   *, repaint: bool = False, deferral: Optional[asyncio.Task] = None):
         """Render the profile dashboard.
 
         `repaint` edits the interaction's existing message instead of sending a new one,
         which is how a "Did you mean?" prompt turns into the dashboard in place rather
-        than leaving a spent suggestion card above it.
+        than leaving a spent suggestion card above it. `deferral` is an acknowledgement
+        still in flight, awaited once the dashboard is built.
         """
         index = self.profile_manager._get_user_index(interaction.user.id)
         is_view_borrowed = profile_name in index.get("borrowed", [])
 
         embed = await self.profile_manager._build_profile_manage_embed(interaction, profile_name)
         view = ProfileManageView(self, interaction, profile_name, is_view_borrowed)
-        # On open rather than on every repaint: it hashes the whole persona, and the
-        # repaint straight after an edit is the post-edit prompt's decision to make.
-        # This catches imports, restores and prompts that were ignored.
-        asyncio.create_task(self.profile_manager.resolve_stale_rating(interaction.user.id, profile_name))
+        if deferral is not None:
+            await deferral
 
         if repaint:
             await interaction.edit_original_response(content=None, embed=embed, view=view)
         else:
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        # On open rather than on every repaint: it hashes the whole persona, and the
+        # repaint straight after an edit is the post-edit prompt's decision to make.
+        # This catches imports, restores and prompts that were ignored. After the send,
+        # so the hash does not compete with it for the CPU.
+        asyncio.create_task(self.profile_manager.resolve_stale_rating(interaction.user.id, profile_name))
 
     bulk_group = app_commands.Group(name="bulk", description="Perform actions on multiple profiles at once.", parent=profile_group)
 

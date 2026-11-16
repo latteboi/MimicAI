@@ -150,8 +150,9 @@ class HelpService:
         it did so inline on the event loop, not in a thread.
 
         Rows are stored unit length so a query is a bare dot product. Once the matrix
-        exists the per-document `emb` is dropped: 256 boxed Python floats is roughly
-        8 KB against 1 KB for the same row of the matrix, and nothing reads it again.
+        exists the per-document `emb` and `emb_b64` are dropped: 256 boxed Python floats
+        is roughly 8 KB against 1 KB for the same row of the matrix, and nothing reads
+        either again -- the cache file was written before this runs.
         """
         import numpy as np
 
@@ -179,6 +180,7 @@ class HelpService:
 
         for doc in vectors:
             doc.pop("emb", None)
+            doc.pop("emb_b64", None)
 
     async def _load_and_embed_docs(self):
         """Reads all .txt shards, tags them semantically, and builds the vector database."""

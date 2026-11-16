@@ -193,8 +193,8 @@ _SHARD_CACHE_MAX_BYTES = 8 * 1024 * 1024
 
 # No single file may take more than an eighth of the budget. Without this, one large
 # shard is allowed to be the entire cache and evicts everything the turn path wants:
-# an LTM shard at LIMIT_LTM is 5000 entries carrying an embedding each, which is most
-# of the budget on its own. With it, the common small shard is cached and the outlier
+# a server's LTM file at LIMIT_LTM carries 2000 embeddings, a quarter of the budget on
+# its own. With it, the common small shard is cached and the outlier
 # is simply read from disk every time, which is what it would have done anyway. This
 # is why opting a path in is a question about *frequency* only -- size answers itself.
 _SHARD_CACHE_MAX_ENTRY_BYTES = _SHARD_CACHE_MAX_BYTES // 8
@@ -435,6 +435,14 @@ class StorageManager:
     def _load_json_gzip(self, file_path: str, encrypted: bool = True) -> Optional[Any]:
         return IOManager.read_json_gzip(file_path, self.fernet, encrypted)
 
+    def _profile_dir(self, entity_id: str, profile_name: Optional[str], strict: bool = False) -> Optional[str]:
+        """`profiles/<pid>` for this owner's name, or None when it resolves to no PID.
+        `strict` as in `_get_shard_path`, which says why a write must ask for it."""
+        pm = self.cog.profile_manager
+        pid = (pm._get_pid_from_name(int(entity_id), profile_name) if strict
+               else pm._get_pid_from_name_any(int(entity_id), profile_name))
+        return os.path.join(self.cog.USERS_DIR, str(entity_id), "profiles", pid) if pid else None
+
     def _get_shard_path(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None,
                         strict: bool = False) -> Optional[str]:
         """Where a per-profile side shard lives, resolved through the owner's index.
@@ -449,24 +457,22 @@ class StorageManager:
 
         Returns None under `strict` when the name resolves to no PID, and the write
         callers below turn that into a no-op rather than a phantom directory.
+
+        Long-term memories are not here: they are a folder of one file per server
+        (`MemoryManager._ltm_path`), resolved through `_profile_dir` the same way.
         """
-        if shard_type in ["ltm", "training", "bonds"]:
-            pm = self.cog.profile_manager
-            pid = (pm._get_pid_from_name(int(entity_id), sub_key) if strict
-                   else pm._get_pid_from_name_any(int(entity_id), sub_key))
-            if not pid:
-                return None
-            return os.path.join(self.cog.USERS_DIR, str(entity_id), "profiles", pid, f"{shard_type}.json.gz")
+        if shard_type in ["training", "bonds"]:
+            p_dir = self._profile_dir(entity_id, sub_key, strict)
+            return os.path.join(p_dir, f"{shard_type}.json.gz") if p_dir else None
         elif shard_type == "profile_shares":
             return os.path.join(self.cog.USERS_DIR, str(entity_id), "shares.json.gz")
         raise ValueError(f"Unknown shard type: {shard_type}")
 
     def _load_shard(self, shard_type: str, entity_id: str, sub_key: Optional[str] = None) -> Optional[Any]:
-        # Cached: an LTM shard is read in full on every retrieval turn -- the vector
-        # cache above it holds the built matrix, not the file -- and a training shard
-        # on every generation that uses examples. Both re-read the same path over and
-        # over, which is the whole test for opting in; the per-entry ceiling decides
-        # what actually gets kept, so a huge LTM shard falls back to a plain read.
+        # Cached: a shard is re-read by the screens that list it and by every
+        # read-modify-write, which is the whole test for opting in; the per-entry
+        # ceiling decides what actually gets kept. Retrieval reads past this, through
+        # MemoryManager's vector cache, which holds the entries it needs beside the rows.
         path = self._get_shard_path(shard_type, entity_id, sub_key)
         return IOManager.read_json_gzip_cached(path, self.fernet) if path else None
 

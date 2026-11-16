@@ -87,7 +87,8 @@ class DefaultConfigNamespace:
 
         self.LIMIT_PROFILES = 100
         self.LIMIT_BORROWED = 100
-        self.LIMIT_LTM = 5000
+        # Per server: a profile keeps one memory file for each server it is used in.
+        self.LIMIT_LTM = 2000
         self.LIMIT_TRAINING = 100
         # Per recording, not per profile: only a profile's selected slot is ever sent.
         self.LIMIT_VOICE_SAMPLE_BYTES = 1 * 1024 * 1024
@@ -166,6 +167,10 @@ PUBLIC_PROFILES_DIR = os.path.join(DATA_DIR, "public_profiles")
 # Reverse index: source profile -> its current borrowers. Plaintext, as index.json is:
 # ids and PIDs, nothing a borrow's own config does not already show its borrower.
 BORROW_INDEX_FILE = os.path.join(DATA_DIR, "borrows.json")
+
+# The embedding model an LTM or training vector with no `emb_model` was made by: the one
+# configured on the first boot of v0.7.12. Plaintext. MemoryManager.load_embedding_baseline.
+EMBEDDING_BASELINE_FILE = os.path.join(DATA_DIR, "embedding_baseline.json")
 
 # High-water mark of the member cache, so the daily cleanup can tell "everyone left"
 # from "chunking has not finished". Safe to delete; a missing file costs one run.
@@ -1444,14 +1449,6 @@ DEFAULT_GROUNDING_RAG_PAYLOAD = (
 
 # --- Long-term memory and training --------------------------------------------
 
-MAX_LTM_COUNT_PER_PROFILE_CONTEXT = 1000
-
-# Comments elsewhere cost their optimisation against "a 1000-turn log" -- intern_turn,
-# the tail-flush note, _select_history_window, loop_probe. Those predate this cap and
-# were taken at the largest log then allowed; the reasoning holds, the figures scale.
-LTM_INJECTION_PROBABILITY = 1
-
-LTM_CREATION_INTERVAL = 10
 MIN_HISTORY_FOR_LTM_CREATION = 2
 #: The most a memory reads: the newest this many public turns since the character's last
 #: one. A backlog past it is skipped, not worked through -- a memory keeps one thing, so
@@ -1461,7 +1458,9 @@ LTM_EXCERPT_TURNS = 40
 #: formed in. Not calibrated against a corpus: raise it if distinct memories are being
 #: dropped, lower it if restatements still get through.
 LTM_DUPLICATE_SIMILARITY = 0.92
-MAX_TRAINING_EXAMPLES_PER_PROFILE = 50
+#: The most servers an imported profile brings memories for: those with the newest. Each
+#: server is a file, and an import names its servers itself.
+LTM_IMPORT_MAX_SERVERS = 100
 
 #: What one long-term memory is written by, and the shape it must have.
 #:
@@ -2247,6 +2246,9 @@ MENTION_POINTER_COOLDOWN_SECONDS = 600
 # hysteresis; trimming *to* the threshold is pathological.
 LOG_TRIM_TARGET = 250
 
+# Comments elsewhere cost their optimisation against "a 1000-turn log" -- intern_turn,
+# the tail-flush note, _select_history_window, loop_probe. Those predate this cap and
+# were taken at the largest log then allowed; the reasoning holds, the figures scale.
 LOG_TRIM_HIGH_WATER = 400
 
 # Who may open a channel's session editor. Absent means CLOSED, so a blueprint written

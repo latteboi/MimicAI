@@ -60,6 +60,7 @@ from ..utils.bonds import apply_updates as apply_bond_updates, describe as descr
 from ..utils.discord_cdn import is_web_url, signed_attachment_url, unsigned_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager, _get_compressor, _get_decompressor
+from .memory_manager import read_ltm_dir, write_imported_ltm
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
 from ..gui.base_components import dismissible, text_embed
 
@@ -4538,8 +4539,9 @@ class ProfileManager:
             entry = {"pid": pid, "config": config, "prompts": p_data.get("prompts") or {},
                      "ltm": [], "training": []}
             if "ltm" in filters:
-                ltm = IOManager.read_json_gzip(os.path.join(p_dir, "ltm.json.gz"), self.cog.fernet)
-                entry["ltm"] = (ltm or {}).get("guild", [])
+                # One list, every server, as a .mimic has always carried it: the per-server
+                # files are this instance's layout, and any version reads a list.
+                entry["ltm"] = read_ltm_dir(p_dir, self.cog.fernet)
             if "training" in filters:
                 entry["training"] = IOManager.read_json_gzip(
                     os.path.join(p_dir, "training.json.gz"), self.cog.fernet) or []
@@ -4660,9 +4662,10 @@ class ProfileManager:
 
                 ltm = p_data.get("ltm") if isinstance(p_data.get("ltm"), list) else []
                 training = p_data.get("training") if isinstance(p_data.get("training"), list) else []
-                # Newest last in both, as they are written.
+                # Newest last in both, as they are written. Memories are bounded per server
+                # as they are filed (write_imported_ltm).
                 jobs.append((new_pid, {"name": local_name, "config": config, "prompts": prompts, "child_bot": None},
-                             ltm[-defaultConfig.LIMIT_LTM:], training[-defaultConfig.LIMIT_TRAINING:]))
+                             ltm, training[-defaultConfig.LIMIT_TRAINING:]))
                 personal[local_name] = new_pid
 
             try:
@@ -4708,7 +4711,7 @@ class ProfileManager:
                 written.append(p_dir)
                 self._save_profile_by_pid(user_id, pid, profile)
                 if ltm:
-                    IOManager.write_json_gzip({"guild": ltm}, os.path.join(p_dir, "ltm.json.gz"), self.cog.fernet)
+                    write_imported_ltm(p_dir, ltm, self.cog.fernet)
                 if training:
                     IOManager.write_json_gzip(training, os.path.join(p_dir, "training.json.gz"), self.cog.fernet)
         except BaseException:
@@ -4867,14 +4870,14 @@ class ProfileManager:
         return name
 
     async def _memory_counts(self, user_id: int, profile_name: str, source_owner_id: int,
-                             source_profile_name: str) -> Tuple[int, int]:
-        """(LTM entries, training examples), read off the event loop: a cache miss is a
-        decrypt, and both dashboards repaint on every edit."""
+                             source_profile_name: str, guild_id: Optional[int]) -> Tuple[int, int]:
+        """(LTM entries in `guild_id`, or in every server without one; training examples),
+        read off the event loop: a cache miss is a decrypt, and both dashboards repaint on
+        every edit."""
         mm = self.cog.memory_manager
         def _read():
-            ltm = mm._load_ltm_shard(str(user_id), profile_name)
             training = mm._load_training_shard(str(source_owner_id), source_profile_name)
-            return (len(ltm.get("guild", [])) if ltm else 0), (len(training) if training else 0)
+            return mm._ltm_count(user_id, profile_name, guild_id), (len(training) if training else 0)
         return await asyncio.to_thread(_read)
 
     async def _build_profile_embed(self, user_id: int, profile_name: str, channel_id: int,
@@ -4893,14 +4896,22 @@ class ProfileManager:
             owner_user = self.cog.bot.get_user(effective_owner_id)
             profile_type = f"Borrowed (from {owner_user.name if owner_user else 'Unknown User'})"
 
-        _, _, _, temp, top_p, top_k, train_ctx, train_rel, prim_model, fall_model = await asyncio.to_thread(
-            self.cog.session_manager._get_user_profile_for_model, user_id, channel_id, profile_name
-        )
-
         config = self._get_profile_config(user_id, profile_name, is_borrowed) or {}
+        # Off this config, as `_get_user_profile_for_model` reads them -- which would read
+        # the config and the prompts again, on a worker thread, for these alone.
+        temp = float(config.get("temperature", defaultConfig.GEMINI_TEMPERATURE))
+        top_p = float(config.get("top_p", defaultConfig.GEMINI_TOP_P))
+        top_k = int(config.get("top_k", defaultConfig.GEMINI_TOP_K))
+        train_ctx = int(config.get("training_context_size", defaultConfig.TRAINING_CONTEXT_SIZE))
+        train_rel = float(config.get("training_relevance_threshold", defaultConfig.TRAINING_RELEVANCE_THRESHOLD))
+        prim_model = config.get("primary_model", PRIMARY_MODEL_NAME)
+        fall_model = config.get("fallback_model", FALLBACK_MODEL_NAME)
 
+        # This server's memories, the count its limit applies to; every server's in a DM.
+        guild = getattr(self.cog.bot.get_channel(channel_id), "guild", None)
+        guild_id = guild.id if guild else None
         ltm_count, train_count = await self._memory_counts(
-            user_id, profile_name, effective_owner_id, effective_profile_name)
+            user_id, profile_name, effective_owner_id, effective_profile_name, guild_id)
 
         created_str = config.get('created_at')
         created_display = "Unknown"
@@ -5088,7 +5099,8 @@ class ProfileManager:
         ltm_val = (
             f"Auto-Creation: {ltm_status}\n"
             f"Auto-Recall: {auto_recall_status}\n"
-            f"Count: `{ltm_count}`\n"
+            + (f"This Server: `{ltm_count:,} / {defaultConfig.LIMIT_LTM:,}`\n" if guild_id
+               else f"All Servers: `{ltm_count:,}`\n") +
             f"Context Size: `{ltm_ctx}`\n"
             f"Relevance Threshold: `{ltm_rel}`\n"
             f"Memory Search: {recall_status}"
@@ -5705,10 +5717,12 @@ class ProfileManager:
                 }
                 self._save_profile_by_pid(owner_id, target_pid, target_data)
 
-                for item in ["ltm.json.gz", "training.json.gz"]:
-                    src_file = os.path.join(source_dir, item)
-                    if os.path.exists(src_file):
-                        shutil.copy2(src_file, os.path.join(target_dir, item))
+                src_file = os.path.join(source_dir, "training.json.gz")
+                if os.path.exists(src_file):
+                    shutil.copy2(src_file, os.path.join(target_dir, "training.json.gz"))
+                if os.path.isdir(os.path.join(source_dir, "ltm")):
+                    shutil.copytree(os.path.join(source_dir, "ltm"), os.path.join(target_dir, "ltm"),
+                                    dirs_exist_ok=True)
 
                 if target_category not in owner_index or not isinstance(owner_index[target_category], dict):
                     owner_index[target_category] = {}

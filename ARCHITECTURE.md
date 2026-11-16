@@ -193,16 +193,16 @@ mutate what they are handed.
 
 A path opts in when it **re-reads the same file** — profile shards (several times a turn),
 `keys.json.gz` (every key resolution and `/settings` screen), LTM and training shards
-(every retrieval), and the child-bot rescan, which re-reads every profile whenever any one
+(the screens that list them, and every write), and the child-bot rescan, which re-reads every profile whenever any one
 of them changes and shares its entries with the turn path. A one-shot sweep of every shard
 must not: the daily orphan pass, the boot share scan and the content-rating reset each
 touch a file once and never again, so caching them evicts the working set to hold data
 nobody will read.
 
 Size is not the caller's problem. `_SHARD_CACHE_MAX_ENTRY_BYTES` caps any single entry at
-an eighth of the budget, so an outlier — an LTM shard at `LIMIT_LTM` carries 5000
-embeddings — is read straight from disk and evicts nothing, while the ordinary small one
-is kept. That is why opting in is a judgement about frequency alone.
+an eighth of the budget, so an outlier is read straight from disk and evicts nothing, while
+the ordinary small one is kept. That is why opting in is a judgement about frequency alone.
+Retrieval does not come through here: see the vector cache under Memory and embeddings.
 
 ---
 
@@ -217,7 +217,8 @@ users/<user_id>/
   profiles/<pid>/
     profile.json.gz                   unified: {name, config, prompts, child_bot}
     name.json                         plaintext sidecar: {name, class} -- see below
-    ltm.json.gz                       long-term memories + b64 float16 embeddings
+    ltm/<guild_id>.json.gz            long-term memories formed in that server + b64 float16
+                                      embeddings (one file per server, LIMIT_LTM each)
     training.json.gz                  training examples + embeddings (fixed ones are in prompts)
     bonds.json.gz                     {speaker ID: [affection, resentment]}, cogs/utils/bonds.py
     global_chat.json.gz               `/profile global_chat` log, keyed (host, profile)
@@ -693,12 +694,28 @@ Vectors are **256-dimensional**, truncated from the embedding model's native out
 Matryoshka Representation Learning. The quality loss is small; the disk and RAM saving is
 not.
 
+**A memory lives in its server's file**, `ltm/<guild_id>.json.gz`, because it is only ever
+recalled there: a turn reads one server's memories and nothing else, and `LIMIT_LTM` applies
+to each server on its own, so a busy server never trims a quiet one. Before v0.7.12 every
+server shared one `ltm.json.gz`; `migrate_ltm_files` splits any it finds at boot, merging by
+id so a re-run or a rollback's leftovers lose nothing. A `.mimic` still carries one list
+(`read_ltm_dir` / `write_imported_ltm`).
+
+**Retrieval reads the vector cache, not the file.** `_cached_vectors` holds, per file, the
+unit rows and the few fields a recall shows (`_Vectors`), built from one read and stored
+under the stamp taken before it, so rows can never be paired with a list they were not
+built from. A hit is one `stat`. LTM and training share it, bounded at
+`_VEC_CACHE_MAX_ROWS`, locked because several worker threads use it at once; help mode keeps
+its own matrix. A row of the wrong width is skipped, not raised on.
+
 Every vector is one model's -- Google's `gemini-embedding-001` unless `/mod` -> System Models
 moves it -- asked for on a Gemini key or, failing that, through OpenRouter's `google/` copy on
 an OpenRouter key (`StorageManager._embedding_routes`, then `services/api/embeddings.py`).
-A model Google does not serve has the OpenRouter route alone. A stored vector does not record
-its model, so a change silently degrades recall of everything already stored; only the
-documentation re-embeds. One archive can hold both routes only because they are the same
+A model Google does not serve has the OpenRouter route alone. Every stored vector names its
+model (`emb_model`, `embedding_model_key`); one without it was made by the instance's baseline,
+the model configured on its first boot of v0.7.12 (`EMBEDDING_BASELINE_FILE`). Recall ranks
+only vectors from the model in use, so after a `/mod` change old memories are not recalled
+until re-saved, rather than recalled as noise; only the documentation re-embeds. One archive can hold both routes only because they are the same
 vectors, so OpenRouter is sent `dimensions` and `input_type`, and a stored document goes to
 Vertex alone -- AI Studio drops the task type. A server's OpenRouter route carries its
 `data_collection`. A longer vector is cut to 256 and a shorter one refused, before either is stored.
@@ -727,8 +744,10 @@ character's clock, with the session synopsis as background. The summariser write
 `LTM_MAX_PER_CAPTURE` memories, one a line, each embedded and stored as its own entry, all
 or none. A verdict (memories, nothing worth keeping, or near-duplicates of ones it already
 has) moves the bookmark on; a failure leaves it and waits another interval. The duplicate
-test is one product against the cached unit rows of the guild the memory formed in, plus
-those stored earlier in the same batch. Recall prefixes each memory with the date it was
+test is one product against the cached unit rows of the server's file, plus those stored
+earlier in the same batch. The capture passes its session's owner to `_add_ltms`, which
+decides whose copy of a borrowed character keeps the memory, and the `recall` function asks
+the same question through `FunctionContext.channel_id`. Recall prefixes each memory with the date it was
 made, on the character's calendar.
 
 **Two triggers, one writer.** `ltm_creation_mode` is `flag` (absent) or `interval`. In `flag`
@@ -846,9 +865,8 @@ format in place.
 
 ## The optional native core
 
-`mimic_core` (Rust/C) is probed at import for three functions:
+`mimic_core` (Rust/C) is probed at import for two functions:
 
-- `calculate_similarities_b64` — `memory_manager.py`
 - `count_tokens` — `helpers.py`
 - `scan_repetition` — `helpers.py`
 
@@ -913,8 +931,6 @@ Any dict keyed by channel, user or profile must be an `LRUCache` or have an evic
 
 ## Provenance
 
-The codebase was generated by AI under human direction, beginning with Gemini 2.5 Pro in
-Google AI Studio. That history is visible in the structure: a god-cog that grew before it
-was split, mixins layered onto services rather than a redesign, and comments that argue at
-length for their own code. The architecture notes above describe what is there now, not
-what a clean-sheet design would have produced.
+The codebase was generated by AI under human direction; [README.md](README.md#built-by-ai)
+says how, and what that history left in the structure. The notes above describe what is
+there now, not what a clean-sheet design would have produced.

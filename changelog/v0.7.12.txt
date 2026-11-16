@@ -1,0 +1,15 @@
+v0.7.12 Beta — 2026-11-16 (UTC)
+Memories are kept per server, and a character keeps recalling while its memories change.
+## **Changed**
+- **Long-term memories are kept per server, up to 2,000 in each**, where the limit was 5,000 across every server. A profile used in several servers no longer loses a quiet server's oldest memories to a busy one, and the memory screen and the profile dashboard count the server you are viewing. Existing memories move over the first time the bot starts on this version; none are lost.
+- **Self-hosting: the first start on this version moves each profile's `ltm.json.gz` into an `ltm/` folder, one file per server.** Back up first. An older version started afterwards finds no memories; they are not lost, and starting this version again brings them back, with any the older version wrote.
+- **Every memory and training example records the embedding model that made it.** After the Embedding Model is changed in `/mod` → System Models, older ones are not recalled until they are saved again, rather than recalled as poor matches.
+- **An imported profile's memories are cleaned like the rest of an imported file**, and bring at most 100 servers' worth.
+## **Fixed**
+- **A character could fail to reply ("Blocked due to: Unknown") after one of its memories or training examples was deleted while it was replying**, and kept failing until they changed again. At the memory limit, a memory written mid-reply made it recall the wrong memories instead.
+- **A character seated in two people's sessions could file one session's memories in the other person's copy**, `/suspend` filed a borrowed character's last memories with its owner instead of the borrower, and a memory added by hand on the memory screen could land in someone else's borrow while the profile was seated in their session.
+- **A character's own memory search searched its owner's memories in a borrowed session**, while its automatic recall used the borrower's.
+- **One damaged memory no longer stops a character recalling any.**
+## **Performance**
+- **Recall no longer reads a character's memories or training examples from disk every turn**, only after they change.
+- **`/profile manage` opens faster**, most of all for a character with memories in many servers: it reads only this server's memories to count them, and builds the dashboard while Discord acknowledges the command.

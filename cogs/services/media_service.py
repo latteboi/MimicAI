@@ -463,7 +463,8 @@ class MediaService:
                         fn_ctx = tool_loop.FunctionContext(
                             owner_id=owner_id, profile_name=profile_name, author_dn=app_name,
                             guild_id=package['guild_id'], triggering_user_id=package['author_id'],
-                            safety_settings=_resolve_safety_settings(channel))
+                            safety_settings=_resolve_safety_settings(channel),
+                            channel_id=getattr(channel, "id", None))
 
                         async def send(turn, cfg, _model=text_model, _state=state_container,
                                        _participant=participant, _msg_a_id=msg_a_id,

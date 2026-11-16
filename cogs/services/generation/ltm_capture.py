@@ -147,6 +147,18 @@ class LtmCaptureMixin:
             (made if created else none).append(name if created else f"{name} ({detail})")
         return made, skipped, none
 
+    def _mark_turn_edited(self, session: Dict[str, Any], turn: Dict[str, Any]) -> None:
+        """Queues an in-place edit of a logged turn for the next flush. A tail write never
+        touches sealed turns, so the boundary is pulled back to this one, as an insert does."""
+        channel_id = next((cid for cid, s in self.cog.multi_profile_channels.items() if s is session), None)
+        index = next((i for i, t in enumerate(session.get("unified_log", [])) if t is turn), None)
+        if channel_id is None or index is None:
+            return   # torn down meanwhile: its log is gone with it
+        if index < session.get("_log_cold_len", 0):
+            session["_log_cold_len"] = index
+        self.cog.session_manager.mark_session_dirty(
+            (channel_id, None, None), session.get("type", "multi"))
+
     async def _summarize_and_store_ltm(
         self, session: Dict[str, Any], seat: Dict[str, Any], p_settings: Dict[str, Any],
         guild_id: Optional[int], r_author: str, triggering_user_id: int,
@@ -196,7 +208,8 @@ class LtmCaptureMixin:
                 stored = await mm._add_ltms(
                     owner_id, profile_name,
                     [(m, encode_embedding_b64(e)) for m, e in zip(memories, embeddings)],
-                    guild_id, r_author, duplicate_similarity=LTM_DUPLICATE_SIMILARITY, source=source)
+                    guild_id, r_author, duplicate_similarity=LTM_DUPLICATE_SIMILARITY, source=source,
+                    session_owner_id=session.get("owner_id"))
         if memories is None:
             # The bookmark stays, so the same turns are read again -- once another
             # interval's worth of replies has built up, not on every round while the
@@ -221,4 +234,5 @@ class LtmCaptureMixin:
         # Link LTM creation to the turn metadata for trace transparency
         if own_turn and "meta" in own_turn:
             own_turn["meta"]["ltm_created"] = stored
+            self._mark_turn_edited(session, own_turn)
         return True, "created" if stored == 1 else f"created {stored}"

@@ -48,6 +48,13 @@ def embedding_model_ids(value: str) -> Dict[str, str]:
     return {"openrouter": name}
 
 
+def embedding_model_key(value: str) -> str:
+    """The name a stored vector records for its model (`emb_model`): one per model, so
+    the same on either road -- vectors from `GOOGLE/x` and `OPENROUTER/google/x` compare."""
+    ids = embedding_model_ids(value)
+    return ids.get("gemini") or ids["openrouter"]
+
+
 def _route_model(route: EmbeddingRoute) -> str:
     return route.model or _SHIPPED_MODEL[route.provider]
 

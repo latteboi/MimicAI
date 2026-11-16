@@ -264,7 +264,7 @@ class SpeakAsMixin:
             owner_id=owner_id, profile_name=profile_name,
             author_dn=ctx["speaker_display_name"], guild_id=guild_id or None,
             triggering_user_id=getattr(ctx.get("author"), "id", owner_id),
-            safety_settings=safety_settings)
+            safety_settings=safety_settings, channel_id=getattr(channel, "id", None))
 
         gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k}
         # Mutated in place by every attempt, so a fallback keeps ticking the card the

@@ -59,12 +59,15 @@ class FunctionContext(NamedTuple):
     triggering_user_id: int
     safety_settings: Optional[Dict[str, Any]] = None
     policy: Optional[Dict[str, Any]] = None
+    #: Where the reply goes. `recall` finds the session there, whose owner decides whose
+    #: copy of a borrowed character is searched -- as the automatic pass does.
+    channel_id: Optional[int] = None
 
 
 async def _recall(cog, query: str, ctx: FunctionContext) -> Dict[str, Any]:
     return await cog.memory_manager.recall_for_tool(
         ctx.owner_id, ctx.profile_name, query, ctx.author_dn, ctx.guild_id,
-        ctx.triggering_user_id)
+        ctx.triggering_user_id, ctx.channel_id)
 
 
 async def _search_web(cog, query: str, ctx: FunctionContext) -> Dict[str, Any]:

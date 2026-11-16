@@ -350,7 +350,8 @@ class ReplyMixin:
             # Already resolved for this reply, off the destination channel. `search_web`
             # asks a second model on behalf of this turn and must be held to the same
             # rules the turn is, not to Google's unset defaults.
-            safety_settings=safety_settings)
+            safety_settings=safety_settings,
+            channel_id=getattr(channel, "id", None))
 
         async def generate(run: _Run, contents: Optional[List] = None,
                            slow_after: Optional[float] = None, on_slow=None):
