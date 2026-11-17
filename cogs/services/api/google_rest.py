@@ -1339,7 +1339,7 @@ class GoogleSpeechModel:
 
     async def replicate(self, sample: Dict[str, Any]) -> str:
         """A stateless replicated voice key (`voicekey_...`) for a voice sample and its consent
-        recording, `ProfileManager.materialise_voice_sample(with_consent=True)`'s shape.
+        recording, `VoiceSampleManager.materialise_voice_sample(with_consent=True)`'s shape.
 
         Stateless, so nothing is kept in this key's project -- no quota spent, nothing left
         behind -- and Google holds the key good for seven days (VOICE_KEY_REUSE_SECONDS).

@@ -167,7 +167,7 @@ class GlobalChatMixin:
         user_api_key = storage._get_api_key_for_user(host_user_id, "gemini")
         or_key = storage._get_api_key_for_user(host_user_id, "openrouter")
         has_ollama = (str(profile_data.get("primary_model") or "").upper().startswith("OLLAMA/")
-                      and self.cog.profile_manager.may_use_ollama(host_user_id))
+                      and self.cog.user_settings.may_use_ollama(host_user_id))
         gemini_blocked = bool(user_api_key) and not storage.personal_gemini_allowed_in_conversation(
             host_user_id, guild_id)
         if gemini_blocked:
@@ -198,7 +198,7 @@ class GlobalChatMixin:
         # to an age-restricted channel, so an adult-rated profile has nowhere
         # compliant to run here. Read through the resolver rather than off the
         # config, so a borrowed profile is judged by its source's rating.
-        allowed, deny_reason = self.cog.profile_manager.content_capability(
+        allowed, deny_reason = self.cog.content_rating.content_capability(
             host_user_id, profile_name, "global_chat")
         if not allowed:
             await interaction.followup.send(

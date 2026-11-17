@@ -113,7 +113,7 @@ class MediaService:
         timeout_retries = 1
 
         async def load_voice_sample():
-            return await self.cog.profile_manager.materialise_voice_sample(*voice_sample_of)
+            return await self.cog.voice_samples.materialise_voice_sample(*voice_sample_of)
 
         async def _attempt(name, _is_fallback):
             nonlocal timeout_retries
@@ -164,7 +164,7 @@ class MediaService:
         that does not match, audio it cannot read -- is kept for as long, so the lines after
         it speak with the preset voice without asking again, and raised this once.
         """
-        manager = self.cog.profile_manager
+        manager = self.cog.voice_samples
         record = await manager.voice_sample_record(owner_id, profile_name)
         if not (record and record.get("consent_mime_type")):
             return None

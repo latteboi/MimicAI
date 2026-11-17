@@ -128,7 +128,7 @@ _GATE_REASONS = {
 
 WIZARD_STEPS = (
     # First: it decides which key the next step asks for, and it can be answered anywhere.
-    # Answering it is registering -- the one way in (`ProfileManager.is_registered`) -- so
+    # Answering it is registering -- the one way in (`UserSettings.is_registered`) -- so
     # every step that would store something waits on it. The first answer comes only
     # through `CreateAccountModal`, with the Terms accepted; the buttons are for switching.
     _Step("provider", "Create your account",
@@ -753,16 +753,16 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         """A provider button, which switches an account's provider. One left on a wizard
         drawn before its account was deleted opens the Create Account form instead: an
         account is never made without the Terms accepted."""
-        if not self.cog.profile_manager.is_registered(self.user_id):
+        if not self.cog.user_settings.is_registered(self.user_id):
             await interaction.response.send_modal(CreateAccountModal(self))
             return
         await self._choose(interaction, provider)
 
     async def _choose(self, interaction: discord.Interaction, provider: str):
         """Asked here, stored by the setter Override Defaults uses, and changed in either.
-        The first answer registers the user: see `ProfileManager.is_registered`."""
+        The first answer registers the user: see `UserSettings.is_registered`."""
         await interaction.response.defer()
-        self.cog.profile_manager.set_provider_preference(self.user_id, provider)
+        self.cog.user_settings.set_provider_preference(self.user_id, provider)
         self.step_key = None
         await self._repaint()
         if provider == PROVIDER_NONE:

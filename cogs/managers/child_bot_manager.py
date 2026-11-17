@@ -70,7 +70,7 @@ class ChildBotManager:
             same_owner = int(b_data.get("original_owner_id", 0)) == int(owner_id)
         except (TypeError, ValueError):
             return False
-        return same_owner and (b_data.get("original_pid") or b_data.get("original_profile_id")) == source_pid
+        return same_owner and b_data.get("original_pid") == source_pid
 
     def _find_borrowed_name_for_owner(self, author_id: int, original_owner_id: int, source_pid: Optional[str]) -> Optional[str]:
         """The name under which author_id has borrowed original_owner_id's profile `source_pid`, if any."""
@@ -88,7 +88,7 @@ class ChildBotManager:
                       "not available to borrow, so the bot cannot speak here.")
 
     def _refusal(self, bot_config: Dict) -> str:
-        listed = self.cog.profile_manager._find_public_entry_id(bot_config['owner_id'], bot_config.get('pid'))
+        listed = self.cog.library._find_public_entry_id(bot_config['owner_id'], bot_config.get('pid'))
         return self.BORROW_FIRST if listed else self.NOT_BORROWABLE
 
     def _speaker_for(self, bot_config: Dict, guild_id: Optional[int],

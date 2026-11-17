@@ -603,7 +603,7 @@ class TriggerIntakeMixin:
                 # whoever you last activated here, and a user with no active profile
                 # silently got UTC. _get_profile_config caches nothing, so it also
                 # cost a decrypt per message to read one string.
-                author_tz = self.cog.profile_manager.user_timezone(triggering_user_id)
+                author_tz = self.cog.user_settings.user_timezone(triggering_user_id)
                 user_hash = _get_user_hash(triggering_user_id)
 
                 created_at = datetime.datetime.now(datetime.timezone.utc) if is_child_mention else trigger_obj.created_at

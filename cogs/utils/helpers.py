@@ -74,7 +74,7 @@ def _channel_is_age_restricted(channel: Any) -> bool:
 
     DMs, group channels, and anything the gateway cache could not resolve count
     as not age-restricted -- the same direction
-    ProfileManager._check_unrestricted_safety_policy already fails in, so the
+    ContentRatingManager._check_unrestricted_safety_policy already fails in, so the
     placement gate and the provider thresholds agree on every channel type.
     """
     if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
@@ -947,7 +947,7 @@ def voice_sample_mime_type(content_type: Optional[str], filename: Optional[str])
 
 
 def describe_voice_samples(summary: Optional[Tuple[int, int, bool]]) -> Optional[str]:
-    """A dashboard's line for `ProfileManager.voice_sample_summary`, or None when no slot is filled."""
+    """A dashboard's line for `VoiceSampleManager.voice_sample_summary`, or None when no slot is filled."""
     filled, slot, selected_filled = summary or (0, 1, False)
     if not filled:
         return None

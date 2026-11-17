@@ -248,7 +248,7 @@ class SessionCompactionMixin:
         turns = [unified_log[i] for i in indices]
         # One clock for a synopsis the whole cast shares: the session owner's. Stored
         # turns carry each speaker's own, and a date read across two zones is wrong.
-        clock, _ = _resolve_zoneinfo(self.cog.profile_manager.user_timezone(session.get("owner_id")))
+        clock, _ = _resolve_zoneinfo(self.cog.user_settings.user_timezone(session.get("owner_id")))
         tags, find = reply_tags(turns), turn_lookup(unified_log)
         transcript = "\n".join(text for text in (self._fold_text(t, clock, tags, find) for t in turns) if text)
         if not transcript.strip():
@@ -433,9 +433,9 @@ class SessionCompactionMixin:
         # A synopsis replaces the one before it, so a reply cut off mid-sentence, or one that
         # dropped the Standing facts the previous one carried, loses them for good (the free
         # router did both in `prod_tests/synopsis_drift_live.py`). Raised, so the next model
-        # in the chain gets a go and, failing that, the turns wait unfolded.
-        keeps_list = ("standing facts:" in system_instruction.casefold()
-                      and "standing facts:" in (previous or "").casefold())
+        # in the chain gets a go and, failing that, the turns wait unfolded. The first pass too:
+        # its excerpt's facts are hidden once folded, and a refusal written as text has no list.
+        keeps_list = "standing facts:" in system_instruction.casefold()
 
         async def _attempt(model_name, is_fallback):
             # `{}` here was the same defect the LTM summariser had: not "no thinking"

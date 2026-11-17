@@ -454,7 +454,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             # behind `i`, and that copy has spoken.
             waiting.remove(seat)
         elif (seat.get('is_skipped')
-              or not self.cog.profile_manager._check_unrestricted_safety_policy(
+              or not self.cog.content_rating._check_unrestricted_safety_policy(
                   seat['owner_id'], seat['profile_name'], channel)
               or self._delivery_refused(seat, channel)):
             return False
@@ -547,7 +547,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         if refusal == PLACEMENT_REFUSALS["checking"]:
             # The check a declaration waits on, queued by the first round it stopped: a
             # declaration made in bulk, or by `/profile generate`, has nobody else to ask.
-            pm.schedule_content_classification(*pm._resolve_effective_profile(owner_id, profile_name))
+            self.cog.content_rating.schedule_content_classification(*pm._resolve_effective_profile(owner_id, profile_name))
         text = f"**{profile_name}** {refusal}"
 
         sent = await self._send_channel_message(channel, text) or []
@@ -578,7 +578,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         log = session.get("unified_log") or []
         recent = list(itertools.islice(
             (t for t in reversed(log) if not t.get("type") and not t.get("is_hidden")), 10))
-        clock, _ = _resolve_zoneinfo(self.cog.profile_manager.user_timezone(session.get("owner_id")))
+        clock, _ = _resolve_zoneinfo(self.cog.user_settings.user_timezone(session.get("owner_id")))
         parts = []
         if session.get("session_prompt"):
             parts.append(f"<scene_prompt>\n{session['session_prompt']}\n</scene_prompt>")
@@ -862,7 +862,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     p_is_b = p['profile_name'] in p_index.get("borrowed", [])
                     p_cfg = self.cog.profile_manager._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
                     if (p_cfg.get("primary_model", "").upper().startswith("OLLAMA/")
-                            and self.cog.profile_manager.may_use_ollama(p['owner_id'])):
+                            and self.cog.user_settings.may_use_ollama(p['owner_id'])):
                         has_ollama = True
                         break
                 
@@ -945,7 +945,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # intake, so each lands in unified_log after the message it answers.
                 blocked_participants = [
                     (p, refusal) for p in profile_order
-                    if (refusal := self.cog.profile_manager.placement_refusal(
+                    if (refusal := self.cog.content_rating.placement_refusal(
                         p['owner_id'], p['profile_name'], channel))
                 ]
                 if blocked_participants:
@@ -1356,7 +1356,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     # Backstop only. profile_order was filtered before the feedback step, so
                     # this fires only if the channel's age-restricted flag is flipped mid-round.
-                    refusal = self.cog.profile_manager.placement_refusal(owner_id, profile_name, channel)
+                    refusal = self.cog.content_rating.placement_refusal(owner_id, profile_name, channel)
                     if refusal:
                         await self._abandon_state_container(channel, state_container, session=session)
                         await self._refuse_placement(session, channel, owner_id, profile_name, refusal)
@@ -2274,7 +2274,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                                     # The batched turn's author, same source as the
                                     # single-turn path in triggers.py.
-                                    batch_tz = self.cog.profile_manager.user_timezone(msg.author_id)
+                                    batch_tz = self.cog.user_settings.user_timezone(msg.author_id)
                                     batch_hash = _get_user_hash(msg.author_id)
 
                                     user_line = _format_history_entry(author_name, msg.created_at, content, batch_tz, entity_id=batch_hash)

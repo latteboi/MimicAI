@@ -112,7 +112,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
                        "Run `/settings` again.")
 
     def __init__(self, cog: "MimicCog", interaction: discord.Interaction):
-        self.defaults = cog.profile_manager._get_user_defaults(interaction.user.id)
+        self.defaults = cog.user_settings._get_user_defaults(interaction.user.id)
         # One object, not a copy: every `_Bulk` form seeds itself from `session.config`
         # -- the voice picker asks it which speech model it is choosing a voice for, the
         # timezone picker asks it which zone is already chosen -- and against this host
@@ -301,7 +301,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
     # --- Storage ----------------------------------------------------------
 
     def _persist(self):
-        self.cog.profile_manager._save_user_defaults(self.user_id, self.defaults)
+        self.cog.user_settings._save_user_defaults(self.user_id, self.defaults)
 
     def _clear(self, key: str):
         self.defaults.pop(key, None)
@@ -349,7 +349,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
 
     def _preferred(self) -> str:
         """The choice made in `/start`: `/settings` is closed to anyone without one."""
-        preferred = self.cog.profile_manager.provider_preference(self.user_id)
+        preferred = self.cog.user_settings.provider_preference(self.user_id)
         return preferred if preferred in PROVIDER_CHOICES else PROVIDER_NONE
 
     def _embed_actions(self) -> discord.Embed:
@@ -584,7 +584,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         """The button beside Clear steps through Google, OpenRouter and None."""
         choices = list(PROVIDER_CHOICES)
         provider = choices[(choices.index(self._preferred()) + 1) % len(choices)]
-        self.cog.profile_manager.set_provider_preference(self.user_id, provider)
+        self.cog.user_settings.set_provider_preference(self.user_id, provider)
         self.view_mode = self.preferred_api(self.cog, self.user_id)
         await self.refresh(interaction)
 

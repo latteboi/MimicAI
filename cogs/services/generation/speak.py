@@ -118,7 +118,7 @@ class SpeakAsMixin:
             profile_data_source = self.cog.profile_manager._get_profile_config(user_id, profile_name, False) or {}
             own_config = profile_data_source
 
-        refusal = self.cog.profile_manager.placement_refusal(effective_owner_id, effective_profile_name, channel)
+        refusal = self.cog.content_rating.placement_refusal(effective_owner_id, effective_profile_name, channel)
         if refusal:
             await interaction_to_respond.followup.send(embed=text_embed(f"**{effective_profile_name}** {refusal}"), ephemeral=True)
             return None

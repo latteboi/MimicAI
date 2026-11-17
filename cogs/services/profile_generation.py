@@ -165,17 +165,16 @@ def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
     hold. Only models on a provider the user holds a key for are kept: a draft is billed
     to the user alone.
     """
-    pm = cog.profile_manager
-    provider = pm.effective_provider(user_id)
+    provider = cog.user_settings.effective_provider(user_id)
     config = dict(zip(("primary_model", "fallback_model"),
                       (system_model(cog, key, provider) for key in GENERATOR_KEYS)))
-    if pm.provider_preference(user_id):
-        apply_defaults(config, pm._get_user_defaults(user_id), borrowed=False)
-    pm._rescue_unusable_models(user_id, config)
+    if cog.user_settings.provider_preference(user_id):
+        apply_defaults(config, cog.user_settings._get_user_defaults(user_id), borrowed=False)
+    cog.user_settings._rescue_unusable_models(user_id, config)
 
     primary, fallbacks = model_chain(resolve_auto_models(cog, config), "primary_model", provider)
     usable: List[str] = [m for m in dict.fromkeys((primary, *fallbacks))
-                         if pm._user_holds_provider_key(user_id, model_provider(m))]
+                         if cog.user_settings._user_holds_provider_key(user_id, model_provider(m))]
     if not usable:
         raise ProfileGenerationError(NO_KEY_MESSAGE)
     return usable[0], tuple(usable[1:])
@@ -195,7 +194,7 @@ async def generate_draft(cog, user_id: int, concept: str,
     primary, fallbacks = generator_models(cog, user_id)
     # The generator tab's thinking and Hosts & Tier, from /mod, for the user's side --
     # whichever models their own defaults put in front of it.
-    settings = system_settings(cog, "generator", cog.profile_manager.effective_provider(user_id))
+    settings = system_settings(cog, "generator", cog.user_settings.effective_provider(user_id))
     default, temperature = TEMPLATES[template_key]
     template = cog.global_prompts.get(template_key, default)
     try:
@@ -293,7 +292,7 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
         prompts["fixed_examples"] = fixed_examples.normalise(draft["fixed_examples"])
     pm._save_profile_prompts(user_id, profile_name, prompts)
     if draft.get("adult"):
-        pm.set_owner_adult_declaration(user_id, profile_name, True)
+        cog.content_rating.set_owner_adult_declaration(user_id, profile_name, True)
 
     extras = {"custom_display_name": draft.get("display_name"),
               "custom_avatar_url": draft.get("avatar_url"),

@@ -589,7 +589,7 @@ def _own_ltm_creating(view): return _own(view) and bool(view.config.get("ltm_cre
 # rendered every group on every repaint regardless of which tab the view was on, so
 # the Tools tab showed you Top-K and the Params tab showed you hormone levels.
 #
-# Each takes the render context ProfileManager._build_profile_embed assembles and
+# Each takes the render context ProfileDashboard._build_profile_embed assembles and
 # returns (name, value, inline) or None. Returning None omits the field entirely,
 # which is how a row says "nothing to report here" -- see the persona sections.
 
@@ -634,7 +634,7 @@ def _render_media_resolution(ctx):
 
 def _describer_chain(cog, owner_id) -> List[str]:
     """The models `simulated` hands this owner's attachments to, in order."""
-    side = cog.profile_manager.effective_provider(owner_id)
+    side = cog.user_settings.effective_provider(owner_id)
     return [m for m in (system_model(cog, k, side) for k in DESCRIBER_KEYS) if is_real_model(m)]
 
 
@@ -1290,7 +1290,7 @@ PROFILE_ACTIONS = (
     # writes the invoker's own -- so they stay owner-only rather than being silently
     # wrong under /mod. Each rates a profile with no verdict as part of the press.
     _Action("publish", "sharing",
-            lambda v: "Unpublish from Library" if v.cog.profile_manager._is_profile_public(
+            lambda v: "Unpublish from Library" if v.cog.library._is_profile_public(
                 v.user_id, v.profile_name) else "Publish to Library",
             "List this profile in the Public Library, rating it first if it needs one.",
             _method("_handle_publish"), _shareable, menu_label="Publish / Unpublish"),
@@ -1522,7 +1522,7 @@ class ProfileManageView(BlockedGuard, ui.View):
         redefined as an identical four-line `refresh_cb` closure inside eleven separate
         dropdown branches.
         """
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(
+        new_embed = await self.cog.profile_dashboard._build_profile_manage_embed(
             interaction, self.profile_name, target_user_id=self.user_id)
         await self.original_interaction.edit_original_response(embed=new_embed, view=self)
 
@@ -1618,7 +1618,7 @@ class ProfileManageView(BlockedGuard, ui.View):
     async def _open_media_options(self, interaction: discord.Interaction, mode: str):
         # Read before the view is built: which slots hold a sample decides its rows, and the
         # records are file reads that belong off the event loop.
-        samples = (await self.cog.profile_manager.voice_sample_records(self.user_id, self.profile_name)
+        samples = (await self.cog.voice_samples.voice_sample_records(self.user_id, self.profile_name)
                    if mode == "voice" else None)
         view = SingleProfileMediaOptionsView(self.cog, self.original_interaction, self.profile_name,
                                              mode, is_borrowed=self.is_borrowed, user_id=self.user_id,
@@ -1754,7 +1754,7 @@ class ProfileManageView(BlockedGuard, ui.View):
             await i.response.defer(ephemeral=True, thinking=True)
             target_name = new_name_input.value.lower().strip()
             
-            success, msg = await self.cog.profile_manager._convert_copy_profile(
+            success, msg = await self.cog.sharing._convert_copy_profile(
                 user_id=i.user.id,
                 source_name=self.profile_name,
                 target_name=target_name,
@@ -1780,7 +1780,7 @@ class ProfileManageView(BlockedGuard, ui.View):
         embed = view.build_embed()
         if self.profile_name not in view.personal_profiles:
             # Not offered, so not preselected; say why rather than open on nothing.
-            _allowed, reason = self.cog.profile_manager.content_capability(
+            _allowed, reason = self.cog.content_rating.content_capability(
                 self.user_id, self.profile_name, "share")
             embed.add_field(name=f"'{self.profile_name}' cannot be shared"[:256],
                             value=reason or "Not available.", inline=False)
@@ -1789,13 +1789,12 @@ class ProfileManageView(BlockedGuard, ui.View):
     async def _handle_publish(self, interaction):
         """Publish or unpublish this one profile, rating it first if it has no verdict."""
         await interaction.response.defer(ephemeral=True, thinking=True)
-        pm = self.cog.profile_manager
-        if pm._is_profile_public(self.user_id, self.profile_name):
-            pm.unpublish_profile(self.user_id, self.profile_name)
+        if self.cog.library._is_profile_public(self.user_id, self.profile_name):
+            self.cog.library.unpublish_profile(self.user_id, self.profile_name)
             message = (f"**{self.profile_name}** is out of the Public Library. Anyone already "
                        "borrowing it keeps it.")
         else:
-            listed, reason = await pm.publish_profile(self.user_id, self.profile_name)
+            listed, reason = await self.cog.library.publish_profile(self.user_id, self.profile_name)
             message = (f"🌐 **{self.profile_name}** is in the Public Library. Give it an intro "
                        "from **Library Intro** on this tab." if listed
                        else f"**{self.profile_name}** was not published. {reason or ''}".strip())
@@ -1935,7 +1934,7 @@ class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     async def _back_callback(self, interaction: discord.Interaction):
         self.stop()
         self.parent._build_view()
-        embed = await self.cog.profile_manager._build_profile_manage_embed(
+        embed = await self.cog.profile_dashboard._build_profile_manage_embed(
             interaction, self.parent.profile_name, target_user_id=self.parent.user_id)
         await interaction.response.edit_message(embed=embed, view=self.parent)
 
@@ -1978,10 +1977,10 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             "config": self._config, "is_borrowed": self.parent.is_borrowed,
             "owner_id": self.parent.user_id,
             "child_bot": _has_child_bot(self.cog, self.parent.user_id, self.parent.profile_name),
-            "voice_sample": await self.cog.profile_manager.voice_sample_summary(
+            "voice_sample": await self.cog.voice_samples.voice_sample_summary(
                 self.parent.user_id, self.parent.profile_name),
             "bonds": await asyncio.to_thread(
-                self.cog.profile_manager.bonds, self.parent.user_id, self.parent.profile_name)
+                self.cog.persona_content.bonds, self.parent.user_id, self.parent.profile_name)
                 if self.action.value == "neuro" else None})
         if field:
             e.add_field(name=field[0], value=str(field[1])[:1024], inline=False)
@@ -2082,7 +2081,7 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             target_user_id=self.parent.user_id))
 
     async def _reset_bonds_callback(self, interaction: discord.Interaction):
-        await asyncio.to_thread(self.cog.profile_manager.reset_bonds,
+        await asyncio.to_thread(self.cog.persona_content.reset_bonds,
                                 self.parent.user_id, self.parent.profile_name)
         await interaction.response.edit_message(embed=await self.embed(), view=self)
 
@@ -2097,7 +2096,7 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     async def _back_callback(self, interaction: discord.Interaction):
         self.stop()
         self.parent._build_view()
-        embed = await self.cog.profile_manager._build_profile_manage_embed(
+        embed = await self.cog.profile_dashboard._build_profile_manage_embed(
             interaction, self.parent.profile_name,
             target_user_id=self.parent.user_id)
         await interaction.response.edit_message(embed=embed, view=self.parent)
@@ -2757,7 +2756,7 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
                                  "a model marked 'clones voices' to hear the sample.")
             elif any(self.voice_samples):
                 lines.append(f"**Voice sample:** slot {slot} \u00b7 empty, so the voice above is used.")
-            elif self.cog.profile_manager.may_set_voice_sample(self.user_id, self.profile_name):
+            elif self.cog.voice_samples.may_set_voice_sample(self.user_id, self.profile_name):
                 lines.append("-# Give this profile a cloned voice with `/profile voice_sample`.")
             if not data.get("speech_tts_enabled"):
                 lines.append("\n⚠️ TTS is currently **off** for this profile.")
@@ -2807,20 +2806,20 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
                 add_button(self, "Use Voice ID", self._use_voice_id, emoji="🆔", row=3)
                 add_button(self, "Design a Voice", self._design_voice, emoji="🎨", row=3)
             slot = self._voice_slot()
-            if self.voice_samples[slot - 1] and self.cog.profile_manager.may_set_voice_sample(
+            if self.voice_samples[slot - 1] and self.cog.voice_samples.may_set_voice_sample(
                     self.user_id, self.profile_name):
                 add_button(self, f"Remove Slot {slot}", self._remove_voice_sample,
                            style=discord.ButtonStyle.danger, row=4)
 
     def _voice_slot(self) -> int:
-        return self.cog.profile_manager.voice_sample_slot(self.user_id, self.profile_name)
+        return self.cog.voice_samples.voice_sample_slot(self.user_id, self.profile_name)
 
     def _add_voice_slot_select(self, row: int):
         """The three slots, one always selected: only that one is sent, and an empty one
         speaks with the preset voice. Shown once any slot is filled -- until then there is
         nothing to choose between, and the screen says how to fill one."""
         current = self._voice_slot()
-        own = self.cog.profile_manager.may_set_voice_sample(self.user_id, self.profile_name)
+        own = self.cog.voice_samples.may_set_voice_sample(self.user_id, self.profile_name)
         options = []
         for slot, record in enumerate(self.voice_samples, start=1):
             if record:
@@ -2963,7 +2962,7 @@ class SingleProfileMediaOptionsView(BlockedGuard, MediaOptionsMixin, ui.View):
 
     async def _remove_voice_sample(self, interaction: discord.Interaction):
         slot = self._voice_slot()
-        await self.cog.profile_manager.delete_voice_sample(self.user_id, self.profile_name, slot)
+        await self.cog.voice_samples.delete_voice_sample(self.user_id, self.profile_name, slot)
         self.voice_samples[slot - 1] = None
         self._build_view()
         await interaction.response.edit_message(**self._render())
@@ -2989,7 +2988,7 @@ class ModelPickerMixin(ReportErrorMixin):
     @staticmethod
     def preferred_api(cog, user_id) -> str:
         """The API tab Models opens on: the user's provider, Google until they choose."""
-        return "openrouter" if cog.profile_manager.provider_preference(user_id) == "openrouter" else "google"
+        return "openrouter" if cog.user_settings.provider_preference(user_id) == "openrouter" else "google"
 
     def _may_use_ollama(self) -> bool:
         """Ollama is offered only on the bot owner's own configs -- see OLLAMA_OWNER_ONLY.
@@ -2997,7 +2996,7 @@ class ModelPickerMixin(ReportErrorMixin):
         Asked of `user_id`, the owner of whatever this picker writes to, because that is
         who the model factory checks at call time.
         """
-        return self.cog.profile_manager.may_use_ollama(getattr(self, "user_id", None))
+        return self.cog.user_settings.may_use_ollama(getattr(self, "user_id", None))
 
     def _shows_training_models(self) -> bool:
         """Whether this picker offers OpenRouter models that may train on prompts.
@@ -5014,7 +5013,7 @@ class VoiceSampleConsentView(BlockedGuard, ui.View):
             await self._finish(interaction, "The recording could not be read back from Discord, "
                                             "so nothing was saved. Upload it again.")
             return
-        manager = self.cog.profile_manager
+        manager = self.cog.voice_samples
         saved = await manager.save_voice_sample(
             self.user_id, self.profile_name, audio, slot=self.slot, mime_type=self.mime_type,
             filename=self.sample.filename, transcript=self.transcript, consent=consent,
@@ -5106,7 +5105,7 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
         # A published profile flipped to 18+ fails the publish gate and has to be found
         # and reverted by hand, so it is withheld here rather than half-applied. One
         # pass over the public index, not an is-published call per profile.
-        published = {d["profile_name"] for d in cog.profile_manager._iter_public_entries(user_id)}
+        published = {d["profile_name"] for d in cog.library._iter_public_entries(user_id)}
 
     for position, name in enumerate(sorted(session.targets)):
         is_borrowed = name in borrowed
@@ -5118,7 +5117,7 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
         if session.declaration is not None:
             if is_borrowed or name in published:
                 counts["skipped_declaration"] += 1
-            elif cog.profile_manager.set_owner_adult_declaration(user_id, name, session.declaration):
+            elif cog.content_rating.set_owner_adult_declaration(user_id, name, session.declaration):
                 touched = True
             else:
                 counts["skipped_declaration"] += 1
@@ -5136,7 +5135,7 @@ async def _apply_bulk_session(cog, user_id: int, session: _BulkSession) -> Dict[
                     # A prompt per profile across forty would be noise, so the rule the
                     # ignored prompt applies is applied outright: listed or borrowed are
                     # re-checked, anything else drops to Unrated.
-                    asyncio.create_task(cog.profile_manager.resolve_stale_rating(user_id, name))
+                    asyncio.create_task(cog.content_rating.resolve_stale_rating(user_id, name))
 
         if session.config or session.pins:
             profile = cog.profile_manager._get_profile_config(user_id, name, is_borrowed)
@@ -5384,16 +5383,16 @@ class UserTimezoneView(_TimezonePickerView):
         super().__init__(cog)
 
     def _current_tz(self) -> str:
-        return self.cog.profile_manager.user_timezone(self.user_id)
+        return self.cog.user_settings.user_timezone(self.user_id)
 
     def _get_header_content(self) -> str:
         return "**Your Timezone**\n" + self._clock_line(self._current_tz())
 
     async def apply(self, interaction: discord.Interaction, canonical_tz: str):
         """Persist the choice, refresh the About Me panel behind this pop-up, close it."""
-        about = self.cog.profile_manager.get_user_about(self.user_id)
+        about = self.cog.user_settings.get_user_about(self.user_id)
         about["timezone"] = canonical_tz
-        self.cog.profile_manager.save_user_about(self.user_id, about)
+        self.cog.user_settings.save_user_about(self.user_id, about)
 
         self.parent_about_view._build_view()
         await self.parent_about_view.update_display()
@@ -5424,7 +5423,7 @@ class SingleProfileTimezoneView(_TimezonePickerView):
             owner_id, name, self.profile_config, self.is_borrowed)
         invalidate_model_cache(self.cog, owner_id, name)
 
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(
+        new_embed = await self.cog.profile_dashboard._build_profile_manage_embed(
             interaction, name, target_user_id=owner_id)
         await self.parent_manage_view.original_interaction.edit_original_response(
             embed=new_embed, view=self.parent_manage_view)
@@ -5758,13 +5757,13 @@ class AppearanceModal(ui.Modal):
             # live in config rather than prompts, so the prompts hook does not see
             # them. Invalidate only -- the rating going stale is resolved the same
             # way a persona edit is, rather than spending a call here.
-            self.cog.profile_manager._invalidate_content_rating(owner_id, self.profile_name)
+            self.cog.content_rating._invalidate_content_rating(owner_id, self.profile_name)
             self.cog.user_appearances.setdefault(user_id_str, {})[self.profile_name] = \
                 self.cog.profile_manager._appearance_entry(config)
 
         # A linked child bot is not touched: its name and avatar are set on its own
         # application in the Discord Developer Portal.
-        new_embed = await self.cog.profile_manager._build_profile_manage_embed(
+        new_embed = await self.cog.profile_dashboard._build_profile_manage_embed(
             self.original_interaction, self.profile_name, target_user_id=owner_id)
         await self.original_interaction.edit_original_response(embed=new_embed)
         await interaction.followup.send(embed=text_embed("Appearance updated."), ephemeral=True)
@@ -5824,7 +5823,7 @@ class MoodAvatarModal(ui.Modal):
             else:
                 config.pop(key, None)
         pm._save_profile_config(self.owner_id, self.profile_name, config, False)
-        pm._invalidate_content_rating(self.owner_id, self.profile_name)
+        self.cog.content_rating._invalidate_content_rating(self.owner_id, self.profile_name)
         self.cog.user_appearances.setdefault(str(self.owner_id), {})[self.profile_name] = \
             pm._appearance_entry(config)
 
@@ -5876,7 +5875,7 @@ class LibraryIntroModal(ui.Modal):
         pm._save_profile_config(self.owner_id, self.profile_name, config, False)
         # Config, not prompts, so the prompts hook does not see it -- the same as
         # appearance. Invalidate only; the stale rating is offered below.
-        pm._invalidate_content_rating(self.owner_id, self.profile_name)
+        self.cog.content_rating._invalidate_content_rating(self.owner_id, self.profile_name)
 
         if self.on_saved:
             await self.on_saved(interaction)
@@ -6741,11 +6740,10 @@ class ContentSafetyView(BlockedGuard, ui.View):
         every user's borrow index. Both are far too heavy for a render, so they are
         resolved once when the view opens and reused until it is rebuilt.
         """
-        pm = self.cog.profile_manager
         try:
-            self.stale = await pm.rating_is_stale(self.user_id, self.profile_name)
+            self.stale = await self.cog.content_rating.rating_is_stale(self.user_id, self.profile_name)
             self.distributed = await asyncio.to_thread(
-                pm.is_profile_distributed, self.user_id, self.profile_name)
+                self.cog.library.is_profile_distributed, self.user_id, self.profile_name)
         except Exception as e:
             print(f"Content Safety state read failed for {self.user_id}/{self.profile_name}: {e}")
 
@@ -6753,14 +6751,13 @@ class ContentSafetyView(BlockedGuard, ui.View):
         pm = self.cog.profile_manager
         eff_owner, eff_name = pm._resolve_effective_profile(self.user_id, self.profile_name)
         config = pm._get_profile_config(eff_owner, eff_name, False) or {}
-        return pm._verdict_of(config), (config.get("content_rating") or {})
+        return self.cog.content_rating._verdict_of(config), (config.get("content_rating") or {})
 
     # --- layout ---------------------------------------------------------------
 
     def _build_view(self):
         self.clear_items()
         verdict, rating = self._rating()
-        pm = self.cog.profile_manager
 
         add_button(self, "← Back to Profile", self.back_cb, style=discord.ButtonStyle.secondary,
                    row=2)
@@ -6797,8 +6794,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
 
         # The declaration is withheld exactly where it has nothing to move: on a
         # published profile, and while a classifier verdict stands.
-        declared = pm._is_owner_declared_adult(self.user_id, self.profile_name)
-        can_declare = not pm._is_profile_public(self.user_id, self.profile_name)
+        declared = self.cog.content_rating._is_owner_declared_adult(self.user_id, self.profile_name)
+        can_declare = not self.cog.library._is_profile_public(self.user_id, self.profile_name)
         if verdict in (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED) and not declared:
             can_declare = False
         if can_declare:
@@ -6828,7 +6825,6 @@ class ContentSafetyView(BlockedGuard, ui.View):
                                else discord.ButtonStyle.success)
 
     def get_embed(self) -> discord.Embed:
-        pm = self.cog.profile_manager
         verdict, rating = self._rating()
 
         colour = {
@@ -6871,7 +6867,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
                     f".\n{where}\nTo have it rated again, edit the persona and choose Submit for "
                     "Re-rating; it stays Refused until then."), inline=False)
         if verdict == CONTENT_RATING_ADULT:
-            if pm._is_owner_declared_adult(self.user_id, self.profile_name):
+            if self.cog.content_rating._is_owner_declared_adult(self.user_id, self.profile_name):
                 if rating.get("checked"):
                     value = "You declared this profile 18+."
                 else:
@@ -6881,14 +6877,14 @@ class ContentSafetyView(BlockedGuard, ui.View):
                     if (int(self.user_id), self.profile_name) in self.cog.pending_classifications:
                         value += "\nThe check is running now."
                     elif rating.get("provider_blocked"):
-                        value += f"\n{pm.rating_failure_hint(rating)}"
+                        value += f"\n{self.cog.content_rating.rating_failure_hint(rating)}"
                     elif rating.get("flagged"):
                         value += ("\nThe rating model gave no verdict, so the bot operator "
                                   "will review it.")
                     elif rating.get("retry_after") and time.time() < rating["retry_after"]:
                         value += (f"\nThe last check failed and it will retry "
                                   f"<t:{int(rating['retry_after'])}:R>. "
-                                  f"{pm.rating_failure_hint(rating)}")
+                                  f"{self.cog.content_rating.rating_failure_hint(rating)}")
                 embed.add_field(name="Set by", value=value, inline=False)
             else:
                 reason = CONTENT_RATING_REASON_LABELS.get(
@@ -6912,7 +6908,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
                           "itself when the verdict lands.",
                     inline=False)
             elif rating.get("provider_blocked"):
-                embed.add_field(name="Held", value=pm.rating_failure_hint(rating), inline=False)
+                embed.add_field(name="Held", value=self.cog.content_rating.rating_failure_hint(rating), inline=False)
             elif rating.get("flagged"):
                 embed.add_field(
                     name="Under review",
@@ -6924,17 +6920,17 @@ class ContentSafetyView(BlockedGuard, ui.View):
                 embed.add_field(
                     name="Held up",
                     value=(f"The last attempt failed and it will retry "
-                           f"<t:{int(retry_after)}:R>.\n{pm.rating_failure_hint(rating)}"),
+                           f"<t:{int(retry_after)}:R>.\n{self.cog.content_rating.rating_failure_hint(rating)}"),
                     inline=False)
 
         # The capability list, rendered from the table the gates actually read.
         rows = []
         for cap, cap_label in CONTENT_CAPABILITY_LABELS.items():
-            allowed, reason = pm.content_capability(self.user_id, self.profile_name, cap)
+            allowed, reason = self.cog.content_rating.content_capability(self.user_id, self.profile_name, cap)
             mark = "✅" if allowed else "❌"
             rows.append(f"{mark} **{cap_label}**" + ("" if allowed else f"\n　　*{reason}*"))
 
-        access = CHANNEL_ACCESS_LABELS[pm._effective_safety_level({"content_rating": rating})]
+        access = CHANNEL_ACCESS_LABELS[self.cog.content_rating._effective_safety_level({"content_rating": rating})]
         rows.insert(0, f"💬 **Runs in:** {access}")
         embed.add_field(name="What this profile can do", value="\n".join(rows), inline=False)
 
@@ -7002,7 +6998,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
         which is why reopening the dashboard was the only way to see a verdict.
         """
         await self._repaint(i)
-        await self.cog.profile_manager.await_classification(self.user_id, self.profile_name)
+        await self.cog.content_rating.await_classification(self.user_id, self.profile_name)
         await self._rerender(i)
 
     # --- actions --------------------------------------------------------------
@@ -7015,7 +7011,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
 
     async def submit_cb(self, i: discord.Interaction):
         await i.response.defer()
-        ok, msg = await self.cog.profile_manager.submit_for_rating(
+        ok, msg = await self.cog.content_rating.submit_for_rating(
             self.user_id, self.profile_name)
         await i.followup.send(embed=text_embed(msg), ephemeral=True)
         if ok:
@@ -7032,11 +7028,10 @@ class ContentSafetyView(BlockedGuard, ui.View):
         a restart mid-classification, or a scheduling call that never created a task.
         """
         await i.response.defer()
-        pm = self.cog.profile_manager
         verdict, _ = self._rating()
         key = (int(self.user_id), self.profile_name)
         if verdict == CONTENT_RATING_PENDING and key not in self.cog.pending_classifications:
-            pm.schedule_content_classification(self.user_id, self.profile_name)
+            self.cog.content_rating.schedule_content_classification(self.user_id, self.profile_name)
         if key in self.cog.pending_classifications:
             # Wait whether this call queued the job or found one already running --
             # the button's whole purpose is to answer "is it done yet", and it used
@@ -7046,14 +7041,13 @@ class ContentSafetyView(BlockedGuard, ui.View):
             await self._rerender(i)
 
     async def declare_cb(self, i: discord.Interaction):
-        pm = self.cog.profile_manager
-        declared = pm._is_owner_declared_adult(self.user_id, self.profile_name)
+        declared = self.cog.content_rating._is_owner_declared_adult(self.user_id, self.profile_name)
         await i.response.defer()
         await asyncio.to_thread(
-            pm.set_owner_adult_declaration, self.user_id, self.profile_name, not declared)
+            self.cog.content_rating.set_owner_adult_declaration, self.user_id, self.profile_name, not declared)
         if not declared:
             # A declaration runs nowhere until it is checked; queue the check now, on the loop.
-            pm.schedule_content_classification(self.user_id, self.profile_name)
+            self.cog.content_rating.schedule_content_classification(self.user_id, self.profile_name)
             await self._await_verdict(i)
             return
         await self._rerender(i)
@@ -7063,7 +7057,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
         pm = self.cog.profile_manager
         verdict, _ = self._rating()
         cleared = await asyncio.to_thread(
-            pm.clear_classifier_verdict, self.user_id, self.profile_name, i.user.id)
+            self.cog.content_rating.clear_classifier_verdict, self.user_id, self.profile_name, i.user.id)
         if cleared and verdict == CONTENT_RATING_REFUSED:
             # A refusal cleared as a false positive was never a strike. A block it caused
             # stays until lifted under Blacklist, which the operator decides.
@@ -7074,7 +7068,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
     async def appeal_cb(self, i: discord.Interaction):
         await i.response.defer()
         appealed = await asyncio.to_thread(
-            self.cog.profile_manager.appeal_refusal, self.user_id, self.profile_name)
+            self.cog.content_rating.appeal_refusal, self.user_id, self.profile_name)
         await i.followup.send(embed=text_embed("Sent to the bot operator for review." if appealed
                               else "This refusal cannot be appealed again."), ephemeral=True)
         await self._rerender(i)
@@ -7082,7 +7076,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
     async def uphold_cb(self, i: discord.Interaction):
         await i.response.defer()
         pm = self.cog.profile_manager
-        if await asyncio.to_thread(pm.uphold_refusal, self.user_id, self.profile_name, i.user.id):
+        if await asyncio.to_thread(self.cog.content_rating.uphold_refusal, self.user_id, self.profile_name, i.user.id):
             self.cog.server_manager.add_strike(
                 self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name), self.profile_name)
         await self._rerender(i)
@@ -7092,7 +7086,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
             await i.response.defer()
             pm = self.cog.profile_manager
             stored = await asyncio.to_thread(
-                pm.moderator_verdict, self.user_id, self.profile_name, verdict, i.user.id)
+                self.cog.content_rating.moderator_verdict, self.user_id, self.profile_name, verdict, i.user.id)
             if stored and verdict == CONTENT_RATING_REFUSED:
                 self.cog.server_manager.add_strike(
                     self.user_id, pm._get_pid_from_name(self.user_id, self.profile_name),
@@ -7102,7 +7096,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
 
     async def force_cb(self, i: discord.Interaction):
         await i.response.defer()
-        self.cog.profile_manager.schedule_content_classification(self.user_id, self.profile_name)
+        self.cog.content_rating.schedule_content_classification(self.user_id, self.profile_name)
         await i.followup.send(embed=text_embed("Re-classification queued."), ephemeral=True)
         await self._await_verdict(i)
 
@@ -7211,17 +7205,16 @@ class PostEditRatingView(BlockedGuard, ui.View):
     @ui.button(label="Re-check Rating", style=discord.ButtonStyle.success)
     async def recheck(self, i: discord.Interaction, _: ui.Button):
         self.stop()
-        pm = self.cog.profile_manager
         await i.response.edit_message(
             embed=self._outcome_embed(f"Re-checking the rating for **{self.profile_name}**…"),
             view=None)
         try:
-            pm.schedule_content_classification(self.user_id, self.profile_name)
-            finished = await pm.await_classification(self.user_id, self.profile_name)
+            self.cog.content_rating.schedule_content_classification(self.user_id, self.profile_name)
+            finished = await self.cog.content_rating.await_classification(self.user_id, self.profile_name)
             if not finished:
                 text = ("Still checking. The verdict will show on the **Content Safety** page "
                         "when it lands.")
-            elif await pm.rating_is_stale(self.user_id, self.profile_name):
+            elif await self.cog.content_rating.rating_is_stale(self.user_id, self.profile_name):
                 # A failed job leaves a real verdict where it was, so the old rating is
                 # still standing. This used to announce it as the new one.
                 text = ("The re-check did not reach a verdict, usually because no API key was "
@@ -7230,7 +7223,7 @@ class PostEditRatingView(BlockedGuard, ui.View):
                         "**Content Safety**.")
             else:
                 verdict, _rating = await asyncio.to_thread(
-                    pm._content_rating_state, self.user_id, self.profile_name)
+                    self.cog.content_rating._content_rating_state, self.user_id, self.profile_name)
                 text = (f"**{self.profile_name}** is now rated "
                         f"**{CONTENT_RATING_LABELS[verdict]}**.")
                 if self.listed and not CONTENT_RATING_CAPABILITIES[verdict]["publish"]:
@@ -7251,7 +7244,7 @@ class PostEditRatingView(BlockedGuard, ui.View):
         await i.response.defer()
         try:
             await asyncio.to_thread(
-                self.cog.profile_manager.drop_to_unrated, self.user_id, self.profile_name)
+                self.cog.content_rating.drop_to_unrated, self.user_id, self.profile_name)
         finally:
             self._release()
         await i.edit_original_response(
@@ -7272,7 +7265,7 @@ class PostEditRatingView(BlockedGuard, ui.View):
     async def on_timeout(self):
         self._release()
         try:
-            outcome = await self.cog.profile_manager.resolve_stale_rating(
+            outcome = await self.cog.content_rating.resolve_stale_rating(
                 self.user_id, self.profile_name)
         except Exception as e:
             print(f"Post-edit rating timeout failed for {self.user_id}/{self.profile_name}: {e}")
@@ -7295,17 +7288,16 @@ async def maybe_prompt_rating_after_edit(cog, interaction: discord.Interaction,
     simply checked again -- it runs nowhere meanwhile, so there is no choice to offer.
     Costs a persona hash, so it is only ever called from an interactive edit path.
     """
-    pm = cog.profile_manager
     key = (int(user_id), profile_name)
     view = None
     try:
-        if not await pm.rating_is_stale(user_id, profile_name):
+        if not await cog.content_rating.rating_is_stale(user_id, profile_name):
             return
-        if await asyncio.to_thread(pm._is_owner_declared_adult, user_id, profile_name):
-            await pm.resolve_stale_rating(user_id, profile_name)
+        if await asyncio.to_thread(cog.content_rating._is_owner_declared_adult, user_id, profile_name):
+            await cog.content_rating.resolve_stale_rating(user_id, profile_name)
             return
-        verdict, _rating = await asyncio.to_thread(pm._content_rating_state, user_id, profile_name)
-        listed, borrowers = await asyncio.to_thread(pm.distribution_of, user_id, profile_name)
+        verdict, _rating = await asyncio.to_thread(cog.content_rating._content_rating_state, user_id, profile_name)
+        listed, borrowers = await asyncio.to_thread(cog.library.distribution_of, user_id, profile_name)
         # One prompt per profile: a second edit inside the window replaces the first,
         # whose buttons would otherwise act on a hold it no longer owns -- and keeps its
         # Still Editing, restarting the wait from this edit.

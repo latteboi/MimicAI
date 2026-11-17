@@ -42,7 +42,16 @@ from .gui.gui_resolve import (
 from .gui.gui_mod import ModStatsView, trace_signature
 from .services.generation.turn_deletion import is_visible_turn
 from .managers.storage_manager import MasterCipher, StorageManager
-from .managers.profile_manager import ProfileManager
+from .managers.profile_manager import ProfileManager, attach_profile_managers
+from .managers.user_settings import UserSettings
+from .managers.borrow_index import BorrowIndex
+from .managers.sharing_manager import SharingManager
+from .managers.library_manager import LibraryManager
+from .managers.content_rating_manager import ContentRatingManager
+from .managers.voice_sample_manager import VoiceSampleManager
+from .managers.persona_content import PersonaContent
+from .services.transfer_service import TransferService
+from .gui.profile_dashboard import ProfileDashboard
 from .managers.session_manager import (NEW_SESSION_COMPACTION, SessionManager, feature_allowed,
                                        feature_refusal, session_from_blueprint)
 from .managers.memory_manager import MemoryManager
@@ -106,7 +115,7 @@ class LRUCache(OrderedDict):
 # message. Listener registration is unaffected either way: it scans members for
 # __cog_listener__ rather than resolving by name.
 def _unregistered(cog, interaction: discord.Interaction) -> bool:
-    return not cog.profile_manager.is_registered(interaction.user.id)
+    return not cog.user_settings.is_registered(interaction.user.id)
 
 
 def _no_session_key(cog, interaction: discord.Interaction) -> bool:
@@ -137,6 +146,18 @@ def _cannot_generate(cog, interaction: discord.Interaction) -> bool:
 
 
 class MimicCog(EventListeners, commands.Cog):
+    # Set by `attach_profile_managers`, the one place the profile managers are wired.
+    profile_manager: ProfileManager
+    user_settings: UserSettings
+    borrows: BorrowIndex
+    sharing: SharingManager
+    library: LibraryManager
+    content_rating: ContentRatingManager
+    voice_samples: VoiceSampleManager
+    persona_content: PersonaContent
+    transfer: TransferService
+    profile_dashboard: ProfileDashboard
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         if not TRAIN_COMMAND_ENABLED:
@@ -197,7 +218,7 @@ class MimicCog(EventListeners, commands.Cog):
             self.fernet = None
 
         self.storage_manager = StorageManager(self)
-        self.profile_manager = ProfileManager(self)
+        attach_profile_managers(self)
         self.session_manager = SessionManager(self)
         self.memory_manager = MemoryManager(self)
         self.server_manager = ServerManager(self)
@@ -251,16 +272,16 @@ class MimicCog(EventListeners, commands.Cog):
         #: `MediaService.replicated_voice`. Lost on restart, which costs one mint each.
         self.voice_keys: LRUCache = LRUCache(max_size=64)
         self.profile_shares: Dict[str, List[Dict[str, Any]]] = {}
-        self.profile_manager._load_profile_shares()
+        self.sharing._load_profile_shares()
         self.public_profiles: Dict[str, Dict[str, Any]] = {}
-        self.profile_manager._load_public_profiles()
+        self.library._load_public_profiles()
         # Reverse index: "<owner_id>:<pid>" -> {borrower_id: [local names]}, with the
         # borrower-side inverse derived in memory. Bounded by the number of borrows
         # that exist, which LIMIT_BORROWED already caps per user. See the block above
-        # ProfileManager._borrow_pid_key for why it is not a scan.
+        # BorrowIndex._borrow_pid_key for why it is not a scan.
         self.borrow_index: Dict[str, Dict[str, List[str]]] = {}
         self.borrow_index_inverse: Dict[str, Dict[str, str]] = {}
-        self.profile_manager._load_borrow_index()
+        self.borrows._load_borrow_index()
         # Before the gateway, so no turn reads or writes a memory while files move.
         self.memory_manager.load_embedding_baseline()
         self.memory_manager.migrate_ltm_files()
@@ -268,7 +289,7 @@ class MimicCog(EventListeners, commands.Cog):
         # here came from a crash mid-delete or an older build; left alone it renders
         # in the hub as an unborrowable "Unknown" entry forever. A listing whose rating
         # no longer allows one goes too.
-        _pruned = self.profile_manager._prune_public_index()
+        _pruned = self.library._prune_public_index()
         if _pruned:
             print(f"Public hub: pruned {len(_pruned)} orphaned or unlistable entr"
                   f"{'y' if len(_pruned) == 1 else 'ies'} "
@@ -281,7 +302,7 @@ class MimicCog(EventListeners, commands.Cog):
         # Resolved channel access per (owner_id, profile_name), derived from the
         # profile's content rating. The gate runs on the turn path and the uncached
         # resolve reads up to two encrypted profile files; invalidated by
-        # ProfileManager._invalidate_content_rating.
+        # ContentRatingManager._invalidate_content_rating.
         self.content_rating_cache: LRUCache = LRUCache(max_size=512)
         # Profiles queued for content classification, so a burst of edits collapses
         # into one job each and a failed job can be retried with a bounded count.
@@ -624,7 +645,7 @@ class MimicCog(EventListeners, commands.Cog):
                     return False
                 return await on_pick(create_interaction, typed)
 
-            creatable = (self.profile_manager.is_registered(interaction.user.id)
+            creatable = (self.user_settings.is_registered(interaction.user.id)
                          and not self._blank_profile_refusal(interaction.user.id, typed))
             await suggest_profile(self, interaction, profile_name, candidates, on_pick,
                                   on_create=on_create if creatable else None)
@@ -661,7 +682,7 @@ class MimicCog(EventListeners, commands.Cog):
         index = self.profile_manager._get_user_index(interaction.user.id)
         is_view_borrowed = profile_name in index.get("borrowed", [])
 
-        embed = await self.profile_manager._build_profile_manage_embed(interaction, profile_name)
+        embed = await self.profile_dashboard._build_profile_manage_embed(interaction, profile_name)
         view = ProfileManageView(self, interaction, profile_name, is_view_borrowed)
         if deferral is not None:
             await deferral
@@ -674,7 +695,7 @@ class MimicCog(EventListeners, commands.Cog):
         # repaint straight after an edit is the post-edit prompt's decision to make.
         # This catches imports, restores and prompts that were ignored. After the send,
         # so the hash does not compete with it for the CPU.
-        asyncio.create_task(self.profile_manager.resolve_stale_rating(interaction.user.id, profile_name))
+        asyncio.create_task(self.content_rating.resolve_stale_rating(interaction.user.id, profile_name))
 
     bulk_group = app_commands.Group(name="bulk", description="Perform actions on multiple profiles at once.", parent=profile_group)
 
@@ -802,7 +823,7 @@ class MimicCog(EventListeners, commands.Cog):
             return
         
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.profile_manager._execute_import(interaction, file_bytes)
+        await self.transfer._execute_import(interaction, file_bytes)
 
     async def _import_into_profile(self, interaction: discord.Interaction, file: discord.Attachment,
                                    profile_name: str, add: str):
@@ -840,7 +861,7 @@ class MimicCog(EventListeners, commands.Cog):
             message = await self.memory_manager.add_training_examples(user_id, profile_name, found,
                                                                       interaction.guild_id)
         else:
-            add_to = self.profile_manager.add_fixed_examples if examples else self.profile_manager.add_lore_entries
+            add_to = self.persona_content.add_fixed_examples if examples else self.persona_content.add_lore_entries
             message = await asyncio.to_thread(add_to, user_id, profile_name, found)
         await settle_status(interaction, message)
         # Training examples are outside the rated text (`_moderated_surface`).
@@ -879,7 +900,7 @@ class MimicCog(EventListeners, commands.Cog):
             await settle_status(interaction, f"❌ **Import Rejected:** {suppress_link_previews(str(e))}")
             return
 
-        profile_name = self.profile_manager._generate_unique_local_name(
+        profile_name = self.transfer._generate_unique_local_name(
             user_id, profile_name_for(card["name"], self.profile_manager._is_valid_profile_name))
         # Laid over every draft, so Regenerate keeps them: the card's own name, its book, its
         # examples, its tag.
@@ -968,7 +989,7 @@ class MimicCog(EventListeners, commands.Cog):
                                  slot: Optional[app_commands.Range[int, 1, VOICE_SAMPLE_SLOTS]] = None,
                                  consent: Optional[discord.Attachment] = None):
         # Checked before the consent screen, so nobody vouches for a file that would be refused.
-        if not self.profile_manager.may_set_voice_sample(interaction.user.id, profile_name):
+        if not self.voice_samples.may_set_voice_sample(interaction.user.id, profile_name):
             await interaction.response.send_message(embed=text_embed(VOICE_SAMPLE_NOT_OWN), ephemeral=True)
             return
         mime_type = voice_sample_mime_type(sample.content_type, sample.filename)
@@ -981,11 +1002,11 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.response.send_message(
                 embed=text_embed(VOICE_SAMPLE_TOO_LARGE.format(limit=limit // (1024 * 1024))), ephemeral=True)
             return
-        records = await self.profile_manager.voice_sample_records(interaction.user.id, profile_name)
+        records = await self.voice_samples.voice_sample_records(interaction.user.id, profile_name)
         if slot is None:
             # The selected slot while it is empty, so a first upload is heard straight away;
             # otherwise the first empty one, so leaving `slot` out never overwrites a voice.
-            selected = self.profile_manager.voice_sample_slot(interaction.user.id, profile_name)
+            selected = self.voice_samples.voice_sample_slot(interaction.user.id, profile_name)
             empty = [n for n, record in enumerate(records, start=1) if not record]
             slot = selected if selected in empty else (empty[0] if empty else None)
         if slot is None:
@@ -1005,7 +1026,8 @@ class MimicCog(EventListeners, commands.Cog):
         await interaction.response.defer(ephemeral=True)
         
         # Lazy Deletion Check (Disk I/O) happens safely after defer
-        removed = await self.profile_manager._validate_and_clean_borrowed_profiles(interaction.user.id)
+        removed = await asyncio.to_thread(
+            self.sharing._validate_and_clean_borrowed_profiles, interaction.user.id)
 
         view = HubPublicLibraryView(self, interaction)
         await view.update_display()
@@ -1066,7 +1088,7 @@ class MimicCog(EventListeners, commands.Cog):
         """
         if guild is None or self.storage_manager.guild_has_text_key(guild.id):
             return None
-        if self.profile_manager.may_use_ollama(user_id):
+        if self.user_settings.may_use_ollama(user_id):
             return None
         if self.storage_manager.admin_key_unassigned(guild, user_id):
             return UNASSIGNED_KEY_GATE.format(server=guild.name)
@@ -2488,7 +2510,7 @@ class MimicCog(EventListeners, commands.Cog):
             # lookup is affordable.
             candidates = gather_owned_candidates(
                 self, user_id, include_system=False,
-                only=lambda name, kind: self.profile_manager.content_capability(
+                only=lambda name, kind: self.content_rating.content_capability(
                     user_id, name, "global_chat")[0],
             )
 
@@ -2512,7 +2534,7 @@ class MimicCog(EventListeners, commands.Cog):
         # first, so an edit no prompt caught is not opened on the verdict before it. Not
         # waited on: this answers inside Discord's three seconds, so a re-check of a shared
         # profile leaves its verdict standing until it lands, as a session start does.
-        allowed, deny_reason = await self.profile_manager.settled_capability(
+        allowed, deny_reason = await self.content_rating.settled_capability(
             user_id, profile_name_lower, "global_chat")
         if not allowed:
             await interaction.response.send_message(

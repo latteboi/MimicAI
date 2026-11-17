@@ -401,7 +401,7 @@ class CustomModelModal(ui.Modal, title="Enter Custom Model ID"):
 
         # Owner first: anyone else who types the prefix is told Ollama is the owner's, not
         # which slots it would or would not fill.
-        if value.startswith("OLLAMA/") and not self.parent_view.cog.profile_manager.may_use_ollama(
+        if value.startswith("OLLAMA/") and not self.parent_view.cog.user_settings.may_use_ollama(
                 getattr(self.parent_view, "user_id", interaction.user.id)):
             await interaction.response.send_message(embed=text_embed(OLLAMA_OWNER_ONLY), ephemeral=True)
             return
@@ -1534,7 +1534,7 @@ class SessionView(_TurnOrderView):
         idx = int(self.select.values[0])
         participant = self.session["profiles"][idx]
         
-        embed = await self.cog.profile_manager._build_profile_embed(
+        embed = await self.cog.profile_dashboard._build_profile_embed(
             participant['owner_id'], participant['profile_name'], self.channel_id,
             viewer_id=interaction.user.id)
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -2953,7 +2953,7 @@ class SessionConfigView(BlockedGuard, ui.View):
             # towards the previous, stricter answer while the recheck lands.
             for owner_id, name in {(p["owner_id"], p["profile_name"])
                                    for p in self.session.get("profiles", [])}:
-                asyncio.create_task(self.cog.profile_manager.resolve_stale_rating(owner_id, name))
+                asyncio.create_task(self.cog.content_rating.resolve_stale_rating(owner_id, name))
 
             if not self.session.get("is_hydrated"):
                 hydrated = await self.cog.session_manager._ensure_session_hydrated(

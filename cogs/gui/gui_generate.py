@@ -215,7 +215,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self._build_view()
         await interaction.response.edit_message(
             embed=self.build_embed("\U0001F310 Rating and publishing…"), view=self)
-        self.published, reason = await self.cog.profile_manager.publish_profile(
+        self.published, reason = await self.cog.library.publish_profile(
             self.user_id, self.profile_name)
         self.busy = False
         self._build_view()

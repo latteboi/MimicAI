@@ -115,7 +115,7 @@ class WhisperMixin:
         it rather than in the channel.
         """
         owner_id, profile_name = target_participant['owner_id'], target_participant['profile_name']
-        refusal = self.cog.profile_manager.placement_refusal(owner_id, profile_name, interaction.channel)
+        refusal = self.cog.content_rating.placement_refusal(owner_id, profile_name, interaction.channel)
         if refusal:
             return ReplyText(text=f"**{profile_name}** {refusal}", blocked=True)
 
@@ -240,7 +240,7 @@ class WhisperMixin:
             "message_ids": [],
             "content": _format_history_entry(
                 interaction.user.name, interaction.created_at, whisper_message,
-                self.cog.profile_manager.user_timezone(interaction.user.id),
+                self.cog.user_settings.user_timezone(interaction.user.id),
                 entity_id=_get_user_hash(interaction.user.id)),
             "timestamp": interaction.created_at.isoformat(),
         }

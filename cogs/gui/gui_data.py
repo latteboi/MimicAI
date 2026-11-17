@@ -198,7 +198,7 @@ class LoreEntryModal(ui.Modal):
     async def on_submit(self, i: discord.Interaction):
         await i.response.defer(ephemeral=True, thinking=True)
         _ok, message = await asyncio.to_thread(
-            self.cog.profile_manager.put_lore_entry, self.profile_owner_id, self.profile_name,
+            self.cog.persona_content.put_lore_entry, self.profile_owner_id, self.profile_name,
             self.entry_id, self.keys_field.value, self.content_field.value)
         await i.followup.send(embed=text_embed(message), ephemeral=True)
         # The lorebook is rated text. Deferred: gui_profiles imports this module.
@@ -229,7 +229,7 @@ class FixedExampleModal(ui.Modal):
     async def on_submit(self, i: discord.Interaction):
         await i.response.defer(ephemeral=True, thinking=True)
         _ok, message = await asyncio.to_thread(
-            self.cog.profile_manager.put_fixed_example, self.profile_owner_id, self.profile_name,
+            self.cog.persona_content.put_fixed_example, self.profile_owner_id, self.profile_name,
             self.entry_id, self.said_field.value, self.reply_field.value)
         await i.followup.send(embed=text_embed(message), ephemeral=True)
         # Fixed examples are rated text. Deferred: gui_profiles imports this module.
@@ -324,10 +324,10 @@ class DataManageView(BlockedGuard, ui.View):
             self.entries = await mm.load_training_examples(self.user_id, self.profile_name)
             return
         if self.mode == 'lore':
-            self.entries = await asyncio.to_thread(self.cog.profile_manager.lorebook, self.user_id, self.profile_name)
+            self.entries = await asyncio.to_thread(self.cog.persona_content.lorebook, self.user_id, self.profile_name)
             return
         if self.mode == 'examples':
-            self.entries = await asyncio.to_thread(self.cog.profile_manager.fixed_examples, self.user_id, self.profile_name)
+            self.entries = await asyncio.to_thread(self.cog.persona_content.fixed_examples, self.user_id, self.profile_name)
             return
         self.entries = await mm.load_ltms(self.user_id, self.profile_name)
         counts: Dict[str, int] = {}
@@ -382,7 +382,7 @@ class DataManageView(BlockedGuard, ui.View):
         """On the viewer's clock, from About Me -- not UTC, and not the character's."""
         if self._clock is None:
             self._clock, _ = _resolve_zoneinfo(
-                self.cog.profile_manager.user_timezone(self.original_interaction.user.id))
+                self.cog.user_settings.user_timezone(self.original_interaction.user.id))
         return entry_date({"created_ts": e.get(key) or e.get("ts")}, self._clock,
                           "%d %b %Y, %I:%M %p %Z") or "undated"
 
@@ -615,7 +615,7 @@ class DataManageView(BlockedGuard, ui.View):
 
     async def back_callback(self, i: discord.Interaction):
         await i.response.defer()
-        embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=self.parent_manage_view.user_id)
+        embed = await self.cog.profile_dashboard._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=self.parent_manage_view.user_id)
         self.parent_manage_view._build_view()
         await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
 
@@ -670,10 +670,10 @@ class DataManageView(BlockedGuard, ui.View):
         async def confirm(i: discord.Interaction):
             mm = self.cog.memory_manager
             if self.mode == 'lore':
-                gone = await asyncio.to_thread(self.cog.profile_manager.delete_lore_entries,
+                gone = await asyncio.to_thread(self.cog.persona_content.delete_lore_entries,
                                                self.user_id, self.profile_name, ids)
             elif self.mode == 'examples':
-                gone = await asyncio.to_thread(self.cog.profile_manager.delete_fixed_examples,
+                gone = await asyncio.to_thread(self.cog.persona_content.delete_fixed_examples,
                                                self.user_id, self.profile_name, ids)
             elif self.mode == 'ltm':
                 # Every LTM the screen can pick is in the server it is showing.
@@ -862,7 +862,7 @@ class StyleGuideView(BlockedGuard, ui.View):
 
     async def _back(self, i: discord.Interaction):
         await i.response.defer()
-        embed = await self.cog.profile_manager._build_profile_manage_embed(
+        embed = await self.cog.profile_dashboard._build_profile_manage_embed(
             self.original_interaction, self.profile_name, target_user_id=self.user_id)
         self.parent_manage_view._build_view()
         await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
@@ -917,7 +917,7 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
     @ui.button(label="Request Data Export", style=discord.ButtonStyle.blurple, emoji="📥")
     async def export_data(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.profile_manager._execute_privacy_export(self.user_id, interaction)
+        await self.cog.transfer._execute_privacy_export(self.user_id, interaction)
 
     @ui.button(label="Delete My Account", style=discord.ButtonStyle.danger, emoji="⚠️")
     async def delete_account(self, interaction: discord.Interaction, button: ui.Button):
@@ -937,7 +937,7 @@ class AccountDeleteModal(ui.Modal, title="Permanently Delete Account"):
             await interaction.response.send_message(embed=text_embed("❌ Deletion cancelled. You must type 'DELETE' exactly."), ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.profile_manager._execute_account_deletion(self.user_id, interaction)
+        await self.cog.transfer._execute_account_deletion(self.user_id, interaction)
 
 class ExportPassphraseModal(ui.Modal, title="Self-Hosted Export"):
     passphrase_input = ui.TextInput(label="Enter a strong passphrase", placeholder="Used to decrypt on your self-hosted instance", required=True, min_length=8, max_length=100)
@@ -949,7 +949,7 @@ class ExportPassphraseModal(ui.Modal, title="Self-Hosted Export"):
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         passphrase = self.passphrase_input.value
-        await self.parent_view.cog.profile_manager._execute_export(interaction, list(self.parent_view.selected_profiles), self.parent_view.export_filters, passphrase=passphrase)
+        await self.parent_view.cog.transfer._execute_export(interaction, list(self.parent_view.selected_profiles), self.parent_view.export_filters, passphrase=passphrase)
 
 class ImportPassphraseModal(ui.Modal, title="Enter Passphrase"):
     passphrase_input = ui.TextInput(label="Passphrase", placeholder="Enter the passphrase used for export", required=True, min_length=8, max_length=100)
@@ -972,7 +972,7 @@ class ImportPassphraseModal(ui.Modal, title="Enter Passphrase"):
             await interaction.followup.send(embed=text_embed("❌ The file could not be read back from Discord. Run `/import` again."),
                                             ephemeral=True)
             return
-        await self.cog.profile_manager._execute_import(interaction, file_bytes=file_bytes, passphrase=self.passphrase_input.value)
+        await self.cog.transfer._execute_import(interaction, file_bytes=file_bytes, passphrase=self.passphrase_input.value)
 
 class BulkExportView(BaseBulkProfileView):
     def __init__(self, cog: 'MimicCog', user_id: int):
@@ -1008,7 +1008,7 @@ class BulkExportView(BaseBulkProfileView):
         if not self.selected_profiles:
             await interaction.followup.send(embed=text_embed("Select at least one profile to export."), ephemeral=True)
             return
-        await self.cog.profile_manager._execute_export(interaction, list(self.selected_profiles), self.export_filters)
+        await self.cog.transfer._execute_export(interaction, list(self.selected_profiles), self.export_filters)
 
     async def export_selfhost_callback(self, interaction: discord.Interaction):
         if not self.selected_profiles:

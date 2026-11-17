@@ -197,7 +197,7 @@ class RegenerationMixin:
             # screen. It used to come after the emoji edit and the follow-up cleanup, so a
             # refused regeneration of a long reply deleted its continuation messages and
             # put back only the first.
-            if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, channel):
+            if not self.cog.content_rating._check_unrestricted_safety_policy(owner_id, profile_name, channel):
                 return
 
             bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)

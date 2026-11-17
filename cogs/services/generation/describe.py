@@ -113,7 +113,7 @@ class MediaDescriptionMixin:
         contents = [{"role": "user", "parts": parts}]
         # The chain the profile owner's provider ships, as their profile's own models are,
         # with that side's thinking and Hosts & Tier from /mod.
-        side = self.cog.profile_manager.effective_provider(owner_id)
+        side = self.cog.user_settings.effective_provider(owner_id)
         settings = system_settings(self.cog, "describer", side)
 
         async def run(name: str, is_fallback: bool):

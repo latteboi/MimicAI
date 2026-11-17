@@ -1415,7 +1415,7 @@ class ModProfilesView(ModBaseView):
                     content=None,
                     view=None, embed=text_embed("Resetting every content rating on this instance..."))
                 counts = await asyncio.to_thread(
-                    self.cog.profile_manager.reset_all_content_ratings)
+                    self.cog.content_rating.reset_all_content_ratings)
 
                 delisted = counts["delisted"]
                 lines = [
@@ -1450,7 +1450,7 @@ class ModProfilesView(ModBaseView):
         # Clear or Uphold, or a verdict for a flagged one.
         async def refused_cb(i: discord.Interaction):
             await i.response.defer()
-            self.refused_rows = await asyncio.to_thread(self.cog.profile_manager.refused_profiles)
+            self.refused_rows = await asyncio.to_thread(self.cog.content_rating.refused_profiles)
             self._build_view()
             await i.edit_original_response(embed=self._get_embed(), view=self)
         add_button(self, "Review Queue", refused_cb, style=discord.ButtonStyle.secondary,
@@ -1468,7 +1468,7 @@ class ModProfilesView(ModBaseView):
                 await i.response.defer()
                 pm_view = ProfileManageView(self.cog, self.original_interaction, pname, False,
                                             target_user_id=int(owner), is_mod_view=True)
-                embed = await self.cog.profile_manager._build_profile_manage_embed(
+                embed = await self.cog.profile_dashboard._build_profile_manage_embed(
                     self.original_interaction, pname, target_user_id=int(owner))
                 await self.original_interaction.edit_original_response(embed=embed, view=pm_view)
             options = []
@@ -1499,7 +1499,7 @@ class ModProfilesView(ModBaseView):
                     is_b = pname in index.get("borrowed", [])
                     await i.response.defer()
                     pm_view = ProfileManageView(self.cog, self.original_interaction, pname, is_b, target_user_id=self.target_user_id, is_mod_view=True)
-                    embed = await self.cog.profile_manager._build_profile_manage_embed(self.original_interaction, pname, target_user_id=self.target_user_id)
+                    embed = await self.cog.profile_dashboard._build_profile_manage_embed(self.original_interaction, pname, target_user_id=self.target_user_id)
                     await self.original_interaction.edit_original_response(embed=embed, view=pm_view)
                 add_select(self, options, sel_cb, placeholder="Select a profile to manage...",
                            row=1)
@@ -2040,7 +2040,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         if key in _PROFILE_KEYS:
             # An unset slot runs what the owner's provider ships, as `model_chain` reads it.
             return self._system_config().get(key) or model_slot_defaults(
-                self.cog.profile_manager.provider_preference(self.user_id)).get(key)
+                self.cog.user_settings.provider_preference(self.user_id)).get(key)
         return system_model(self.cog, key, self.audience)
 
     def _shipped(self, key: str) -> str:

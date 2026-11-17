@@ -882,9 +882,9 @@ class StorageManager:
         pm = self.cog.profile_manager
         for recipient_id_str, shares in list(self.cog.profile_shares.items()):
             if (recipient_id_str not in all_bot_member_ids
-                    or not pm.is_registered(int(recipient_id_str))):
+                    or not self.cog.user_settings.is_registered(int(recipient_id_str))):
                 cleaned_shares += len(self.cog.profile_shares.pop(recipient_id_str, []))
-                pm._save_profile_share_shard(recipient_id_str, None)
+                self.cog.sharing._save_profile_share_shard(recipient_id_str, None)
                 continue
 
             valid_shares = []
@@ -904,7 +904,7 @@ class StorageManager:
                     self.cog.profile_shares[recipient_id_str] = valid_shares
                 else:
                     self.cog.profile_shares.pop(recipient_id_str, None)
-                pm._save_profile_share_shard(recipient_id_str, valid_shares)
+                self.cog.sharing._save_profile_share_shard(recipient_id_str, valid_shares)
 
         # --- 3. Orphaned Server Pointers ---
         cleaned_pointers = 0
@@ -983,7 +983,7 @@ class StorageManager:
                     self.cog.user_indices.pop(user_id_str, None)
                     # Their index.json went with the tree, so the reconcile hooked
                     # into _save_user_index can never fire for them again.
-                    self.cog.profile_manager._borrow_index_drop_user(int(user_id_str))
+                    self.cog.borrows._borrow_index_drop_user(int(user_id_str))
                     cleaned_users_count += 1
         
 
@@ -1028,7 +1028,7 @@ class StorageManager:
                 if not key:
                     shard = users_path / user_id_str / "profiles" / borrow_pid / "profile.json.gz"
                     config = (IOManager.read_json_gzip(str(shard), self.fernet) or {}).get("config") or {}
-                    key = self.cog.profile_manager._borrow_key_for_config(config) or ""
+                    key = self.cog.borrows._borrow_key_for_config(config) or ""
                 owner_id, _, source_pid = key.partition(":")
                 if not (owner_id and source_pid):
                     continue

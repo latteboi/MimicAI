@@ -465,7 +465,7 @@ class EventListeners:
 
         await self._cache_command_ids()
         text = (MENTION_POINTER_REGISTERED.format(help=self.command_mention("help"))
-                if self.profile_manager.is_registered(message.author.id)
+                if self.user_settings.is_registered(message.author.id)
                 else MENTION_POINTER_UNREGISTERED.format(start=self.command_mention("start")))
         try:
             await message.reply(text, mention_author=False)
@@ -481,7 +481,7 @@ class EventListeners:
         is_borrowed = profile_name in self.profile_manager._get_user_index(owner_id).get("borrowed", [])
         config = self.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed) or {}
         return (str(config.get("primary_model", "")).upper().startswith("OLLAMA/")
-                and self.profile_manager.may_use_ollama(owner_id))
+                and self.user_settings.may_use_ollama(owner_id))
 
     def _reaction_user_is_admin(self, payload: discord.RawReactionActionEvent) -> bool:
         """Administrator (or bot owner) test for a raw reaction.
@@ -1211,7 +1211,7 @@ class EventListeners:
             author_id = msg.author.id
             # Must match what triggers.py stamped when the turn was first written,
             # or an edit re-renders the line in a different timezone from the original.
-            user_tz = self.profile_manager.user_timezone(author_id)
+            user_tz = self.user_settings.user_timezone(author_id)
 
             # Rebuilt by the same builder that wrote the turn, so the text files and image
             # tags survive the edit. Read from the message as it is now: an attachment

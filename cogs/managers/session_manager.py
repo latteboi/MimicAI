@@ -1614,9 +1614,9 @@ class SessionManager:
             server_index = self.cog.server_manager._get_server_index(server_id_str)
             old_profile_name = self._active_profile_name(
                 user_id, server_index.get("user_active_profiles", {}).get(str(user_id), {}).get(str(channel_id)))
-            # The PID, not the name -- see _active_profile_name. A pre-PID index has
-            # none, and its folder is named after the profile anyway.
-            stored = self.cog.profile_manager._get_pid_from_name(user_id, profile_name) or profile_name
+            # The PID, not the name -- see _active_profile_name. The name is in the index
+            # (checked above), so it has one.
+            stored = self.cog.profile_manager._get_pid_from_name(user_id, profile_name)
             server_index.setdefault("user_active_profiles", {}).setdefault(str(user_id), {})[str(channel_id)] = stored
             self.cog.server_manager._save_server_index(server_id_str, server_index)
 
@@ -1689,13 +1689,6 @@ class SessionManager:
         if session and session.get("profiles"):
             cleaned_any = False
             valid_profiles = []
-
-            # Once per distinct owner, not once per participant. This scan reads and
-            # decrypts every borrowed profile the owner has, so a five-participant
-            # session sharing one owner ran that whole sweep five times per
-            # hydration, on the event loop.
-            for owner_id in {p["owner_id"] for p in session["profiles"]}:
-                await self.cog.profile_manager._validate_and_clean_borrowed_profiles(owner_id)
 
             for p in list(session["profiles"]):
                 p_owner_id = p["owner_id"]
@@ -1789,6 +1782,13 @@ class SessionManager:
 
         # 3. Synchronise Memory for all current participants
         self._recompute_pending_whispers(session, force=True)
+
+        # Borrows whose source is gone, once per hydration and distinct owner, in a thread:
+        # the scan reads every borrow the owner has, and ran on the loop on every message.
+        # A live session needs no re-scan -- a deleted source cascades to its borrows -- and
+        # the seat check above, on every call, drops a seat this clears.
+        for owner_id in {p["owner_id"] for p in session.get("profiles") or ()}:
+            await asyncio.to_thread(self.cog.sharing._validate_and_clean_borrowed_profiles, owner_id)
 
         session["is_hydrated"] = True
         return session

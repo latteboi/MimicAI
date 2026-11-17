@@ -531,7 +531,7 @@ class ServerManager:
             for pid in pids:
                 self.cog.public_profiles.pop(pid, None)
             if pids:
-                self.cog.profile_manager._save_public_index()
+                self.cog.library._save_public_index()
             applied.append(f"Unpublished {len(pids)} profile(s) from the Public Library.")
 
         if suspend_sessions:

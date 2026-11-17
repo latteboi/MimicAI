@@ -36,7 +36,7 @@ class OllamaHostModal(ui.Modal, title="Set Ollama Host URL"):
     async def on_submit(self, interaction: discord.Interaction):
         # The host is where every message a profile sees would be sent, and the probe
         # below dials it from the bot's own network: the bot owner's call alone.
-        if not self.parent_view.cog.profile_manager.may_use_ollama(
+        if not self.parent_view.cog.user_settings.may_use_ollama(
                 getattr(self.parent_view, "user_id", interaction.user.id)):
             await interaction.response.send_message(embed=text_embed(OLLAMA_OWNER_ONLY), ephemeral=True)
             return
@@ -263,7 +263,7 @@ def build_about_embed(cog: 'MimicCog', user_id: int) -> discord.Embed:
     The About tab renders this, and so does `/settings` for a blocked user in place of
     the tabs, with no view attached -- nothing on it is theirs to change while blocked.
     """
-    about = cog.profile_manager.get_user_about(user_id)
+    about = cog.user_settings.get_user_about(user_id)
     stored_tz = about.get("timezone")
 
     # The resolved value is what actually gets used, so it is what is shown --
@@ -317,7 +317,7 @@ class SettingsAboutView(SettingsBaseView):
 
     Everything here is stored sparsely in `index.json["about"]` -- plaintext, already
     cached in `cog.user_indices`, and read on the turn path. See the block above
-    ProfileManager.get_user_about for why it is not an encrypted shard and not a key
+    UserSettings.get_user_about for why it is not an encrypted shard and not a key
     inside "defaults".
     """
 
@@ -330,7 +330,7 @@ class SettingsAboutView(SettingsBaseView):
         add_button(self, "Set Timezone", self._act_timezone, style=discord.ButtonStyle.primary,
                    row=0, emoji="\N{GLOBE WITH MERIDIANS}")
 
-        about = self.cog.profile_manager.get_user_about(self.user_id)
+        about = self.cog.user_settings.get_user_about(self.user_id)
         if about.get("timezone"):
             add_button(self, "Clear Timezone", self._act_clear_timezone,
                        style=discord.ButtonStyle.secondary, row=0)
@@ -358,9 +358,9 @@ class SettingsAboutView(SettingsBaseView):
 
     async def _act_clear_timezone(self, i: discord.Interaction):
         await i.response.defer()
-        about = self.cog.profile_manager.get_user_about(self.user_id)
+        about = self.cog.user_settings.get_user_about(self.user_id)
         about.pop("timezone", None)
-        self.cog.profile_manager.save_user_about(self.user_id, about)
+        self.cog.user_settings.save_user_about(self.user_id, about)
         self._build_view()
         await self.update_display()
 
@@ -369,9 +369,9 @@ class SettingsAboutView(SettingsBaseView):
 
     async def _act_clear_birthday(self, i: discord.Interaction):
         await i.response.defer()
-        about = self.cog.profile_manager.get_user_about(self.user_id)
+        about = self.cog.user_settings.get_user_about(self.user_id)
         about.pop("birthday", None)
-        self.cog.profile_manager.save_user_about(self.user_id, about)
+        self.cog.user_settings.save_user_about(self.user_id, about)
         self._build_view()
         await self.update_display()
 
@@ -388,7 +388,7 @@ class UserBirthdayModal(ui.Modal, title="Your Birthday"):
         self.cog = cog
         self.parent_about_view = parent_about_view
         current = valid_birthday(
-            cog.profile_manager.get_user_about(parent_about_view.user_id).get("birthday")) or {}
+            cog.user_settings.get_user_about(parent_about_view.user_id).get("birthday")) or {}
         self.day = ui.TextInput(label="Day", default=str(current.get("day", "")),
                                 required=False, max_length=2, placeholder="1-31")
         self.month = ui.TextInput(
@@ -405,12 +405,12 @@ class UserBirthdayModal(ui.Modal, title="Your Birthday"):
                 embed=text_embed(f"❌ **Invalid Input:** {suppress_link_previews(str(e))}"), ephemeral=True)
             return
         user_id = self.parent_about_view.user_id
-        about = self.cog.profile_manager.get_user_about(user_id)
+        about = self.cog.user_settings.get_user_about(user_id)
         if birthday:
             about["birthday"] = birthday
         else:
             about.pop("birthday", None)
-        self.cog.profile_manager.save_user_about(user_id, about)
+        self.cog.user_settings.save_user_about(user_id, about)
 
         await interaction.response.defer()
         self.parent_about_view._build_view()

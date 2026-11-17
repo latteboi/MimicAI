@@ -143,7 +143,7 @@ class PromptBuilderMixin:
         pm = self.cog.profile_manager
         lines = []
         if profile_owner_id is not None:
-            own = describe_birthday(pm.character_birthday(profile_owner_id, profile_name), profile_today)
+            own = describe_birthday(self.cog.persona_content.character_birthday(profile_owner_id, profile_name), profile_today)
             if own:
                 lines.append(own)
 
@@ -151,7 +151,7 @@ class PromptBuilderMixin:
         for owner_id, name in cast:
             if (owner_id, name) == (profile_owner_id, profile_name):
                 continue
-            birthday = pm.character_birthday(owner_id, name)
+            birthday = self.cog.persona_content.character_birthday(owner_id, name)
             # Settled on the UTC date first, so a character with no birthday this week
             # costs no config read.
             if birthday_offset(birthday, utc_today, reach=2) is None:
@@ -174,7 +174,7 @@ class PromptBuilderMixin:
             if user_id in seen:
                 continue
             seen.add(user_id)
-            about = self.cog.profile_manager.get_user_about(user_id)
+            about = self.cog.user_settings.get_user_about(user_id)
             if not about.get("birthday"):
                 continue
             try:
@@ -429,7 +429,7 @@ class PromptBuilderMixin:
             people = (self._bond_roster(session, profile_data, self_id) if session
                       else [(_get_user_hash(uid), name) for uid, name in present_users][:BOND_ROSTER_SIZE])
             if people:
-                held = self.cog.profile_manager.bonds(profile_owner_id, profile_name_to_use)
+                held = self.cog.persona_content.bonds(profile_owner_id, profile_name_to_use)
                 turn_parts.append(self.cog.global_prompts.get("BOND_STATE", DEFAULT_BOND_INSTRUCTION)
                                   .format(bonds=render_bonds(people, held)))
 
@@ -566,7 +566,7 @@ class PromptBuilderMixin:
             p_config = self.cog.profile_manager._get_profile_config(owner_id, profile_name, is_borrowed)
 
             if bond_updates and p_config and p_config.get("bond_engine_enabled"):
-                self.cog.profile_manager.apply_bonds(owner_id, profile_name, bond_updates)
+                self.cog.persona_content.apply_bonds(owner_id, profile_name, bond_updates)
             if new_state and p_config and p_config.get("neuro_engine_enabled"):
                 current_state = neuro_levels(p_config)
                 current_state.update(new_state)

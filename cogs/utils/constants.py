@@ -258,7 +258,7 @@ MODEL_PROVIDERS = {"gemini": "Google", "openrouter": "OpenRouter"}
 #: What `/start` offers, stored as `index.json["about"]["provider"]`: a provider, or
 #: `none` -- no shipped models, only the user's own Override Defaults, and Google's chain
 #: wherever a model must still be read for them. Choosing any of them is registering:
-#: absent, the user may not create anything (`ProfileManager.is_registered`).
+#: absent, the user may not create anything (`UserSettings.is_registered`).
 PROVIDER_NONE = "none"
 PROVIDER_CHOICES = {**MODEL_PROVIDERS, PROVIDER_NONE: "None"}
 
@@ -360,7 +360,7 @@ OPENROUTER_SERVICE_TIER_VALUES = frozenset(v for v, _l, _d in OPENROUTER_SERVICE
 
 # Ollama is a URL the bot dials with every message a profile sees, other members' names
 # included -- so only the bot owner may configure it, and the URL is always the
-# operator's own machine. ProfileManager.may_use_ollama is what the factory and the
+# operator's own machine. UserSettings.may_use_ollama is what the factory and the
 # pickers both ask.
 OLLAMA_OWNER_ONLY = (
     "Ollama models can only be used by this bot's owner. Choose a Google or OpenRouter "

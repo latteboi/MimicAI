@@ -555,7 +555,7 @@ class MemoryManager:
         if session_owner_id and session_owner_id != profile_owner_id:
             pm = self.cog.profile_manager
             # The borrow index, not a read of every borrow's config.
-            held = {b_pid for borrower, b_pid in pm._borrowers_of(
+            held = {b_pid for borrower, b_pid in self.cog.borrows._borrowers_of(
                 profile_owner_id, pm._get_pid_from_name(profile_owner_id, profile_name))
                     if borrower == session_owner_id}
             borrowed = pm._get_user_index(session_owner_id).get("borrowed")

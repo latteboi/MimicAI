@@ -117,7 +117,16 @@ cogs/
   MimicCog.py              god-cog: all caches, all slash commands, LRUCache definition
   managers/
     storage_manager.py     IOManager: AES-GCM + zstd + orjson persistence primitives
-    profile_manager.py     profile CRUD, personal/borrowed/system resolution, sharing
+    profile_manager.py     cog.profile_manager: profile CRUD, PIDs, personal/borrowed/system
+                           resolution, the user index, catalogue, signatures. Its
+                           attach_profile_managers wires it and the managers below.
+    user_settings.py       cog.user_settings: About Me, Override Defaults, provider preference
+    borrow_index.py        cog.borrows: borrows.json, the source -> borrowers reverse index
+    sharing_manager.py     cog.sharing: share queue, accepting/cloning/converting borrows
+    library_manager.py     cog.library: the public index, publishing, distribution
+    content_rating_manager.py  cog.content_rating: classifier, verdicts, refusals, channel access
+    voice_sample_manager.py    cog.voice_samples: voice sample recordings and consent
+    persona_content.py     cog.persona_content: lorebook, fixed examples, bonds, birthday
     session_manager.py     hydration/dehydration, eviction, history derivation
     memory_manager.py      LTM, embeddings, cosine/MMR retrieval, training examples
     server_manager.py      per-guild index, webhooks, global prompts, system models
@@ -131,8 +140,10 @@ cogs/
     tools_service.py       web grounding, URL context, anti-repetition critic
     help_service.py        RAG over bundled documentation
     profile_generation.py  /profile generate: draft, parse, model choice, save on accept
+    transfer_service.py    cog.transfer: .mimic export/import, privacy export, account deletion
   listeners/               gateway events; inherited by MimicCog
-  gui/                     Discord UI views and modals
+  gui/                     Discord UI views and modals; profile_dashboard.py is
+                           cog.profile_dashboard, the profile dashboard embed
   utils/                   constants, helpers, content, fuzzy, http_client, memory_tuning,
                            loop_probe, discord_cdn
 ```
@@ -241,7 +252,7 @@ created or removed in it and not when a file inside a child is rewritten, which 
 when the name maps can go stale.
 
 `users/<id>/` exists only once a user registers, by choosing a provider in `/start` --
-Google, OpenRouter or None, stored as `about.provider` (`ProfileManager.is_registered`).
+Google, OpenRouter or None, stored as `about.provider` (`UserSettings.is_registered`).
 Reading someone with no directory -- autocomplete, a message in a session channel -- answers
 an empty index held in memory and writes nothing (`_get_user_index`), and every path that
 would create their data refuses until then (`refuse_unregistered`). A private share is
@@ -623,7 +634,7 @@ A profile its owner can edit may carry up to three **voice samples** (`/profile
 voice_sample`), one per slot: the audio sealed beside the profile's shards, and a sealed
 record of its type, transcript and who vouched that the voice was theirs to use. Slot 1 is
 the pre-slot file names. One slot is always selected (`voice_sample_slot` in config,
-`ProfileManager.voice_sample_slot`), and only it is sent; an empty one means the preset voice.
+`VoiceSampleManager.voice_sample_slot`), and only it is sent; an empty one means the preset voice.
 A borrow speaks with its source's recordings, resolved through `original_pid`; it keeps the
 selection its config was copied with, and follows the source's while it has none. Nothing copies them — clone, convert and export
 rebuild a profile from its config and prompts — and removing the profile's directory removes

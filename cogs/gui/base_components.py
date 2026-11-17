@@ -125,9 +125,9 @@ async def refuse_unregistered(cog, interaction: discord.Interaction) -> bool:
     """True, having said so, when this user has not set up through `/start`.
 
     The gate in front of every command and button that would create a user's own data --
-    see `ProfileManager.is_registered`. Answers however far the interaction has got.
+    see `UserSettings.is_registered`. Answers however far the interaction has got.
     """
-    if cog.profile_manager.is_registered(interaction.user.id):
+    if cog.user_settings.is_registered(interaction.user.id):
         return False
     if interaction.response.is_done():
         await interaction.followup.send(embed=text_embed(NOT_REGISTERED), ephemeral=True)
@@ -716,7 +716,7 @@ class BaseBulkProfileView(BlockedGuard, ui.View):
         self.excluded_public = []
         if self.exclude_public:
             published = {d["profile_name"]
-                         for d in self.cog.profile_manager._iter_public_entries(self.user_id)}
+                         for d in self.cog.library._iter_public_entries(self.user_id)}
             self.excluded_public = [n for n in self.personal_profiles if n in published]
             self.personal_profiles = [n for n in self.personal_profiles if n not in published]
 

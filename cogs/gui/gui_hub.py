@@ -31,9 +31,9 @@ class HubBaseView(TabbedView):
     )
 
 
-def _borrower_count(pm, owner_id: int, pid: Optional[str]) -> int:
+def _borrower_count(cog, owner_id: int, pid: Optional[str]) -> int:
     """People borrowing one profile, counted once each: one borrow-index lookup."""
-    return len({borrower_id for borrower_id, _ in pm._borrowers_of(owner_id, pid)}) if pid else 0
+    return len({borrower_id for borrower_id, _ in cog.borrows._borrowers_of(owner_id, pid)}) if pid else 0
 
 
 class HubStatsView(HubBaseView):
@@ -43,17 +43,17 @@ class HubStatsView(HubBaseView):
     def build_embed(self) -> discord.Embed:
         """Blocking: one owner-index read per creator, as the Library's own open."""
         pm = self.cog.profile_manager
-        listings = list(pm._iter_public_entries())
-        reach = {d["id"]: _borrower_count(pm, d["owner_id"], d["original_pid"]) for d in listings}
+        listings = list(self.cog.library._iter_public_entries())
+        reach = {d["id"]: _borrower_count(self.cog, d["owner_id"], d["original_pid"]) for d in listings}
         creators = {d["owner_id"] for d in listings}
 
         index = pm._get_user_index(self.user_id)
         personal = list(index.get("personal", {}))
         borrowed = len(index.get("borrowed", {}))
-        waiting = len(pm._pending_shares(self.user_id))
+        waiting = len(self.cog.sharing._pending_shares(self.user_id))
         mine = [d for d in listings if d["owner_id"] == self.user_id]
         # Every profile of yours, listed or only shared privately: reach is reach.
-        yours = {name: {b for b, _ in pm._borrowers_of(self.user_id, pm._get_pid_from_name(self.user_id, name))}
+        yours = {name: {b for b, _ in self.cog.borrows._borrowers_of(self.user_id, pm._get_pid_from_name(self.user_id, name))}
                  for name in personal}
         borrowers = set().union(*yours.values()) if yours else set()
 
@@ -114,7 +114,7 @@ class HubPublicLibraryView(HubBaseView):
     def _load_public_data(self):
         # ponytail: one owner-index read per creator, on the loop, every Library open --
         # cheap until creators outgrow the 200-entry user_indices LRU; then cache this list.
-        self.all_public = self._sorted(self.cog.profile_manager._iter_public_entries())
+        self.all_public = self._sorted(self.cog.library._iter_public_entries())
 
     def _sorted(self, entries):
         """Newest first, most recently updated first, or most borrowed first with newest
@@ -124,8 +124,7 @@ class HubPublicLibraryView(HubBaseView):
         newest = sorted(entries, key=lambda x: x['published_at'], reverse=True)
         if self.sort != "borrowed":
             return newest
-        pm = self.cog.profile_manager
-        return sorted(newest, key=lambda x: _borrower_count(pm, x['owner_id'], x.get('original_pid')),
+        return sorted(newest, key=lambda x: _borrower_count(self.cog, x['owner_id'], x.get('original_pid')),
                       reverse=True)
 
     def _num_pages(self) -> int:
@@ -139,7 +138,7 @@ class HubPublicLibraryView(HubBaseView):
         listing renamed after the borrow offered Borrow again.
         """
         return any(borrower_id == self.user_id for borrower_id, _ in
-                   self.cog.profile_manager._borrowers_of(p_info['owner_id'], p_info.get('original_pid')))
+                   self.cog.borrows._borrowers_of(p_info['owner_id'], p_info.get('original_pid')))
 
     def setup_items(self):
         for item in self.children[:]:
@@ -193,9 +192,8 @@ class HubPublicLibraryView(HubBaseView):
         """The dropdown page's display names, off each listing's entry (`library_display_name`)."""
         start = self.current_page * self.PER_PAGE
         page = [p for p in self.filtered_list[start:start + self.PER_PAGE] if p.get('original_pid')]
-        pm = self.cog.profile_manager
         self._display_names = {
-            p['original_pid']: pm.library_display_name(p['owner_id'], p['original_pid']) for p in page}
+            p['original_pid']: self.cog.library.library_display_name(p['owner_id'], p['original_pid']) for p in page}
 
     async def update_display(self):
         if not self.filtered_list:
@@ -231,7 +229,7 @@ class HubPublicLibraryView(HubBaseView):
 
         byline = f"Created by **{owner_name}**"
         borrowers = len({borrower_id for borrower_id, _ in
-                         self.cog.profile_manager._borrowers_of(owner_id, original_pid)})
+                         self.cog.borrows._borrowers_of(owner_id, original_pid)})
         if borrowers:
             byline += f" \u00B7 Borrowed by {borrowers} {'user' if borrowers == 1 else 'users'}"
         intro = cfg_data.get("library_intro")
@@ -292,8 +290,8 @@ class HubPublicLibraryView(HubBaseView):
             return
 
         await i.response.defer(ephemeral=True)
-        local_name = self.cog.profile_manager._generate_unique_local_name(i.user.id, p_info['profile_name'])
-        if await self.cog.profile_manager._accept_share_request(i, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], local_name, is_public_borrow=True):
+        local_name = self.cog.transfer._generate_unique_local_name(i.user.id, p_info['profile_name'])
+        if await self.cog.sharing._accept_share_request(i, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], local_name, is_public_borrow=True):
             await i.followup.send(embed=text_embed(f"✅ Borrowed **{p_info['profile_name']}** as **{local_name}**."), ephemeral=True)
 
     async def edit_intro_cb(self, i: discord.Interaction):
@@ -324,7 +322,7 @@ class HubPublicLibraryView(HubBaseView):
         owner = self.cog.bot.get_user(entry['owner_id'])
         return (term in entry['profile_name'].lower()
                 or (owner is not None and term in owner.name.lower())
-                or term in self.cog.profile_manager.library_search_text(
+                or term in self.cog.library.library_search_text(
                     entry['owner_id'], entry.get('original_pid')))
 
     async def search_cb(self, i: discord.Interaction):
@@ -366,7 +364,7 @@ class HubIncomingView(HubBaseView):
     """Shares waiting for you, and who may send them.
 
     A share is only ever offered: it waits here, and nobody is messaged to say so --
-    see `ProfileManager.accepts_share`. Closing turns away new ones and leaves those
+    see `SharingManager.accepts_share`. Closing turns away new ones and leaves those
     already waiting to be answered; blocking someone takes theirs back.
     """
 
@@ -380,13 +378,13 @@ class HubIncomingView(HubBaseView):
         self.setup_items()
 
     def _about(self):
-        return self.cog.profile_manager.get_user_about(self.user_id)
+        return self.cog.user_settings.get_user_about(self.user_id)
 
     def setup_items(self):
         for item in self.children[:]:
             if item.row != 4: self.remove_item(item)
 
-        shares = self.cog.profile_manager._pending_shares(self.user_id)
+        shares = self.cog.sharing._pending_shares(self.user_id)
         
         # Group
         sharers = {}
@@ -429,7 +427,7 @@ class HubIncomingView(HubBaseView):
             add_button(self, "Cancel Selection", self.clear_selection, row=action_row)
             return
 
-        if not self.cog.profile_manager.is_registered(self.user_id):
+        if not self.cog.user_settings.is_registered(self.user_id):
             return
         about = self._about()
         closed = bool(about.get("shares_closed"))
@@ -445,7 +443,7 @@ class HubIncomingView(HubBaseView):
         self.add_item(block_select)
 
     async def update_display(self):
-        shares = self.cog.profile_manager._pending_shares(self.user_id)
+        shares = self.cog.sharing._pending_shares(self.user_id)
         
         if self.selected_sharer_id:
             u = self.cog.bot.get_user(self.selected_sharer_id)
@@ -460,7 +458,7 @@ class HubIncomingView(HubBaseView):
             await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
             return
 
-        if not self.cog.profile_manager.is_registered(self.user_id):
+        if not self.cog.user_settings.is_registered(self.user_id):
             embed = discord.Embed(title="Incoming Shares", description=NOT_REGISTERED,
                                   color=discord.Color.dark_grey())
             await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
@@ -498,8 +496,7 @@ class HubIncomingView(HubBaseView):
     async def toggle_open(self, i: discord.Interaction):
         if await refuse_unregistered(self.cog, i):
             return
-        pm = self.cog.profile_manager
-        pm.set_shares_closed(self.user_id, not self._about().get("shares_closed"))
+        self.cog.sharing.set_shares_closed(self.user_id, not self._about().get("shares_closed"))
         self.setup_items()
         await i.response.defer()
         await self.update_display()
@@ -507,7 +504,7 @@ class HubIncomingView(HubBaseView):
     async def set_blocked(self, i: discord.Interaction):
         if await refuse_unregistered(self.cog, i):
             return
-        self.cog.profile_manager.set_blocked_sharers(
+        self.cog.sharing.set_blocked_sharers(
             self.user_id, [int(v) for v in (i.data or {}).get("values", [])])
         self.setup_items()
         await i.response.defer()
@@ -522,7 +519,7 @@ class HubIncomingView(HubBaseView):
             await i.followup.send(embed=text_embed(f"Your block list is full ({self.BLOCK_LIMIT}). Unblock someone "
                                   "on this tab first."), ephemeral=True)
             return
-        self.cog.profile_manager.set_blocked_sharers(self.user_id, [*blocked, self.selected_sharer_id])
+        self.cog.sharing.set_blocked_sharers(self.user_id, [*blocked, self.selected_sharer_id])
         await i.followup.send(embed=text_embed("Blocked. Their shares are gone, and they cannot offer you more."),
                               ephemeral=True)
         self.selected_sharer_id = None
@@ -535,7 +532,7 @@ class HubIncomingView(HubBaseView):
             return
         pm = self.cog.profile_manager
         sharer_id = self.selected_sharer_id
-        shares = [s for s in pm._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
+        shares = [s for s in self.cog.sharing._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
         clones = sum(1 for s in shares if s.get("kind") == "clone")
 
         # A borrow counts towards the borrowed limit, a clone towards the personal one.
@@ -556,19 +553,19 @@ class HubIncomingView(HubBaseView):
             current_name = (pm._get_name_from_pid(sharer_id, target_pid) if target_pid else None) or fallback_name
 
             if current_name not in sharer_index.get("personal", []):
-                await pm._reject_share_request(self.original_interaction, sharer_id, target_pid, fallback_name, kind)
+                await self.cog.sharing._reject_share_request(self.original_interaction, sharer_id, target_pid, fallback_name, kind)
                 continue
 
             # The source's own name, amended only where this user already has it.
-            local_name = pm._generate_unique_local_name(self.user_id, current_name)
+            local_name = self.cog.transfer._generate_unique_local_name(self.user_id, current_name)
             label = current_name if local_name == current_name else f"{current_name} as {local_name}"
             if kind == "clone":
-                ok, message = await pm._execute_clone_handshake(sharer_id, target_pid, self.user_id, local_name)
+                ok, message = await self.cog.sharing._execute_clone_handshake(sharer_id, target_pid, self.user_id, local_name)
                 if ok:
                     accepted.append(f"{label} (clone)")
                 else:
                     failed.append(f"• **{current_name}** -- {message}")
-            elif await self.cog.profile_manager._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name, is_public_borrow=False):
+            elif await self.cog.sharing._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name, is_public_borrow=False):
                 accepted.append(label)
 
         msg = f"Accepted: {', '.join(accepted)}" if accepted else "No valid profiles found."
@@ -582,9 +579,9 @@ class HubIncomingView(HubBaseView):
     async def reject_all(self, i: discord.Interaction):
         await i.response.defer(ephemeral=True)
         sharer_id = self.selected_sharer_id
-        shares =[s for s in self.cog.profile_manager._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
+        shares =[s for s in self.cog.sharing._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
         for s in shares:
-            await self.cog.profile_manager._reject_share_request(self.original_interaction, sharer_id, s.get('original_pid'), s['profile_name'], s.get("kind"))
+            await self.cog.sharing._reject_share_request(self.original_interaction, sharer_id, s.get('original_pid'), s['profile_name'], s.get("kind"))
         await i.followup.send(embed=text_embed("Rejected shares."), ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
@@ -647,7 +644,7 @@ class HubShareManagerView(HubBaseView):
     def _get_user_public_profiles(self):
         """Scans public_profiles for entries owned by this user, returning (name, is_locked) pairs."""
         return [(d["profile_name"], d["status"] == "locked")
-                for d in self.cog.profile_manager._iter_public_entries(self.user_id)]
+                for d in self.cog.library._iter_public_entries(self.user_id)]
 
     def setup_items(self):
         for item in self.children[:]:
@@ -800,7 +797,6 @@ class HubShareManagerView(HubBaseView):
         RATING_CONCURRENCY at once, each may wait on the classifier; while any needs a
         rating, one ephemeral message counts them off as they land.
         """
-        pm = self.cog.profile_manager
         unrated = [n for n in names if n in self.needs_rating]
         progress = None
         if unrated:
@@ -812,7 +808,7 @@ class HubShareManagerView(HubBaseView):
 
         async def rate(name):
             async with gate:
-                return name, await pm.rate_for_distribution(self.user_id, name, self.capability)
+                return name, await self.cog.content_rating.rate_for_distribution(self.user_id, name, self.capability)
 
         answers, lines = {}, []
         # Edited from here, not inside `rate`: a rate-limited edit must not hold a slot.
@@ -832,7 +828,7 @@ class HubShareManagerView(HubBaseView):
 
     async def send_private(self, i: discord.Interaction, kind: Optional[str] = None):
         """Offers the selection to each recipient; `kind` is the share's, sparse as
-        `ProfileManager._is_share_of` reads it."""
+        `SharingManager._is_share_of` reads it."""
         if self.processing: return
         self.processing = True
 
@@ -866,13 +862,13 @@ class HubShareManagerView(HubBaseView):
             recipient_id = int(recipient_id_str)
             if recipient_id == self.user_id:
                 continue
-            waiting = pm._pending_shares(recipient_id)
+            waiting = self.cog.sharing._pending_shares(recipient_id)
             mine = [s for s in waiting if s.get('sharer_id') == self.user_id]
             new = [n for n in shareable
-                   if not any(pm._is_share_of(s, self.user_id, pids[n], n, kind) for s in mine)]
+                   if not any(self.cog.sharing._is_share_of(s, self.user_id, pids[n], n, kind) for s in mine)]
             # Unregistered, closed, blocked or full: one answer for all four, so a
             # sender cannot tell a block from anything else.
-            if (not pm.accepts_share(recipient_id, self.user_id)
+            if (not self.cog.sharing.accepts_share(recipient_id, self.user_id)
                     or len(mine) + len(new) > LIMIT_PENDING_SHARES):
                 turned_away.append(f"<@{recipient_id}>")
                 continue
@@ -881,7 +877,7 @@ class HubShareManagerView(HubBaseView):
                              "profile_name": n, "shared_at": now, **({"kind": kind} if kind else {})}
                             for n in new]
                 self.cog.profile_shares[str(recipient_id)] = waiting
-                pm._save_profile_share_shard(str(recipient_id), waiting)
+                self.cog.sharing._save_profile_share_shard(str(recipient_id), waiting)
             offered.append(f"<@{recipient_id}>")
 
         self.processing = False
@@ -905,17 +901,16 @@ class HubShareManagerView(HubBaseView):
             if isinstance(item, ui.Button) and item.label == "Apply Changes": item.disabled = True
         await i.response.edit_message(view=self)
 
-        pm = self.cog.profile_manager
         # Read through the normaliser: the old inline version resolved string entries via
         # a name.txt that is never written, so every already-public profile landed in
         # `to_publish` and was judged again.
-        current_public_set = {d["profile_name"] for d in pm._iter_public_entries(self.user_id)}
+        current_public_set = {d["profile_name"] for d in self.cog.library._iter_public_entries(self.user_id)}
         target_set = set(self.selected_profiles)
         to_publish = sorted(target_set - current_public_set)
         to_unpublish = sorted(current_public_set - target_set)
 
         # Past the day's limit is refused before rating, so it spends no classifier call.
-        left, refusal = pm.publishes_left(self.user_id)
+        left, refusal = self.cog.library.publishes_left(self.user_id)
         over_limit = {name: refusal for name in to_publish[left:]}
         # Publishing analyses nothing of its own. It reads the rating, because that rating
         # *is* the safety analysis -- a profile with none is rated here, by this press.
@@ -923,13 +918,13 @@ class HubShareManagerView(HubBaseView):
         failed_list.update(over_limit)
         published_list = []
         for name in allowed:
-            if pm.list_public(self.user_id, name):
+            if self.cog.library.list_public(self.user_id, name):
                 published_list.append(name)
         if published_list:
-            pm._save_public_index()
-            pm.note_publishes(self.user_id, len(published_list))
+            self.cog.library._save_public_index()
+            self.cog.library.note_publishes(self.user_id, len(published_list))
 
-        unpublished_list = [name for name in to_unpublish if pm.unpublish_profile(self.user_id, name)]
+        unpublished_list = [name for name in to_unpublish if self.cog.library.unpublish_profile(self.user_id, name)]
 
         self.processing = False
         self._loaded = False

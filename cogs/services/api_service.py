@@ -344,7 +344,7 @@ class APIService:
                 raise ValueError(IMAGE_MODEL_NO_OLLAMA)
             if speech:
                 raise ValueError(SPEECH_MODEL_NO_OLLAMA)
-            if not self.cog.profile_manager.may_use_ollama(config_owner_id):
+            if not self.cog.user_settings.may_use_ollama(config_owner_id):
                 raise ValueError(OLLAMA_OWNER_ONLY)
             ollama_host = p_settings.get("ollama_host_url", OLLAMA_LOCAL_URL)
             return OllamaModel(actual_name, api_url=ollama_host, system_instruction=system_instruction, thinking_params=t_params)
@@ -448,7 +448,7 @@ class APIService:
         """`user_defaults.model_chain` under the provider preference of `config`'s owner, with
         a MimicAI Auto slot turned into the models its tier runs on today."""
         return model_chain(resolve_auto_models(self.cog, config), primary_key,
-                           self.cog.profile_manager.provider_preference(owner_id))
+                           self.cog.user_settings.provider_preference(owner_id))
 
     def get_top_models(self, provider: str, target_config_key: str,
                        ollama_host: Optional[str] = None) -> List[str]:
@@ -565,7 +565,7 @@ class APIService:
         if not channel:
             return None, True, 0.0, 0.0, 0, "Could not find the channel for this interaction.", None, ""
 
-        refusal = self.cog.profile_manager.placement_refusal(profile_owner_id_for_instructions, profile_name_for_instructions, channel)
+        refusal = self.cog.content_rating.placement_refusal(profile_owner_id_for_instructions, profile_name_for_instructions, channel)
         if refusal:
             return None, True, 0.0, 0.0, 0, f"**{profile_name_for_instructions}** {refusal}", None, ""
 
