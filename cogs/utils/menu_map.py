@@ -72,6 +72,7 @@ _STATIC_DASHBOARDS = [
             ("API Keys", [
                 "Four key slots: Google Gemini 1-2, OpenRouter 1-2",
                 "Submit Key / Edit Key / Delete Key on the selected slot",
+                "Sign in with OpenRouter (link) on an OpenRouter slot, where the bot offers it",
                 "Assign this key to... (Personal, and any server you administrate)",
                 "Save Assignments (an assignment is not stored until this is clicked)",
             ]),

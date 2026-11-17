@@ -40,8 +40,8 @@ from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, PERMISSION_E
                              SERVER_KEY_PITCH, SERVER_KEY_UNASSIGNED, WIZARD_COPY, WIZARD_TOUR)
 from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
                               add_select)
-from .gui_settings import (KEY_SLOTS, SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
-                           SubmitAPIKeyModal, _fit_list, save_api_key)
+from .gui_settings import (SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
+                           SubmitAPIKeyModal, _fit_list)
 from .base_components import text_embed
 
 if TYPE_CHECKING:
@@ -402,9 +402,6 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         # The step picked from the dropdown; None follows the first one not done.
         self.step_key: Optional[str] = None
         self.tour_page = next(iter(WIZARD_TOUR))
-        # This wizard's OpenRouter sign-in link, and the task waiting on its code.
-        self._sign_in_url: Optional[str] = None
-        self._sign_in_task: Optional[asyncio.Task] = None
         self._init_scopes()
         if interaction.guild is not None:
             # The server it was run in first: the one its runner came here to fix.
@@ -668,7 +665,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             # A link: Discord opens it, and no interaction reaches us.
             if provider == "openrouter" and openrouter_signin.enabled():
                 buttons.append(ui.Button(label="Sign in with OpenRouter ↗", row=0,
-                                         url=self._open_sign_in()))
+                                         url=self._sign_in_link()))
             else:
                 buttons.append(ui.Button(label=f"Get {name} key ↗" if named else "Get a key ↗",
                                          row=0, url=KEY_PAGES[provider]))
@@ -716,12 +713,6 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
                                    start_category=category, start_page=page)
         await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
 
-    def _slot_for(self, provider: str) -> str:
-        filled = (self.cog.storage_manager._get_user_keys_data(self.user_id) or {}).get("slots") or {}
-        mine = [slot for slot, _label, p in KEY_SLOTS if p == provider]
-        # An empty slot first; with both full, the first is replaced, as Edit Key would.
-        return next((s for s in mine if s not in filled), mine[0])
-
     async def _act_use_here(self, interaction: discord.Interaction):
         """A key you already hold, made this server's: one added before it was automatic."""
         await interaction.response.defer()
@@ -733,47 +724,15 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             ephemeral=True)
 
     async def _act_paste_key(self, interaction: discord.Interaction, provider: str):
-        if self.admin_guilds:
-            # Stay on this step once it is done: the server picker appears under it.
-            self.step_key = "key"
         await interaction.response.send_modal(
             SubmitAPIKeyModal(self.cog, self._slot_for(provider), provider, view=self,
                               assign_personal=True))
 
-    def _open_sign_in(self) -> str:
-        """The sign-in link, and the wait for its code, begun when the link is first drawn:
-        a link button opens the browser without an interaction reaching us. One per
-        wizard, so a repaint keeps the link the user may already have open."""
-        if self._sign_in_url is None:
-            self._sign_in_url, state, verifier = openrouter_signin.start()
-            self._sign_in_task = asyncio.create_task(self._await_sign_in(state, verifier))
-        return self._sign_in_url
-
-    async def _await_sign_in(self, state: str, verifier: str):
-        # As long as the wizard lives: the /start token it repaints through lasts that long.
-        code = await openrouter_signin.receive_code(self.cog.bot, state, self.timeout or 900)
-        # Spent either way; the next repaint draws a fresh link.
-        self._sign_in_url = None
-        if code is None:
-            return
-        try:
-            key = await openrouter_signin.exchange(code, verifier)
-            slot = self._slot_for("openrouter")
-            saved, message = await save_api_key(self.cog, self.user_id, slot,
-                                                "openrouter", key, assign_personal=True)
-        except openrouter_signin.SignInFailed as e:
-            saved, message = False, f"❌ {e}"
-        if saved:
-            message += self._claim_server(slot, self.original_interaction.guild)
-            message += ("\n\nFree models work now. For the rest, add credit at "
-                        "<https://openrouter.ai/settings/credits>.")
-            if self.admin_guilds:
-                self.step_key = "key"
-        try:
-            await self._repaint()
-            await self.original_interaction.followup.send(embed=text_embed(message), ephemeral=True)
-        except discord.HTTPException:
-            pass  # The /start token has lapsed. The key is saved: /start again shows it.
+    def _key_landed(self, slot: str, guild: Optional[discord.Guild]) -> str:
+        if self.admin_guilds:
+            # Stay on this step once it is done: the server picker appears under it.
+            self.step_key = "key"
+        return super()._key_landed(slot, guild)
 
     async def _act_prefer_gemini(self, interaction: discord.Interaction):
         await self._prefer(interaction, "gemini")

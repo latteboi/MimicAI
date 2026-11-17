@@ -12,6 +12,7 @@ from .base_components import (
 from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, valid_birthday
 from ..utils.helpers import _get_user_hash, _resolve_zoneinfo, suppress_link_previews
 from ..utils.data_policy import is_paid_gemini_slot, may_save_free_gemini_key
+from ..utils import openrouter_signin
 from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
@@ -80,12 +81,7 @@ class SubmitAPIKeyModal(ui.Modal, title="Submit API Key"):
         saved, msg = await save_api_key(self.cog, interaction.user.id, self.slot_id, self.provider,
                                         raw_key, self.assign_personal)
         if saved and isinstance(self.view, KeyScopeMixin):
-            msg += self.view._claim_server(self.slot_id, interaction.guild)
-            if not self.view._saved_scopes(self.provider, self.slot_id):
-                msg += ("\nIt isn't used anywhere yet: pick where under *Assign this key to...*, "
-                        "then press **Save Assignments**.")
-            # What is saved may have just changed under the ticks this view staged.
-            self.view._load_scopes()
+            msg += self.view._key_landed(self.slot_id, interaction.guild)
         if saved and self.view:
             await self.view._repaint()
 
@@ -473,6 +469,68 @@ class KeyScopeMixin:
                 self.admin_guilds.append(g)
         # Sorted, so a server stays on the same page and can be found by name.
         self.admin_guilds.sort(key=lambda g: g.name.casefold())
+        # The OpenRouter sign-in link on screen, the slot it fills, and the wait for its code.
+        self._sign_in_url = self._sign_in_slot = self._sign_in_task = None
+
+    def _slot_for(self, provider: str) -> str:
+        filled = (self.cog.storage_manager._get_user_keys_data(self.user_id) or {}).get("slots") or {}
+        mine = [slot for slot, _label, p in KEY_SLOTS if p == provider]
+        # An empty slot first; with both full, the first is replaced, as Edit Key would.
+        return next((s for s in mine if s not in filled), mine[0])
+
+    def _key_landed(self, slot: str, guild: Optional[discord.Guild]) -> str:
+        """After a key is saved to `slot` from this view, pasted or signed in: claims the
+        server it was added in and reloads the ticks. The line to tell the user."""
+        msg = self._claim_server(slot, guild)
+        if not self._saved_scopes(SLOT_PROVIDER[slot], slot):
+            msg += ("\nIt isn't used anywhere yet: pick where under *Assign this key to...*, "
+                    "then press **Save Assignments**.")
+        # What is saved may have just changed under the ticks this view staged.
+        self._load_scopes()
+        return msg
+
+    def _sign_in_link(self, slot: Optional[str] = None) -> str:
+        """Sign in with OpenRouter's link, and the wait for its code, begun when the link is
+        first drawn: a link button opens the browser without an interaction reaching us.
+        Kept across repaints, since the user may already have it open. It fills `slot`, or
+        with None, `_slot_for` when the key lands; a link for another slot ends this one."""
+        if self._sign_in_url is not None:
+            if slot == self._sign_in_slot:
+                return self._sign_in_url
+            # Still waiting, so nothing is lost: once a code lands the url is None.
+            self._sign_in_task.cancel()
+        self._sign_in_url, state, verifier = openrouter_signin.start()
+        self._sign_in_slot = slot
+        self._sign_in_task = asyncio.create_task(self._await_sign_in(slot, state, verifier))
+        return self._sign_in_url
+
+    async def _await_sign_in(self, slot: Optional[str], state: str, verifier: str):
+        # As long as the view lives: the interaction token it repaints through lasts that long.
+        code = await openrouter_signin.receive_code(self.cog.bot, state, self.timeout or 900)
+        # Spent either way; the next repaint draws a fresh link.
+        self._sign_in_url = None
+        if code is None:
+            return
+        slot = slot or self._slot_for("openrouter")
+        try:
+            key = await openrouter_signin.exchange(code, verifier)
+            # `/start` makes every key Personal (it offers no Personal tick); `/settings`
+            # only where there is none, as a paste does.
+            saved, message = await save_api_key(self.cog, self.user_id, slot, "openrouter", key,
+                                                assign_personal=not self._OFFER_PERSONAL)
+        except openrouter_signin.SignInFailed as e:
+            saved, message = False, f"❌ {e}"
+        if saved:
+            message += self._key_landed(slot, self.original_interaction.guild)
+            message += ("\n\nFree models work now. For the rest, add credit at "
+                        "<https://openrouter.ai/settings/credits>.")
+        try:
+            # A view left by a tab switch, or timed out, would paint over what replaced it.
+            if not self.is_finished():
+                await self._repaint()
+            await self.original_interaction.followup.send(embed=text_embed(message), ephemeral=True)
+        except discord.HTTPException:
+            pass  # The token has lapsed. The key is saved: reopening the panel shows it.
 
     def _saved_scopes(self, provider: str, slot: Optional[str] = None) -> set:
         """Where `slot` (the selected one by default) is assigned now, as dropdown values."""
@@ -681,6 +739,14 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
         elif self.selected_slot:
             add_button(self, "Submit Key", self.edit_key_callback,
                        style=discord.ButtonStyle.success, row=2)
+        if self._offers_sign_in():
+            # A link: Discord opens it, and no interaction reaches us.
+            self.add_item(ui.Button(label="Sign in with OpenRouter ↗", row=2,
+                                    url=self._sign_in_link(self.selected_slot)))
+
+    def _offers_sign_in(self) -> bool:
+        return (self.selected_slot is not None and openrouter_signin.enabled()
+                and SLOT_PROVIDER[self.selected_slot] == "openrouter")
 
     async def update_display(self):
         embed = discord.Embed(title="API Key Management", description="Manage your 4 API key slots and assign them to your Personal account or Servers you administrate.", color=discord.Color.blue())
@@ -718,7 +784,10 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
                     lines.append("-# Nothing changes until you press Save Assignments.")
                     embed.add_field(name="Unsaved Changes", value="\n".join(lines), inline=False)
             else:
-                embed.add_field(name=f"Slot: {label}", value="**Status:** ❌ Empty\nClick 'Submit Key' to add a key to this slot.", inline=False)
+                how = ("Click 'Submit Key' to paste a key, or 'Sign in with OpenRouter' to have "
+                       "OpenRouter make one and send it here, with nothing to copy."
+                       if self._offers_sign_in() else "Click 'Submit Key' to add a key to this slot.")
+                embed.add_field(name=f"Slot: {label}", value=f"**Status:** ❌ Empty\n{how}", inline=False)
         else:
             embed.add_field(name="Overview", value="Select a slot from the dropdown above to view or manage it.", inline=False)
 

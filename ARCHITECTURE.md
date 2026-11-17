@@ -642,10 +642,11 @@ remembered (`_TTS_MISSING_VOICES`) and speak the default from then on, without a
 
 ### Sign in with OpenRouter
 
-`/start` can fetch a user's OpenRouter key through OpenRouter's OAuth (PKCE) instead of a paste.
+`/start` and `/settings` → API Keys can fetch a user's OpenRouter key through OpenRouter's OAuth
+(PKCE) instead of a paste (`KeyScopeMixin._sign_in_link`).
 The callback is a Cloudflare Worker (`cloudflare/openrouter_signin.js`), not this process,
 which serves no HTTP: it posts the code through a webhook into a private channel, and the
-wizard that drew the link takes it off the gateway with `wait_for`, matched on the webhook id
+view that drew the link takes it off the gateway with `wait_for`, matched on the webhook id
 and the link's `state`. The verifier stays in that wait, so a code seen in the channel is
 useless. An instance without `OPENROUTER_SIGNIN_URL` and `OPENROUTER_RELAY_WEBHOOK_ID` keeps
 the paste. `cogs/utils/openrouter_signin.py`.

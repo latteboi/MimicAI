@@ -136,9 +136,9 @@ class DefaultConfigNamespace:
 
         self.MIMIC_NEWS = ""
 
-        # Sign in with OpenRouter, on /start's key step: the public URL OpenRouter sends
-        # the browser back to, and the webhook that URL relays the code through
-        # (`cloudflare/openrouter_signin.js`). Without both, the step offers paste alone.
+        # Sign in with OpenRouter, on /start's key step and /settings -> API Keys: the public
+        # URL OpenRouter sends the browser back to, and the webhook that URL relays the code
+        # through (`cloudflare/openrouter_signin.js`). Without both, both offer paste alone.
         self.OPENROUTER_SIGNIN_URL = get_config_value("OPENROUTER_SIGNIN_URL")
         self.OPENROUTER_RELAY_WEBHOOK_ID = int(get_config_value("OPENROUTER_RELAY_WEBHOOK_ID") or 0)
 

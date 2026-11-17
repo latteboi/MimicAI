@@ -1,5 +1,7 @@
 v0.7.12 Beta — 2026-11-16 (UTC)
 Memories are kept per server, and a character keeps recalling while its memories change.
+## **Added**
+- **`/settings` → API Keys offers Sign in with OpenRouter** on an OpenRouter slot, as `/start` does: approve MimicAI on OpenRouter and the key fills that slot by itself, with nothing to copy. It becomes your Personal key only if you have none.
 ## **Changed**
 - **Long-term memories are kept per server, up to 2,000 in each**, where the limit was 5,000 across every server. A profile used in several servers no longer loses a quiet server's oldest memories to a busy one, and the memory screen and the profile dashboard count the server you are viewing. Existing memories move over the first time the bot starts on this version; none are lost.
 - **Self-hosting: the first start on this version moves each profile's `ltm.json.gz` into an `ltm/` folder, one file per server.** Back up first. An older version started afterwards finds no memories; they are not lost, and starting this version again brings them back, with any the older version wrote.
