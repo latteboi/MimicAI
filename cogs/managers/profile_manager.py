@@ -28,7 +28,7 @@ from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, BORROW_INDEX_FILE, PROFILE_NAME_SIDECAR, CLASSIFIER_KEYS,
     PID_CLASS_PREFIXES, PROFILE_MESSAGE_MAX_LENGTH, defaultConfig,
     PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, DEFAULT_LTM_SUMMARIZATION_INSTRUCTIONS,
-    DEFAULT_ANTI_REPETITION_PROMPT, UTILITY_FALLBACK_KEYS, NO_FALLBACK,
+    DEFAULT_ANTI_REPETITION_PROMPT, UTILITY_FALLBACK_KEYS, NO_FALLBACK, IMAGE_MODEL_KEYS, AUDIO_MODEL_KEYS,
     TTS_VOICE_GENDER, TTS_VOICE_CHARACTER,
     DEFAULT_SAFETY_SETTINGS,
     CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS,
@@ -77,6 +77,10 @@ except ImportError:
 #: never deleted. Recognised here only so the migration and _borrow_key_for_config
 #: can refuse it; nothing writes it any more.
 _UNKNOWN_SOURCE_PID = "00000000"
+
+#: Model slots no provider preference fills: image and speech bill per use, so their owner
+#: picks one. A new profile writes None to them, and a borrow keeps its author's.
+_UNSHIPPED_MODEL_KEYS = IMAGE_MODEL_KEYS | AUDIO_MODEL_KEYS
 
 #: The most a .mimic payload may inflate to. A real export is at most one Discord
 #: upload -- 10 MiB, a few times that inflated -- and every inflated byte costs several
@@ -2112,7 +2116,8 @@ class ProfileManager:
         if not preferred:
             return {}
         # No provider ships no models: only their own defaults move a slot.
-        mine = {**config, **(model_slot_defaults(preferred) if preferred in MODEL_PROVIDERS else {})}
+        shipped = model_slot_defaults(preferred) if preferred in MODEL_PROVIDERS else {}
+        mine = {**config, **{k: v for k, v in shipped.items() if k not in _UNSHIPPED_MODEL_KEYS}}
         apply_defaults(mine, self._get_user_defaults(user_id), borrowed=True)
         return {k: v for k, v in mine.items() if config.get(k) != v}
 
@@ -2773,7 +2778,7 @@ class ProfileManager:
                 # disk has no key and must keep recalling. See ltm_auto_recall_enabled.
                 "ltm_recall_enabled": False,
                 "ltm_recall_tool_enabled": False,
-                "image_generation_enabled": False, "image_generation_model": DEFAULT_IMAGE_MODEL,
+                "image_generation_enabled": False,
                 # Empty means "send no such field" -- see
                 # MediaService.resolve_image_output_params. Not defaulted to a ratio,
                 # because every image model already has one and ours would only
@@ -2794,7 +2799,7 @@ class ProfileManager:
                 "url_fetching_enabled": False, "response_mode": "regular", "thinking_summary_visible": "off",
                 "thinking_level": "low", "thinking_budget": -1,
                 "error_response": "An error has occurred.", "speech_tts_enabled": False, "speech_voice": DEFAULT_SPEECH_VOICE,
-                "speech_model": DEFAULT_SPEECH_MODEL, "speech_temperature": NEW_PROFILE_SPEECH_TEMPERATURE,
+                "speech_temperature": NEW_PROFILE_SPEECH_TEMPERATURE,
                 "neuro_engine_enabled": False, "neuro_state": {"dopamine": 50, "cortisol": 20, "oxytocin": 50, "adrenaline": 20},
                 "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat()
             }
@@ -2811,6 +2816,9 @@ class ProfileManager:
                                if v != platform.get(k)})
             else:
                 config.update({k: NO_FALLBACK for pair in MODEL_SLOT_PAIRS.items() for k in pair})
+            # Written, since absent runs the shipped chain, and before the owner's own
+            # defaults, which may name one.
+            config.update(dict.fromkeys(_UNSHIPPED_MODEL_KEYS, NO_FALLBACK))
             # The template above is what the bot ships; anything the user has set as
             # their own default wins over it. New profiles take every defaultable key,
             # including the ones a borrow may not have -- there is no author here whose
@@ -4881,9 +4889,11 @@ class ProfileManager:
         return await asyncio.to_thread(_read)
 
     async def _build_profile_embed(self, user_id: int, profile_name: str, channel_id: int,
-                                   viewer_id: Optional[int] = None) -> discord.Embed:
+                                   viewer_id: Optional[int] = None,
+                                   all_models: bool = False) -> discord.Embed:
         """`viewer_id`, for a card shown to someone other than its owner, adds how the
-        character feels about them, where Bonds is on."""
+        character feels about them, where Bonds is on. `all_models` lists every model
+        category, where the Response chain alone is the default."""
         index = self._get_user_index(user_id)
         is_borrowed = profile_name in index.get("borrowed", [])
 
@@ -5023,6 +5033,8 @@ class ProfileManager:
                            ("Training", "training_analysis_model")):
             primary, fallbacks = model_chain(resolved, key, preferred)
             providers[key] = {model_provider(m) for m in (primary, *fallbacks)}
+            if key != "primary_model" and not all_models:
+                continue
             # A MimicAI Auto slot reads as its tier, with the model it runs on today beside it.
             tiers = {resolved[k]: short_model_name(stored[k])
                      for k in (key, MODEL_SLOT_PAIRS[key]) if auto_tier(stored.get(k))}
@@ -5158,7 +5170,9 @@ class ProfileManager:
         return self.cog.global_prompts.get("ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT)
 
     async def _build_profile_manage_embed(self, interaction: discord.Interaction, profile_name: str, target_user_id: Optional[int] = None) -> discord.Embed:
-        return await self._build_profile_embed(target_user_id or interaction.user.id, profile_name, interaction.channel_id)
+        return await self._build_profile_embed(
+            target_user_id or interaction.user.id, profile_name, interaction.channel_id,
+            all_models=interaction.user.id in self.cog.dashboard_all_models)
 
 
     def _invalidate_channel_model_cache(self, key: Tuple[int, int]):

@@ -772,6 +772,10 @@ class StorageManager:
             if g.unavailable or g.chunked:
                 continue
             try:
+                # discord.py files a guild's chunk request under the guild id and drops it
+                # only on completion or a fresh READY: one Discord never answered (a startup
+                # chunk timing out) is what every later `chunk()` waits on, for good.
+                g._state._chunk_requests.pop(g.id, None)
                 members = await asyncio.wait_for(g.chunk(), timeout=60)
             except Exception as e:
                 print(f"[Cleanup] Guild {g.id} re-chunk failed: {type(e).__name__}: {e}")

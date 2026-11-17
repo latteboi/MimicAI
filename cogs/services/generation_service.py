@@ -518,7 +518,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
     #: not been the thing this gate reads for some time. It also says what to do about
     #: it, because the previous wording stated a rule and left the reader with no next
     #: step.
-    async def _refuse_placement(self, session, channel, owner_id: int, profile_name: str) -> None:
+    async def _refuse_placement(self, session, channel, owner_id: int, profile_name: str,
+                                refusal: str) -> None:
         """Post why the runtime gate refused a participant, and record it as a real turn.
 
         It used to be a bare channel message that nothing wrote down. Everything that
@@ -537,10 +538,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         participant -- there is no later write in this round guaranteed to supersede it,
         and for a round where *every* participant was blocked there is no later write
         at all.
+
+        `refusal` is the gate's answer when it refused, never asked again here: the trigger
+        intake awaits in between, and a declaration's check landing there made the gate say
+        None -- which fell back to "mark this channel age-restricted", posted in one that was.
         """
         pm = self.cog.profile_manager
-        refusal = (pm.placement_refusal(owner_id, profile_name, channel)
-                   or PLACEMENT_REFUSALS["unrestricted"])
         if refusal == PLACEMENT_REFUSALS["checking"]:
             # The check a declaration waits on, queued by the first round it stopped: a
             # declaration made in bulk, or by `/profile generate`, has nobody else to ask.
@@ -941,12 +944,13 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # round instead of one per turn. The notices themselves wait for the trigger
                 # intake, so each lands in unified_log after the message it answers.
                 blocked_participants = [
-                    p for p in profile_order
-                    if not self.cog.profile_manager._check_unrestricted_safety_policy(
-                        p['owner_id'], p['profile_name'], channel)
+                    (p, refusal) for p in profile_order
+                    if (refusal := self.cog.profile_manager.placement_refusal(
+                        p['owner_id'], p['profile_name'], channel))
                 ]
                 if blocked_participants:
-                    profile_order = [p for p in profile_order if p not in blocked_participants]
+                    blocked = [p for p, _ in blocked_participants]
+                    profile_order = [p for p in profile_order if p not in blocked]
 
                 # --- Delivery gate, here for the same reason ---
                 # A seat Discord will refuse still costs a full generation, thrown away at
@@ -1017,12 +1021,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
                 seen_blocked = set()
-                for p in blocked_participants:
+                for p, refusal in blocked_participants:
                     key = (p['owner_id'], p['profile_name'])
                     if key in seen_blocked:
                         continue
                     seen_blocked.add(key)
-                    await self._refuse_placement(session, channel, p['owner_id'], p['profile_name'])
+                    await self._refuse_placement(session, channel, p['owner_id'], p['profile_name'], refusal)
 
                 if not profile_order:
                     for trigger in all_triggers_for_round:
@@ -1352,9 +1356,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                     # Backstop only. profile_order was filtered before the feedback step, so
                     # this fires only if the channel's age-restricted flag is flipped mid-round.
-                    if not self.cog.profile_manager._check_unrestricted_safety_policy(owner_id, profile_name, channel):
+                    refusal = self.cog.profile_manager.placement_refusal(owner_id, profile_name, channel)
+                    if refusal:
                         await self._abandon_state_container(channel, state_container, session=session)
-                        await self._refuse_placement(session, channel, owner_id, profile_name)
+                        await self._refuse_placement(session, channel, owner_id, profile_name, refusal)
                         continue
 
                     user_index = self.cog.profile_manager._get_user_index(owner_id)

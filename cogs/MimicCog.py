@@ -232,6 +232,9 @@ class MimicCog(EventListeners, commands.Cog):
         #: send Discord refused (403). Cleared by the next send that lands; read by the
         #: round's delivery gate.
         self.refused_sends: LRUCache = LRUCache(max_size=500)
+        #: Viewer ids who pressed Show More Models on a profile dashboard. In memory on
+        #: purpose: Response alone is the default, so losing this on a restart is harmless.
+        self.dashboard_all_models: LRUCache = LRUCache(max_size=200)
         
         self.server_manager._load_channel_webhooks()
 

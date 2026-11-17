@@ -141,7 +141,8 @@ HELP_CATEGORIES = {
     },
     "3. Models and Parameters": {
         "Choosing Models": (
-            "Set at `/profile manage` -> **Params** -> Models. You choose a **Primary Model** and a **Fallback Model**.\n\n"
+            "Set at `/profile manage` -> **Params** -> Models. You choose a **Primary Model** and a **Fallback Model**. "
+            "A new profile's image and speech models are None until you choose one.\n\n"
             "**Providers:**\n"
             "• **Google Gemini** -- Gemini models, plus Gemini's own speech and image models.\n"
             "• **OpenRouter** -- Anthropic, Meta, xAI, DeepSeek and many others through one key.\n"

@@ -457,8 +457,8 @@ OPENROUTER_TRAINING_MODEL_HIDDEN = (
 #: A typed OpenRouter id the image catalogue does not list: a text model there reaches
 #: the Image API and 400s, and an omission is deliberate -- api/openrouter_image_catalogue.
 NO_MODEL_SET = (
-    "This profile has no model set. Choose one under `/profile manage` -> Models, or pick "
-    "a provider in `/start` so the profiles you make next start with one."
+    "This profile has no model set for this. Choose one under `/profile manage` -> Models, "
+    "or pick a provider in `/start` so the profiles you make next start with a reply model."
 )
 
 OPENROUTER_NOT_IMAGE_MODEL = (

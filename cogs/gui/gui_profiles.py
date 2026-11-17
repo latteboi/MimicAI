@@ -1452,6 +1452,11 @@ class ProfileManageView(BlockedGuard, ui.View):
         large = sum(item.size == LARGE for item in self._token_advice())
         add_button(self, f"Token Advice · {large}" if large else "Token Advice", self._show_token_advice,
                    emoji="💡", row=below_strip)
+        add_button(self, "Refresh", self._repaint, emoji="🔄", row=below_strip)
+        if self.current_tab == "home":
+            more = self.original_interaction.user.id in self.cog.dashboard_all_models
+            add_button(self, "Show Fewer Models" if more else "Show More Models",
+                       self._toggle_models, row=below_strip)
         if is_mod:
             self._add_mod_back_button(below_strip)
             ModBaseView.attach_nav(
@@ -1485,6 +1490,19 @@ class ProfileManageView(BlockedGuard, ui.View):
                    else self.cog.profile_manager.effective_prompts(self.user_id, self.profile_name))
         return profile_advice(self.config, lorebook.constant(lorebook.entries(prompts.get("lorebook"))),
                               fixed_examples.entries(prompts.get("fixed_examples")), cog=self.cog)
+
+    async def _toggle_models(self, interaction: discord.Interaction):
+        """The dashboard's Models field: Response alone, or every category."""
+        shown = self.cog.dashboard_all_models
+        if shown.pop(interaction.user.id, None) is None:
+            shown[interaction.user.id] = True
+        await self._repaint(interaction)
+
+    async def _repaint(self, interaction: discord.Interaction):
+        """Rebuild the buttons and the embed from what is stored now."""
+        await interaction.response.defer()
+        self._build_view()
+        await self._refresh_dashboard(interaction)
 
     async def _show_token_advice(self, interaction: discord.Interaction):
         view = TokenAdviceView(self)
@@ -4034,10 +4052,8 @@ class ThinkingPickerMixin:
         raw = str(self._slot_model(self.slot, role) or "")
         upper = raw.upper()
         if upper.startswith("OPENROUTER/") or ("/" in raw and not upper.startswith(("GOOGLE/", "OLLAMA/"))):
-            return ("takes both -- effort as `reasoning.effort`, a share of the "
-                    f"{defaultConfig.LIMIT_OUTPUT_TOKENS:,}-token output cap (Max and Extra "
-                    "High are the same ~95% there, leaving little for the reply) and the "
-                    "budget as `reasoning.max_tokens`, budget winning where both are set")
+            return ("takes effort or a budget, the budget where both are set; OpenRouter "
+                    "converts either to the one the model reads")
         if upper.startswith("OLLAMA/"):
             return ("takes effort only, coarsely (low/medium/high); a model not built "
                     "for thinking refuses it and the bot retries once without")
