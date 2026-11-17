@@ -537,11 +537,23 @@ class ChildBotManager:
             return None
 
         try:
-            # size=96 is what a message renders at, and it keeps an animated source
-            # inside the 256 KB upload limit that the full-size original can exceed.
-            resp = await get_capped(get_shared_client(), f"{partial.url}?size=96",
-                                    MAX_EMOJI_SIZE_BYTES, timeout=15.0)
-            if resp.content is None:
+            # 128 is Discord's own emoji size. An animated source over the 256 KB upload
+            # limit at 128 is retried at 96 before it is given up for a still picture.
+            # `<:name:id>` carries no animated flag (the Generation Visual modal writes it
+            # that way unless the user typed `a:`), and a main-bot message still animates
+            # because the client knows the emoji. Read from the markup alone, the mirror
+            # was the still PNG. The CDN answers 415 to `.gif` for a static emoji, so ask
+            # for the GIF first and fall back to the PNG.
+            base = f"https://cdn.discordapp.com/emojis/{partial.id}"
+            resp = None
+            for ext, size in (("gif", 128), ("gif", 96), ("png", 128)):
+                if ext == "gif" and resp is not None and resp.status_code != 200:
+                    continue  # not animated: the second GIF size would 415 too
+                resp = await get_capped(get_shared_client(), f"{base}.{ext}?size={size}",
+                                        MAX_EMOJI_SIZE_BYTES, timeout=15.0)
+                if resp.content is not None:
+                    break
+            else:
                 return None
             created = await child.create_application_emoji(name=name, image=resp.content)
             return str(created)
