@@ -37,7 +37,7 @@ from .base_components import (
     BaseBulkProfileView, ConfigModal, ActionTextInputModal, TimeoutCleanupMixin,
     ReportErrorMixin, add_button, add_select, redraw_select, build_pagination_controls,
     build_confirm_view, invalidate_model_cache, PageJumpModal, paged_nav_options,
-    refuse_unregistered,
+    refuse_unregistered, add_topgg_links,
 )
 from ..services.api.openrouter_catalogue import (
     AUTHOR_PREFIX, BROWSE_CHEAPEST, BROWSE_POPULAR, BROWSE_TRENDING,
@@ -1789,6 +1789,7 @@ class ProfileManageView(BlockedGuard, ui.View):
     async def _handle_publish(self, interaction):
         """Publish or unpublish this one profile, rating it first if it has no verdict."""
         await interaction.response.defer(ephemeral=True, thinking=True)
+        extra = {}
         if self.cog.library._is_profile_public(self.user_id, self.profile_name):
             self.cog.library.unpublish_profile(self.user_id, self.profile_name)
             message = (f"**{self.profile_name}** is out of the Public Library. Anyone already "
@@ -1796,9 +1797,11 @@ class ProfileManageView(BlockedGuard, ui.View):
         else:
             listed, reason = await self.cog.library.publish_profile(self.user_id, self.profile_name)
             message = (f"🌐 **{self.profile_name}** is in the Public Library. Give it an intro "
-                       "from **Library Intro** on this tab." if listed
+                       f"from **Library Intro** on this tab.\n{PUBLISHED_REVIEW_LINE}" if listed
                        else f"**{self.profile_name}** was not published. {reason or ''}".strip())
-        await interaction.followup.send(embed=text_embed(message), ephemeral=True)
+            if listed:
+                extra["view"] = add_topgg_links(ui.View(timeout=None))
+        await interaction.followup.send(embed=text_embed(message), ephemeral=True, **extra)
         self._build_view()
         await self._refresh_dashboard(interaction)
 

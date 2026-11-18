@@ -9,7 +9,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 from ..utils.discord_cdn import unsigned_attachment_url
 from .base_components import (BlockedGuard, PageJumpModal, TabbedView, add_button, add_select,
                               build_pagination_controls, bulk_select_options,
-                              paged_nav_options, refuse_unregistered, resolve_bulk_select)
+                              paged_nav_options, refuse_unregistered, resolve_bulk_select,
+                              add_topgg_links)
 from .gui_start import NewProfileModal
 from .base_components import dismissible, text_embed
 
@@ -942,6 +943,11 @@ class HubShareManagerView(HubBaseView):
             report_embed.color = discord.Color.orange()
         if not (published_list or unpublished_list or failed_list): report_embed.description = "No changes were made."
 
+        if published_list:
+            report_embed.description = PUBLISHED_REVIEW_LINE
+            await i.followup.send(embed=report_embed, ephemeral=True,
+                                  view=add_topgg_links(ui.View(timeout=None)))
+            return
         await i.followup.send(embed=report_embed, ephemeral=True)
 
 class HubCloneManagerView(HubShareManagerView):

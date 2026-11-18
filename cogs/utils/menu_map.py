@@ -57,11 +57,33 @@ _STATIC_DASHBOARDS = [
                 "Step 3 Get a character: Browse Library or Generate one (after step 1)",
                 "Step 4 Add it to this channel: opens the cast editor (administrators, or Open casting)",
                 "Step 5 Say something to it: no button; just talk in the channel",
-                "Refresh re-probes; Guide opens /guide at the current step's page",
+                "Refresh re-probes; Guide opens the manual (/help → Docs) at the current step's page",
             ]),
             ("Using it (once setup is done)", [
                 "Just talk to it; Other ways to talk; Memory; Pictures and voice; "
                 "When something is wrong",
+            ]),
+        ],
+    ),
+    (
+        "`/help` (anywhere; answers only you)",
+        [
+            ("Home", [
+                "Docs: the manual, browsed by category and page",
+                "Ask MimicGuide: a form for one question, answered from the docs, only to you",
+                "MimicGuide here / Remove MimicGuide: the guide into this channel's session or out; "
+                "administrators, or anyone under Open casting; servers only, greyed with the reason",
+                "Tickets (n new): your support tickets; greyed until you create your account in /start",
+            ]),
+            ("Tickets", [
+                "Your tickets, a bell on any with something new; a dropdown opens one",
+                "New Ticket: what it is about, your message, and an optional link to a "
+                "character's reply, whose generation trace is attached",
+                "A ticket: the conversation, Reply, Close Ticket, Back",
+            ]),
+            ("Inbox (the bot owner, in place of Tickets)", [
+                "Every open ticket, unread first, paged; Show closed / Show open",
+                "A ticket: who wrote it and from which server, Reply, Close Ticket, View Trace",
             ]),
         ],
     ),

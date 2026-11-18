@@ -446,6 +446,8 @@ class TransferService:
             # above never writes their index.json, so the reconcile in _save_user_index
             # cannot fire and both directions would otherwise survive the deletion.
             self.cog.borrows._borrow_index_drop_user(user_id)
+            # 4c. And in the ticket index: their ticket files went with the tree.
+            self.cog.tickets.drop_user(user_id)
         await asyncio.to_thread(_scrub)
 
         # Deliberately not touched: data/mod/blacklist.json. An enforcement record is

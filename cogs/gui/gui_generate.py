@@ -18,7 +18,8 @@ from discord import ui
 from ..services.profile_generation import (ProfileGenerationError, generate_draft,
                                            save_draft)
 from ..utils.helpers import suppress_link_previews
-from .base_components import BlockedGuard, TimeoutCleanupMixin, add_button
+from .base_components import BlockedGuard, TimeoutCleanupMixin, add_button, add_topgg_links
+from ..utils.constants import PUBLISHED_REVIEW_LINE
 from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
@@ -91,6 +92,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             if not self.card and not self.published:
                 add_button(self, "Publish to Library", self.publish, style=discord.ButtonStyle.green,
                            emoji="🌐", disabled=self.busy)
+            if self.published:
+                add_topgg_links(self)
             return
         add_button(self, "Save", self.save, style=discord.ButtonStyle.green, emoji="✅",
                    disabled=self.busy)
@@ -106,7 +109,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             lines.append(f"**{status}**")
         elif self.saved:
             lines.append(f"✅ **Saved as `{self.profile_name}`.**"
-                         + (" 🌐 Listed in the Public Library." if self.published else ""))
+                         + (f" 🌐 Listed in the Public Library.\n{PUBLISHED_REVIEW_LINE}"
+                            if self.published else ""))
         else:
             lines.append(f"A draft, to be saved as `{self.profile_name}`. "
                          f"Nothing is written until you press **Save**.")

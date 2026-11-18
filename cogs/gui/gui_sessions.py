@@ -16,7 +16,7 @@ from ..utils import follow_ups
 from .base_components import (BlockedGuard, PageJumpModal, SELECT_ALL, SELECT_PAGE, add_button,
                               paged_nav_options, send_status, settle_status, update_status,
                               add_select, build_pagination_controls,
-                              bulk_select_options, resolve_bulk_select)
+                              bulk_select_options, refuse_uninformed, resolve_bulk_select)
 from ..services.generation.compaction import compaction_model_config, resolve_compaction_settings
 from ..utils.user_defaults import chain_lines
 from ..managers.session_manager import (director_enabled, director_model_config, feature_access,
@@ -2924,7 +2924,8 @@ class SessionConfigView(BlockedGuard, ui.View):
 
         What it does that nothing else does:
 
-        * Marks the session started, which is the whole point.
+        * Marks the session started, which is the whole point -- once whoever starts the
+          server's first session has confirmed its members were told (`refuse_uninformed`).
         * Settles any seated profile's stale content rating.
         * Persists the blueprint. A session woken as a shell by `_ensure_session_shell`
           is in memory only until something saves it, and an unstarted empty shell is
@@ -2941,9 +2942,12 @@ class SessionConfigView(BlockedGuard, ui.View):
         """
         started = self.cog.session_manager.is_started(self.session)
         async def commit(i: discord.Interaction):
+            # Starting, not updating: a session already live has been asked about.
+            was_started = self.cog.session_manager.is_started(self.session)
+            if not was_started and await refuse_uninformed(self.cog, i):
+                return
             await i.response.defer()
 
-            was_started = self.cog.session_manager.is_started(self.session)
             self.session["started"] = True
             self.cog.session_manager._save_multi_profile_sessions()
 

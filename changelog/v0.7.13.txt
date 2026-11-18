@@ -1,0 +1,16 @@
+v0.7.13 Beta — 2026-11-18 (UTC)
+Help, the manual and support tickets live in one place: /help.
+## **Added**
+- **Support tickets, in `/help` → Tickets.** Write to the people who run the bot without joining a support server: say what it is about, describe it, and optionally paste a link to a character's reply that went wrong, whose generation trace goes with the ticket. Replies come back to the same place, and the button counts tickets with something new; nothing is sent to your DMs. You need an account (`/start`). Up to 3 can be open at once; a closed ticket is deleted 30 days later, and tickets are in your `/privacy` export.
+- **The bot owner sees an Inbox in `/help`** in place of Tickets: every open ticket, newest news first, to read, answer and close.
+- **`/thanks` shows where your Top.gg vote stands:** open now, or when you can vote again.
+## **Changed**
+- **`/help` is a dashboard: Docs, Ask MimicGuide, MimicGuide here, and Tickets.** Docs is the manual `/guide` used to open, and `/guide` is gone. Ask MimicGuide is what `/help ask:` did, from a form. MimicGuide here adds the guide to the channel's session, or takes it out.
+- **`/profile generate` takes no options: it opens the same form as Generate in `/start` and the Public Library.** One draft a minute still applies, now to all three, and a draft that is refused or fails no longer counts.
+- **An internal name alone is enough to generate a character**, and every field you fill adds to the draft: a Display Name is the name the persona is written around, where before the draft wrote about a name of its own and yours replaced it afterwards.
+- **The first time anyone starts a session in a server, they are asked to confirm its members know what that means:** that in a session channel the bot reads what is posted, keeps a log, sends it to an AI provider, and that characters may remember it. Once per server. Servers with sessions running already are asked the next time a new one starts.
+- **The Terms of Service and Privacy Policy are revised, effective 18 November 2026.** Terms 3 asks whoever starts a session in a server to make sure its members know; the Policy adds support tickets (what they hold, that they are exported and deleted with your account, and kept 30 days after closing), the record of who confirmed a server's members were told, tickets as a way to contact us, and that opening `/thanks` asks Top.gg whether your vote is active. You do not need to accept them again.
+- **Vote and Review links for Top.gg sit where you have just finished something:** `/start` once you are set up, `/news`, `/invite`, and the confirmation after publishing a profile to the Library. Nothing asks you unprompted, and voting or reviewing unlocks nothing.
+- **The bot's greeting when it joins a server says what it does with messages** in a channel with a session, and that members should be told.
+## **Fixed**
+- **Anyone could add MimicGuide to a channel, take it out, or start a session with it through `/help`.** It now asks what the cast editor asks: an administrator, or anyone where the channel is set to Open casting. It is unavailable in DMs, where there are no sessions, and says so.

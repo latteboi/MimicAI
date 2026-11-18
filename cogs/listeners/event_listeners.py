@@ -1281,7 +1281,7 @@ class EventListeners:
 
         `generation_blocked` -- both scopes -- not `global_blacklist`. The generation
         scope was meant to leave the command surface open, but most of it reaches a
-        model with no component in between: `/help ask`, `/trigger`, `/memorise`,
+        model with no component in between: Ask MimicGuide, `/trigger`, `/memorise`,
         `/whisper` and an in-character `/speak` all do. Until that check lives at the
         call itself, a narrower gate here is a hole with a label on it.
 

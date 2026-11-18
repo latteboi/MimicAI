@@ -83,9 +83,9 @@ down to Mimic Dice; each character plays its own hand, and the table reacts when
 ## Features
 
 The feature surface is large and moves quickly, so the authoritative map lives inside the
-bot: run **`/guide`** for a full dashboard-by-dashboard tree, or **`/help`** to ask a
-question and get an answer retrieved from the bundled documentation. What follows is the
-shape of it.
+bot: run **`/help`** for the manual (Docs), to ask a question and get an answer retrieved
+from the bundled documentation (Ask MimicGuide), or to open a support ticket. What follows
+is the shape of it.
 
 ### Characters
 
@@ -279,7 +279,7 @@ codebase this size would have shaken out differently. They are being worked thro
 
 - Some features add latency by design — the anti-repetition critic and RAG-mode grounding
   each cost an extra model call per turn.
-- Interfaces still move between releases. The in-bot `/guide` is regenerated with the code
+- Interfaces still move between releases. The in-bot manual (`/help` → Docs) is regenerated with the code
   and is always more current than any external documentation.
 - Bug reports are welcome.
 

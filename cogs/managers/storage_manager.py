@@ -984,6 +984,8 @@ class StorageManager:
                     # Their index.json went with the tree, so the reconcile hooked
                     # into _save_user_index can never fire for them again.
                     self.cog.borrows._borrow_index_drop_user(int(user_id_str))
+                    # Their ticket files went with it too; the ticket index names them.
+                    self.cog.tickets.drop_user(int(user_id_str))
                     cleaned_users_count += 1
         
 
@@ -1195,6 +1197,10 @@ class StorageManager:
                     if gc_file.exists() and gc_file.stat().st_mtime < thirty_days_ago:
                         _delete_file_shard(str(gc_file))
                         cleaned_session_files_ttl += 1
+
+        # Support tickets closed past their retention (Privacy Policy 5): read off the
+        # ticket index alone, no directory walked.
+        self.cog.tickets.purge_expired()
         return True
 
     @tasks.loop(time=datetime.time(hour=17, minute=0, tzinfo=datetime.timezone.utc)) # 17:00 UTC = 3:00 AM AEST

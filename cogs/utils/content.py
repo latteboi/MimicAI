@@ -2,9 +2,9 @@
 
 Two corpora live here, and they are deliberately not the same text:
 
-* `HELP_CATEGORIES` backs the `/guide` dropdown. It is browsable prose, read by a
+* `HELP_CATEGORIES` backs `/help` → Docs. It is browsable prose, read by a
   human who is scrolling to learn how something works.
-* `DEFAULT_HELP_DOCS` backs Help Mode and `/help ask`. Each entry is written on disk
+* `DEFAULT_HELP_DOCS` backs Help Mode and `/help` → Ask MimicGuide. Each entry is written on disk
   as a shard under `mod/docs/`, embedded, and retrieved by vector search. It is
   written for retrieval against a user's *problem*, which is why the shards are terse
   and carry explicit `Symptom:` / `Fix:` pairs -- those lines are what a frustrated
@@ -12,7 +12,7 @@ Two corpora live here, and they are deliberately not the same text:
 
 They were previously split across two modules, alongside a third structure
 (`DOC_CATEGORIES`) that nothing read at all. Keeping both here means a feature change
-touches one file, and the drift between what `/guide` says and what Help Mode answers
+touches one file, and the drift between what Docs says and what Help Mode answers
 is visible in a single diff.
 
 The operator may edit the on-disk shards via `/mod` -> Docs. `HelpService` tracks
@@ -30,7 +30,7 @@ HELP_CATEGORIES = {
             "Profiles speak through **webhooks**: a distinct name and avatar, with no extra bot application.\n\n"
             "Profiles talk inside **sessions**. A session is bound to one channel, holds a cast of profiles, and keeps a single "
             "shared transcript that each participant sees from its own point of view.\n\n"
-            "Use the dropdowns below to browse the documentation. For a question you would rather just ask, use `/help ask:<your question>`."
+            "Use the dropdowns below to browse the documentation. For a question you would rather just ask, use **Ask MimicGuide** in `/help`."
         ),
         "First Steps": (
             "**The short version: run `/start`.** It works out what you have already done, shows you what is left, "
@@ -125,12 +125,13 @@ HELP_CATEGORIES = {
             "**Limit:** 100 examples per profile."
         ),
         "Generating a Profile with AI": (
-            "`/profile generate` drafts a complete profile from a short concept, a picture of the character, or both: persona, "
+            "`/profile generate` drafts a complete profile from an internal name alone, or with a short concept, a picture of the "
+            "character and a display name, each adding to the rest: persona, "
             "instructions, a display name, a typing emoji "
             "and an intro for the Public Library. It is also on **Generate** in `/start` and in `/profile hub` -> **Public Library**. "
             "Once it is saved, **Publish to Library** rates it and lists it in one press.\n\n"
-            "Give it an `image` (PNG, JPEG or WebP, up to 4 MB) and the draft takes the character's look from it. The image is "
-            "posted in your DMs and becomes the avatar, unless you give an `avatar_url`; deleting that message removes it.\n\n"
+            "Give it an **Image** (PNG, JPEG or WebP, up to 4 MB) and the draft takes the character's look from it. The image is "
+            "posted in your DMs and becomes the avatar, unless you give an **Avatar URL**; deleting that message removes it.\n\n"
             "You see the draft before anything is saved. **Save** creates the profile, **Regenerate** tries again from the same concept, "
             "**Refine** rewrites it to what you ask for, and **Discard** throws it away. A draft you leave alone expires after ten minutes.\n\n"
             "The draft is written by the model a new profile of yours would use -- your own default if you set one in `/settings` -> "
@@ -613,13 +614,26 @@ HELP_CATEGORIES = {
     },
     "8. Getting Help and Fixing Things": {
         "Help Mode and /help": (
-            "**`/help ask:<question>`** answers a technical question about the bot directly, retrieving from this documentation. Nobody else "
-            "sees the answer.\n\n"
-            "**`/help`** with no question toggles **MimicGuide**, a built-in system profile, in and out of the current session, so you can ask "
-            "follow-ups conversationally.\n\n"
+            "**`/help`** opens the help dashboard, visible only to you:\n"
+            "• **Docs** is this manual.\n"
+            "• **Ask MimicGuide** answers one technical question from this documentation. Nobody else sees the answer.\n"
+            "• **MimicGuide here** adds **MimicGuide**, a built-in system profile, to this channel's session so you can ask "
+            "follow-ups conversationally, or takes it out again. Like the cast editor, it needs an administrator, or a channel "
+            "set to Open casting, and it works in servers only: there are no sessions in DMs.\n"
+            "• **Tickets** writes to the people who run this bot (below).\n\n"
             "**Help Mode** (`/profile manage` -> Tools -> Help Mode) lets one of *your* profiles answer bot questions in character. When "
             "someone asks something technical, the relevant documentation is retrieved and injected for that turn only; the profile answers as "
             "itself. If the question is not technical, nothing is injected and the profile just talks normally."
+        ),
+        "Support Tickets": (
+            "**`/help` → Tickets** writes to the people who run this bot, and their replies come back to the same place: "
+            "the button shows how many tickets have something new. Nothing is sent to your DMs, so look in `/help`.\n\n"
+            "**New Ticket** asks what it is about, your message, and optionally a link to a character's reply that went "
+            "wrong (right-click it → Copy Message Link). The reply's generation trace goes with the ticket, which is usually "
+            "the first thing anyone helping you needs.\n\n"
+            "You need an account (`/start`). Up to 3 tickets can be open at once, each holds up to 30 messages, and a new "
+            "one can be opened every 10 minutes. Either side can close a ticket; a closed ticket is deleted 30 days later, "
+            "and they are part of your `/privacy` export and go with your account."
         ),
         "When a Profile Says Nothing": (
             "In order of likelihood:\n\n"
@@ -667,7 +681,7 @@ HELP_CATEGORIES = {
             "**Sessions:** `/session config`, `/session swap`, `/session view`, `/session audit`, `/trigger`\n\n"
             "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/purge`, `/compact`\n\n"
             "**Setup and data:** `/settings`, `/export`, `/import`, `/privacy`, `/terms`, `/invite`, `/whoami`, `/viewavatar`\n\n"
-            "**Documentation:** `/start` (guided setup), `/guide` (this browser), `/help`, `/news` (what changed in each release)\n\n"
+            "**Documentation and support:** `/start` (guided setup), `/help` (this manual, MimicGuide and support tickets), `/news` (what changed in each release)\n\n"
             "**Support the project:** `/thanks` (Ko-fi, or vote and review on Top.gg)\n\n"
             "**Operator:** `/mod`, `/shutdown`\n\n"
             "`/refresh`, `/cancel`, `/suspend`, `/purge` (bar in a DM), `/memorise`, `/compact`, `/play stop`, `/session config` and `/session swap` require "
@@ -867,16 +881,16 @@ WIZARD_TOUR = {
         "Images can also search the web for reference photographs first — `/profile manage` → Images → Image Output."
     ),
     "When something is wrong": (
-        "`/help` puts **MimicGuide** into the channel, where it answers questions about the bot from its own "
-        "documentation. `/help ask:<question>` answers one question without joining.\n\n"
+        "`/help` has the manual, **Ask MimicGuide** for one question answered from the docs, **MimicGuide here** to "
+        "put the guide in the channel for follow-ups, and **Tickets** to reach the people who run the bot.\n\n"
         "`/cancel` stops a generation that is hanging. `/session audit` reports what a session is actually sending, "
         "token by token, which is where a mysteriously expensive or forgetful character gives itself away.\n\n"
-        "`/guide` is the full manual."
+        "`/help` → Docs is the full manual."
     ),
 }
 
 
-# --- Help Mode / `/help ask` retrieval corpus -------------------------------------
+# --- Help Mode / Ask MimicGuide retrieval corpus -------------------------------------
 #
 # Written to disk as `mod/docs/<category>/<name>.txt` on boot, embedded once, and
 # searched by cosine similarity per query. Style rules, because they are what makes
@@ -976,10 +990,10 @@ DEFAULT_HELP_DOCS = {
     ),
     "profiles/generating_profiles.txt": (
         "Command: `/profile generate` (also Generate in `/start` and in `/profile hub` -> Public Library)\n"
-        "Concept: Drafts a complete profile -- persona fields, AI instructions, display name, placeholder emoji and Public Library intro -- from a short concept sentence, a picture of the character, or both, so you start from a structurally complete character rather than an empty form.\n"
+        "Concept: Drafts a complete profile -- persona fields, AI instructions, display name, placeholder emoji and Public Library intro -- from the internal name alone, or with a short concept sentence, a picture of the character and a display name, so you start from a structurally complete character rather than an empty form.\n"
         "Review: Nothing is saved until you press Save. Regenerate rolls a new draft from the same concept; Refine rewrites the current draft to a request such as 'make her older'; Discard throws it away. An untouched draft expires after ten minutes.\n"
-        "Options: `internal_name` is the name you manage it by. `prompt`, the concept, is optional when an image is given. `display_name` and `avatar_url`, both optional, set the name and image it speaks with, as Appearance does; left blank, the draft picks a display name. The Generate form in `/start` and the Public Library has the same fields, the image included.\n"
-        "Image: `image` takes a PNG, JPEG or WebP of up to 4 MB -- the most the content rating reads of an avatar. The model takes the character's appearance from it and lets the rest suggest who they are; a concept given with it wins where the two disagree. The image is posted in your DMs and becomes the avatar unless you give `avatar_url`; deleting that message removes it, and with DMs closed the draft is still made, without the avatar. It never names a real person in a photo: the character is fictional, inspired by the picture.\n"
+        "Form: The command takes no options; it opens the same form as Generate in `/start` and the Public Library. Internal Name is the name you manage it by, and is enough on its own: the draft is suggested by it. Everything else is optional and adds to the rest rather than replacing it -- the concept, the image, and a Display Name, which the draft is written around; left blank, the draft picks one. Avatar URL only sets the picture it speaks with, as Appearance does: the model never sees it. One draft a minute; a refused or failed one does not count.\n"
+        "Image: The form's Image takes a PNG, JPEG or WebP of up to 4 MB -- the most the content rating reads of an avatar. The model takes the character's appearance from it and lets the rest suggest who they are; a concept given with it wins where the two disagree. The image is posted in your DMs and becomes the avatar unless you give an Avatar URL; deleting that message removes it, and with DMs closed the draft is still made, without the avatar. It never names a real person in a photo: the character is fictional, inspired by the picture.\n"
         "Model: The draft is written by the model a new profile of yours would run on (your `/settings` -> Override Defaults primary model if set, otherwise your provider's default -- before you choose one, the default of the provider your key is for), using your personal key, retrying once on the fallback model.\n"
         "Status: The result is an ordinary Class A Personal Profile with no special properties. It counts against your 100-profile limit and is edited exactly like any other.\n"
         "Expectation: Treat it as a first draft. The structure will be sound; the voice will be generic until you edit the Persona and Instructions yourself, and add Training Examples.\n"
@@ -1413,13 +1427,27 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'My fallback model costs as much as the primary.' Fix: The fallback inherits the primary's effort until you set its own. Open Thinking Parameters and set the third dropdown -- the fallback effort -- to Low."
     ),
     "features/help_mode.txt": (
-        "Commands: `/help`, `/help ask:<question>`, `/guide`\n"
-        "Concept: `/help ask` answers a technical question about the bot directly, retrieving from the documentation. The answer is ephemeral. `/help` with no argument toggles MimicGuide, a built-in system profile, in and out of the current session so you can ask follow-ups conversationally. `/guide` opens a browsable documentation menu.\n"
+        "Command: `/help` (a dashboard visible only to you: Docs, Ask MimicGuide, MimicGuide here, Tickets)\n"
+        "Concept: `/help` -> Ask MimicGuide answers a technical question about the bot directly, retrieving from the documentation; only you see the answer, and it takes two questions a minute. `/help` -> MimicGuide here adds MimicGuide, a built-in system profile, to the channel's session so you can ask follow-ups conversationally, or removes it. `/help` -> Docs opens the browsable manual. `/guide` no longer exists: its manual is Docs.\n"
+        "Who may add MimicGuide: the same people who may edit the channel's cast -- administrators, or anyone where an administrator set the channel to Open casting. It works in servers only; there are no sessions in DMs.\n"
         "Help Mode on your own profiles: `/profile manage` -> Tools -> Help Mode lets one of your own characters answer technical questions in character. Relevant documentation is retrieved and injected for that turn only; if the question is not technical, nothing is injected and the profile talks normally.\n"
         "Operator control: The documentation corpus is editable at `/mod` -> Docs, and re-embeds when saved.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: '/help ask says documentation vectors are not loaded.' Fix: The bot operator has no Google or OpenRouter API key configured. Embedding the documentation requires one.\n"
+        "- Symptom: 'Ask MimicGuide says documentation vectors are not loaded.' Fix: The bot operator has no Google or OpenRouter API key configured. Embedding the documentation requires one.\n"
+        "- Symptom: 'MimicGuide here is greyed out.' Fix: The line under it says why: you are in a DM, you are not an administrator and the channel is not set to Open casting, or the server has no API key for MimicGuide to answer on.\n"
         "- Symptom: 'A Help Mode profile answers technical questions when I wanted roleplay.' Fix: Turn Help Mode off for that profile. It only triggers on questions that match the documentation, but a roleplay scenario about the bot itself can match."
+    ),
+    "features/support_tickets.txt": (
+        "Command: `/help` -> Tickets (the bot owner sees Inbox instead)\n"
+        "Concept: A support ticket writes to the people who run this bot from inside Discord, without a support server. Replies come back to the same place, and the Tickets button counts tickets with something new. Nothing is sent by DM: open `/help` to read replies.\n"
+        "Opening one: `/help` -> Tickets -> New Ticket. Choose what it is about (Something's broken, Setup and API keys, Content rating, Idea or request, Something else), write the message, and optionally paste a link to a character's reply that went wrong (right-click the message -> Copy Message Link); that reply's generation trace is attached for the bot owner.\n"
+        "Limits: An account is needed (`/start`). Up to 3 tickets open at once, up to 30 messages in one ticket, 2,000 characters a message, and one new ticket every 10 minutes; a refused or failed one does not count.\n"
+        "Closing and keeping: You or the bot owner can close a ticket; a closed one cannot be reopened, so open a new one if there is more to say. A closed ticket is deleted 30 days later, and opening an eleventh deletes your oldest closed one. Tickets are in your `/privacy` export and are deleted with your account.\n"
+        "Troubleshooting / Symptoms:\n"
+        "- Symptom: 'The Tickets button is greyed out.' Fix: Create your account in `/start` first.\n"
+        "- Symptom: 'New Ticket is greyed out.' Fix: The line under the list says why: 3 tickets already open, or one opened in the last 10 minutes.\n"
+        "- Symptom: 'I never got a reply in my DMs.' Fix: Replies are not sent by DM. Open `/help` -> Tickets; a ticket with a reply shows a bell.\n"
+        "- Symptom: 'I can't reply to my ticket.' Fix: It is closed, or it has reached 30 messages. Open a new ticket."
     ),
     "features/data_portability.txt": (
         "Commands: `/export`, `/import`, `/privacy`, in a server or a DM. Every reply, the export file included, is visible only to you.\n"
@@ -1466,10 +1494,12 @@ OLLAMA_GUIDE_TEXT = (
 # known, and with plain code spans where they are not -- see MimicCog.command_mention.
 WELCOME_MESSAGE = (
     "Hey! I run AI characters (profiles) — each with its own persona, memory, name, and face in your channels.\n\n"
+    "In a channel with a session running, I read the messages posted there, keep a log of them, and send them to an AI "
+    "provider to write replies — so whoever starts a session should let members know.\n\n"
     "**New to this bot? Run {start}.** This will guide you through setting up MimicAI in your server.\n\n"
     + SERVER_KEY_PITCH + "\n\n"
     "Activating a character *in a channel* requires a user with **Administrator** permissions — so if you do not have them here, feel free to build yours in a server of your own.\n\n"
-    "{help} is a system profile that can assist with your queries, but only use this after you've set up MimicAI!"
+    "{help} has the manual, MimicGuide to answer questions about the bot, and support tickets."
 )
 
 #: The answer to an @ of the bot outside a live session (`_answer_bot_mention`), with
@@ -1490,12 +1520,12 @@ WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")
 #: when they are asking whether to trust the bot with an API key -- and a self-hosted
 #: instance has no reason to send its users to someone else's website to find out what
 #: it does with their data. The shape is `DropdownContentView`'s: category -> page ->
-#: body, so the same browser that backs `/guide` renders it with no new view class.
+#: body, so the same browser that backs `/help` → Docs renders it with no new view class.
 #:
 #: Keep this in step with the site. It is the same document, not a summary of one:
 #: shortening a clause here would leave the bot and the website disagreeing about what
 #: the operator has undertaken.
-LEGAL_EFFECTIVE_DATE = "15 November, 2026 (UTC)"
+LEGAL_EFFECTIVE_DATE = "18 November, 2026 (UTC)"
 
 LEGAL_DOCUMENTS = {
     "Terms of Service": {
@@ -1535,7 +1565,14 @@ LEGAL_DOCUMENTS = {
             "\n"
             "**Voices.** Upload a voice sample only of your own voice, or of a speaker who "
             "has given you permission to clone theirs. A profile's cloned voice is used by "
-            "anyone who borrows that profile."
+            "anyone who borrows that profile.\n"
+            "\n"
+            "**Running characters in a server.** If you start a session in a server, you must "
+            "make sure its members know that, in a channel with a session, the Software reads "
+            "the messages posted there, keeps them in the session log, sends them to the AI "
+            "provider whose key pays for the replies, and that characters may remember what "
+            "they read. The bot asks the first person to start a session in each server to "
+            "confirm this, once."
         ),
         "4. API Costs & Liability": (
             "By providing a personal API key, you acknowledge that you are solely "
@@ -1665,8 +1702,9 @@ LEGAL_DOCUMENTS = {
             "So that data can be found without decrypting it, a small set of index "
             "files is stored unencrypted: profile names and IDs, which profiles borrow "
             "which, your About Me settings and defaults, each server's active sessions,"
-            " key assignments and data policy, the Public Library listing, and "
-            "enforcement records, including the review list of profiles whose content "
+            " key assignments and data policy, the Public Library listing, the list of "
+            "support tickets (who opened each, its category, status and dates, never what "
+            "it says), and enforcement records, including the review list of profiles whose content "
             "rating awaits the instance owner's review."
         ),
         "3. Data We Collect & Store": (
@@ -1697,7 +1735,12 @@ LEGAL_DOCUMENTS = {
             "you assign them to. Discord Bot Tokens are strictly collected and stored "
             "*only* for the instance owner.\n"
             "• **Server Settings:** Each server's sessions, webhooks, key assignments, "
-            "and data policy.\n"
+            "and data policy, and who confirmed that its members were told about the bot, "
+            "and when.\n"
+            "• **Support Tickets:** What you and the instance owner write in a ticket "
+            "opened through /help, its category, the server it was opened from, and, if "
+            "you attach a link to a profile's reply, that reply's generation trace, "
+            "without the memories it recalled unless the profile is yours.\n"
             "• **Enforcement Records:** where access is restricted, the Discord account"
             " or server ID, the date, the restriction applied, when it ends, a short "
             "reason, and who applied it; and, for a profile the content rating refused "
@@ -1744,6 +1787,10 @@ LEGAL_DOCUMENTS = {
             "**Media:** Gemini can receive attached media through Google's Files API, which"
             " deletes uploaded files under Google's own terms.\n"
             "\n"
+            "**Top.gg:** On the Official Instance, opening /thanks sends your Discord ID to "
+            "Top.gg to show whether your vote there is active. Nothing else is sent, and the "
+            "answer is kept in memory only until you can vote again.\n"
+            "\n"
             "**Infrastructure:** Discord carries every message, attachment, and data "
             "export. The Official Instance runs on Google Cloud."
         ),
@@ -1757,11 +1804,12 @@ LEGAL_DOCUMENTS = {
             "purged after 30 days of inactivity**, or when its channel is deleted. An "
             "active session keeps at most its most recent 400 turns, and server "
             "administrators can clear it sooner. Global Chat logs are also purged after"
-            " 30 days of inactivity.\n"
+            " 30 days of inactivity. A support ticket is deleted 30 days after it is "
+            "closed, and opening an eleventh deletes your oldest closed one.\n"
             "\n"
             "Through /privacy, Request Data Export gives you a decrypted copy of the "
-            "profiles, memories, training examples, voice recordings, API keys, and "
-            "settings stored under your account. The archive holds your API keys "
+            "profiles, memories, training examples, voice recordings, API keys, "
+            "settings, and support tickets stored under your account. The archive holds your API keys "
             "unencrypted, so keep it safe. Delete My Account erases everything stored "
             "under your account, withdraws your Public Library listings, unassigns your"
             " keys from servers, and ends other users' borrows of your profiles within "
@@ -1811,8 +1859,9 @@ LEGAL_DOCUMENTS = {
         ),
         "8. Contact": (
             "Questions about these terms or your data, and requests to remove data that "
-            "/privacy cannot reach, can be sent to mimicai.bot@gmail.com. For a self-hosted"
-            " instance, contact the individual or entity hosting it."
+            "/privacy cannot reach, can be opened as a support ticket in /help or sent to "
+            "mimicai.bot@gmail.com. For a self-hosted instance, contact the individual or "
+            "entity hosting it, whom its /help tickets reach."
         ),
     },
 }

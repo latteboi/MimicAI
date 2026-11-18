@@ -39,7 +39,7 @@ from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, PERMISSION_EFFECTS,
                              SERVER_KEY_PITCH, SERVER_KEY_UNASSIGNED, WIZARD_COPY, WIZARD_TOUR)
 from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
-                              add_select)
+                              add_select, add_topgg_links)
 from .gui_settings import (SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
                            SubmitAPIKeyModal, _fit_list)
 from .base_components import text_embed
@@ -559,7 +559,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         if focus is None:
             e.add_field(name="You're set up",
                         value="Just talk in the channel. **Using it ▸** covers what else there is.\n"
-                              "-# Enjoying MimicAI? `/thanks` has ways to support it.",
+                              "-# Enjoying MimicAI? A vote or a review on Top.gg helps others find it.",
                         inline=False)
         else:
             e.add_field(name=f"Step {WIZARD_STEPS.index(focus) + 1}. {focus.title}",
@@ -607,6 +607,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         if focus is None:
             add_button(self, "Using it ▸", self._act_tour, style=discord.ButtonStyle.primary,
                        row=3)
+            # Set up is the good moment, and seen once: it asks nothing more often than that.
+            add_topgg_links(self, row=4)
 
     def _build_tour(self):
         options = [discord.SelectOption(label=page, value=page,
@@ -823,42 +825,41 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
 
 
 class NewProfileModal(ui.Modal):
-    """Collects a name and a concept, an image or both, and hands off to `/profile generate`.
+    """Collects a name and anything more, and hands off to `_generate_profile`, which drafts
+    from all of it together (`compose_concept`).
 
-    That command carries name validation, the profile and key-access limits, and ninety
-    lines of prompt assembly and parsing. Calling its callback directly means the wizard
-    -- and the Public Library's Generate button -- cannot drift from what it does,
-    including its error messages, which are the ones the rest of the documentation
-    describes.
+    The one form behind `/profile generate`, the wizard's Generate and the Public Library's,
+    so the three cannot drift: name validation, the limits, the draft and its error
+    messages all live in that one method.
     """
 
     def __init__(self, cog: 'MimicCog'):
         super().__init__(title="Generate a Character")
         self.cog = cog
         self.name_input = ui.TextInput(
-            label="Internal Name", placeholder="e.g. detective", max_length=32, required=True)
+            label="Internal Name", max_length=32, required=True,
+            placeholder="e.g. detective. Enough on its own; anything below adds to it.")
         self.add_item(self.name_input)
-        # Concept and image side by side, each naming the other: either one is enough.
         self.concept_input = ui.TextInput(
-            label="Concept (or an image below)", style=discord.TextStyle.paragraph,
+            label="Concept (optional)", style=discord.TextStyle.paragraph,
             max_length=500, required=False,
             placeholder="e.g. A cynical noir detective who never removes his coat.")
         self.add_item(self.concept_input)
         self.image_input = ui.FileUpload(required=False)
         self.add_item(ui.Label(
-            text="Image (or a concept above)", component=self.image_input,
-            description="A picture to draft from. It becomes the avatar unless you give a URL."))
+            text="Image (optional)", component=self.image_input,
+            description="Drafted from with the rest. It becomes the avatar unless you give a URL."))
         self.display_name_input = ui.TextInput(
             label="Display Name (optional)", max_length=20, required=False,
-            placeholder="The name it speaks under. Blank lets the draft pick one.")
+            placeholder="The name it speaks under, and the draft writes about. Blank: the draft picks.")
         self.add_item(self.display_name_input)
         self.avatar_url_input = ui.TextInput(
             label="Avatar URL (optional)", required=False, placeholder="https://...")
         self.add_item(self.avatar_url_input)  # Five components: all a modal holds.
 
     async def on_submit(self, interaction: discord.Interaction):
-        await self.cog.profile_generate_slash.callback(
-            self.cog, interaction, (self.name_input.value or "").strip(),
+        await self.cog._generate_profile(
+            interaction, (self.name_input.value or "").strip(),
             prompt=(self.concept_input.value or "").strip() or None,
             image=self.image_input.values[0] if self.image_input.values else None,
             display_name=(self.display_name_input.value or "").strip() or None,

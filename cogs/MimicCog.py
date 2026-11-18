@@ -1,6 +1,6 @@
 from .utils.constants import (
     ALLOWED_MODELS, CHANNEL_MODEL_CACHE_MAX_SIZE, COG_LOCK_FILE_PATH, DATA_DIR,
-    CAST_POLICY_OPEN, DEFAULT_CAST_POLICY,
+    DEFAULT_CAST_POLICY,
     DEFAULT_SYSTEM_INSTRUCTION,
     FALLBACK_MODEL_NAME, LOCK_REFRESH_INTERVAL_SECONDS, LOCK_STALE_THRESHOLD_SECONDS,
     MAX_MULTI_PROFILES, MOD_DATA_DIR, PLACEHOLDER_EMOJI, PRIMARY_MODEL_NAME, PUBLIC_PROFILES_DIR,
@@ -12,21 +12,27 @@ from .utils.constants import (
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_SLOTS_FULL,
     IMPORT_FILE_TOO_LARGE, IMPORT_LOW_MEMORY, CARD_TEXT_MAX_BYTES, LIMIT_FIXED_EXAMPLES, GEMINI_FREE_TIER_BLOCKED, NO_SERVER_KEY_GATE, UNASSIGNED_KEY_GATE, PROFILE_MESSAGE_MAX_LENGTH,
     PERSONA_TEXT_INPUT_MAX_LENGTH,
-    BOT_PERMISSIONS, CHILD_BOT_PERMISSIONS, invite_url, KOFI_URL, TOPGG_URL,
+    BOT_PERMISSIONS, CHILD_BOT_PERMISSIONS, invite_url, KOFI_URL, OFFICIAL_BOT_ID, TOPGG_LINKS,
+    TOPGG_VOTE_API,
 )
-from .services.profile_generation import (IMAGE_CONCEPT, ProfileGenerationError, clean_display_name,
-                                           draft_from_card, generate_draft, generator_models)
+from .services.profile_generation import (ProfileGenerationError, clean_display_name, compose_concept,
+                                           draft_from_card, generate_draft)
 from .utils.character_card import (CardError, card_portrait, prompt_text, profile_name_for, read_card,
                                    read_examples, read_lorebook)
 from .utils.memory_tuning import low_memory
 from .utils.signatures import unsign
 from .listeners.event_listeners import EventListeners
 from .gui.base_components import (ActionTextInputModal, DropdownContentView, build_confirm_view,
+                                  add_topgg_links, cast_refusal, refuse_uninformed,
                                   refuse_unregistered, text_embed,
                                   send_status, settle_status, update_status)
+from .gui.gui_help import GUIDE_PROFILE, HelpView, guide_refusal
+from .utils.http_client import get_shared_client
+from .managers.ticket_store import TicketStore
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
 from .gui.gui_generate import GeneratedProfileView
 from .gui.gui_hub import HubPublicLibraryView
+from .gui.gui_start import NewProfileModal
 from .gui.gui_sessions import (
     GlobalChatPlayView, GlobalChatHistoryView, WhisperHistoryView, SessionSwapListView,
     SessionView, SessionConfigView, SessionAuditView, GenerationTraceView, last_user_message_id
@@ -74,6 +80,8 @@ import asyncio
 import contextlib
 import io
 import os
+import re
+import httpx
 import orjson as json
 import datetime
 import uuid
@@ -86,6 +94,9 @@ from collections import OrderedDict
 import pathlib
 from .utils.helpers import (_resolve_safety_settings, _scrub_response_text, resolve_thinking_params,
                             suppress_link_previews, voice_sample_mime_type, check_portrait_upload)
+
+#: A Discord message link: (server or @me, channel, message). `_ticket_trace`.
+MESSAGE_LINK = re.compile(r"https://(?:(?:ptb|canary)\.)?discord(?:app)?\.com/channels/(\d+|@me)/(\d+)/(\d+)")
 
 class LRUCache(OrderedDict):
     def __init__(self, max_size, *args, **kwargs):
@@ -132,17 +143,6 @@ def _feature_closed(key: str):
 
 def _no_table_here(cog, interaction: discord.Interaction) -> bool:
     return cog.game_service.lobby_refusal(interaction.channel_id) is not None
-
-
-def _cannot_generate(cog, interaction: discord.Interaction) -> bool:
-    """Not registered, or no key a draft could run on: `generate_draft`'s own refusals."""
-    if _unregistered(cog, interaction):
-        return True
-    try:
-        generator_models(cog, interaction.user.id)
-    except ProfileGenerationError:
-        return True
-    return False
 
 
 class MimicCog(EventListeners, commands.Cog):
@@ -228,6 +228,7 @@ class MimicCog(EventListeners, commands.Cog):
         self.generation_service = GenerationService(self)
         self.api_service = APIService(self)
         self.help_service = HelpService(self)
+        self.tickets = TicketStore(self)
         self.game_service = GameService(self)
 
         self.server_manager._load_global_prompts()
@@ -382,13 +383,21 @@ class MimicCog(EventListeners, commands.Cog):
         self.branches_opening: Dict[int, asyncio.Event] = {}
         # user id -> when an @ of the bot was last answered (`_answer_bot_mention`).
         self.mention_pointers_sent: LRUCache = LRUCache(max_size=256)
+        # user id -> when their last profile draft started (`_generate_profile`).
+        self.draft_times: LRUCache = LRUCache(max_size=256)
+        # user id -> when they last opened a support ticket, and their Ask MimicGuide
+        # cooldown (`/help`). In memory: a restart forgives both, which costs nothing.
+        self.ticket_times: LRUCache = LRUCache(max_size=256)
+        self.ask_cooldowns: LRUCache = LRUCache(max_size=256)
+        # user id -> when their active Top.gg vote lapses (`_vote_status`).
+        self.vote_expiry: LRUCache = LRUCache(max_size=256)
         self.all_bot_ids: Set[int] = set()
         # One permit per finisher task (there is one), held while it works a request:
         # `.locked()` is how intake tells a user they are queued. At 3 the lone finisher
         # could never exhaust it, so it never locked and nobody was ever told.
         self.image_gen_semaphore = asyncio.Semaphore(1)
 
-        # Priority Queues for Premium Fast-Lane
+        # Every request is queued at IMAGE_QUEUE_PRIORITY: first come, first served, no paid fast lane.
         self.image_request_queue = asyncio.PriorityQueue(maxsize=10)
         self.text_request_queue = asyncio.PriorityQueue()
         
@@ -501,20 +510,19 @@ class MimicCog(EventListeners, commands.Cog):
         return None
 
     @profile_group.command(name="generate", description="Uses AI to draft a new profile from a concept or an image, for you to review before saving.")
-    @cooldown_unless_refused(1, 60.0, _cannot_generate)
-    @app_commands.rename(profile_name="internal_name")
-    @app_commands.describe(
-        profile_name="The unique internal name you manage the profile by.",
-        prompt="The character concept (e.g., 'A cynical noir detective'). Optional with an image.",
-        image="A picture of the character to draft from. It becomes the avatar unless you give avatar_url.",
-        display_name="The name it speaks under. Left blank, the draft picks one.",
-        avatar_url="A link to the image it speaks with, as under Appearance."
-    )
-    async def profile_generate_slash(self, interaction: discord.Interaction, profile_name: str,
-                                     prompt: Optional[str] = None,
-                                     image: Optional[discord.Attachment] = None,
-                                     display_name: Optional[app_commands.Range[str, 1, 20]] = None,
-                                     avatar_url: Optional[str] = None):
+    async def profile_generate_slash(self, interaction: discord.Interaction):
+        # The same form as Generate in /start and the Public Library. No cooldown here:
+        # opening a form costs nothing, and the draft is limited where it is made.
+        if await refuse_unregistered(self, interaction):
+            return
+        await interaction.response.send_modal(NewProfileModal(self))
+
+    async def _generate_profile(self, interaction: discord.Interaction, profile_name: str,
+                                prompt: Optional[str] = None,
+                                image: Optional[discord.Attachment] = None,
+                                display_name: Optional[str] = None,
+                                avatar_url: Optional[str] = None):
+        """What `NewProfileModal` submits, however it was opened."""
         if await refuse_unregistered(self, interaction):
             return
         await send_status(interaction, "Drafting your character...")
@@ -541,10 +549,6 @@ class MimicCog(EventListeners, commands.Cog):
                     "❌ **Invalid Avatar URL:** It must be a link starting with https://.")
                 return
             
-        concept = (prompt or "").strip()
-        if not concept and image is None:
-            await settle_status(interaction, "Give a concept, an image, or both.")
-            return
         if image is not None:
             mime_type, refusal = check_portrait_upload(image)
             if refusal:
@@ -562,6 +566,15 @@ class MimicCog(EventListeners, commands.Cog):
             await settle_status(interaction, f"You have reached the maximum of {limit} personal profiles.")
             return
 
+        # One draft a minute, from any of the three ways in. Spent only past the refusals
+        # above, before the portrait DM, and given back if the draft fails.
+        now = interaction.created_at.timestamp()
+        wait = 60.0 - (now - self.draft_times.get(interaction.user.id, 0.0))
+        if wait > 0:
+            await settle_status(interaction, f"One draft a minute. Please try again in {int(wait) + 1} second(s).")
+            return
+        self.draft_times[interaction.user.id] = now
+
         image_part = kept = None
         if image is not None:
             # A link the user gave is the avatar; otherwise the image is, re-posted so it lasts.
@@ -576,10 +589,12 @@ class MimicCog(EventListeners, commands.Cog):
             image_part = {"url": kept or image.url, "mime_type": mime_type}
 
         # A draft, not a profile: GeneratedProfileView shows it and writes it on Save.
-        concept = concept or IMAGE_CONCEPT
+        concept = compose_concept(profile_name, (prompt or "").strip(),
+                                  appearance.get("display_name"), image is not None)
         try:
             draft, model_used = await generate_draft(self, interaction.user.id, concept, image=image_part)
         except ProfileGenerationError as e:
+            self.draft_times.pop(interaction.user.id, None)
             await settle_status(interaction,
                 f"❌ **Generation Failed:** {suppress_link_previews(str(e))}")
             return
@@ -1044,24 +1059,15 @@ class MimicCog(EventListeners, commands.Cog):
         if not self.has_lock: return
         
         # Administrators always, plus every member when this channel's session is set
-        # to Open Casting. The policy is read through cast_policy_for_channel because
-        # it must not wake or create a session: _ensure_session_shell below does that,
-        # and asking it first would let the check invent the session that answers it.
+        # to Open Casting (`cast_refusal`).
         #
         # `/session swap` is deliberately not widened by this, and neither is the
         # `session` cast source inside the editor -- Open Casting lets a member seat
         # their own characters, not reach into anybody else's.
-        is_admin = (interaction.user.guild_permissions.administrator
-                    or interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID))
-        if not is_admin:
-            policy = self.session_manager.cast_policy_for_channel(
-                interaction.guild_id, interaction.channel_id)
-            if policy != CAST_POLICY_OPEN:
-                await interaction.response.send_message(
-                    embed=text_embed("You must be a server administrator to configure sessions. An "
-                    "administrator can set this channel's session to **Open casting** "
-                    "to let anyone edit it."), ephemeral=True)
-                return
+        refusal = cast_refusal(self, interaction)
+        if refusal:
+            await interaction.response.send_message(embed=text_embed(refusal), ephemeral=True)
+            return
 
         block = self._session_key_block(interaction.guild, interaction.user.id)
         if block:
@@ -1353,8 +1359,11 @@ class MimicCog(EventListeners, commands.Cog):
             # where a half-built cast genuinely should not be live.
             #
             # Every field the full start path sets is set here, because this session
-            # now goes live without ever passing through the config view.
+            # now goes live without ever passing through the config view -- the
+            # members-informed question included.
             if not session:
+                if await refuse_uninformed(self, interaction):
+                    return
                 session = {
                     "type": "multi", "profiles": [new_participant],
                     "unified_log": [], "is_hydrated": False,
@@ -2244,6 +2253,44 @@ class MimicCog(EventListeners, commands.Cog):
             ephemeral=True)
 
     @app_commands.checks.cooldown(2, 10.0, key=lambda i: i.user.id)
+    async def _log_for_channel(self, channel_id: int):
+        """The channel's session log: the live one when hydrated, else the one on disk."""
+        session = self.multi_profile_channels.get(channel_id)
+        if session and session.get("is_hydrated"):
+            return session.get("unified_log")
+        for s_type in ["multi", "freewill"]:
+            disk_log = await self.session_manager._load_session_from_disk((channel_id, None, None), s_type)
+            if disk_log:
+                return disk_log
+        return None
+
+    async def _ticket_trace(self, user_id: int, link: str):
+        """(what a ticket keeps of a message link, a note for its writer or None).
+
+        The link always; the trace of the reply it points at too, while the session still
+        has one, for the bot owner to open from the ticket as the trace menu would. Its
+        recalled memories only when the reply is the writer's own profile's: they are that
+        profile owner's, and a ticket is exported as its writer's data."""
+        match = MESSAGE_LINK.search(link)
+        if not match:
+            return None, "That is not a link to a Discord message, so nothing was attached."
+        trace = {"url": match.group(0)}
+        channel_id, message_id = int(match.group(2)), int(match.group(3))
+        log = await self._log_for_channel(channel_id)
+        index = next((i for i, t in enumerate(log if isinstance(log, list) else [])
+                      if message_id in t.get("message_ids", [])), None)
+        turn = log[index] if index is not None else None
+        if not turn or turn.get("is_user") is not False or not turn.get("meta"):
+            return trace, "That message has no generation trace to attach, so only its link was kept."
+        turn = {**turn, "meta": dict(turn["meta"])}
+        if str(turn.get("owner_id")) != str(user_id):
+            turn["meta"].pop("ltms_recalled", None)
+        trace["turn"] = turn
+        prompt_id = last_user_message_id(log, index)
+        if prompt_id:
+            trace["prompt_url"] = f"https://discord.com/channels/{match.group(1)}/{channel_id}/{prompt_id}"
+        return trace, None
+
     async def view_generation_trace(self, interaction: discord.Interaction, message: discord.Message):
         if not self.has_lock or self._refused_by_blacklist(interaction): return
         await interaction.response.defer(ephemeral=True)
@@ -2255,21 +2302,7 @@ class MimicCog(EventListeners, commands.Cog):
             await interaction.followup.send(
                 embed=text_embed(f"{signature}\n\n-# {text}" if signature else text), ephemeral=True)
 
-        channel_id = message.channel.id
-        session = self.multi_profile_channels.get(channel_id)
-        unified_log = None
-        
-        if session and session.get("is_hydrated"):
-            unified_log = session.get("unified_log")
-        else:
-            # Check disk for dehydrated sessions
-            for s_type in ["multi", "freewill"]:
-                dummy_key = (channel_id, None, None)
-                disk_log = await self.session_manager._load_session_from_disk(dummy_key, s_type)
-                if disk_log:
-                    unified_log = disk_log
-                    break
-                    
+        unified_log = await self._log_for_channel(message.channel.id)
         if not isinstance(unified_log, list) or not unified_log:
             await refuse("Could not find session data for this channel.")
             return
@@ -2595,14 +2628,6 @@ class MimicCog(EventListeners, commands.Cog):
         view = StartWizardView(self, interaction, state)
         await view.update_display()
 
-    @app_commands.command(name="guide", description="Displays detailed documentation about the bot's features and commands.")
-    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
-    async def guide_slash(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-        from .utils.content import HELP_CATEGORIES
-        view = DropdownContentView(HELP_CATEGORIES, "MimicAI Help & Documentation")
-        await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
-
     @app_commands.command(name="news", description="What changed in each release of MimicAI.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def news_slash(self, interaction: discord.Interaction):
@@ -2611,8 +2636,8 @@ class MimicCog(EventListeners, commands.Cog):
         if not notes:
             await interaction.response.send_message(embed=text_embed("No release notes shipped with this instance."), ephemeral=True)
             return
-        view = DropdownContentView(notes, "MimicAI News",
-                                   footer="Enjoying MimicAI? /thanks has ways to support it.")
+        view = DropdownContentView(notes, "MimicAI News", links=TOPGG_LINKS,
+                                   footer="Enjoying MimicAI? A vote or a review helps others find it.")
         await interaction.response.send_message(embed=view.get_embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="thanks", description="Support MimicAI: Ko-fi, vote or review on Top.gg.")
@@ -2620,6 +2645,8 @@ class MimicCog(EventListeners, commands.Cog):
     async def thanks_slash(self, interaction: discord.Interaction):
         # A thank-you and nothing more: a tip or a vote unlocks no feature or limit, and
         # nothing offers this unasked -- it is only pointed at where someone is already looking.
+        await interaction.response.defer(ephemeral=True)  # the vote lookup is a network call
+        vote = await self._vote_status(interaction.user.id)
         embed = discord.Embed(
             title="Support MimicAI",
             description=(
@@ -2628,187 +2655,233 @@ class MimicCog(EventListeners, commands.Cog):
                 "**Ko-fi** — a one-off tip.\n"
                 "**Vote on Top.gg** — helps new people find MimicAI.\n"
                 "**Review** — tell others what you make with it.\n\n"
-                "-# Nothing here unlocks a feature or a limit. Thank you for being here."),
+                + (f"{vote}\n" if vote else "")
+                + "-# Nothing here unlocks a feature or a limit. Thank you for being here."),
             color=discord.Color.blurple())
         view = ui.View(timeout=None)
-        for label, url in (("Ko-fi", KOFI_URL), ("Vote on Top.gg", f"{TOPGG_URL}/vote"),
-                           ("Review", f"{TOPGG_URL}#reviews")):
-            view.add_item(ui.Button(label=label, url=url))
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        view.add_item(ui.Button(label="Ko-fi", url=KOFI_URL))
+        add_topgg_links(view)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
-    @app_commands.command(name="help", description="Toggle MimicGuide into this session, or instantly ask a technical question.")
-    @app_commands.checks.cooldown(2, 60.0, key=lambda i: i.user.id)
-    @app_commands.describe(ask="A technical question to ask the bot directly (Optional).")
-    async def help_slash(self, interaction: discord.Interaction, ask: Optional[str] = None):
-        if ask:
-            await send_status(interaction, "Looking that up in the guide...")
-        else:
-            await interaction.response.defer(ephemeral=True)
-        
+    async def _vote_status(self, user_id: int) -> Optional[str]:
+        """Where this user's Top.gg vote stands, as a line for `/thanks`, or None.
+
+        Asked only when they open `/thanks` -- never to remind anyone -- and only on the
+        official instance, whose listing the links name and whose project token is
+        `TOPGG_TOKEN`. An active vote is held in memory until it lapses, so asking again
+        sends nothing; "none active" is not held, so a vote cast a minute ago shows at once.
+        Anything but a clean answer shows no line. Privacy Policy 4.
+        """
+        if not defaultConfig.TOPGG_TOKEN or not self.bot.user or self.bot.user.id != OFFICIAL_BOT_ID:
+            return None
+        now = time.time()
+        expires = self.vote_expiry.get(user_id)
+        if not expires or expires <= now:
+            try:
+                response = await get_shared_client().get(
+                    TOPGG_VOTE_API.format(user_id=user_id), params={"source": "discord"},
+                    headers={"Authorization": f"Bearer {defaultConfig.TOPGG_TOKEN}"}, timeout=3.0)
+            except httpx.HTTPError:
+                return None
+            if response.status_code == 404:
+                return "-# Your vote is open: one click on **Vote on Top.gg**."
+            if response.status_code != 200:
+                return None
+            try:
+                expires = datetime.datetime.fromisoformat(response.json()["expires_at"]).timestamp()
+            except (ValueError, KeyError, TypeError):
+                return None
+            self.vote_expiry[user_id] = expires
+        if expires <= now:
+            return "-# Your vote is open: one click on **Vote on Top.gg**."
+        return f"-# You've voted. Thank you! You can vote again <t:{int(expires)}:R>."
+
+    @app_commands.command(name="help", description="The manual, MimicGuide, and support tickets to the people who run this bot.")
+    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
+    async def help_slash(self, interaction: discord.Interaction):
+        # The ticket index is read once per process, off the loop, before anything counts it.
+        await asyncio.to_thread(self.tickets.load)
+        view = HelpView(self, interaction)
+        await interaction.response.send_message(**view.render(), ephemeral=True)
+
+    async def _ask_guide(self, interaction: discord.Interaction, ask: str):
+        """`/help` → Ask MimicGuide: one question answered from the docs, to the asker alone."""
+        # Two a minute, what `/help ask:` had as a command: it is a model call.
+        cooldown = self.ask_cooldowns.get(interaction.user.id)
+        if cooldown is None:
+            cooldown = self.ask_cooldowns[interaction.user.id] = app_commands.Cooldown(2, 60.0)
+        retry = cooldown.update_rate_limit()
+        if retry:
+            await interaction.response.send_message(embed=text_embed(
+                f"Two questions a minute. Ask again in {int(retry) + 1} second(s)."), ephemeral=True)
+            return
+        await send_status(interaction, "Looking that up in the guide...")
+
         owner_id = int(defaultConfig.DISCORD_OWNER_ID)
         self.profile_manager._get_or_create_system_profile("mimicguide")
+
+        if not hasattr(self, 'doc_vectors') or not self.doc_vectors:
+            await settle_status(interaction, "Documentation vectors are not loaded or missing. Ensure the Bot Owner has configured an API key.")
+            return
+            
+        guild_id = interaction.guild_id if interaction.guild else 0
+        protocol_block = await self.help_service._get_relevant_help_context(ask, guild_id, force_always_respond=True)
         
-        if ask:
-            if not hasattr(self, 'doc_vectors') or not self.doc_vectors:
-                await settle_status(interaction, "Documentation vectors are not loaded or missing. Ensure the Bot Owner has configured an API key.")
-                return
+        if not protocol_block:
+            await settle_status(interaction, "I couldn't find anything in the documentation related to your question.")
+            return
+        
+        # --- Fetch mimicguide configuration ---
+        p_config = self.profile_manager._get_profile_config(owner_id, "mimicguide", False) or {}
+        prompts = self.profile_manager._get_profile_prompts(owner_id, "mimicguide") or {}
+        
+        # --- Construct Base System Instruction (Bypassing Fluff) ---
+        persona_data = prompts.get("persona", {})
+        ai_instr_str = prompts.get("ai_instructions", "")
+        
+        final_instr_parts = []
+        
+        if persona_data and any(persona_data.values()):
+            persona_blocks = []
+            for key in self.persona_modal_sections_order: 
+                if lines := persona_data.get(key,[]):
+                    decrypted_lines = [self.storage_manager._decrypt_data(line).strip() for line in lines if line.strip()]
+                    if any(l.strip() for l in decrypted_lines):
+                        block_content = "\n".join(decrypted_lines)
+                        persona_blocks.append(f"<{key}>\n{block_content}\n</{key}>")
+            if persona_blocks:
+                persona_str = "<persona_profile>\n" + "\n\n".join(persona_blocks) + "\n</persona_profile>"
+                final_instr_parts.append(persona_str)
                 
-            guild_id = interaction.guild_id if interaction.guild else 0
-            protocol_block = await self.help_service._get_relevant_help_context(ask, guild_id, force_always_respond=True)
-            
-            if not protocol_block:
-                await settle_status(interaction, "I couldn't find anything in the documentation related to your question.")
-                return
-            
-            # --- Fetch mimicguide configuration ---
-            p_config = self.profile_manager._get_profile_config(owner_id, "mimicguide", False) or {}
-            prompts = self.profile_manager._get_profile_prompts(owner_id, "mimicguide") or {}
-            
-            # --- Construct Base System Instruction (Bypassing Fluff) ---
-            persona_data = prompts.get("persona", {})
-            ai_instr_str = prompts.get("ai_instructions", "")
-            
-            final_instr_parts = []
-            
-            if persona_data and any(persona_data.values()):
-                persona_blocks = []
-                for key in self.persona_modal_sections_order: 
-                    if lines := persona_data.get(key,[]):
-                        decrypted_lines = [self.storage_manager._decrypt_data(line).strip() for line in lines if line.strip()]
-                        if any(l.strip() for l in decrypted_lines):
-                            block_content = "\n".join(decrypted_lines)
-                            persona_blocks.append(f"<{key}>\n{block_content}\n</{key}>")
-                if persona_blocks:
-                    persona_str = "<persona_profile>\n" + "\n\n".join(persona_blocks) + "\n</persona_profile>"
-                    final_instr_parts.append(persona_str)
-                    
-            decrypted_parts = []
-            if isinstance(ai_instr_str, list):
-                for part in ai_instr_str:
-                    dec = self.storage_manager._decrypt_data(part)
-                    if dec.strip():
-                        cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
-                        decrypted_parts.append(cleaned_part)
-            elif isinstance(ai_instr_str, str):
-                dec = self.storage_manager._decrypt_data(ai_instr_str)
+        decrypted_parts = []
+        if isinstance(ai_instr_str, list):
+            for part in ai_instr_str:
+                dec = self.storage_manager._decrypt_data(part)
                 if dec.strip():
                     cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
                     decrypted_parts.append(cleaned_part)
+        elif isinstance(ai_instr_str, str):
+            dec = self.storage_manager._decrypt_data(ai_instr_str)
+            if dec.strip():
+                cleaned_part = "\n".join([line.strip() for line in dec.split("\n")])
+                decrypted_parts.append(cleaned_part)
+        
+        if decrypted_parts:
+            final_instr_parts.append("<instructions>\n" + "\n\n".join(decrypted_parts).strip() + "\n</instructions>")
             
-            if decrypted_parts:
-                final_instr_parts.append("<instructions>\n" + "\n\n".join(decrypted_parts).strip() + "\n</instructions>")
-                
-            final_instr_parts.append(protocol_block)
+        final_instr_parts.append(protocol_block)
+        
+        sys_prompt = "\n\n".join(final_instr_parts).strip() if final_instr_parts else DEFAULT_SYSTEM_INSTRUCTION
+        
+        # --- Assemble Payload & Parameters ---
+        user_prompt = f"<user_query>\n{ask}\n</user_query>"
+        contents_for_api_call = [{'role': 'user', 'parts': [user_prompt]}]
+        
+        temp = float(p_config.get("temperature", 0.2))
+        top_p = float(p_config.get("top_p", 0.9))
+        top_k = int(p_config.get("top_k", 40))
+        
+        adv_params = {
+            "frequency_penalty": p_config.get("frequency_penalty"),
+            "presence_penalty": p_config.get("presence_penalty"),
+            "repetition_penalty": p_config.get("repetition_penalty"),
+            "min_p": p_config.get("min_p"),
+            "top_a": p_config.get("top_a")
+        }
+        adv_params = {k: v for k, v in adv_params.items() if v is not None}
+        gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
+        
+        t_params_worker = resolve_thinking_params(p_config, "response", cog=self)
+        if not p_config.get("thinking_level"):
+            # MimicGuide answers documentation questions off retrieved shards. The
+            # shared default for the response slot is "high"; this path has always
+            # picked cheap over deliberative, and that is still the right trade for
+            # a lookup, so it keeps its own default rather than the slot's.
+            t_params_worker["thinking_level"] = "none"
+        
+        d_safe = _resolve_safety_settings(interaction.channel)
+        
+        custom_error = p_config.get("error_response", "An error has occurred.")
+
+        # --- Execute Pipeline ---
+        async def _ask(model_name, _is_fallback):
+            # Intentionally passing None for tools to strictly disable grounding/fetching overrides
+            model_instance = self.api_service._instantiate_model(model_name, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config, config_owner_id=owner_id)
+            resp = await model_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
+            if not resp or not resp.candidates:
+                raise ValueError("Empty or blocked response")
+            return getattr(resp, 'text', "")
+
+        # Primary then Fallback -- the chain every other model call runs, in place of
+        # one of its own.
+        try:
+            response_text, _used, _was_fallback = await self.api_service.run_with_fallback(
+                *self.api_service.model_chain(p_config, "primary_model", owner_id), _ask,
+                label="Ask MimicGuide")
+        except Exception as e:
+            print(f"Ask MimicGuide failed: {e}")
+            response_text = f"{custom_error}\n\n-# (API Failure)"
+
+        response_text = _scrub_response_text(response_text).strip()
+        if not response_text:
+            response_text = custom_error
             
-            sys_prompt = "\n\n".join(final_instr_parts).strip() if final_instr_parts else DEFAULT_SYSTEM_INSTRUCTION
-            
-            # --- Assemble Payload & Parameters ---
-            user_prompt = f"<user_query>\n{ask}\n</user_query>"
-            contents_for_api_call = [{'role': 'user', 'parts': [user_prompt]}]
-            
-            temp = float(p_config.get("temperature", 0.2))
-            top_p = float(p_config.get("top_p", 0.9))
-            top_k = int(p_config.get("top_k", 40))
-            
-            adv_params = {
-                "frequency_penalty": p_config.get("frequency_penalty"),
-                "presence_penalty": p_config.get("presence_penalty"),
-                "repetition_penalty": p_config.get("repetition_penalty"),
-                "min_p": p_config.get("min_p"),
-                "top_a": p_config.get("top_a")
+        await settle_status(interaction, response_text)
+
+    async def _toggle_guide(self, interaction: discord.Interaction):
+        """`/help` → MimicGuide here: the bot owner's guide into this channel's cast, or out.
+
+        It changes the cast, so it asks what the cast editor asks: who may (`guide_refusal`),
+        and, where it would start the server's first session, that members were told."""
+        refusal = guide_refusal(self, interaction)
+        if refusal:
+            await interaction.response.send_message(embed=text_embed(refusal), ephemeral=True)
+            return
+        session = self.multi_profile_channels.get(interaction.channel_id)
+        if not session and await refuse_uninformed(self, interaction):
+            return
+        owner_id = int(defaultConfig.DISCORD_OWNER_ID)
+        self.profile_manager._get_or_create_system_profile(GUIDE_PROFILE)
+        result_msg = ""
+        
+        participant = {
+            "owner_id": owner_id,
+            "profile_name": "mimicguide",
+            "pid": self.profile_manager._get_pid_from_name(owner_id, "mimicguide"),
+            "method": "webhook",
+            "ephemeral": False
+        }
+        
+        if not session:
+            session = {
+                "type": "multi", "profiles": [participant],
+                "unified_log": [], "is_hydrated": False, "owner_id": interaction.user.id, "is_running": False,
+                "task_queue": asyncio.Queue(), "worker_task": None, "session_mode": "sequential",
+                "compaction": dict(NEW_SESSION_COMPACTION),
             }
-            adv_params = {k: v for k, v in adv_params.items() if v is not None}
-            gen_config = {"temperature": temp, "top_p": top_p, "top_k": top_k, "_advanced_params": adv_params}
-            
-            t_params_worker = resolve_thinking_params(p_config, "response", cog=self)
-            if not p_config.get("thinking_level"):
-                # MimicGuide answers documentation questions off retrieved shards. The
-                # shared default for the response slot is "high"; this path has always
-                # picked cheap over deliberative, and that is still the right trade for
-                # a lookup, so it keeps its own default rather than the slot's.
-                t_params_worker["thinking_level"] = "none"
-            
-            d_safe = _resolve_safety_settings(interaction.channel)
-            
-            custom_error = p_config.get("error_response", "An error has occurred.")
-
-            # --- Execute Pipeline ---
-            async def _ask(model_name, _is_fallback):
-                # Intentionally passing None for tools to strictly disable grounding/fetching overrides
-                model_instance = self.api_service._instantiate_model(model_name, guild_id, owner_id, sys_prompt, d_safe, t_params_worker, None, p_config, config_owner_id=owner_id)
-                resp = await model_instance.generate_content_async(contents_for_api_call, generation_config=gen_config)
-                if not resp or not resp.candidates:
-                    raise ValueError("Empty or blocked response")
-                return getattr(resp, 'text', "")
-
-            # Primary then Fallback -- the chain every other model call runs, in place of
-            # one of its own.
-            try:
-                response_text, _used, _was_fallback = await self.api_service.run_with_fallback(
-                    *self.api_service.model_chain(p_config, "primary_model", owner_id), _ask,
-                    label="/help ask")
-            except Exception as e:
-                print(f"/help ask failed: {e}")
-                response_text = f"{custom_error}\n\n-# (API Failure)"
-
-            response_text = _scrub_response_text(response_text).strip()
-            if not response_text:
-                response_text = custom_error
-                
-            await settle_status(interaction, response_text)
-            
+            self.multi_profile_channels[interaction.channel_id] = session
+            result_msg = "MimicGuide joined and created a new Chat Session."
         else:
-            owner_id = int(defaultConfig.DISCORD_OWNER_ID)
-            self.profile_manager._get_or_create_system_profile("mimicguide")
+            participant_index = -1
+            for i, p in enumerate(session['profiles']):
+                if p.get('owner_id') == owner_id and p.get('profile_name') == "mimicguide":
+                    participant_index = i
+                    break
             
-            session = self.multi_profile_channels.get(interaction.channel_id)
-            seated = session and any(p.get('owner_id') == owner_id and p.get('profile_name') == "mimicguide"
-                                     for p in session['profiles'])
-            # Leaving needs no key; joining a server with none seats a guide that can never answer.
-            if not seated and (block := self._session_key_block(interaction.guild, interaction.user.id)):
-                await interaction.followup.send(embed=text_embed(block), ephemeral=True)
-                return
-            action_taken = None
-            result_msg = ""
-            
-            participant = {
-                "owner_id": owner_id,
-                "profile_name": "mimicguide",
-                "pid": self.profile_manager._get_pid_from_name(owner_id, "mimicguide"),
-                "method": "webhook",
-                "ephemeral": False
-            }
-            
-            if not session:
-                session = {
-                    "type": "multi", "profiles": [participant],
-                    "unified_log": [], "is_hydrated": False, "owner_id": interaction.user.id, "is_running": False,
-                    "task_queue": asyncio.Queue(), "worker_task": None, "session_mode": "sequential",
-                    "compaction": dict(NEW_SESSION_COMPACTION),
-                }
-                self.multi_profile_channels[interaction.channel_id] = session
-                result_msg = "MimicGuide joined and created a new Chat Session."
+            if participant_index != -1:
+                session['profiles'].pop(participant_index)
+                result_msg = "MimicGuide departed the Chat Session."
+                if not session['profiles']:
+                    self.multi_profile_channels.pop(interaction.channel_id, None)
             else:
-                participant_index = -1
-                for i, p in enumerate(session['profiles']):
-                    if p.get('owner_id') == owner_id and p.get('profile_name') == "mimicguide":
-                        participant_index = i
-                        break
-                
-                if participant_index != -1:
-                    session['profiles'].pop(participant_index)
-                    result_msg = "MimicGuide departed the Chat Session."
-                    if not session['profiles']:
-                        self.multi_profile_channels.pop(interaction.channel_id, None)
-                else:
-                    if len(session['profiles']) >= 200:
-                        await interaction.followup.send(embed=text_embed("The session is full (200 max)."), ephemeral=True)
-                        return
-                    session['profiles'].append(participant)
-                    result_msg = "MimicGuide joined the Chat Session."
-            
-            self.session_manager._save_multi_profile_sessions()
-            await interaction.followup.send(embed=text_embed(result_msg), ephemeral=True)
+                if len(session['profiles']) >= 200:
+                    await interaction.response.send_message(embed=text_embed("The session is full (200 max)."), ephemeral=True)
+                    return
+                session['profiles'].append(participant)
+                result_msg = "MimicGuide joined the Chat Session."
+        
+        self.session_manager._save_multi_profile_sessions()
+        await interaction.response.send_message(embed=text_embed(result_msg), ephemeral=True)
 
     @app_commands.command(name="terms", description="View the MimicAI Terms of Service and Privacy Policy.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -2823,8 +2896,7 @@ class MimicCog(EventListeners, commands.Cog):
         view = DropdownContentView(
             LEGAL_DOCUMENTS,
             f"MimicAI Terms of Service & Privacy Policy · Effective {LEGAL_EFFECTIVE_DATE}",
-            link_button_label="View on mimic-ai.org",
-            link_button_url="https://mimic-ai.org/")
+            links=[("View on mimic-ai.org", "https://mimic-ai.org/")])
         view.block_exempt = True
         await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
@@ -2856,6 +2928,8 @@ class MimicCog(EventListeners, commands.Cog):
         view = ui.View(timeout=None)
         view.add_item(ui.Button(label="Add to Server",
                                 url=invite_url(self.bot.user.id, BOT_PERMISSIONS)))
+        # Whoever runs /invite is about to recommend the bot: the listing is the other half.
+        add_topgg_links(view)
         await interaction.response.send_message(embed=embed, view=view)
 
         # A child bot's link is otherwise shown once, when it is linked, and /start can only

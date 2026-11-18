@@ -10,7 +10,8 @@ import traceback
 import collections
 import itertools
 import datetime
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Any, Optional
 from ..utils.constants import (
     defaultConfig, PLACEHOLDER_EMOJI, GAME_BEAT_STALE_SECONDS, VARIETY_HINTS,
     WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, TYPING_INDICATOR_SECONDS,
@@ -64,6 +65,54 @@ from .generation.ltm_capture import LtmCaptureMixin
 from .generation.turn_deletion import TurnDeletionMixin
 from .generation.describe import MediaDescriptionMixin
 from .generation.reply import ReplyAttempt, ReplyMixin, reply_gen_config, reply_meta
+
+
+@dataclass(slots=True)
+class Round:
+    """What the seats of one round share: the only way one seat's turn reaches the next.
+
+    `_run_seat_turn` runs each seat in a frame of its own, so a name a turn binds dies
+    with it; anything a later seat or the round's end must see is set here. Slots, so a
+    misspelt field raises instead of quietly becoming a new one. The names are the
+    worker's own locals, which it builds this from.
+    """
+    session: dict
+    session_type: str
+    channel_id: int
+    channel: Any
+    #: Rewritten in place by handoffs and by seats leaving: `round_order` is this list.
+    profile_order: list
+    all_triggers_for_round: list
+    new_round_turn_data: list
+    batch_start_index: int
+    round_author_name: str
+    triggering_user_id: Optional[int]
+    anchor_message: Any
+    single_turn_round: bool
+    is_proactive_auto_round: bool
+    proactive_follow_up: Any
+    pre_generation_warnings: list
+    urls_skipped: int
+    round_url_turns: list
+    #: The worker's, not the round's: it outlives the round, and its `finally` sweeps it.
+    round_audio_paths: list
+    grounding_sources: list
+    grounding_profile_key: Any
+    #: The image fields a mid-round `!image` replaces for the seats after it.
+    is_image_gen_round: bool
+    image_gen_prompt: str
+    generated_image_path_for_round: Optional[str]
+    generator_profile_key: Any
+    generator_display_name: str
+    image_gen_error_msg: Optional[str]
+    #: The next seat's container, opened by the handoff before that seat's turn begins.
+    pending_state_container: Optional[dict]
+    #: (speaker, reply) for each seat that has answered: what later seats search their
+    #: memories with, and the round so far that speech is voiced against.
+    responses_this_round: list = field(default_factory=list)
+    #: One follow-up raised per round across the cast, so a round never turns into
+    #: everyone's reminders at once.
+    follow_up_raised_this_round: bool = False
 
 
 class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, RegenerationMixin,
@@ -1055,7 +1104,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     ):
                         print(f"Whisper barrier timed out in channel {channel_id}; proceeding with the round.")
 
-                was_blocked = False
                 generator_profile_key = None
                 generator_display_name = "A participant"
                 image_gen_error_msg = None
@@ -1078,12 +1126,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         else:
                             generator_display_name = gen_effective_profile_name
 
-                responses_this_round = []
-                # One follow-up raised per round across the cast, so a round never turns
-                # into everyone's reminders at once.
-                follow_up_raised_this_round = False
-                # [NEW] Track round-specific audio segments for stitching
-                round_audio_segments = []
                 # [FIXED] Populate initial context immediately from batched triggers
                 initial_round_context = "\n".join([t[0] for t in new_round_turn_data])
 
@@ -1228,1100 +1270,25 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             image_gen_placeholder_id, image_gen_error_msg,
                         )
 
+                rnd = Round(
+                    session=session, session_type=session_type, channel_id=channel_id, channel=channel,
+                    profile_order=profile_order, all_triggers_for_round=all_triggers_for_round,
+                    new_round_turn_data=new_round_turn_data, batch_start_index=batch_start_index,
+                    round_author_name=round_author_name, triggering_user_id=triggering_user_id,
+                    anchor_message=anchor_message, single_turn_round=single_turn_round,
+                    is_proactive_auto_round=is_proactive_auto_round, proactive_follow_up=proactive_follow_up,
+                    pre_generation_warnings=pre_generation_warnings, urls_skipped=urls_skipped,
+                    round_url_turns=round_url_turns, round_audio_paths=round_audio_paths,
+                    grounding_sources=grounding_sources, grounding_profile_key=grounding_profile_key,
+                    is_image_gen_round=is_image_gen_round, image_gen_prompt=image_gen_prompt,
+                    generated_image_path_for_round=generated_image_path_for_round,
+                    generator_profile_key=generator_profile_key, generator_display_name=generator_display_name,
+                    image_gen_error_msg=image_gen_error_msg, pending_state_container=pending_state_container)
                 for i, participant in enumerate(profile_order):
-                    session['round_order'] = (profile_order, i)
-                    turn_warnings = []
-                    if i == 0:
-                        turn_warnings.extend(pre_generation_warnings)
-
-                    api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "gemini")
-                    or_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "openrouter")
-                    
-                    # Initialize turn-specific variables at the very start of the loop
-                    is_generator = False
-                    p_settings = {}
-                    participant_key = (participant['owner_id'], participant['profile_name'])
-                    turn_grounding_sources = []
-                    if participant_key == grounding_profile_key:
-                        turn_grounding_sources.extend(grounding_sources)
-                    sources_text_list = []
-                    contents_for_api_call = [] 
-                    response_text = ""
-                    was_blocked = False
-                    placeholder_message = None
-                    # Critic audit trail. Bound out here because the meta block that
-                    # records them sits after the generation try/except, and a turn that
-                    # failed before the critic ran still writes a turn object.
-                    critic_constraints = None
-                    critic_settings = None
-                    critic_source = None
-                    critic_hint = None
-                    # Bound per participant, not per round: the teardown paths below sit
-                    # outside the generation try/except, so an early failure used to reach
-                    # them with the *previous* participant's container -- or, on the first
-                    # participant, with none at all (UnboundLocalError).
-                    #
-                    # Usually already open, with this participant's placeholder on its way:
-                    # the feedback step opens it for the first seat, the previous turn's
-                    # handoff for every later one. Taken here, so every exit below owns it.
-                    state_container = pending_state_container
-                    pending_state_container = None
-                    # Same hazard, same fix, for the three the meta block reads. They are
-                    # assigned deep inside the generation try/except -- the gather at the
-                    # top of it, and the neuro extraction after the response lands -- so a
-                    # turn that raises before those points reaches the meta block with the
-                    # *previous* participant's values still bound. The `in locals()` guards
-                    # there only ever caught the first participant's UnboundLocalError;
-                    # from the second onwards they read True and recorded profile A's
-                    # recalls, training count and hormone vector onto profile B's turn.
-                    ltm_recall = None
-                    training_examples_list = []
-                    parsed_neuro_state = None
-                    parsed_ltm_flag = False
-                    # (setter's turn_id, record) raised in this turn's prompt, and the one
-                    # its reply set, for the meta block -- same hazard as the four above.
-                    raised_follow_up = None
-                    set_follow_up = None
-
-                    if not self._may_still_speak(session, participant):
-                        await self._abandon_state_container(channel, state_container, session=session)
-                        continue
-
-                    # Resolve Real-time settings
-                    p_owner_id = participant['owner_id']
-                    p_name = participant['profile_name']
-                    p_index = self.cog.profile_manager._get_user_index(p_owner_id)
-                    p_is_b = p_name in p_index.get("borrowed", [])
-                    p_settings = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_b)
-                    if p_settings is None:
-                        # Deleted since the round began: a turn now is paid for and spoken
-                        # with no persona. The next hydration unseats it.
-                        await self._abandon_state_container(channel, state_container, session=session)
-                        continue
-
-                    is_ollama = p_settings.get("primary_model", "").upper().startswith("OLLAMA/")
-                    
-                    if not api_key and not or_key and not is_ollama:
-                        await self._abandon_state_container(channel, state_container, session=session)
-                        if i == 0:
-                            # Not `triggering_user_id`: that falls back to the session's
-                            # owner for a round nobody started.
-                            await self._notify_no_server_key(
-                                channel, self._first_human_author(all_triggers_for_round))
+                    if not await self._run_seat_turn(rnd, i, participant):
                         break
-
-                    # Ensure custom_main is safely bound early for error fallback
-                    custom_main = p_settings.get("error_response", "An error has occurred.")
-
-                    # Check Image Gen intent vs Profile Toggle
-                    if is_image_gen_round and participant_key == generator_profile_key:
-                        is_generator = p_settings.get("image_generation_enabled", False)
-
-                    placeholder_message = None
-                    response_text = ""
-
-                    profile_settings = {} # Initialize to prevent UnboundLocalError
-                    t1_start_mono = time.monotonic()
-                    self.cog.session_manager._mark_session_accessed(channel_id)
-                    participant_key = (participant['owner_id'], participant['profile_name'])
-                    
-                    if participant.get('method') == 'child_bot':
-                        p_owner_id_typing = participant['owner_id']
-                        p_name_typing = participant['profile_name']
-                        p_index_typing = self.cog.profile_manager._get_user_index(p_owner_id_typing)
-                        p_is_b_typing = p_name_typing in p_index_typing.get("borrowed", [])
-                        p_settings_typing = self.cog.profile_manager._get_profile_config(p_owner_id_typing, p_name_typing, p_is_b_typing) or {}
-                        
-                        if not p_settings_typing.get("child_bot_placeholder", False):
-                            await self.cog.manager_queue.put({
-                                "action": "send_to_child", "bot_id": participant['bot_id'],
-                                "payload": {"action": "start_typing", "channel_id": channel_id}
-                            })
-
-                    owner_id = participant['owner_id']
-                    profile_name = participant['profile_name']
-                    session_key = (channel_id, owner_id, profile_name)
-                    attempt = ReplyAttempt()
-
-                    # [FIX] Initialize these before the try block to prevent UnboundLocalError
-                    response = None
-                    response_text = ""
-                    was_blocked = False
-                    # Assigned from _construct_system_instructions well inside the try below,
-                    # but read by the meta block after the except handler. Anything that
-                    # raises before that point — a missing guild API key is the common one —
-                    # left it unbound, so the recovery path itself died with an
-                    # UnboundLocalError and masked the real error.
-                    fallback_model_name = None
-
-                    # Backstop only. profile_order was filtered before the feedback step, so
-                    # this fires only if the channel's age-restricted flag is flipped mid-round.
-                    refusal = self.cog.content_rating.placement_refusal(owner_id, profile_name, channel)
-                    if refusal:
-                        await self._abandon_state_container(channel, state_container, session=session)
-                        await self._refuse_placement(session, channel, owner_id, profile_name, refusal)
-                        continue
-
-                    user_index = self.cog.profile_manager._get_user_index(owner_id)
-                    is_borrowed = profile_name in user_index.get("borrowed", [])
-                    effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
-
-                    speaker_display_name = profile_name
-                    appearance_data = self.cog.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
-                    if appearance_data.get("custom_display_name"):
-                        speaker_display_name = appearance_data["custom_display_name"]
-
-                    placeholder_message = None
-                    response_text = ""
-
-                    try:
-                        # No key gate here. The provider-aware gate above already broke out
-                        # of the loop if this participant has nothing to route with. Re-checking
-                        # only the Gemini slot killed every turn on OpenRouter-only or Ollama
-                        # servers, and on a Gemini server whose key was inside the 60s 429
-                        # cooldown -- both reported as "not configured", which they are not.
-                        msg_a_id = None
-                        app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
-                        
-                        # Opened already unless the seat before this one left the loop
-                        # before its handoff. The first participant's container is also the
-                        # one the image round ticked, so a placeholder its heartbeat spawned
-                        # is already recorded here.
-                        if state_container is None:
-                            state_container = await self._open_turn_feedback(
-                                session, channel, participant, p_settings)
-
-                        # A `!image` taken in mid-round is drawn here, by the seat it reached,
-                        # as the opening one is before the loop: the seats after see this image.
-                        # Not by a seat that cannot draw: the request stays an ordinary message.
-                        mid_round_image = session.pop('pending_image_gen_data', None)
-                        if mid_round_image and p_settings.get("image_generation_enabled", False):
-                            if generated_image_path_for_round:
-                                # The round's earlier image, posted by its seat already.
-                                try: os.remove(generated_image_path_for_round)
-                                except OSError: pass
-                            is_image_gen_round = is_generator = True
-                            image_gen_prompt = mid_round_image['prompt']
-                            generator_profile_key = participant_key
-                            generator_display_name = speaker_display_name
-                            # Its search, as the opening image's: into the image prompt alone.
-                            if image_rag_enabled(p_settings):
-                                grounded = await self._await_with_status(
-                                    self.cog.tools_service._get_hybrid_grounding_context(
-                                        image_gen_prompt, channel.guild.id,
-                                        self._grounding_history(session, participant, p_settings, len(profile_order)),
-                                        p_settings, owner_id, safety_settings=_resolve_safety_settings(channel),
-                                        is_for_image=True, warning_channel=channel),
-                                    STATUS_SEARCHING_WEB, channel, participant, state_container)
-                                if grounded:
-                                    g_context, g_sources, _, g_warning = grounded
-                                    if g_warning:
-                                        turn_warnings.append(g_warning)
-                                    if g_context:
-                                        image_gen_prompt = self.cog.global_prompts.get(
-                                            "IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING).format(
-                                                prompt=image_gen_prompt, grounding=g_context)
-                                        turn_grounding_sources.extend(g_sources or [])
-                            (generated_image_path_for_round, _,
-                             image_gen_error_msg) = await self._run_image_generation_round(
-                                session, channel, participant_key, image_gen_prompt,
-                                speaker_display_name, participant, state_container,
-                                new_round_turn_data)
-
-                        # [NEW] Hybrid STM: Rebuild history dynamically from unified_log.
-                        # Whatever this round appended is reserved, so a batch of user
-                        # messages does not push history out of the window. Anything built
-                        # into contents_for_api_call before this point would be discarded
-                        # by the assignment -- the URL context and the kickstart fallback
-                        # are both re-applied below, from supplementary_parts.
-                        bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-
-                        # Read Reactions caught since the last seat spoke, appended for this
-                        # one. The first seat's were committed with the round.
-                        if i and commit_reactions(session, len(session.get("unified_log", []))):
-                            self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
-
-                        unified_log = session.get("unified_log", [])
-                        hide_folded = self.cog.session_manager.compaction_enabled(session)
-                        contents_for_api_call = self.cog.session_manager._build_history_for_participant(
-                            unified_log, bot_pid, p_settings,
-                            len(profile_order) or 1,
-                            reserved_tail=len(unified_log) - batch_start_index,
-                            hide_folded=hide_folded,
-                        )
-
-                        round_context_text = "\n".join([t[0] for t in new_round_turn_data])
-                        dynamic_context_for_turn = (round_context_text + "\n" + "\n".join(
-                            text for _, text in responses_this_round)).strip()
-                        
-                        if not dynamic_context_for_turn and session.get("unified_log"):
-                            # Fallback to the last available turn for vector search context
-                            dynamic_context_for_turn = session["unified_log"][-1].get("content", "")
-
-                        # Parallelise Training Examples, LTM retrieval, and Help Context
-                        ltm_task = self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, unified_log, owner_id, profile_name, dynamic_context_for_turn, round_author_name, channel.guild.id, triggering_user_id,
-                                                                       threshold=ltm_auto_threshold(p_settings))
-                        training_task = self.cog.memory_manager._get_relevant_training_examples(owner_id, profile_name, dynamic_context_for_turn, channel.guild.id)
-                        
-                        help_task = None
-                        if p_settings.get("help_mode_enabled", False):
-                            help_task = self.cog.help_service._get_relevant_help_context(dynamic_context_for_turn, channel.guild.id)
-                        
-                        tasks_to_gather = [ltm_task, training_task]
-                        if help_task: tasks_to_gather.append(help_task)
-                            
-                        gathered_results = await asyncio.gather(*tasks_to_gather)
-                        ltm_recall = gathered_results[0]
-                        training_examples_list = gathered_results[1]
-                        help_context_text = gathered_results[2] if help_task else None
-
-                        # The session's critic, on every seat it was not told to leave out.
-                        # Persistence is how many further rounds a constraint stays in force.
-                        critic_settings = resolve_critic_settings(session)
-                        if not critic_settings["enabled"] or self.cog.session_manager.participant_identity(
-                                participant)[1] in critic_settings["skip"]:
-                            critic_settings = None
-                        if critic_settings:
-                            cache = session.setdefault("critic_cache", {}).get(participant_key)
-
-                            if cache and cache.get("rounds", 0) > 0:
-                                critic_constraints = cache["text"]
-                                critic_source = "cache"
-                                cache["rounds"] -= 1
-                            else:
-                                # "session" scope screens this profile against every
-                                # screened seat's recent lines instead of only its own: a
-                                # seat left out is usually there for a catchphrase, which
-                                # would trip everyone else's scan. Walked backwards and
-                                # stopped at the quota, not filtered over the whole log:
-                                # this is tail-local state.
-                                session_transcript = None
-                                if critic_settings["scope"] == "session":
-                                    session_transcript = []
-                                    for _t in reversed(unified_log):
-                                        if (_t.get("is_user") or _t.get("type") or _t.get("is_hidden")
-                                                or (hide_folded and _t.get("compacted"))
-                                                or _t.get("speaker_pid") in critic_settings["skip"]):
-                                            continue
-                                        session_transcript.append(_t.get("content", ""))
-                                        if len(session_transcript) >= critic_settings["lookback"]:
-                                            break
-                                    session_transcript.reverse()
-
-                                # _run_critic scans recent role=='model' turns; contents_for_api_call is
-                                # already the unified_log-derived history for this participant.
-                                critic_constraints, critic_source = await self.cog.tools_service._run_critic(
-                                    contents_for_api_call, speaker_display_name, channel.guild.id,
-                                    session, session_transcript=session_transcript,
-                                )
-                                if critic_constraints and critic_settings["persistence"] > 0:
-                                    session["critic_cache"][participant_key] = {
-                                        "text": critic_constraints,
-                                        "rounds": critic_settings["persistence"],
-                                    }
-                            # The variety nudge, in any mode but Off and fresh every turn: a
-                            # cached constraint skips _run_critic, and it would go quiet with
-                            # it. Off this character's own replies whatever the scope -- a
-                            # shape is one character's rut, not the cast's.
-                            critic_hint = variety_hint(
-                                own_replies(contents_for_api_call, max(3, critic_settings["lookback"])))
-
-                        # _construct_system_instructions places <negative_constraints>
-                        # itself, so the critic has to have run by now. It reads only
-                        # contents_for_api_call and the log tail, both of which are built
-                        # above, so moving it ahead of this call costs nothing.
-                        # One tuple for the prompt and both models -- see tool_loop.
-                        functions = functions_for(p_settings)
-                        follow_up_block = None
-                        if follow_ups.enabled(session):
-                            if proactive_follow_up and proactive_follow_up[0] == participant:
-                                raised_follow_up = proactive_follow_up[1]
-                            elif not follow_up_raised_this_round:
-                                raised_follow_up = follow_ups.due(unified_log, bot_pid, owner_id, time.time())
-                            follow_up_block = follow_ups.prompt_block(
-                                self.cog.global_prompts, raised_follow_up, unified_log)
-                        full_system_instruction, turn_context, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
-                            self._construct_system_instructions,
-                            owner_id, profile_name, channel.id, is_multi_profile=True,
-                            training_examples_list=training_examples_list, recalled_ltm=ltm_recall.text,
-                            critic_constraints=critic_constraints, variety_hint=VARIETY_HINTS.get(critic_hint),
-                            follow_up_block=follow_up_block, functions=functions,
-                        )
-
-                        session_key = (channel.id, owner_id, profile_name)
-
-                        # The history ends on this character's own turn when nobody has
-                        # answered it -- which note that earns is `kickstart_note`.
-                        follow_up = kickstart_note(contents_for_api_call, self.cog.global_prompts, unified_log)
-                        if follow_up and contents_for_api_call[-1]['role'] == 'user':
-                            contents_for_api_call[-1]['parts'].append(follow_up)  # after <reactions>
-                        elif follow_up:
-                            contents_for_api_call.append({'role': 'user', 'parts': [follow_up]})
-
-                        # Collect all supplementary context to inject into the final user turn.
-                        # The turn context first: straight after the conversation, ahead of
-                        # the round's own material, so the transcript before it stays a
-                        # cacheable prefix.
-                        supplementary_parts = [turn_context] if turn_context else []
-                        supplementary_parts.extend(round_notes(all_triggers_for_round))
-
-                        # [UPDATED] Standardised XML injection for pending whispers
-                        whisper_context = whisper_recap(
-                            session.get("pending_whispers", {}).pop(participant_key, None),
-                            p_settings.get("timezone"), self.cog.global_prompts)
-                        if whisper_context:
-                            supplementary_parts.append(whisper_context)
-
-                        if help_context_text:
-                            supplementary_parts.append(help_context_text)
-
-                        # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
-                        # This allows participants to see images this round without them persisting in RAM history.
-                        all_current_media, media_skipped_note = self._round_media(
-                            new_round_turn_data, links=resolve_url_mode(p_settings) != "off",
-                            emojis=server_context_guild(session, channel) is not None)
-                        if media_skipped_note:
-                            supplementary_parts.append(media_skipped_note)
-                        if urls_skipped and resolve_url_mode(p_settings) == "rag":
-                            supplementary_parts.append(ROUND_URLS_SKIPPED_NOTE.format(
-                                limit=ROUND_URL_MESSAGES_MAX, count=urls_skipped))
-                        if all_current_media:
-                            supplementary_parts.extend(labelled(all_current_media))
-                        
-                        if is_image_gen_round:
-                            if generated_image_path_for_round:
-                                if is_generator:
-                                    present_template = self.cog.global_prompts.get("IMAGE_PRESENT", DEFAULT_IMAGE_PRESENT)
-                                    system_note = present_template.format(prompt=image_gen_prompt)
-                                else:
-                                    other_template = self.cog.global_prompts.get("IMAGE_PRESENT_OTHER", DEFAULT_IMAGE_PRESENT_OTHER)
-                                    system_note = other_template.format(name=generator_display_name, prompt=image_gen_prompt)
-                                
-                                text_gen_parts = [
-                                    system_note,
-                                    {"mime_type": generated_image_attachment(generated_image_path_for_round)[1],
-                                     "url": generated_image_path_for_round}
-                                ]
-                                supplementary_parts.extend(text_gen_parts)
-                            else:
-                                if is_generator:
-                                    fail_reason = image_gen_error_msg or "Safety Filter / Unknown"
-                                    failed_template = self.cog.global_prompts.get("IMAGE_FAILED", DEFAULT_IMAGE_FAILED)
-                                    system_note = failed_template.format(prompt=image_gen_prompt, reason=fail_reason)
-                                    supplementary_parts.append(system_note)
-
-                        if not contents_for_api_call:
-                            contents_for_api_call.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
-
-                        # Inject supplementary parts into the final user turn to ensure alternating roles
-                        if supplementary_parts:
-                            if contents_for_api_call[-1].get('role') == 'user':
-                                contents_for_api_call[-1]['parts'].extend(supplementary_parts)
-                            else:
-                                contents_for_api_call.append({'role': 'user', 'parts': supplementary_parts})
-
-                        # [NEW] Advanced Params Injection
-                        p_index = self.cog.profile_manager._get_user_index(owner_id)
-                        p_is_borrowed = profile_name in p_index.get("borrowed", [])
-                        profile_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
-                        
-                        gen_config = reply_gen_config(profile_settings, temp, top_p, top_k)
-
-                        all_participant_names = self._participant_names(session)
-
-                        try:
-                            # Waited on, never awaited directly: an await cancelled the send
-                            # along with the turn, losing the id of a message Discord had
-                            # already posted. The send records that id on the container itself.
-                            await self._await_turn_feedback(state_container)
-                            msg_a_id = state_container.get('msg_a_id')
-                            attempt = await self._attempt_reply(
-                                channel=channel, participant=participant, p_settings=p_settings,
-                                owner_id=owner_id, user_id=triggering_user_id,
-                                system_instruction=full_system_instruction, primary_model=primary_model,
-                                fallback_model_name=fallback_model_name, history=contents_for_api_call,
-                                gen_config=gen_config, msg_a_id=msg_a_id, app_name=app_name,
-                                app_avatar=app_avatar, state_container=state_container,
-                                participant_names=all_participant_names, log_context="multi_profile",
-                                probe_label=f"  participant turn {i}", functions=functions)
-                        except asyncio.CancelledError:
-                            await self._abandon_state_container(
-                                channel, state_container, session=session,
-                                bot_id=participant.get('bot_id'))
-                            if 'contents_for_api_call' in locals():
-                                contents_for_api_call.clear()
-                                del contents_for_api_call
-                            raise
-                        response = attempt.response
-
-                        reply = self._reply_text(attempt, p_settings, owner_id, profile_name, all_participant_names,
-                                                 guild=server_context_guild(session, channel))
-                        response_text, was_blocked, parsed_neuro_state = reply.text, reply.blocked, reply.neuro_state
-                        # A blocked reply is not one worth remembering. On the seat, in memory
-                        # like `_ltm_retry_at`, for `_ltm_due` at this round's end.
-                        parsed_ltm_flag = reply.ltm_flag and not was_blocked and ltm_flag_enabled(p_settings)
-                        if parsed_ltm_flag:
-                            participant["_ltm_flag"] = True
-                        # Not from a round nobody asked for: set there, one would bring an
-                        # absent person back up every time the channel went quiet.
-                        if (reply.follow_up and not was_blocked and not is_proactive_auto_round
-                                and follow_ups.enabled(session)):
-                            set_follow_up = follow_ups.resolve(
-                                reply.follow_up, session.get("unified_log", []), time.time())
-                            if set_follow_up:
-                                follow_ups.note_set(session, set_follow_up)
-                                self.cog.session_manager._save_multi_profile_sessions()
-                        turn_warnings.extend(reply.warnings)
-                        if reply.sources is not None:
-                            turn_grounding_sources.extend(reply.sources)
-                            sources_text_list = _format_citation_subtext(turn_grounding_sources)
-                            
-                        # --- Native Tool Extraction (Citations) ---
-                        # Native citations are now handled inline directly in the text response above.
-                            
-                        # --- Placeholder Update & Sending ---
-                        if not was_blocked:
-                            # spawn_after: everything below this point -- speech synthesis
-                            # above all -- happens before the turn is delivered, and a child
-                            # bot with no placeholder of its own has nothing on screen once
-                            # its typing indicator expires nine seconds in.
-                            await self._update_sending_placeholder(channel, participant.get('method', 'webhook'), participant.get('bot_id'), state_container, t1_start_mono, spawn_after=10.0)
-
-                    except Exception as e:
-                        print(f"Multi-profile generation error for '{profile_name}': {e}")
-                        traceback.print_exc()
-                        response_text = f"{custom_main}\n\n-# Blocked due to: **Unknown**."
-                        # `was_blocked` stays False here, and the turn is the error text: a
-                        # follow-up raised to it was never answered, nor one set by it.
-                        raised_follow_up = set_follow_up = None
-
-                    participant_key = (participant['owner_id'], participant['profile_name'])
-
-                    # Inside the participant loop, after response extraction:
-                    
-                    thought_text = ""
-                    if hasattr(response, 'thought') and response.thought:
-                        thought_text = response.thought.strip()
-                    
-                    # Deduplication logic (handled in previous step)
-                    if thought_text and response_text:
-                        if thought_text in response_text:
-                            response_text = response_text.replace(thought_text, "").strip()
-                        
-                        response_text = re.sub(r'^\**Thoughts:?\**\n?', '', response_text, flags=re.IGNORECASE).strip()
-                        response_text = re.sub(r'^\**Reasoning:?\**\n?', '', response_text, flags=re.IGNORECASE).strip()
-
-                        if len(thought_text) > 50:
-                            snippet = thought_text[:50]
-                            if snippet in response_text:
-                                parts = response_text.split(snippet, 1)
-                                if len(parts) > 1:
-                                    response_text = parts[1].strip()
-
-                    # [NEW] Reformat summary text: one sentence per line
-                    if thought_text:
-                        sentences = _split_into_sentences_with_abbreviations(thought_text)
-                        thought_text = "\n".join(sentences)
-
-                    # Update Display Text and Prepare Thought File
-                    display_text = response_text
-                    thought_file_to_send = None
-                    if thought_text and p_settings.get("thinking_summary_visible") == "on":
-                        thought_file_to_send = discord.File(io.BytesIO(thought_text.encode('utf-8')), filename="thinking_summary.txt")
-
-                    t2_end_mono = time.monotonic()
-                    duration = t2_end_mono - t1_start_mono
-                    sent_timestamp = datetime.datetime.now(datetime.timezone.utc) 
-
-                    timezone_str = profile_settings.get("timezone", "UTC")
-                    profile_id = self.cog.profile_manager._get_profile_id(owner_id, profile_name)
-                    main_history_line = _format_history_entry(speaker_display_name, sent_timestamp, response_text, timezone_str, entity_id=profile_id)
-                    
-                    history_line = main_history_line
-
-                    turn_id = str(uuid.uuid4())
-                    bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
-                    
-                    # Anti-Repetition Critic. Recorded only when the critic was actually
-                    # on for this seat, so an absent key reads as "off" rather
-                    # than as an empty verdict -- the same contract as neuro_state. The
-                    # text is capped because this rides in every turn of a 1000-turn log
-                    # that is re-serialised, re-compressed and re-encrypted on flush.
-                    critic = None
-                    if critic_settings and critic_settings["enabled"]:
-                        critic = {
-                            "mode": critic_settings["mode"],
-                            "scope": critic_settings["scope"],
-                            "strictness": critic_settings["strictness"],
-                            "lookback": critic_settings["lookback"],
-                            "source": critic_source,
-                            "text": (critic_constraints or "")[:CRITIC_AUDIT_TEXT_MAX],
-                            **({"hint": critic_hint} if critic_hint else {}),
-                        }
-                    meta = reply_meta(
-                        attempt, duration=duration, training_examples=training_examples_list,
-                        ltm_recall=ltm_recall, sources=turn_grounding_sources,
-                        neuro_state=parsed_neuro_state, critic=critic,
-                        ltm_flag=parsed_ltm_flag)
-                    if set_follow_up:
-                        meta["follow_up"] = set_follow_up
-                    # Raised means put to the character: answered whether it brought the
-                    # thing up or let it go, as the reminder allows. A blocked reply saw it
-                    # and said nothing, so it stays for the next turn.
-                    if raised_follow_up and not was_blocked:
-                        meta["follow_up_answered"] = raised_follow_up[0]
-                        follow_up_raised_this_round = True
-
-                    turn_object = {
-                        "turn_id": turn_id,
-                        "is_user": False,
-                        "speaker_pid": bot_pid,
-                        "owner_id": owner_id,
-                        "profile_name": profile_name,
-                        "message_ids": [],
-                        "content": history_line,
-                        "meta": meta
-                    }
-                    
-                    # Clean up any legacy signature if it exists
-                    turn_object.pop('thought_signature', None)
-                    
-                    session.setdefault("unified_log", []).append(intern_turn(turn_object))
-                    session['last_speaker_key'] = participant_key
-                    # What the seats after this one search their memories with, and the
-                    # speech that voices them hears as the round so far.
-                    if not was_blocked:
-                        responses_this_round.append((speaker_display_name, response_text))
-
-                    # Append only. The delivery branches below flush as soon as the
-                    # message_ids are known, and the round-end flush backs that up.
-                    session_type = session.get("type", "multi")
-                    self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
-
-                    # [NEW] Unified Synthesis Logic
-                    audio_file_for_send = None
-                    turn_audio_path = None
-                    #: The messages meant to carry this turn's audio, to tell afterwards
-                    #: whether Discord took it.
-                    audio_carriers = []
-                    
-                    # Not for a reply that failed: that is the profile's error text, and
-                    # voicing it bought a second paid call and held the failure back for
-                    # the half-minute synthesis takes.
-                    if (profile_settings.get("speech_tts_enabled", False) and session.get("audio_mode", "off") == "on"
-                            and not was_blocked):
-                        s_voice = profile_settings.get("speech_voice", DEFAULT_SPEECH_VOICE)
-                        s_model = profile_settings.get("speech_model")
-                        if s_model and "none" not in s_model.lower():
-                            # 1. Build Contextual Round Transcript
-                            round_transcript = ""
-                            for prev_name, prev_resp in responses_this_round[:-1]:
-                                round_transcript += f"{prev_name}: {prev_resp}\n\n"
-
-                            # 2. Construct Conditional Markdown Prompt
-                            s_temp = float(profile_settings.get("speech_temperature", 1.0))
-                            s_arch = profile_settings.get("speech_archetype", "")
-                            s_acc = profile_settings.get("speech_accent", "")
-                            s_dyn = profile_settings.get("speech_dynamics", "")
-                            s_styl = profile_settings.get("speech_style", "")
-                            s_pace = profile_settings.get("speech_pacing", "")
-
-                            prompt_parts = []
-                            if s_arch or s_acc:
-                                part = f"# AUDIO PROFILE: {speaker_display_name}\n"
-                                if s_arch: part += f"Archetype: {s_arch}\n"
-                                if s_acc: part += f"Accent: {s_acc}\n"
-                                prompt_parts.append(part.strip())
-                            if s_dyn:
-                                part = f"## THE SCENE\nDynamics: {s_dyn}\nAction: Fluid conversation."
-                                prompt_parts.append(part.strip())
-                            if s_styl or s_pace:
-                                part = "### DIRECTOR'S NOTES\n"
-                                if s_styl: part += f"Style: {s_styl}\n"
-                                if s_pace: part += f"Pacing: {s_pace}\n"
-                                prompt_parts.append(part.strip())
-                            if round_transcript:
-                                prompt_parts.append(f"#### SAMPLE CONTEXT\nPrevious turn flow:\n{round_transcript.strip()}")
-                            prompt_parts.append(f"#### TRANSCRIPT\n{speaker_display_name}: {response_text}")
-
-                            # Only once there is direction above it -- see
-                            # TTS_SYNTHESIS_PREAMBLE. prompt_parts always ends with the
-                            # transcript, so anything beyond it is a director section.
-                            if len(prompt_parts) > 1:
-                                prompt_parts.insert(0, TTS_SYNTHESIS_PREAMBLE)
-
-                            tts_priming_prompt = "\n\n".join(prompt_parts)
-                            # The same direction for a model that would read the prompt above
-                            # aloud (Gemini 3.8): one style line sent beside the bare reply.
-                            tts_style = "; ".join(f"{label}: {value}" for label, value in (
-                                ("Archetype", s_arch), ("Accent", s_acc), ("Scene", s_dyn),
-                                ("Style", s_styl), ("Pacing", s_pace)) if value)
-
-                            # 3. Synthesise Audio
-                            #
-                            # The heartbeat started before this is still the one running, so
-                            # the phase is renamed rather than restarted. Without it a TTS
-                            # round trip reads as "Sending..." for half a minute, which is
-                            # both wrong and the least informative thing it could say.
-                            if state_container:
-                                state_container['phase_label'] = "Synthesising speech"
-                            try:
-                                turn_audio_path = await self.cog.media_service.synthesise_speech(
-                                    response_text,
-                                    channel.guild.id,
-                                    directed_prompt=tts_priming_prompt,
-                                    style=tts_style or None,
-                                    voice_sample_of=(owner_id, profile_name),
-                                    user_id=triggering_user_id,
-                                    config_owner_id=owner_id,
-                                    model_id=s_model,
-                                    voice_name=s_voice,
-                                    temperature=s_temp,
-                                    speed=profile_settings.get("speech_speed"),
-                                    language_code=profile_settings.get("speech_language") or None,
-                                    fallback_model_id=profile_settings.get("speech_fallback_model"),
-                                    # Audio past it is paid for and then refused, so a model
-                                    # billed by the second is capped here, not only checked below.
-                                    max_bytes=upload_limit_bytes(channel.guild),
-                                )
-                                round_audio_paths.append(turn_audio_path)
-                            except asyncio.CancelledError:
-                                raise
-                            except Exception as e:
-                                tts_reason = _format_api_error(e)
-                                print(f"Text-to-speech failed for '{profile_name}': {tts_reason}")
-                                turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason=tts_reason))
-                            finally:
-                                if state_container:
-                                    state_container['phase_label'] = "Sending"
-
-                            if turn_audio_path:
-                                # Checked before sending, so a file over the limit is never
-                                # uploaded only to be refused.
-                                audio_size = os.path.getsize(turn_audio_path)
-                                upload_limit = upload_limit_bytes(channel.guild)
-                                if audio_size > upload_limit:
-                                    turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(
-                                        reason=ERR_REASON_AUDIO_TOO_LARGE.format(
-                                            size=f"{audio_size / 1048576:.1f}",
-                                            limit=f"{upload_limit / 1048576:.0f}")))
-                                else:
-                                    audio_file_for_send = discord.File(
-                                        turn_audio_path,
-                                        filename=sent_file_name(speaker_display_name, response_text,
-                                                                os.path.splitext(turn_audio_path)[1], "voice"))
-
-                    file_to_send = None
-                    extra_audio_file = None
-                    if is_generator and generated_image_path_for_round:
-                        file_to_send = discord.File(
-                            generated_image_path_for_round,
-                            filename=generated_image_attachment(
-                                generated_image_path_for_round, generator_display_name, image_gen_prompt)[0])
-                        if audio_file_for_send:
-                            extra_audio_file = audio_file_for_send
-                    elif audio_file_for_send:
-                        file_to_send = audio_file_for_send
-
-                    is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
-                    typing_cursor_mode, typing_cursor_emoji = resolve_typing_cursor(
-                        profile_settings, PLACEHOLDER_EMOJI)
-
-                    # Realistic typing streams its own first chunk instead of editing the
-                    # placeholder, so the placeholder has to come down before the send --
-                    # but not a moment earlier. This teardown used to sit above the speech
-                    # synthesis block, which meant that with realistic typing *and* audio
-                    # enabled the placeholder vanished and the channel then showed nothing
-                    # at all for the whole duration of the TTS round-trip. Deferring it to
-                    # here keeps the placeholder (and its "Sending..." heartbeat) up until
-                    # the turn is genuinely ready to be delivered.
-                    if is_realistic_typing:
-                        await self._stop_sending_heartbeat(state_container)
-                        msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
-                        msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
-                        # bot_id, because a child bot participant reaches this branch too.
-                        # Without it the webhook delete 10008s and the client delete needs
-                        # Manage Messages -- and the ids are cleared either way, so the
-                        # bot_id-aware delete a dozen lines below never got a second go at
-                        # them. That left the placeholder in the channel for good.
-                        p_bot_id = participant.get('bot_id')
-                        await self._safe_delete_placeholder(channel, msg_a_to_delete, bot_id=p_bot_id)
-                        await self._safe_delete_placeholder(channel, msg_b_to_delete, bot_id=p_bot_id)
-                        if state_container:
-                            state_container['msg_a_id'] = None
-                            state_container['msg_b_id'] = None
-
-                    if participant.get('method') == 'child_bot':
-                        # Stop any pending sending heartbeat task immediately
-                        await self._stop_sending_heartbeat(state_container)
-
-                        # Delete placeholder before child bot delivers
-                        msg_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
-                        if msg_to_delete:
-                            await self._safe_delete_placeholder(channel, msg_to_delete, bot_id=participant.get('bot_id'))
-                            if state_container:
-                                state_container['msg_a_id'] = None
-
-                        rmode = profile_settings.get("response_mode", "regular")
-                        reply_id = None
-                        should_ping = False
-
-                        if i == 0:
-                            if anchor_message and rmode == "mention":
-                                display_text = f"{anchor_message.author.mention} {display_text}"
-                            reply_id = anchor_message.id if (anchor_message and rmode in ["reply", "mention_reply"]) else None
-                            should_ping = (rmode == "mention_reply")
-
-                        payload = {
-                            "channel_id": channel.id, "content": display_text,
-                            "realistic_typing": is_realistic_typing,
-                            "typing_cps": profile_settings.get("typing_cps", 30.0),
-                            "typing_max_delay": profile_settings.get("typing_max_delay", 2.5),
-                            "typing_mode": profile_settings.get("typing_mode", "sentence"),
-                            "typing_cursor": typing_cursor_mode,
-                            "typing_cursor_emoji": typing_cursor_emoji,
-                            "reply_to_id": reply_id, "ping": should_ping,
-                            # The seat, which on a borrow is not the bot's own profile.
-                            "signer": (owner_id, profile_name)
-                        }
-
-                        if file_to_send:
-                            # The child bot lives in this process, so it can open the
-                            # file itself: no read, no base64, nothing resident here.
-                            attachment_data = None
-                            if is_generator and generated_image_path_for_round:
-                                attachment_data = {
-                                    "filename": generated_image_attachment(
-                                        generated_image_path_for_round, generator_display_name, image_gen_prompt)[0],
-                                    "path": generated_image_path_for_round
-                                }
-                            elif audio_file_for_send:
-                                attachment_data = {
-                                    "filename": audio_file_for_send.filename,
-                                    "path": turn_audio_path
-                                }
-                            if attachment_data:
-                                payload["attachment"] = attachment_data
-                            if attachment_data and attachment_data.get("path"):
-                                # file_to_send was opened from this same path for the
-                                # webhook branch and is never sent here -- execute_send
-                                # opens its own handle. Release the descriptor rather
-                                # than leaving it to the round's teardown.
-                                file_to_send.close()
-                                file_to_send = None
-
-                        # Direct in-process execution (replaces 45-second queue wait)
-                        sent_child_messages = await self.cog.child_bot_manager.execute_send(participant['bot_id'], payload)
-                        if audio_file_for_send and not extra_audio_file:
-                            audio_carriers.extend(sent_child_messages or [])
-                        
-                        if sent_child_messages:
-                            session['last_bot_message_id'] = sent_child_messages[-1].id
-                            for sm in sent_child_messages:
-                                turn_object.setdefault("message_ids", []).append(sm.id)
-
-                        # Dispatch citation sources directly
-                        if sources_text_list:
-                            for source_msg in sources_text_list:
-                                s_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
-                                    "channel_id": channel.id, "content": source_msg, "signer": (owner_id, profile_name),
-                                    "realistic_typing": False, "reply_to_id": None, "ping": False
-                                })
-                                if s_msgs:
-                                    for sm in s_msgs:
-                                        turn_object.setdefault("message_ids", []).append(sm.id)
-
-                        # Dispatch extra audio attachment directly
-                        if extra_audio_file:
-                            # A path, as the image goes: execute_send opens its own handle, so
-                            # the one opened for the webhook branch is released here.
-                            extra_audio_file.close()
-                            a_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
-                                "channel_id": channel.id, "content": "", "realistic_typing": False,
-                                "signer": (owner_id, profile_name),
-                                "attachment": {"filename": extra_audio_file.filename, "path": turn_audio_path}
-                            })
-                            audio_carriers.extend(a_msgs or [])
-                            if a_msgs:
-                                for sm in a_msgs:
-                                    turn_object.setdefault("message_ids", []).append(sm.id)
-
-                        # Dispatch thinking summary directly
-                        if thought_file_to_send and thought_text:
-                            t_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
-                                "channel_id": channel.id, "content": "", "realistic_typing": False,
-                                "signer": (owner_id, profile_name),
-                                "attachment": {"filename": "thinking_summary.txt", "data": thought_text.encode('utf-8')}
-                            })
-                            if t_msgs:
-                                for sm in t_msgs:
-                                    turn_object.setdefault("message_ids", []).append(sm.id)
-
-                        # The webhook branch persists its message_ids the moment they are
-                        # known; this branch used to leave them to whichever save came next
-                        # -- the following participant's, or the round-level one. A crash in
-                        # that window left the turn on disk with an empty message_ids list,
-                        # which is what regenerate, delete and the audit view key off, so the
-                        # messages stayed in the channel with nothing able to address them.
-                        if turn_object.get("message_ids"):
-                            session_type = session.get("type", "multi")
-                            await self.cog.session_manager.flush_session((channel_id, None, None), session_type)
-
-                    else: # Webhook logic
-                        sent_messages = await self._send_channel_message(
-                            channel, display_text, target_message_to_edit=None,
-                            profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
-                            file=file_to_send, reply_to=(anchor_message if i == 0 else None)
-                        )
-                        if audio_file_for_send and not extra_audio_file:
-                            audio_carriers.extend(sent_messages)
-                        
-                        if sources_text_list:
-                            for source_msg in sources_text_list:
-                                s_msgs = await self._send_channel_message(
-                                    channel, source_msg, bypass_typing=True,
-                                    profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name
-                                )
-                                if s_msgs: sent_messages.extend(s_msgs)
-                        
-                        # [NEW] Dispatch extra audio follow-up for Webhook
-                        if extra_audio_file:
-                            # Recorded like every other message the turn posts. It was the
-                            # one follow-up left off message_ids, so deleting or
-                            # regenerating the turn could never reach it.
-                            a_msgs = await self._send_channel_message(
-                                channel, "", file=extra_audio_file,
-                                profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
-                                bypass_typing=True
-                            )
-                            audio_carriers.extend(a_msgs)
-                            if a_msgs: sent_messages.extend(a_msgs)
-
-                        if thought_file_to_send:
-                            t_msgs = await self._send_channel_message(
-                                channel, "", file=thought_file_to_send,
-                                profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
-                                bypass_typing=True
-                            )
-                            if t_msgs: sent_messages.extend(t_msgs)
-
-                        if sent_messages:
-                            session['last_bot_message_id'] = sent_messages[-1].id
-                            session_type = session.get("type", "multi")
-                            
-                            for msg in sent_messages:
-                                turn_object.setdefault("message_ids", []).append(msg.id)
-                            
-                            await self.cog.session_manager.flush_session((channel_id, None, None), session_type)
-                    
-                    # --- Dispatch Warnings and Clean Up Placeholders ---
-                    await self._stop_sending_heartbeat(state_container)
-                    self.cog.session_manager.release_in_flight(session, state_container)
-
-                    msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
-                    msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
-
-                    await self._safe_delete_placeholder(channel, msg_a_to_delete, bot_id=participant.get('bot_id'))
-                    await self._safe_delete_placeholder(channel, msg_b_to_delete, bot_id=participant.get('bot_id'))
-
-                    if state_container:
-                        state_container['msg_a_id'] = None
-                        state_container['msg_b_id'] = None
-                        
-                    # The text posted and the audio did not: Discord refused the file after all,
-                    # and the send went on without it rather than lose the reply.
-                    if audio_file_for_send and turn_object.get("message_ids") and not any(
-                            m.attachments for m in audio_carriers):
-                        turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason=ERR_REASON_AUDIO_NOT_UPLOADED))
-
-                    await self._dispatch_warnings(channel, participant.get('method', 'webhook'), participant.get('bot_id'), turn_warnings, owner_id, profile_name, session, turn_object)
-
-                    # Delivered or lost by now, and nothing reads the file again.
-                    if turn_audio_path:
-                        for audio_file in (audio_file_for_send, extra_audio_file):
-                            if audio_file:
-                                audio_file.close()
-                        try: os.remove(turn_audio_path)
-                        except OSError: pass
-                        round_audio_paths.remove(turn_audio_path)
-                    
-                    # [FIXED] Turn cleanup: release turn-specific buffers without purging the round's generated image
-                    if 'contents_for_api_call' in locals():
-                        contents_for_api_call.clear()
-                        del contents_for_api_call
-                    if 'response' in locals():
-                        del response
-
-                    # Check if session was cancelled mid-turn and stop the round
-                    if not session.get('is_running') and not session.get('is_regenerating'):
-                        break
-
-                    # Ahead of `next_p`, so the placeholder that goes up is the named seat's.
-                    if not was_blocked and not single_turn_round:
-                        self._hand_on(session, channel, profile_order, i, response_text)
-
-                    # Seats removed while this one wrote leave the order before the next
-                    # placeholder goes up in their name. In place: `round_order` is this list,
-                    # and the loop reads on past `i` from it.
-                    profile_order[i + 1:] = [p for p in profile_order[i + 1:]
-                                             if self._may_still_speak(session, p)]
-                    is_last_participant = (participant == profile_order[-1])
-                    if not is_last_participant:
-                        # What arrived while this seat was writing is taken ahead of the next
-                        # placeholder, so that placeholder goes up once, for the right seat:
-                        # a message in it that calls a seat gives it the next turn, even one
-                        # that has spoken -- this round is the one that answers it -- and past
-                        # the response limit, as its own round would have been. What arrives
-                        # while it settles is read as history, as at the round's opening.
-                        batched_triggers = []
-                        while not session['task_queue'].empty():
-                            try: batched_triggers.append(session['task_queue'].get_nowait())
-                            except asyncio.QueueEmpty: break
-                        batched_triggers = self._defer_reactions(session, self.cog.session_manager.withdraw_cancelled_triggers(
-                            session, batched_triggers))
-                        called = self._user_called_seat(session, batched_triggers)
-                        if called is not None:
-                            self._give_next_turn(session, channel, profile_order, i, called,
-                                                 capped=False)
-
-                        # Pipelined visual feedback for next participant
-                        next_p = profile_order[i + 1]
-                        if next_p.get('method') == 'child_bot':
-                            next_p_index = self.cog.profile_manager._get_user_index(next_p['owner_id'])
-                            next_p_is_b = next_p['profile_name'] in next_p_index.get("borrowed", [])
-                            next_p_settings = self.cog.profile_manager._get_profile_config(next_p['owner_id'], next_p['profile_name'], next_p_is_b) or {}
-                            if not next_p_settings.get("child_bot_placeholder", False):
-                                await self.cog.manager_queue.put({
-                                    "action": "send_to_child", "bot_id": next_p['bot_id'],
-                                    "payload": {"action": "start_typing", "channel_id": channel_id}
-                                })
-
-                        # Yield briefly to ensure Discord orders messages correctly
-                        await asyncio.sleep(0.2)
-
-                        # The next seat's placeholder goes up here rather than at the top of
-                        # its turn, where it waited on the mid-round intake below (reply
-                        # lookups, URL fetches). Not before the sleep: a child bot's warnings
-                        # leave through manager_queue as background sends, and the sleep is
-                        # their head start on this placeholder.
-                        pending_state_container = await self._open_turn_feedback(
-                            session, channel, next_p)
-
-                        # Someone who began typing while this seat was writing is waited
-                        # for behind the next placeholder, as the round's opening is.
-                        await self._settle_round(session, handoff=True)
-
-                        while not session['task_queue'].empty():
-                            try: batched_triggers.append(session['task_queue'].get_nowait())
-                            except asyncio.QueueEmpty: break
-                        # The whole batch again: a message taken above can be deleted while
-                        # it settles.
-                        batched_triggers = self._defer_reactions(session, self.cog.session_manager.withdraw_cancelled_triggers(
-                            session, batched_triggers))
-
-                        if batched_triggers:
-                            batched = []
-                            for trigger in batched_triggers:
-                                # [UPDATED] Unpack structured tuples in mid-round batches to ensure all messages are read
-                                if isinstance(trigger, tuple) and len(trigger) > 1 and isinstance(trigger[1], discord.Message):
-                                    trigger = trigger[1]
-                                batched.append((trigger, await batched_message(trigger)))
-                            # The newest linked messages only, as at the round's start.
-                            linked = [n for n, (_, m) in enumerate(batched)
-                                      if m is not None and URL_FETCH_PATTERN.search(m.typed)]
-                            opened, links_skipped = self._round_links(linked)
-                            urls_skipped += links_skipped
-
-                            for batch_index, (trigger, msg) in enumerate(batched):
-                                if msg is not None:
-                                    # None when there is nothing to draw, which queues no
-                                    # image round: the message still reaches the round as
-                                    # an ordinary turn.
-                                    batched_image_prompt = image_command_prompt(msg.typed)
-                                    if batched_image_prompt and self._may_draw(session, channel_id, msg.author_id):
-                                        session['pending_image_gen_data'] = {'prompt': batched_image_prompt}
-
-                                    author_name = msg.author_name
-                                    reply_to, reply_media = reply_record(
-                                        session.get("unified_log", []), msg.reply_ref)
-                                    batch_turn = await self._compose_user_turn(
-                                        msg.typed, msg.attachments)
-                                    content, batch_msg_media = batch_turn.content, batch_turn.media_parts
-                                    
-                                    # [NEW] Batch URL Context Logic
-                                    any_url_enabled_batch = False
-                                    for p in session['profiles']:
-                                        p_index_batch = self.cog.profile_manager._get_user_index(p['owner_id'])
-                                        p_is_b_batch = p['profile_name'] in p_index_batch.get("borrowed", [])
-                                        p_settings_batch = self.cog.profile_manager._get_profile_config(p['owner_id'], p['profile_name'], p_is_b_batch) or {}
-                                        
-                                        u_mode = p_settings_batch.get("url_mode", "off")
-                                        if "url_mode" not in p_settings_batch:
-                                            u_mode = "rag" if p_settings_batch.get("url_fetching_enabled", False) else "off"
-                                            
-                                        if u_mode == "rag":
-                                            any_url_enabled_batch = True; break
-                                    
-                                    url_text_batch = None
-                                    url_media_batch = []
-                                    
-                                    if any_url_enabled_batch and batch_index in opened:
-                                        # The message's own text, not the quoted reply folded into
-                                        # `content` above -- see _collect_round_triggers.
-                                        url_text_list, url_media, _ = await self.cog.tools_service._process_urls_in_content(msg.typed, msg.guild_id, {"url_fetching_enabled": True}, warning_channel=channel)
-                                        if url_text_list: url_text_batch = "\n".join(url_text_list)
-                                        url_media_batch = url_media
-
-                                    # The batched turn's author, same source as the
-                                    # single-turn path in triggers.py.
-                                    batch_tz = self.cog.user_settings.user_timezone(msg.author_id)
-                                    batch_hash = _get_user_hash(msg.author_id)
-
-                                    user_line = _format_history_entry(author_name, msg.created_at, content, batch_tz, entity_id=batch_hash)
-
-                                    new_turn_id = str(uuid.uuid4())
-                                    new_turn_object = {
-                                        "turn_id": new_turn_id,
-                                        "is_user": True,
-                                        "speaker_pid": str(msg.author_id),
-                                        "message_ids": [msg.message_id],
-                                        "content": user_line
-                                    }
-                                    if reply_to:
-                                        new_turn_object["reply_to"] = reply_to
-                                    if url_text_batch:
-                                        new_turn_object["url_context"] = url_text_batch
-                                        round_url_turns.append(new_turn_object)
-                                        if keep_url_context(session.get("unified_log", []), round_url_turns):
-                                            self.cog.session_manager.mark_session_dirty(
-                                                (channel_id, None, None), session_type, structural=True)
-                                    # Before the reply that was still being delivered when
-                                    # this was sent, which is the order the channel shows.
-                                    insert_index = log_user_turn(
-                                        session, new_turn_object, msg.created_at)
-                                    batch_start_index = min(batch_start_index, insert_index)
-                                    # Read Reactions, as at the round's opening. Without it a
-                                    # reaction then a message sent while a seat was still
-                                    # writing -- the usual order -- waited for a round that
-                                    # opens on a message, and the seats left never read it.
-                                    if commit_reactions(session, insert_index):
-                                        self.cog.session_manager.mark_session_dirty(
-                                            (channel_id, None, None), session_type)
-                                    # Into the round's turn data as well, or its pictures reach
-                                    # no one: the log keeps text only, and the characters still
-                                    # to speak take their media from here.
-                                    new_round_turn_data.append(
-                                        (user_line, url_text_batch, reply_media + batch_msg_media + url_media_batch))
-
-                            all_triggers_for_round.extend(batched_triggers)
-                    
-                    # No forced gc.collect() here. It ran once per participant per round and
-                    # cost ~11 ms of pure GIL-held CPU on a warm heap (worse on the e2-micro),
-                    # stalling Discord heartbeats; asyncio.to_thread does not avoid that, since
-                    # a collection holds the GIL regardless of which thread calls it. Image
-                    # buffers are freed by refcounting the moment the last reference drops, so
-                    # the pass only ever reclaimed reference cycles the automatic collector
-                    # would have caught anyway.
+                # A mid-round `!image` replaces the round's image, and it is that one removed below.
+                generated_image_path_for_round = rnd.generated_image_path_for_round
 
                 session.pop('round_order', None)
                 self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
@@ -2417,9 +1384,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     try: os.remove(audio_path)
                     except OSError: pass
                 round_audio_paths.clear()
-                # Nothing this round published is in flight any more. The per-participant
-                # release below the delivery step handles the normal path; this catches
-                # the cancelled and errored ones, which leave the loop without reaching it.
+                # Nothing this round published is in flight any more. Each seat's turn
+                # tears its own container down (`_run_seat_turn`'s finally); this catches
+                # the ones no turn owned yet -- the feedback step's, when the round dies
+                # before its first seat, and a handoff's, when it dies before the next.
                 #
                 # This used to *keep* the containers holding a sending_task and drop the
                 # rest, which was exactly backwards: a container still holding one here is
@@ -2455,4 +1423,1087 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         self.cog.background_tasks.discard(ctask)
         if session.get('worker_task') == ctask:
             session['worker_task'] = None
+
+    async def _run_seat_turn(self, rnd: Round, i: int, participant: dict) -> bool:
+        """One seat's turn in `rnd`: True to go on to the next seat, False to end the round.
+
+        Its own frame, so nothing a turn binds outlives it. The worker used to run every
+        seat in one frame, and a turn that failed early read the previous seat's values
+        -- one seat's recalls and hormone vector were recorded on another's turn. What
+        the seats share is `rnd`, and they share it only through `rnd`.
+        """
+        session, channel, channel_id = rnd.session, rnd.channel, rnd.channel_id
+        session_type = rnd.session_type
+        # Taken before anything can fail, so every exit owns it: the feedback step opens it
+        # for the first seat, the previous turn's handoff for every later one, and the
+        # turn opens its own when neither did. The `finally` is its teardown on every
+        # exit -- a skipped seat, a cancel, a delivery that raised. On the delivered path
+        # the turn has already taken it down, and the `finally` finds nothing left.
+        state_container, rnd.pending_state_container = rnd.pending_state_container, None
+        try:
+            session['round_order'] = (rnd.profile_order, i)
+            turn_warnings = []
+            if i == 0:
+                turn_warnings.extend(rnd.pre_generation_warnings)
+
+            api_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "gemini")
+            or_key = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "openrouter")
+            
+            # Bound before the generation try below, because everything after its except
+            # reads them on every exit -- including one where the try raised before
+            # assigning them. Left unbound, the recovery path would itself raise
+            # (UnboundLocalError) and take the round with it. tests/test_turn_locals.py.
+            is_generator = False
+            p_settings = {}
+            participant_key = (participant['owner_id'], participant['profile_name'])
+            turn_grounding_sources = []
+            if participant_key == rnd.grounding_profile_key:
+                turn_grounding_sources.extend(rnd.grounding_sources)
+            sources_text_list = []
+            contents_for_api_call = [] 
+            response_text = ""
+            was_blocked = False
+            placeholder_message = None
+            # Critic audit trail: a turn that failed before the critic ran still writes
+            # a turn object, and the meta block records these.
+            critic_constraints = None
+            critic_settings = None
+            critic_source = None
+            critic_hint = None
+            # Assigned deep inside the generation try -- the gather at the top of it,
+            # and the neuro extraction after the response lands -- and read by the meta
+            # block whether or not it got that far.
+            ltm_recall = None
+            training_examples_list = []
+            parsed_neuro_state = None
+            parsed_ltm_flag = False
+            # (setter's turn_id, record) raised in this turn's prompt, and the one
+            # its reply set, for the meta block -- same hazard as the four above.
+            raised_follow_up = None
+            set_follow_up = None
+
+            if not self._may_still_speak(session, participant):
+                return True
+
+            # Resolve Real-time settings
+            p_owner_id = participant['owner_id']
+            p_name = participant['profile_name']
+            p_index = self.cog.profile_manager._get_user_index(p_owner_id)
+            p_is_b = p_name in p_index.get("borrowed", [])
+            p_settings = self.cog.profile_manager._get_profile_config(p_owner_id, p_name, p_is_b)
+            if p_settings is None:
+                # Deleted since the round began: a turn now is paid for and spoken
+                # with no persona. The next hydration unseats it.
+                return True
+
+            is_ollama = p_settings.get("primary_model", "").upper().startswith("OLLAMA/")
+            
+            if not api_key and not or_key and not is_ollama:
+                if i == 0:
+                    # Not `triggering_user_id`: that falls back to the session's
+                    # owner for a round nobody started.
+                    await self._notify_no_server_key(
+                        channel, self._first_human_author(rnd.all_triggers_for_round))
+                return False
+
+            # Ensure custom_main is safely bound early for error fallback
+            custom_main = p_settings.get("error_response", "An error has occurred.")
+
+            # Check Image Gen intent vs Profile Toggle
+            if rnd.is_image_gen_round and participant_key == rnd.generator_profile_key:
+                is_generator = p_settings.get("image_generation_enabled", False)
+
+            placeholder_message = None
+            response_text = ""
+
+            profile_settings = {} # Initialize to prevent UnboundLocalError
+            t1_start_mono = time.monotonic()
+            self.cog.session_manager._mark_session_accessed(channel_id)
+            participant_key = (participant['owner_id'], participant['profile_name'])
+            
+            if participant.get('method') == 'child_bot':
+                p_owner_id_typing = participant['owner_id']
+                p_name_typing = participant['profile_name']
+                p_index_typing = self.cog.profile_manager._get_user_index(p_owner_id_typing)
+                p_is_b_typing = p_name_typing in p_index_typing.get("borrowed", [])
+                p_settings_typing = self.cog.profile_manager._get_profile_config(p_owner_id_typing, p_name_typing, p_is_b_typing) or {}
+                
+                if not p_settings_typing.get("child_bot_placeholder", False):
+                    await self.cog.manager_queue.put({
+                        "action": "send_to_child", "bot_id": participant['bot_id'],
+                        "payload": {"action": "start_typing", "channel_id": channel_id}
+                    })
+
+            owner_id = participant['owner_id']
+            profile_name = participant['profile_name']
+            session_key = (channel_id, owner_id, profile_name)
+            attempt = ReplyAttempt()
+
+            # [FIX] Initialize these before the try block to prevent UnboundLocalError
+            response = None
+            response_text = ""
+            was_blocked = False
+            # Assigned from _construct_system_instructions well inside the try below,
+            # but read by the meta block after the except handler. Anything that
+            # raises before that point — a missing guild API key is the common one —
+            # left it unbound, so the recovery path itself died with an
+            # UnboundLocalError and masked the real error.
+            fallback_model_name = None
+
+            # Backstop only. profile_order was filtered before the feedback step, so
+            # this fires only if the channel's age-restricted flag is flipped mid-round.
+            refusal = self.cog.content_rating.placement_refusal(owner_id, profile_name, channel)
+            if refusal:
+                await self._refuse_placement(session, channel, owner_id, profile_name, refusal)
+                return True
+
+            user_index = self.cog.profile_manager._get_user_index(owner_id)
+            is_borrowed = profile_name in user_index.get("borrowed", [])
+            effective_owner_id, effective_profile_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
+
+            speaker_display_name = profile_name
+            appearance_data = self.cog.user_appearances.get(str(effective_owner_id), {}).get(effective_profile_name, {})
+            if appearance_data.get("custom_display_name"):
+                speaker_display_name = appearance_data["custom_display_name"]
+
+            placeholder_message = None
+            response_text = ""
+
+            try:
+                # No key gate here. The provider-aware gate above already broke out
+                # of the loop if this participant has nothing to route with. Re-checking
+                # only the Gemini slot killed every turn on OpenRouter-only or Ollama
+                # servers, and on a Gemini server whose key was inside the 60s 429
+                # cooldown -- both reported as "not configured", which they are not.
+                msg_a_id = None
+                app_name, app_avatar = self._resolve_appearance_data(owner_id, profile_name)
+                
+                # Opened already unless the seat before this one left the loop
+                # before its handoff. The first participant's container is also the
+                # one the image round ticked, so a placeholder its heartbeat spawned
+                # is already recorded here.
+                if state_container is None:
+                    state_container = await self._open_turn_feedback(
+                        session, channel, participant, p_settings)
+
+                # A `!image` taken in mid-round is drawn here, by the seat it reached,
+                # as the opening one is before the loop: the seats after see this image.
+                # Not by a seat that cannot draw: the request stays an ordinary message.
+                mid_round_image = session.pop('pending_image_gen_data', None)
+                if mid_round_image and p_settings.get("image_generation_enabled", False):
+                    if rnd.generated_image_path_for_round:
+                        # The round's earlier image, posted by its seat already.
+                        try: os.remove(rnd.generated_image_path_for_round)
+                        except OSError: pass
+                    rnd.is_image_gen_round = is_generator = True
+                    rnd.image_gen_prompt = mid_round_image['prompt']
+                    rnd.generator_profile_key = participant_key
+                    rnd.generator_display_name = speaker_display_name
+                    # Its search, as the opening image's: into the image prompt alone.
+                    if image_rag_enabled(p_settings):
+                        grounded = await self._await_with_status(
+                            self.cog.tools_service._get_hybrid_grounding_context(
+                                rnd.image_gen_prompt, channel.guild.id,
+                                self._grounding_history(session, participant, p_settings, len(rnd.profile_order)),
+                                p_settings, owner_id, safety_settings=_resolve_safety_settings(channel),
+                                is_for_image=True, warning_channel=channel),
+                            STATUS_SEARCHING_WEB, channel, participant, state_container)
+                        if grounded:
+                            g_context, g_sources, _, g_warning = grounded
+                            if g_warning:
+                                turn_warnings.append(g_warning)
+                            if g_context:
+                                rnd.image_gen_prompt = self.cog.global_prompts.get(
+                                    "IMAGE_GROUNDING", DEFAULT_IMAGE_GROUNDING).format(
+                                        prompt=rnd.image_gen_prompt, grounding=g_context)
+                                turn_grounding_sources.extend(g_sources or [])
+                    (rnd.generated_image_path_for_round, _,
+                     rnd.image_gen_error_msg) = await self._run_image_generation_round(
+                        session, channel, participant_key, rnd.image_gen_prompt,
+                        speaker_display_name, participant, state_container,
+                        rnd.new_round_turn_data)
+
+                # [NEW] Hybrid STM: Rebuild history dynamically from unified_log.
+                # Whatever this round appended is reserved, so a batch of user
+                # messages does not push history out of the window. Anything built
+                # into contents_for_api_call before this point would be discarded
+                # by the assignment -- the URL context and the kickstart fallback
+                # are both re-applied below, from supplementary_parts.
+                bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
+
+                # Read Reactions caught since the last seat spoke, appended for this
+                # one. The first seat's were committed with the round.
+                if i and commit_reactions(session, len(session.get("unified_log", []))):
+                    self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
+
+                unified_log = session.get("unified_log", [])
+                hide_folded = self.cog.session_manager.compaction_enabled(session)
+                contents_for_api_call = self.cog.session_manager._build_history_for_participant(
+                    unified_log, bot_pid, p_settings,
+                    len(rnd.profile_order) or 1,
+                    reserved_tail=len(unified_log) - rnd.batch_start_index,
+                    hide_folded=hide_folded,
+                )
+
+                round_context_text = "\n".join([t[0] for t in rnd.new_round_turn_data])
+                dynamic_context_for_turn = (round_context_text + "\n" + "\n".join(
+                    text for _, text in rnd.responses_this_round)).strip()
+                
+                if not dynamic_context_for_turn and session.get("unified_log"):
+                    # Fallback to the last available turn for vector search context
+                    dynamic_context_for_turn = session["unified_log"][-1].get("content", "")
+
+                # Parallelise Training Examples, LTM retrieval, and Help Context
+                ltm_task = self.cog.memory_manager._get_relevant_ltm_for_prompt(session_key, unified_log, owner_id, profile_name, dynamic_context_for_turn, rnd.round_author_name, channel.guild.id, rnd.triggering_user_id,
+                                                               threshold=ltm_auto_threshold(p_settings))
+                training_task = self.cog.memory_manager._get_relevant_training_examples(owner_id, profile_name, dynamic_context_for_turn, channel.guild.id)
+                
+                help_task = None
+                if p_settings.get("help_mode_enabled", False):
+                    help_task = self.cog.help_service._get_relevant_help_context(dynamic_context_for_turn, channel.guild.id)
+                
+                tasks_to_gather = [ltm_task, training_task]
+                if help_task: tasks_to_gather.append(help_task)
+                    
+                gathered_results = await asyncio.gather(*tasks_to_gather)
+                ltm_recall = gathered_results[0]
+                training_examples_list = gathered_results[1]
+                help_context_text = gathered_results[2] if help_task else None
+
+                # The session's critic, on every seat it was not told to leave out.
+                # Persistence is how many further rounds a constraint stays in force.
+                critic_settings = resolve_critic_settings(session)
+                if not critic_settings["enabled"] or self.cog.session_manager.participant_identity(
+                        participant)[1] in critic_settings["skip"]:
+                    critic_settings = None
+                if critic_settings:
+                    cache = session.setdefault("critic_cache", {}).get(participant_key)
+
+                    if cache and cache.get("rounds", 0) > 0:
+                        critic_constraints = cache["text"]
+                        critic_source = "cache"
+                        cache["rounds"] -= 1
+                    else:
+                        # "session" scope screens this profile against every
+                        # screened seat's recent lines instead of only its own: a
+                        # seat left out is usually there for a catchphrase, which
+                        # would trip everyone else's scan. Walked backwards and
+                        # stopped at the quota, not filtered over the whole log:
+                        # this is tail-local state.
+                        session_transcript = None
+                        if critic_settings["scope"] == "session":
+                            session_transcript = []
+                            for _t in reversed(unified_log):
+                                if (_t.get("is_user") or _t.get("type") or _t.get("is_hidden")
+                                        or (hide_folded and _t.get("compacted"))
+                                        or _t.get("speaker_pid") in critic_settings["skip"]):
+                                    continue
+                                session_transcript.append(_t.get("content", ""))
+                                if len(session_transcript) >= critic_settings["lookback"]:
+                                    break
+                            session_transcript.reverse()
+
+                        # _run_critic scans recent role=='model' turns; contents_for_api_call is
+                        # already the unified_log-derived history for this participant.
+                        critic_constraints, critic_source = await self.cog.tools_service._run_critic(
+                            contents_for_api_call, speaker_display_name, channel.guild.id,
+                            session, session_transcript=session_transcript,
+                        )
+                        if critic_constraints and critic_settings["persistence"] > 0:
+                            session["critic_cache"][participant_key] = {
+                                "text": critic_constraints,
+                                "rounds": critic_settings["persistence"],
+                            }
+                    # The variety nudge, in any mode but Off and fresh every turn: a
+                    # cached constraint skips _run_critic, and it would go quiet with
+                    # it. Off this character's own replies whatever the scope -- a
+                    # shape is one character's rut, not the cast's.
+                    critic_hint = variety_hint(
+                        own_replies(contents_for_api_call, max(3, critic_settings["lookback"])))
+
+                # _construct_system_instructions places <negative_constraints>
+                # itself, so the critic has to have run by now. It reads only
+                # contents_for_api_call and the log tail, both of which are built
+                # above, so moving it ahead of this call costs nothing.
+                # One tuple for the prompt and both models -- see tool_loop.
+                functions = functions_for(p_settings)
+                follow_up_block = None
+                if follow_ups.enabled(session):
+                    if rnd.proactive_follow_up and rnd.proactive_follow_up[0] == participant:
+                        raised_follow_up = rnd.proactive_follow_up[1]
+                    elif not rnd.follow_up_raised_this_round:
+                        raised_follow_up = follow_ups.due(unified_log, bot_pid, owner_id, time.time())
+                    follow_up_block = follow_ups.prompt_block(
+                        self.cog.global_prompts, raised_follow_up, unified_log)
+                full_system_instruction, turn_context, grounding_enabled, temp, top_p, top_k, primary_model, fallback_model_name = await asyncio.to_thread(
+                    self._construct_system_instructions,
+                    owner_id, profile_name, channel.id, is_multi_profile=True,
+                    training_examples_list=training_examples_list, recalled_ltm=ltm_recall.text,
+                    critic_constraints=critic_constraints, variety_hint=VARIETY_HINTS.get(critic_hint),
+                    follow_up_block=follow_up_block, functions=functions,
+                )
+
+                session_key = (channel.id, owner_id, profile_name)
+
+                # The history ends on this character's own turn when nobody has
+                # answered it -- which note that earns is `kickstart_note`.
+                follow_up = kickstart_note(contents_for_api_call, self.cog.global_prompts, unified_log)
+                if follow_up and contents_for_api_call[-1]['role'] == 'user':
+                    contents_for_api_call[-1]['parts'].append(follow_up)  # after <reactions>
+                elif follow_up:
+                    contents_for_api_call.append({'role': 'user', 'parts': [follow_up]})
+
+                # Collect all supplementary context to inject into the final user turn.
+                # The turn context first: straight after the conversation, ahead of
+                # the round's own material, so the transcript before it stays a
+                # cacheable prefix.
+                supplementary_parts = [turn_context] if turn_context else []
+                supplementary_parts.extend(round_notes(rnd.all_triggers_for_round))
+
+                # [UPDATED] Standardised XML injection for pending whispers
+                whisper_context = whisper_recap(
+                    session.get("pending_whispers", {}).pop(participant_key, None),
+                    p_settings.get("timezone"), self.cog.global_prompts)
+                if whisper_context:
+                    supplementary_parts.append(whisper_context)
+
+                if help_context_text:
+                    supplementary_parts.append(help_context_text)
+
+                # [FIXED] Ephemeral Media Injection: Manually add all current round media to the API call
+                # This allows participants to see images this round without them persisting in RAM history.
+                all_current_media, media_skipped_note = self._round_media(
+                    rnd.new_round_turn_data, links=resolve_url_mode(p_settings) != "off",
+                    emojis=server_context_guild(session, channel) is not None)
+                if media_skipped_note:
+                    supplementary_parts.append(media_skipped_note)
+                if rnd.urls_skipped and resolve_url_mode(p_settings) == "rag":
+                    supplementary_parts.append(ROUND_URLS_SKIPPED_NOTE.format(
+                        limit=ROUND_URL_MESSAGES_MAX, count=rnd.urls_skipped))
+                if all_current_media:
+                    supplementary_parts.extend(labelled(all_current_media))
+                
+                if rnd.is_image_gen_round:
+                    if rnd.generated_image_path_for_round:
+                        if is_generator:
+                            present_template = self.cog.global_prompts.get("IMAGE_PRESENT", DEFAULT_IMAGE_PRESENT)
+                            system_note = present_template.format(prompt=rnd.image_gen_prompt)
+                        else:
+                            other_template = self.cog.global_prompts.get("IMAGE_PRESENT_OTHER", DEFAULT_IMAGE_PRESENT_OTHER)
+                            system_note = other_template.format(name=rnd.generator_display_name, prompt=rnd.image_gen_prompt)
+                        
+                        text_gen_parts = [
+                            system_note,
+                            {"mime_type": generated_image_attachment(rnd.generated_image_path_for_round)[1],
+                             "url": rnd.generated_image_path_for_round}
+                        ]
+                        supplementary_parts.extend(text_gen_parts)
+                    else:
+                        if is_generator:
+                            fail_reason = rnd.image_gen_error_msg or "Safety Filter / Unknown"
+                            failed_template = self.cog.global_prompts.get("IMAGE_FAILED", DEFAULT_IMAGE_FAILED)
+                            system_note = failed_template.format(prompt=rnd.image_gen_prompt, reason=fail_reason)
+                            supplementary_parts.append(system_note)
+
+                if not contents_for_api_call:
+                    contents_for_api_call.append({'role': 'user', 'parts': [self.cog.global_prompts.get("KICKSTART_START", DEFAULT_KICKSTART_START)]})
+
+                # Inject supplementary parts into the final user turn to ensure alternating roles
+                if supplementary_parts:
+                    if contents_for_api_call[-1].get('role') == 'user':
+                        contents_for_api_call[-1]['parts'].extend(supplementary_parts)
+                    else:
+                        contents_for_api_call.append({'role': 'user', 'parts': supplementary_parts})
+
+                # [NEW] Advanced Params Injection
+                p_index = self.cog.profile_manager._get_user_index(owner_id)
+                p_is_borrowed = profile_name in p_index.get("borrowed", [])
+                profile_settings = self.cog.profile_manager._get_profile_config(owner_id, profile_name, p_is_borrowed) or {}
+                
+                gen_config = reply_gen_config(profile_settings, temp, top_p, top_k)
+
+                all_participant_names = self._participant_names(session)
+
+                # Waited on, never awaited directly: an await cancelled the send
+                # along with the turn, losing the id of a message Discord had
+                # already posted. The send records that id on the container itself.
+                await self._await_turn_feedback(state_container)
+                msg_a_id = state_container.get('msg_a_id')
+                attempt = await self._attempt_reply(
+                    channel=channel, participant=participant, p_settings=p_settings,
+                    owner_id=owner_id, user_id=rnd.triggering_user_id,
+                    system_instruction=full_system_instruction, primary_model=primary_model,
+                    fallback_model_name=fallback_model_name, history=contents_for_api_call,
+                    gen_config=gen_config, msg_a_id=msg_a_id, app_name=app_name,
+                    app_avatar=app_avatar, state_container=state_container,
+                    participant_names=all_participant_names, log_context="multi_profile",
+                    probe_label=f"  participant turn {i}", functions=functions)
+                response = attempt.response
+
+                reply = self._reply_text(attempt, p_settings, owner_id, profile_name, all_participant_names,
+                                         guild=server_context_guild(session, channel))
+                response_text, was_blocked, parsed_neuro_state = reply.text, reply.blocked, reply.neuro_state
+                # A blocked reply is not one worth remembering. On the seat, in memory
+                # like `_ltm_retry_at`, for `_ltm_due` at this round's end.
+                parsed_ltm_flag = reply.ltm_flag and not was_blocked and ltm_flag_enabled(p_settings)
+                if parsed_ltm_flag:
+                    participant["_ltm_flag"] = True
+                # Not from a round nobody asked for: set there, one would bring an
+                # absent person back up every time the channel went quiet.
+                if (reply.follow_up and not was_blocked and not rnd.is_proactive_auto_round
+                        and follow_ups.enabled(session)):
+                    set_follow_up = follow_ups.resolve(
+                        reply.follow_up, session.get("unified_log", []), time.time())
+                    if set_follow_up:
+                        follow_ups.note_set(session, set_follow_up)
+                        self.cog.session_manager._save_multi_profile_sessions()
+                turn_warnings.extend(reply.warnings)
+                if reply.sources is not None:
+                    turn_grounding_sources.extend(reply.sources)
+                    sources_text_list = _format_citation_subtext(turn_grounding_sources)
+                    
+                # --- Native Tool Extraction (Citations) ---
+                # Native citations are now handled inline directly in the text response above.
+                    
+                # --- Placeholder Update & Sending ---
+                if not was_blocked:
+                    # spawn_after: everything below this point -- speech synthesis
+                    # above all -- happens before the turn is delivered, and a child
+                    # bot with no placeholder of its own has nothing on screen once
+                    # its typing indicator expires nine seconds in.
+                    await self._update_sending_placeholder(channel, participant.get('method', 'webhook'), participant.get('bot_id'), state_container, t1_start_mono, spawn_after=10.0)
+
+            except Exception as e:
+                print(f"Multi-profile generation error for '{profile_name}': {e}")
+                traceback.print_exc()
+                response_text = f"{custom_main}\n\n-# Blocked due to: **Unknown**."
+                # `was_blocked` stays False here, and the turn is the error text: a
+                # follow-up raised to it was never answered, nor one set by it.
+                raised_follow_up = set_follow_up = None
+
+            participant_key = (participant['owner_id'], participant['profile_name'])
+
+            # Inside the participant loop, after response extraction:
+            
+            thought_text = ""
+            if hasattr(response, 'thought') and response.thought:
+                thought_text = response.thought.strip()
+            
+            # Deduplication logic (handled in previous step)
+            if thought_text and response_text:
+                if thought_text in response_text:
+                    response_text = response_text.replace(thought_text, "").strip()
+                
+                response_text = re.sub(r'^\**Thoughts:?\**\n?', '', response_text, flags=re.IGNORECASE).strip()
+                response_text = re.sub(r'^\**Reasoning:?\**\n?', '', response_text, flags=re.IGNORECASE).strip()
+
+                if len(thought_text) > 50:
+                    snippet = thought_text[:50]
+                    if snippet in response_text:
+                        parts = response_text.split(snippet, 1)
+                        if len(parts) > 1:
+                            response_text = parts[1].strip()
+
+            # [NEW] Reformat summary text: one sentence per line
+            if thought_text:
+                sentences = _split_into_sentences_with_abbreviations(thought_text)
+                thought_text = "\n".join(sentences)
+
+            # Update Display Text and Prepare Thought File
+            display_text = response_text
+            thought_file_to_send = None
+            if thought_text and p_settings.get("thinking_summary_visible") == "on":
+                thought_file_to_send = discord.File(io.BytesIO(thought_text.encode('utf-8')), filename="thinking_summary.txt")
+
+            t2_end_mono = time.monotonic()
+            duration = t2_end_mono - t1_start_mono
+            sent_timestamp = datetime.datetime.now(datetime.timezone.utc) 
+
+            timezone_str = profile_settings.get("timezone", "UTC")
+            profile_id = self.cog.profile_manager._get_profile_id(owner_id, profile_name)
+            main_history_line = _format_history_entry(speaker_display_name, sent_timestamp, response_text, timezone_str, entity_id=profile_id)
+            
+            history_line = main_history_line
+
+            turn_id = str(uuid.uuid4())
+            bot_pid = self.cog.profile_manager._get_pid_from_name_any(owner_id, profile_name)
+            
+            # Anti-Repetition Critic. Recorded only when the critic was actually
+            # on for this seat, so an absent key reads as "off" rather
+            # than as an empty verdict -- the same contract as neuro_state. The
+            # text is capped because this rides in every turn of a 1000-turn log
+            # that is re-serialised, re-compressed and re-encrypted on flush.
+            critic = None
+            if critic_settings and critic_settings["enabled"]:
+                critic = {
+                    "mode": critic_settings["mode"],
+                    "scope": critic_settings["scope"],
+                    "strictness": critic_settings["strictness"],
+                    "lookback": critic_settings["lookback"],
+                    "source": critic_source,
+                    "text": (critic_constraints or "")[:CRITIC_AUDIT_TEXT_MAX],
+                    **({"hint": critic_hint} if critic_hint else {}),
+                }
+            meta = reply_meta(
+                attempt, duration=duration, training_examples=training_examples_list,
+                ltm_recall=ltm_recall, sources=turn_grounding_sources,
+                neuro_state=parsed_neuro_state, critic=critic,
+                ltm_flag=parsed_ltm_flag)
+            if set_follow_up:
+                meta["follow_up"] = set_follow_up
+            # Raised means put to the character: answered whether it brought the
+            # thing up or let it go, as the reminder allows. A blocked reply saw it
+            # and said nothing, so it stays for the next turn.
+            if raised_follow_up and not was_blocked:
+                meta["follow_up_answered"] = raised_follow_up[0]
+                rnd.follow_up_raised_this_round = True
+
+            turn_object = {
+                "turn_id": turn_id,
+                "is_user": False,
+                "speaker_pid": bot_pid,
+                "owner_id": owner_id,
+                "profile_name": profile_name,
+                "message_ids": [],
+                "content": history_line,
+                "meta": meta
+            }
+            
+            # Clean up any legacy signature if it exists
+            turn_object.pop('thought_signature', None)
+            
+            session.setdefault("unified_log", []).append(intern_turn(turn_object))
+            session['last_speaker_key'] = participant_key
+            # What the seats after this one search their memories with, and the
+            # speech that voices them hears as the round so far.
+            if not was_blocked:
+                rnd.responses_this_round.append((speaker_display_name, response_text))
+
+            # Append only. The delivery branches below flush as soon as the
+            # message_ids are known, and the round-end flush backs that up.
+            self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
+
+            # [NEW] Unified Synthesis Logic
+            audio_file_for_send = None
+            turn_audio_path = None
+            #: The messages meant to carry this turn's audio, to tell afterwards
+            #: whether Discord took it.
+            audio_carriers = []
+            
+            # Not for a reply that failed: that is the profile's error text, and
+            # voicing it bought a second paid call and held the failure back for
+            # the half-minute synthesis takes.
+            if (profile_settings.get("speech_tts_enabled", False) and session.get("audio_mode", "off") == "on"
+                    and not was_blocked):
+                s_voice = profile_settings.get("speech_voice", DEFAULT_SPEECH_VOICE)
+                s_model = profile_settings.get("speech_model")
+                if s_model and "none" not in s_model.lower():
+                    # 1. Build Contextual Round Transcript
+                    round_transcript = ""
+                    for prev_name, prev_resp in rnd.responses_this_round[:-1]:
+                        round_transcript += f"{prev_name}: {prev_resp}\n\n"
+
+                    # 2. Construct Conditional Markdown Prompt
+                    s_temp = float(profile_settings.get("speech_temperature", 1.0))
+                    s_arch = profile_settings.get("speech_archetype", "")
+                    s_acc = profile_settings.get("speech_accent", "")
+                    s_dyn = profile_settings.get("speech_dynamics", "")
+                    s_styl = profile_settings.get("speech_style", "")
+                    s_pace = profile_settings.get("speech_pacing", "")
+
+                    prompt_parts = []
+                    if s_arch or s_acc:
+                        part = f"# AUDIO PROFILE: {speaker_display_name}\n"
+                        if s_arch: part += f"Archetype: {s_arch}\n"
+                        if s_acc: part += f"Accent: {s_acc}\n"
+                        prompt_parts.append(part.strip())
+                    if s_dyn:
+                        part = f"## THE SCENE\nDynamics: {s_dyn}\nAction: Fluid conversation."
+                        prompt_parts.append(part.strip())
+                    if s_styl or s_pace:
+                        part = "### DIRECTOR'S NOTES\n"
+                        if s_styl: part += f"Style: {s_styl}\n"
+                        if s_pace: part += f"Pacing: {s_pace}\n"
+                        prompt_parts.append(part.strip())
+                    if round_transcript:
+                        prompt_parts.append(f"#### SAMPLE CONTEXT\nPrevious turn flow:\n{round_transcript.strip()}")
+                    prompt_parts.append(f"#### TRANSCRIPT\n{speaker_display_name}: {response_text}")
+
+                    # Only once there is direction above it -- see
+                    # TTS_SYNTHESIS_PREAMBLE. prompt_parts always ends with the
+                    # transcript, so anything beyond it is a director section.
+                    if len(prompt_parts) > 1:
+                        prompt_parts.insert(0, TTS_SYNTHESIS_PREAMBLE)
+
+                    tts_priming_prompt = "\n\n".join(prompt_parts)
+                    # The same direction for a model that would read the prompt above
+                    # aloud (Gemini 3.8): one style line sent beside the bare reply.
+                    tts_style = "; ".join(f"{label}: {value}" for label, value in (
+                        ("Archetype", s_arch), ("Accent", s_acc), ("Scene", s_dyn),
+                        ("Style", s_styl), ("Pacing", s_pace)) if value)
+
+                    # 3. Synthesise Audio
+                    #
+                    # The heartbeat started before this is still the one running, so
+                    # the phase is renamed rather than restarted. Without it a TTS
+                    # round trip reads as "Sending..." for half a minute, which is
+                    # both wrong and the least informative thing it could say.
+                    if state_container:
+                        state_container['phase_label'] = "Synthesising speech"
+                    try:
+                        turn_audio_path = await self.cog.media_service.synthesise_speech(
+                            response_text,
+                            channel.guild.id,
+                            directed_prompt=tts_priming_prompt,
+                            style=tts_style or None,
+                            voice_sample_of=(owner_id, profile_name),
+                            user_id=rnd.triggering_user_id,
+                            config_owner_id=owner_id,
+                            model_id=s_model,
+                            voice_name=s_voice,
+                            temperature=s_temp,
+                            speed=profile_settings.get("speech_speed"),
+                            language_code=profile_settings.get("speech_language") or None,
+                            fallback_model_id=profile_settings.get("speech_fallback_model"),
+                            # Audio past it is paid for and then refused, so a model
+                            # billed by the second is capped here, not only checked below.
+                            max_bytes=upload_limit_bytes(channel.guild),
+                        )
+                        rnd.round_audio_paths.append(turn_audio_path)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as e:
+                        tts_reason = _format_api_error(e)
+                        print(f"Text-to-speech failed for '{profile_name}': {tts_reason}")
+                        turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason=tts_reason))
+                    finally:
+                        if state_container:
+                            state_container['phase_label'] = "Sending"
+
+                    if turn_audio_path:
+                        # Checked before sending, so a file over the limit is never
+                        # uploaded only to be refused.
+                        audio_size = os.path.getsize(turn_audio_path)
+                        upload_limit = upload_limit_bytes(channel.guild)
+                        if audio_size > upload_limit:
+                            turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(
+                                reason=ERR_REASON_AUDIO_TOO_LARGE.format(
+                                    size=f"{audio_size / 1048576:.1f}",
+                                    limit=f"{upload_limit / 1048576:.0f}")))
+                        else:
+                            audio_file_for_send = discord.File(
+                                turn_audio_path,
+                                filename=sent_file_name(speaker_display_name, response_text,
+                                                        os.path.splitext(turn_audio_path)[1], "voice"))
+
+            file_to_send = None
+            extra_audio_file = None
+            if is_generator and rnd.generated_image_path_for_round:
+                file_to_send = discord.File(
+                    rnd.generated_image_path_for_round,
+                    filename=generated_image_attachment(
+                        rnd.generated_image_path_for_round, rnd.generator_display_name, rnd.image_gen_prompt)[0])
+                if audio_file_for_send:
+                    extra_audio_file = audio_file_for_send
+            elif audio_file_for_send:
+                file_to_send = audio_file_for_send
+
+            is_realistic_typing = profile_settings.get("realistic_typing_enabled", False)
+            typing_cursor_mode, typing_cursor_emoji = resolve_typing_cursor(
+                profile_settings, PLACEHOLDER_EMOJI)
+
+            # Realistic typing streams its own first chunk instead of editing the
+            # placeholder, so the placeholder has to come down before the send --
+            # but not a moment earlier. This teardown used to sit above the speech
+            # synthesis block, which meant that with realistic typing *and* audio
+            # enabled the placeholder vanished and the channel then showed nothing
+            # at all for the whole duration of the TTS round-trip. Deferring it to
+            # here keeps the placeholder (and its "Sending..." heartbeat) up until
+            # the turn is genuinely ready to be delivered.
+            if is_realistic_typing:
+                await self._stop_sending_heartbeat(state_container)
+                msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
+                msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+                # bot_id, because a child bot participant reaches this branch too.
+                # Without it the webhook delete 10008s and the client delete needs
+                # Manage Messages -- and the ids are cleared either way, so the
+                # bot_id-aware delete a dozen lines below never got a second go at
+                # them. That left the placeholder in the channel for good.
+                p_bot_id = participant.get('bot_id')
+                await self._safe_delete_placeholder(channel, msg_a_to_delete, bot_id=p_bot_id)
+                await self._safe_delete_placeholder(channel, msg_b_to_delete, bot_id=p_bot_id)
+                if state_container:
+                    state_container['msg_a_id'] = None
+                    state_container['msg_b_id'] = None
+
+            if participant.get('method') == 'child_bot':
+                # Stop any pending sending heartbeat task immediately
+                await self._stop_sending_heartbeat(state_container)
+
+                # Delete placeholder before child bot delivers
+                msg_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
+                if msg_to_delete:
+                    await self._safe_delete_placeholder(channel, msg_to_delete, bot_id=participant.get('bot_id'))
+                    if state_container:
+                        state_container['msg_a_id'] = None
+
+                rmode = profile_settings.get("response_mode", "regular")
+                reply_id = None
+                should_ping = False
+
+                if i == 0:
+                    if rnd.anchor_message and rmode == "mention":
+                        display_text = f"{rnd.anchor_message.author.mention} {display_text}"
+                    reply_id = rnd.anchor_message.id if (rnd.anchor_message and rmode in ["reply", "mention_reply"]) else None
+                    should_ping = (rmode == "mention_reply")
+
+                payload = {
+                    "channel_id": channel.id, "content": display_text,
+                    "realistic_typing": is_realistic_typing,
+                    "typing_cps": profile_settings.get("typing_cps", 30.0),
+                    "typing_max_delay": profile_settings.get("typing_max_delay", 2.5),
+                    "typing_mode": profile_settings.get("typing_mode", "sentence"),
+                    "typing_cursor": typing_cursor_mode,
+                    "typing_cursor_emoji": typing_cursor_emoji,
+                    "reply_to_id": reply_id, "ping": should_ping,
+                    # The seat, which on a borrow is not the bot's own profile.
+                    "signer": (owner_id, profile_name)
+                }
+
+                if file_to_send:
+                    # The child bot lives in this process, so it can open the
+                    # file itself: no read, no base64, nothing resident here.
+                    attachment_data = None
+                    if is_generator and rnd.generated_image_path_for_round:
+                        attachment_data = {
+                            "filename": generated_image_attachment(
+                                rnd.generated_image_path_for_round, rnd.generator_display_name, rnd.image_gen_prompt)[0],
+                            "path": rnd.generated_image_path_for_round
+                        }
+                    elif audio_file_for_send:
+                        attachment_data = {
+                            "filename": audio_file_for_send.filename,
+                            "path": turn_audio_path
+                        }
+                    if attachment_data:
+                        payload["attachment"] = attachment_data
+                    if attachment_data and attachment_data.get("path"):
+                        # file_to_send was opened from this same path for the
+                        # webhook branch and is never sent here -- execute_send
+                        # opens its own handle. Release the descriptor rather
+                        # than leaving it to the round's teardown.
+                        file_to_send.close()
+                        file_to_send = None
+
+                # Direct in-process execution (replaces 45-second queue wait)
+                sent_child_messages = await self.cog.child_bot_manager.execute_send(participant['bot_id'], payload)
+                if audio_file_for_send and not extra_audio_file:
+                    audio_carriers.extend(sent_child_messages or [])
+                
+                if sent_child_messages:
+                    session['last_bot_message_id'] = sent_child_messages[-1].id
+                    for sm in sent_child_messages:
+                        turn_object.setdefault("message_ids", []).append(sm.id)
+
+                # Dispatch citation sources directly
+                if sources_text_list:
+                    for source_msg in sources_text_list:
+                        s_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
+                            "channel_id": channel.id, "content": source_msg, "signer": (owner_id, profile_name),
+                            "realistic_typing": False, "reply_to_id": None, "ping": False
+                        })
+                        if s_msgs:
+                            for sm in s_msgs:
+                                turn_object.setdefault("message_ids", []).append(sm.id)
+
+                # Dispatch extra audio attachment directly
+                if extra_audio_file:
+                    # A path, as the image goes: execute_send opens its own handle, so
+                    # the one opened for the webhook branch is released here.
+                    extra_audio_file.close()
+                    a_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
+                        "channel_id": channel.id, "content": "", "realistic_typing": False,
+                        "signer": (owner_id, profile_name),
+                        "attachment": {"filename": extra_audio_file.filename, "path": turn_audio_path}
+                    })
+                    audio_carriers.extend(a_msgs or [])
+                    if a_msgs:
+                        for sm in a_msgs:
+                            turn_object.setdefault("message_ids", []).append(sm.id)
+
+                # Dispatch thinking summary directly
+                if thought_file_to_send and thought_text:
+                    t_msgs = await self.cog.child_bot_manager.execute_send(participant['bot_id'], {
+                        "channel_id": channel.id, "content": "", "realistic_typing": False,
+                        "signer": (owner_id, profile_name),
+                        "attachment": {"filename": "thinking_summary.txt", "data": thought_text.encode('utf-8')}
+                    })
+                    if t_msgs:
+                        for sm in t_msgs:
+                            turn_object.setdefault("message_ids", []).append(sm.id)
+
+                # The webhook branch persists its message_ids the moment they are
+                # known; this branch used to leave them to whichever save came next
+                # -- the following participant's, or the round-level one. A crash in
+                # that window left the turn on disk with an empty message_ids list,
+                # which is what regenerate, delete and the audit view key off, so the
+                # messages stayed in the channel with nothing able to address them.
+                if turn_object.get("message_ids"):
+                    await self.cog.session_manager.flush_session((channel_id, None, None), session_type)
+
+            else: # Webhook logic
+                sent_messages = await self._send_channel_message(
+                    channel, display_text, target_message_to_edit=None,
+                    profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
+                    file=file_to_send, reply_to=(rnd.anchor_message if i == 0 else None)
+                )
+                if audio_file_for_send and not extra_audio_file:
+                    audio_carriers.extend(sent_messages)
+                
+                if sources_text_list:
+                    for source_msg in sources_text_list:
+                        s_msgs = await self._send_channel_message(
+                            channel, source_msg, bypass_typing=True,
+                            profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name
+                        )
+                        if s_msgs: sent_messages.extend(s_msgs)
+                
+                # [NEW] Dispatch extra audio follow-up for Webhook
+                if extra_audio_file:
+                    # Recorded like every other message the turn posts. It was the
+                    # one follow-up left off message_ids, so deleting or
+                    # regenerating the turn could never reach it.
+                    a_msgs = await self._send_channel_message(
+                        channel, "", file=extra_audio_file,
+                        profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
+                        bypass_typing=True
+                    )
+                    audio_carriers.extend(a_msgs)
+                    if a_msgs: sent_messages.extend(a_msgs)
+
+                if thought_file_to_send:
+                    t_msgs = await self._send_channel_message(
+                        channel, "", file=thought_file_to_send,
+                        profile_owner_id_for_appearance=owner_id, profile_name_for_appearance=profile_name,
+                        bypass_typing=True
+                    )
+                    if t_msgs: sent_messages.extend(t_msgs)
+
+                if sent_messages:
+                    session['last_bot_message_id'] = sent_messages[-1].id
+                    
+                    for msg in sent_messages:
+                        turn_object.setdefault("message_ids", []).append(msg.id)
+                    
+                    await self.cog.session_manager.flush_session((channel_id, None, None), session_type)
+            
+            # --- Dispatch Warnings and Clean Up Placeholders ---
+            await self._stop_sending_heartbeat(state_container)
+            self.cog.session_manager.release_in_flight(session, state_container)
+
+            msg_a_to_delete = state_container.get('msg_a_id') if state_container else msg_a_id
+            msg_b_to_delete = state_container.get('msg_b_id') if state_container else None
+
+            await self._safe_delete_placeholder(channel, msg_a_to_delete, bot_id=participant.get('bot_id'))
+            await self._safe_delete_placeholder(channel, msg_b_to_delete, bot_id=participant.get('bot_id'))
+
+            if state_container:
+                state_container['msg_a_id'] = None
+                state_container['msg_b_id'] = None
+                
+            # The text posted and the audio did not: Discord refused the file after all,
+            # and the send went on without it rather than lose the reply.
+            if audio_file_for_send and turn_object.get("message_ids") and not any(
+                    m.attachments for m in audio_carriers):
+                turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason=ERR_REASON_AUDIO_NOT_UPLOADED))
+
+            await self._dispatch_warnings(channel, participant.get('method', 'webhook'), participant.get('bot_id'), turn_warnings, owner_id, profile_name, session, turn_object)
+
+            # Delivered or lost by now, and nothing reads the file again.
+            if turn_audio_path:
+                for audio_file in (audio_file_for_send, extra_audio_file):
+                    if audio_file:
+                        audio_file.close()
+                try: os.remove(turn_audio_path)
+                except OSError: pass
+                rnd.round_audio_paths.remove(turn_audio_path)
+            
+            # Released before the handoff below, which waits on the network.
+            contents_for_api_call.clear()
+
+            # Check if session was cancelled mid-turn and stop the round
+            if not session.get('is_running') and not session.get('is_regenerating'):
+                return False
+
+            # Ahead of `next_p`, so the placeholder that goes up is the named seat's.
+            if not was_blocked and not rnd.single_turn_round:
+                self._hand_on(session, channel, rnd.profile_order, i, response_text)
+
+            # Seats removed while this one wrote leave the order before the next
+            # placeholder goes up in their name. In place: `round_order` is this list,
+            # and the loop reads on past `i` from it.
+            rnd.profile_order[i + 1:] = [p for p in rnd.profile_order[i + 1:]
+                                         if self._may_still_speak(session, p)]
+            is_last_participant = (participant == rnd.profile_order[-1])
+            if not is_last_participant:
+                # What arrived while this seat was writing is taken ahead of the next
+                # placeholder, so that placeholder goes up once, for the right seat:
+                # a message in it that calls a seat gives it the next turn, even one
+                # that has spoken -- this round is the one that answers it -- and past
+                # the response limit, as its own round would have been. What arrives
+                # while it settles is read as history, as at the round's opening.
+                batched_triggers = []
+                while not session['task_queue'].empty():
+                    try: batched_triggers.append(session['task_queue'].get_nowait())
+                    except asyncio.QueueEmpty: break
+                batched_triggers = self._defer_reactions(session, self.cog.session_manager.withdraw_cancelled_triggers(
+                    session, batched_triggers))
+                called = self._user_called_seat(session, batched_triggers)
+                if called is not None:
+                    self._give_next_turn(session, channel, rnd.profile_order, i, called,
+                                         capped=False)
+
+                # Pipelined visual feedback for next participant
+                next_p = rnd.profile_order[i + 1]
+                if next_p.get('method') == 'child_bot':
+                    next_p_index = self.cog.profile_manager._get_user_index(next_p['owner_id'])
+                    next_p_is_b = next_p['profile_name'] in next_p_index.get("borrowed", [])
+                    next_p_settings = self.cog.profile_manager._get_profile_config(next_p['owner_id'], next_p['profile_name'], next_p_is_b) or {}
+                    if not next_p_settings.get("child_bot_placeholder", False):
+                        await self.cog.manager_queue.put({
+                            "action": "send_to_child", "bot_id": next_p['bot_id'],
+                            "payload": {"action": "start_typing", "channel_id": channel_id}
+                        })
+
+                # Yield briefly to ensure Discord orders messages correctly
+                await asyncio.sleep(0.2)
+
+                # The next seat's placeholder goes up here rather than at the top of
+                # its turn, where it waited on the mid-round intake below (reply
+                # lookups, URL fetches). Not before the sleep: a child bot's warnings
+                # leave through manager_queue as background sends, and the sleep is
+                # their head start on this placeholder.
+                rnd.pending_state_container = await self._open_turn_feedback(
+                    session, channel, next_p)
+
+                # Someone who began typing while this seat was writing is waited
+                # for behind the next placeholder, as the round's opening is.
+                await self._settle_round(session, handoff=True)
+
+                while not session['task_queue'].empty():
+                    try: batched_triggers.append(session['task_queue'].get_nowait())
+                    except asyncio.QueueEmpty: break
+                # The whole batch again: a message taken above can be deleted while
+                # it settles.
+                batched_triggers = self._defer_reactions(session, self.cog.session_manager.withdraw_cancelled_triggers(
+                    session, batched_triggers))
+
+                if batched_triggers:
+                    batched = []
+                    for trigger in batched_triggers:
+                        # [UPDATED] Unpack structured tuples in mid-round batches to ensure all messages are read
+                        if isinstance(trigger, tuple) and len(trigger) > 1 and isinstance(trigger[1], discord.Message):
+                            trigger = trigger[1]
+                        batched.append((trigger, await batched_message(trigger)))
+                    # The newest linked messages only, as at the round's start.
+                    linked = [n for n, (_, m) in enumerate(batched)
+                              if m is not None and URL_FETCH_PATTERN.search(m.typed)]
+                    opened, links_skipped = self._round_links(linked)
+                    rnd.urls_skipped += links_skipped
+
+                    for batch_index, (trigger, msg) in enumerate(batched):
+                        if msg is not None:
+                            # None when there is nothing to draw, which queues no
+                            # image round: the message still reaches the round as
+                            # an ordinary turn.
+                            batched_image_prompt = image_command_prompt(msg.typed)
+                            if batched_image_prompt and self._may_draw(session, channel_id, msg.author_id):
+                                session['pending_image_gen_data'] = {'prompt': batched_image_prompt}
+
+                            author_name = msg.author_name
+                            reply_to, reply_media = reply_record(
+                                session.get("unified_log", []), msg.reply_ref)
+                            batch_turn = await self._compose_user_turn(
+                                msg.typed, msg.attachments)
+                            content, batch_msg_media = batch_turn.content, batch_turn.media_parts
+                            
+                            # [NEW] Batch URL Context Logic
+                            any_url_enabled_batch = False
+                            for p in session['profiles']:
+                                p_index_batch = self.cog.profile_manager._get_user_index(p['owner_id'])
+                                p_is_b_batch = p['profile_name'] in p_index_batch.get("borrowed", [])
+                                p_settings_batch = self.cog.profile_manager._get_profile_config(p['owner_id'], p['profile_name'], p_is_b_batch) or {}
+                                
+                                u_mode = p_settings_batch.get("url_mode", "off")
+                                if "url_mode" not in p_settings_batch:
+                                    u_mode = "rag" if p_settings_batch.get("url_fetching_enabled", False) else "off"
+                                    
+                                if u_mode == "rag":
+                                    any_url_enabled_batch = True; break
+                            
+                            url_text_batch = None
+                            url_media_batch = []
+                            
+                            if any_url_enabled_batch and batch_index in opened:
+                                # The message's own text, not the quoted reply folded into
+                                # `content` above -- see _collect_round_triggers.
+                                url_text_list, url_media, _ = await self.cog.tools_service._process_urls_in_content(msg.typed, msg.guild_id, {"url_fetching_enabled": True}, warning_channel=channel)
+                                if url_text_list: url_text_batch = "\n".join(url_text_list)
+                                url_media_batch = url_media
+
+                            # The batched turn's author, same source as the
+                            # single-turn path in triggers.py.
+                            batch_tz = self.cog.user_settings.user_timezone(msg.author_id)
+                            batch_hash = _get_user_hash(msg.author_id)
+
+                            user_line = _format_history_entry(author_name, msg.created_at, content, batch_tz, entity_id=batch_hash)
+
+                            new_turn_id = str(uuid.uuid4())
+                            new_turn_object = {
+                                "turn_id": new_turn_id,
+                                "is_user": True,
+                                "speaker_pid": str(msg.author_id),
+                                "message_ids": [msg.message_id],
+                                "content": user_line
+                            }
+                            if reply_to:
+                                new_turn_object["reply_to"] = reply_to
+                            if url_text_batch:
+                                new_turn_object["url_context"] = url_text_batch
+                                rnd.round_url_turns.append(new_turn_object)
+                                if keep_url_context(session.get("unified_log", []), rnd.round_url_turns):
+                                    self.cog.session_manager.mark_session_dirty(
+                                        (channel_id, None, None), session_type, structural=True)
+                            # Before the reply that was still being delivered when
+                            # this was sent, which is the order the channel shows.
+                            insert_index = log_user_turn(
+                                session, new_turn_object, msg.created_at)
+                            rnd.batch_start_index = min(rnd.batch_start_index, insert_index)
+                            # Read Reactions, as at the round's opening. Without it a
+                            # reaction then a message sent while a seat was still
+                            # writing -- the usual order -- waited for a round that
+                            # opens on a message, and the seats left never read it.
+                            if commit_reactions(session, insert_index):
+                                self.cog.session_manager.mark_session_dirty(
+                                    (channel_id, None, None), session_type)
+                            # Into the round's turn data as well, or its pictures reach
+                            # no one: the log keeps text only, and the characters still
+                            # to speak take their media from here.
+                            rnd.new_round_turn_data.append(
+                                (user_line, url_text_batch, reply_media + batch_msg_media + url_media_batch))
+
+                    rnd.all_triggers_for_round.extend(batched_triggers)
+            
+            # No forced gc.collect() here. It ran once per participant per round and
+            # cost ~11 ms of pure GIL-held CPU on a warm heap (worse on the e2-micro),
+            # stalling Discord heartbeats; asyncio.to_thread does not avoid that, since
+            # a collection holds the GIL regardless of which thread calls it. Image
+            # buffers are freed by refcounting the moment the last reference drops, so
+            # the pass only ever reclaimed reference cycles the automatic collector
+            # would have caught anyway.
+
+            return True
+        finally:
+            await self._abandon_state_container(
+                channel, state_container, session=session, bot_id=participant.get('bot_id'))
 

@@ -4,9 +4,10 @@ import traceback
 
 import discord
 from discord import ui
-from typing import Awaitable, Callable, Optional
+from typing import Awaitable, Callable, Optional, Sequence, Tuple
 
-from ..utils.constants import NOT_REGISTERED, PLACEHOLDER_EMOJI
+from ..utils.constants import (CAST_POLICY_OPEN, CAST_REFUSAL, MEMBERS_INFORMED_PROMPT,
+                               NOT_REGISTERED, PLACEHOLDER_EMOJI, TOPGG_LINKS, defaultConfig)
 from ..utils.helpers import suppress_link_previews
 
 def build_tab_nav_bar(target_view: ui.View, current_tab: str, tabs, row: int = 4):
@@ -36,6 +37,13 @@ def add_button(view: ui.View, label: str, callback, *, row: int = 0,
     view.add_item(btn)
     return btn
 
+
+
+def add_topgg_links(view: ui.View, row: Optional[int] = None) -> ui.View:
+    """The Top.gg vote and review links, as buttons on `view` -- see `TOPGG_LINKS` for where."""
+    for label, url in TOPGG_LINKS:
+        view.add_item(ui.Button(label=label, url=url, row=row))
+    return view
 
 def add_select(view: ui.View, options, callback, *, row: int = 0,
                placeholder: Optional[str] = None, min_values: int = 1,
@@ -136,6 +144,52 @@ async def refuse_unregistered(cog, interaction: discord.Interaction) -> bool:
     return True
 
 
+
+def cast_refusal(cog, interaction: discord.Interaction) -> Optional[str]:
+    """Why this member may not change this channel's cast, or None: administrators and the
+    bot owner always, anyone else only where an administrator set Open casting.
+
+    Read through `cast_policy_for_channel`, which must not wake or create a session: the
+    check would otherwise invent the session that answers it. In a server only."""
+    if (interaction.user.guild_permissions.administrator
+            or interaction.user.id == int(defaultConfig.DISCORD_OWNER_ID)):
+        return None
+    if cog.session_manager.cast_policy_for_channel(
+            interaction.guild_id, interaction.channel_id) == CAST_POLICY_OPEN:
+        return None
+    return CAST_REFUSAL
+
+async def refuse_uninformed(cog, interaction: discord.Interaction) -> bool:
+    """True, having asked, when nobody has yet confirmed this server's members were told.
+
+    Asked of whoever starts a session in a server, once for the server: every path that
+    takes a channel from no session, or a draft, to a running one asks this first (the
+    cast editor's Start, `/session swap`'s new session, MimicGuide in `/help`). Confirming
+    records who and when in the server's index, and they press Start again: the start is
+    not carried through, so no path needs a second copy of its own. Terms 3.
+    """
+    guild = interaction.guild
+    if guild is None:
+        return False
+    server_id = str(guild.id)
+    if cog.server_manager._get_server_index(server_id).get("members_informed"):
+        return False
+
+    async def confirm(i: discord.Interaction):
+        index = cog.server_manager._get_server_index(server_id)
+        index["members_informed"] = {"by": i.user.id, "at": time.time()}
+        await asyncio.to_thread(cog.server_manager._save_server_index, server_id, index)
+        await i.response.edit_message(
+            embed=closed_embed("Thank you", "Start the session again to go ahead."), view=None)
+
+    embed = text_embed(MEMBERS_INFORMED_PROMPT.format(server=guild.name), title="Before characters run here")
+    view = build_confirm_view("I've told them", confirm, interaction)
+    if interaction.response.is_done():
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    return True
+
 async def send_status(interaction: discord.Interaction, text: str) -> None:
     """Our own "is thinking...": an ephemeral embed saying what a slow command is doing.
 
@@ -199,7 +253,7 @@ async def settle_status(interaction: discord.Interaction, content: Optional[str]
 
     Text arrives in the status's own embed, so the reply takes its place rather than
     jumping to bare text, and gets an embed's 4096 characters where a message stops at
-    2000. A longer `/help ask` answer used to fail this edit and leave the status spinning.
+    2000. A longer Ask MimicGuide answer used to fail this edit and leave the status spinning.
     """
     ticker = interaction.extras.pop("status_ticker", None)
     if ticker is not None:
@@ -633,15 +687,15 @@ class ActionTextInputModal(ui.Modal):
         await self.on_submit_callback(interaction, self.input.value)
 
 class DropdownContentView(BlockedGuard, ui.View):
-    def __init__(self, content_dict: dict, title: str, link_button_label: Optional[str] = None,
-                 link_button_url: Optional[str] = None, start_category: Optional[str] = None,
+    def __init__(self, content_dict: dict, title: str, links: Sequence[Tuple[str, str]] = (),
+                 start_category: Optional[str] = None,
                  start_page: Optional[str] = None, footer: Optional[str] = None):
         super().__init__(timeout=600)
         self.content_dict = content_dict
         self.footer = footer
         self.view_title = title
-        self.link_button_label = link_button_label
-        self.link_button_url = link_button_url
+        #: (label, url) link buttons under the dropdowns.
+        self.links = links
 
         # `start_category` / `start_page` open the browser on one page rather than at
         # the beginning, which is what lets a "Read more" button elsewhere hand the
@@ -672,9 +726,8 @@ class DropdownContentView(BlockedGuard, ui.View):
             await interaction.response.edit_message(embed=self.get_embed(), view=self)
         add_select(self, page_options, page_callback, placeholder="Select Page...", row=1)
 
-        if self.link_button_label and self.link_button_url:
-            btn = ui.Button(label=self.link_button_label, url=self.link_button_url, row=2)
-            self.add_item(btn)
+        for label, url in self.links:
+            self.add_item(ui.Button(label=label, url=url, row=2))
 
     def get_embed(self) -> discord.Embed:
         content = self.content_dict[self.selected_category][self.selected_page]

@@ -127,6 +127,7 @@ cogs/
     content_rating_manager.py  cog.content_rating: classifier, verdicts, refusals, channel access
     voice_sample_manager.py    cog.voice_samples: voice sample recordings and consent
     persona_content.py     cog.persona_content: lorebook, fixed examples, bonds, birthday
+    ticket_store.py        cog.tickets: /help support tickets -- tickets.json + sealed bodies
     session_manager.py     hydration/dehydration, eviction, history derivation
     memory_manager.py      LTM, embeddings, cosine/MMR retrieval, training examples
     server_manager.py      per-guild index, webhooks, global prompts, system models
@@ -225,6 +226,7 @@ users/<user_id>/
                                       its "catalogue" is one Fernet token -- see below
   keys.json.gz                        API key slots + provider assignments
   shares.json.gz                      incoming profile shares
+  tickets/<n>.json.gz                 a support ticket's messages and attached trace
   profiles/<pid>/
     profile.json.gz                   unified: {name, config, prompts, child_bot}
     name.json                         plaintext sidecar: {name, class} -- see below
@@ -234,13 +236,16 @@ users/<user_id>/
     bonds.json.gz                     {speaker ID: [affection, resentment]}, cogs/utils/bonds.py
     global_chat.json.gz               `/profile global_chat` log, keyed (host, profile)
 servers/<guild_id>/
-  index.json                          active sessions, user profile prefs, key pointers
+  index.json                          active sessions, user profile prefs, key pointers,
+                                      who confirmed members were told (`members_informed`)
   api_keys.json.gz
   webhooks.json.gz
   sessions/<channel_id>/multi/session_log.json.gz
 public_profiles/                      the shared library index: each listing under its PID,
                                       with its display name and intro (plaintext: public)
 borrows.json                          plaintext reverse index: source PID -> borrow PIDs
+tickets.json                          plaintext ticket index: who, category, status, times,
+                                      unread flags -- never the text (`TicketStore`)
 mod/                                  blacklist, global prompt and system model overrides, docs
 ```
 
@@ -421,7 +426,9 @@ channel. Its shape:
    reactions, replies, proactive kicks. This runs even when nobody will answer.
 7. **Optionally generate one image** (`image_round.py`) *before* any participant speaks, so
    every turn in the round can see it.
-8. **Rotate.** Each participant in turn: build its prompt, call its model, deliver. The
+8. **Rotate.** Each participant in turn: build its prompt, call its model, deliver. Each
+   turn is `_run_seat_turn`, a frame of its own: what seats share goes through the `Round`
+   it is handed, and its `finally` tears the seat's placeholder down on every exit. The
    next participant's placeholder goes up at the handoff, not at the top of its turn. A
    reply that names another seat by a wakeword — names included — gives it that next
    turn (`_hand_on`), and so does a message sent mid-round that calls one

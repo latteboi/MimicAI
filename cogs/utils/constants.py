@@ -75,6 +75,9 @@ class DefaultConfigNamespace:
     def __init__(self):
         self.DISCORD_SDK = get_config_value("DISCORD_SDK")
         self.DISCORD_OWNER_ID = get_config_value("DISCORD_OWNER_ID")
+        # The Top.gg listing's project token, for /thanks's vote status (official instance).
+        # Read here with the rest: the Secret Manager client is released after boot.
+        self.TOPGG_TOKEN = get_config_value("TOPGG_TOKEN")
         self.PLACEHOLDER_EMOJI = get_config_value("PLACEHOLDER_EMOJI", "⏳")
         
         raw_key = get_config_value("ENCRYPTION_KEY")
@@ -265,6 +268,18 @@ PROVIDER_CHOICES = {**MODEL_PROVIDERS, PROVIDER_NONE: "None"}
 #: What every path that would create a user's data says to someone who has not set up.
 NOT_REGISTERED = ("Run `/start` first and create your account -- it is how you set MimicAI "
                   "up, and nothing is stored for you until you do.")
+
+#: Asked of whoever first starts a session in a server (`refuse_uninformed`), once. Terms 3.
+MEMBERS_INFORMED_PROMPT = (
+    "Characters are about to run in **{server}** for the first time, so make sure its members "
+    "know what that means. In a channel with a session, MimicAI reads the messages posted "
+    "there, keeps them in the session log, sends them to the AI provider whose key pays for "
+    "the replies, and characters may remember what they read.\n\n"
+    "A line in the channel topic or a pinned message is enough. The Terms of Service "
+    "(Section 3) ask this of whoever starts a session, and it is asked once per server.")
+#: Who may change a channel's cast, said to anyone else (`cast_refusal`).
+CAST_REFUSAL = ("You must be a server administrator to configure sessions. An administrator "
+                "can set this channel's session to **Open casting** to let anyone edit it.")
 
 #: A value, deliberately not an alias for FALLBACK_MODEL_NAME: it was spelled that way
 #: while the two coincided, so bumping the fallback silently moved the researcher onto a
@@ -2898,6 +2913,26 @@ LORE_SCAN_TURNS = 4
 LIMIT_FIXED_EXAMPLES = 20
 EXAMPLE_SAID_MAX_CHARS, EXAMPLE_REPLY_MAX_CHARS = 1000, 2000
 
+#: Support tickets (`/help` → Tickets, `TicketStore`). Open at once per user; kept per user,
+#: an eleventh dropping the oldest closed one; messages in one ticket, both sides; and one
+#: message's length. Together they bound what one user can store at a few hundred KB.
+LIMIT_OPEN_TICKETS = 3
+LIMIT_TICKETS_KEPT = 10
+LIMIT_TICKET_MESSAGES = 30
+TICKET_MESSAGE_MAX_CHARS = 2000
+#: A closed ticket is deleted this long after its last change (Privacy Policy 5).
+TICKET_RETENTION_DAYS = 30
+#: Between one user's new tickets. A refused or failed one does not count.
+TICKET_OPEN_COOLDOWN_SECONDS = 600
+#: Stored value -> shown label. The value is what the index keeps.
+TICKET_CATEGORIES = {
+    "bug": "Something's broken",
+    "setup": "Setup and API keys",
+    "rating": "Content rating",
+    "idea": "Idea or request",
+    "other": "Something else",
+}
+
 #: Server context (`/session config` → Server Context): custom emoji names listed, and the
 #: channel topic's length. Both sit in the system instruction on every call.
 LIMIT_SERVER_EMOJIS = 100
@@ -3373,6 +3408,15 @@ OFFICIAL_BOT_ID = 1376696185947164854
 #: is about the software only, never Adult profiles: payment processors drop adult content.
 KOFI_URL = "https://ko-fi.com/latteboi"
 TOPGG_URL = f"https://top.gg/bot/{OFFICIAL_BOT_ID}"
+#: Its vote and review pages, as link buttons: `/thanks`, and the few screens someone sees at a
+#: good moment -- `/start` finished, `/news`, `/invite`, a profile just published. Offered
+#: there and nowhere else: never unasked, never in a channel's conversation, never for a reward.
+TOPGG_LINKS = (("Vote on Top.gg", f"{TOPGG_URL}/vote"), ("Review on Top.gg", f"{TOPGG_URL}#reviews"))
+#: Top.gg API v1, one user's latest vote: 404 when they have none active, else `expires_at`.
+#: Needs `defaultConfig.TOPGG_TOKEN`, the listing's project token (docs.top.gg/api/v1/votes).
+TOPGG_VOTE_API = "https://top.gg/api/v1/projects/@me/votes/{user_id}"
+#: Under a profile just listed in the Public Library, beside `TOPGG_LINKS`.
+PUBLISHED_REVIEW_LINE = "-# Proud of it? A review on Top.gg helps others find MimicAI."
 
 #: Every permission the bot uses, and all any instance's invite asks a server for.
 BOT_PERMISSIONS = discord.Permissions(

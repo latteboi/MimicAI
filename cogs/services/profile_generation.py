@@ -1,8 +1,8 @@
 """Drafting a character from a concept: the prompt, the parse, the model and the save.
 
 `/profile generate` is reached three ways -- the command itself, the /start wizard and the
-Public Library's Generate button, from a concept, an image or both -- and all three arrive
-at the command's callback, which
+Public Library's Generate button, from whatever the form was given -- and all three open
+`NewProfileModal`, which hands off to `MimicCog._generate_profile`, which
 drafts through here and shows the draft (`gui_generate.GeneratedProfileView`) before
 anything is written. A draft lives only on that view: nothing touches disk until Save.
 """
@@ -63,6 +63,19 @@ REVISION_TEMPLATE = (
 
 #: What the template is handed as `{prompt}` when an image comes with no concept.
 IMAGE_CONCEPT = "the character in the attached image"
+
+
+def compose_concept(name: str, concept: str = "", display_name: Optional[str] = None,
+                    image: bool = False) -> str:
+    """Every field of the form as one concept, each adding to the others: the internal name
+    alone is enough, and a display name given is the one the draft writes about, rather
+    than replacing an invented one after the persona has been written around it."""
+    lines = [concept or (IMAGE_CONCEPT if image else f"a character suggested by the name \"{name}\"")]
+    if display_name:
+        lines.append(f"Their name is {display_name}.")
+    if concept or image:
+        lines.append(f'Filed as "{name}", which may hint at who they are.')
+    return "\n".join(lines)
 
 #: Appended after the operator's template for the same reason as REVISION_TEMPLATE.
 IMAGE_NOTE = (
