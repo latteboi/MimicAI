@@ -5,7 +5,7 @@ import asyncio
 import discord
 from typing import Dict, Set, Any, Optional, Tuple
 from ..utils.user_defaults import (
-    MODEL_SLOT_PAIRS, chain_lines, model_chain, model_provider, short_model_name)
+    MODEL_SLOT_PAIRS, chain_lines, model_chain, model_provider, short_model_name, subscription_chain)
 from ..utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, TTS_VOICE_GENDER, TTS_VOICE_CHARACTER, CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS, CONTENT_RATING_REASON_LABELS, CONTENT_RATING_REASON_FALLBACK, CONTENT_RATING_PENDING, CONTENT_RATING_ADULT, CONTENT_RATING_EMOJI, DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_VOICE, SPEECH_LANGUAGE_NAMES, IMAGE_GROUNDING_LABELS)
 from ..utils.helpers import (
@@ -114,10 +114,11 @@ class ProfileDashboard:
                     self.cog.content_rating._content_rating_state(user_id, profile_name),
                     self.cog.content_rating._is_owner_declared_adult(user_id, profile_name),
                     self.cog.library.distribution_of(user_id, profile_name), ids,
-                    self.cog.user_settings.provider_preference(user_id))
+                    self.cog.user_settings.provider_preference(user_id),
+                    self.cog.storage_manager.subscription_payer(guild_id, user_id))
         (is_borrowed, effective_owner_id, effective_profile_name, config, ltm_count, train_count,
          held, appearance_data, enforced, (verdict, verdict_reason), declared,
-         (is_public, borrowers), (pid_a, pid_b), preferred) = await asyncio.to_thread(_read)
+         (is_public, borrowers), (pid_a, pid_b), preferred, paid) = await asyncio.to_thread(_read)
 
         embed = discord.Embed(title=f"Profile Dashboard: '{profile_name}'", color=discord.Color.blue())
         profile_type = "Personal"
@@ -227,12 +228,22 @@ class ProfileDashboard:
         # wrapped into a wall.
         stored = {**config, "primary_model": prim_model, "fallback_model": fall_model}
         resolved = resolve_auto_models(self.cog, stored)
-        model_lines = []
+        # Where a MimicAI subscription pays -- the server's key here, or the Personal one in a
+        # DM -- its models are what run, so they are what is shown.
+        model_lines = (["-# A MimicAI subscription pays here, so these are its models "
+                        "(Set Models → API: Subscription)."] if paid else [])
         providers = {}
         for label, key in (("Response", "primary_model"), ("Image", "image_generation_model"),
                            ("Audio", "speech_model"), ("Grounding", "grounding_rag_model"),
                            ("LTM", "ltm_model"),
                            ("Training", "training_analysis_model")):
+            if paid:
+                chain = subscription_chain(self.cog, stored, key)
+                providers[key] = {"openrouter"} if chain else set()
+                if key == "primary_model" or all_models:
+                    model_lines.extend(chain_lines(label, chain[0], chain[1]) if chain else
+                                       [f"**{label}** → not in the subscription"])
+                continue
             primary, fallbacks = model_chain(resolved, key, preferred)
             providers[key] = {model_provider(m) for m in (primary, *fallbacks)}
             if key != "primary_model" and not all_models:

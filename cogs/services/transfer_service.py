@@ -21,6 +21,7 @@ from ..utils import fixed_examples, lorebook
 from ..managers.storage_manager import IOManager, _get_compressor, _get_decompressor
 from ..managers.memory_manager import read_ltm_dir, write_imported_ltm
 from ..gui.base_components import text_embed
+from .api.stripe import StripeError
 try:
     import orjson as json
 except ImportError:
@@ -391,6 +392,12 @@ class TransferService:
                             with open(os.path.join(target_dir, file), 'wb') as f:
                                 f.write(audio)
             
+            # Kept outside their folder, so added here: never the key or its hash.
+            subscription = self.cog.subscriptions.export_row(user_id)
+            if subscription:
+                with open(os.path.join(export_base, "subscription.json"), 'wb') as f:
+                    f.write(json.dumps(subscription, option=json.OPT_INDENT_2))
+
             zip_base = os.path.join(temp_d, f"mimicai_data_{user_id_str}")
             shutil.make_archive(zip_base, 'zip', export_base)
             return temp_d, f"{zip_base}.zip"
@@ -407,7 +414,18 @@ class TransferService:
 
     async def _execute_account_deletion(self, user_id: int, interaction: discord.Interaction):
         user_id_str = str(user_id)
-        
+
+        # 0. Stop the billing first: once the record is gone, nothing here could find it.
+        try:
+            await self.cog.subscriptions.cancel_payments(user_id)
+        except StripeError as e:
+            print(f"Account deletion: could not cancel {user_id}'s subscription: {e}")
+            await interaction.followup.send(embed=text_embed(
+                "❌ Your MimicAI subscription couldn't be cancelled, so nothing was deleted. "
+                "Try again later, or cancel it first: `/settings` → API Keys → MimicAI "
+                "Subscription → **Manage**."), ephemeral=True)
+            return
+
         # 1. Shutdown Child Bots
         child_bots_to_kill = [bot_id for bot_id, data in self.cog.child_bots.items() if str(data.get("owner_id")) == user_id_str]
         for bot_id in child_bots_to_kill:
@@ -448,6 +466,9 @@ class TransferService:
             self.cog.borrows._borrow_index_drop_user(user_id)
             # 4c. And in the ticket index: their ticket files went with the tree.
             self.cog.tickets.drop_user(user_id)
+            # 4d. And the subscription record, which lives outside the tree. Its key, which
+            # nothing names any more, is deleted by the next reconcile's sweep.
+            self.cog.subscriptions.drop_user(user_id)
         await asyncio.to_thread(_scrub)
 
         # Deliberately not touched: data/mod/blacklist.json. An enforcement record is

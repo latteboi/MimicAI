@@ -28,6 +28,7 @@ from ..services.generation.global_chat import build_global_chat_embed
 from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, cast_costs, quiet_label, session_advice
 from ..services.generation.tool_loop import functions_for
 from .base_components import dismissible, text_embed
+from .gui_settings import _fit_list
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -1430,6 +1431,25 @@ def turn_order(session: Dict) -> List[Tuple[Optional[int], str]]:
 TURN_ORDER_LEGEND = "✓ spoke · ▶ speaking · slot = /session swap slot:"
 
 
+def silent_seats(cog, channel, profiles, indices) -> Tuple[Optional[str], Dict[int, str]]:
+    """(why nobody speaks in `channel`, {seat index: why that seat does not}), for the seats
+    at `indices`, in PLACEMENT_LABELS' words. A round skips a seat the placement gate refuses
+    without a word in the channel, so the cast listings are where anyone reads why. Asked a
+    page at a time, never for a whole 200-seat cast: an uncached answer parses a profile."""
+    if channel is None:
+        return None, {}
+    whole = cog.content_rating.channel_block(channel)
+    if whole:
+        return PLACEMENT_LABELS[whole], {}
+    reasons = {}
+    for n in dict.fromkeys(indices):
+        p = profiles[n]
+        key = cog.content_rating.profile_block(p['owner_id'], p['profile_name'], channel)
+        if key:
+            reasons[n] = PLACEMENT_LABELS[key]
+    return None, reasons
+
+
 class _TurnOrderView(BlockedGuard, ui.View):
     """A paged turn-order list (`turn_order`) over the channel's live session, re-read on
     every render: the order moves turn by turn, and the dict is replaced by a new session.
@@ -1451,7 +1471,11 @@ class _TurnOrderView(BlockedGuard, ui.View):
         self.num_pages = max(1, (len(entries) - 1) // self.items_per_page + 1)
         self.current_page = min(self.current_page, self.num_pages - 1)
         start = self.current_page * self.items_per_page
-        self.page = entries[start:start + self.items_per_page]
+        page = entries[start:start + self.items_per_page]
+        self.nobody_speaks, why = silent_seats(
+            self.cog, self.cog.bot.get_channel(self.channel_id), self.session.get('profiles') or [],
+            [n for n, _ in page if n is not None])
+        self.page = [(n, f"{text} · ⛔ {why[n]}" if n in why else text) for n, text in page]
         self.render()
 
         async def turn(i, step):
@@ -1467,7 +1491,8 @@ class _TurnOrderView(BlockedGuard, ui.View):
     def order_text(self) -> str:
         if not self.session.get('profiles'):
             return "*No participants*"
-        return "\n".join(text for _, text in self.page)
+        lines = "\n".join(text for _, text in self.page)
+        return f"⛔ **No one speaks here:** {self.nobody_speaks}.\n\n{lines}" if self.nobody_speaks else lines
 
     def footer(self) -> str:
         return f"Page {self.current_page + 1} of {self.num_pages} · {TURN_ORDER_LEGEND}"
@@ -1812,15 +1837,24 @@ class SessionConfigView(BlockedGuard, ui.View):
         existing = self._seated(participant)
         return existing is not None and existing.get('method') == participant.get('method')
 
-    def _seat_items(self, items) -> List[str]:
-        """Seat each entry that is not already taken. Returns the ones refused.
+    def _live_channel(self):
+        """This channel as the gateway keeps it: discord.py updates a cached channel in place,
+        so its age-restricted flag is current, where the interaction's copy is a snapshot."""
+        return (self.cog.bot.get_channel(self.original_interaction.channel_id)
+                or self.original_interaction.channel)
+
+    def _seat_items(self, items) -> List[Tuple[str, str]]:
+        """Seat each entry that is not already taken. Returns (name, why) for each refused,
+        the why to follow the name.
 
         One add path for all three selection gestures -- a single name, Select Page and
-        Select All -- so the cast limit and the duplicate rule cannot drift between
-        them.
+        Select All -- so the cast limit, the duplicate rule and the placement gate cannot
+        drift between them. A profile that may not speak here is refused, not seated to be
+        skipped every round (`seat_refusal`).
         """
         blocked = []
         index = self._seated_index()
+        channel = self._live_channel()
         for item in items:
             if len(self.session['profiles']) >= 200:
                 break
@@ -1834,7 +1868,14 @@ class SessionConfigView(BlockedGuard, ui.View):
                 # silent: Select All hits it on every pass. Only the cross-method
                 # collision is worth a word.
                 if existing.get('method') != participant.get('method'):
-                    blocked.append(participant['profile_name'])
+                    blocked.append((participant['profile_name'],
+                                    "is already in the cast the other way: a profile speaks as "
+                                    "a child bot **or** a webhook, not both."))
+                continue
+            refusal = self.cog.content_rating.seat_refusal(
+                participant['owner_id'], participant['profile_name'], channel)
+            if refusal:
+                blocked.append((participant['profile_name'], refusal))
                 continue
             self.session['profiles'].append(participant)
             index[key] = participant
@@ -2121,12 +2162,11 @@ class SessionConfigView(BlockedGuard, ui.View):
 
             await i.response.defer(); await self.update_display()
             if blocked:
-                names = ", ".join(f"`{n}`" for n in blocked[:5])
-                more = f" (+{len(blocked) - 5})" if len(blocked) > 5 else ""
-                await i.followup.send(
-                    embed=text_embed(f"Skipped {names}{more} — already in the cast the other way "
-                    f"(a profile speaks as a child bot **or** a webhook, not both)."),
-                    ephemeral=True)
+                lines = [f"• **{name}** {why}" for name, why in blocked[:5]]
+                if len(blocked) > 5:
+                    lines.append(f"…and {len(blocked) - 5} more.")
+                await i.followup.send(embed=text_embed("**Not added:**\n" + "\n".join(lines)),
+                                      ephemeral=True)
         add_select(self, options, cast_cb, placeholder=placeholder, min_values=0,
                    max_values=len(options) if page_items else 1, row=1,
                    disabled=not page_items)
@@ -2214,26 +2254,24 @@ class SessionConfigView(BlockedGuard, ui.View):
                        style=discord.ButtonStyle.secondary, row=2)
 
         profiles = self.session.get('profiles', [])
-        total_active = len(profiles)
-        
-        def _cast_line(idx, p):
+        start_p = self.current_page * 20 if len(profiles) > 20 else 0
+        shown = range(start_p, min(start_p + 20, len(profiles)))
+        nobody, why = silent_seats(self.cog, self._live_channel(), profiles, shown)
+
+        def _cast_line(n, p):
             method_lbl = 'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'
             pid = p.get('pid')
             pid_str = f" `[{pid}]`" if pid else ""
-            return f"{idx}. `{p['profile_name']}`{pid_str} ({method_lbl})"
+            mark = " ⛔" if n in why else ""
+            return f"{n + 1}. `{p['profile_name']}`{pid_str} ({method_lbl}){mark}"
 
-        if total_active <= 20:
-            cast_list = "\n".join(_cast_line(idx + 1, p)
-                                  for idx, p in enumerate(profiles)) or "*No participants*"
-        else:
-            start_p = self.current_page * 20
-            end_p = start_p + 20
-            page_profiles_cast = profiles[start_p:end_p]
-            
-            cast_list = "\n".join(_cast_line(idx, p) for idx, p in
-                                  enumerate(page_profiles_cast, start=start_p + 1)) or "*No participants*"
-            
+        cast_list = "\n".join(_cast_line(n, profiles[n]) for n in shown) or "*No participants*"
         embed.add_field(name="Current Cast", value=cast_list, inline=False)
+        # Beside the cast rather than on its lines: that field is near its 1,024 characters.
+        if nobody or why:
+            value = (f"No one in this channel: {nobody}." if nobody
+                     else _fit_list([f"`{profiles[n]['profile_name']}`: {w}" for n, w in why.items()], "\n", 1000))
+            embed.add_field(name="⛔ Won't speak here", value=value, inline=False)
 
     def _render_config(self, embed: discord.Embed):
         """Session-wide behaviour: execution mode, master prompt, features, response limit, settle window, cast access."""
@@ -2602,7 +2640,8 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Full mode", value="\n".join([
             f"Instructions: {'custom' if store().get('instructions') else 'default'}.",
             *chain_lines("Models", *self.cog.api_service.model_chain(
-                session.get("critic") or {}, "critic_model", session.get("owner_id"))),
+                session.get("critic") or {}, "critic_model", session.get("owner_id"),
+                guild_id=self.original_interaction.guild_id)),
             *([] if full else ["-# Used in Full only."])]), inline=False)
 
         for mode in CRITIC_MODES:
@@ -2781,7 +2820,8 @@ class SessionConfigView(BlockedGuard, ui.View):
             f"{on(dir_on)} · Gives each proactive round a scene event to react to. "
             f"Instructions: {'custom' if pro.get('director_instructions') else 'default'}.",
             *chain_lines("Models", *self.cog.api_service.model_chain(
-                director_model_config(pro), "director_model", self.session.get("owner_id"))),
+                director_model_config(pro), "director_model", self.session.get("owner_id"),
+                guild_id=self.original_interaction.guild_id)),
             *([] if enabled else ["-# Idle while Proactivity is off."])]), inline=False)
         embed.add_field(name="Follow-ups", value=(
             f"{on(follow_ups_on)} · A character may come back to someone later: when they next speak, "
@@ -2831,7 +2871,8 @@ class SessionConfigView(BlockedGuard, ui.View):
         embed.add_field(name="Fold Size", value=f"`{cfg['chunk']}` turns", inline=True)
         embed.add_field(name="Length", value=f"About `{cfg['max_words']}` words", inline=True)
         embed.add_field(name="Models", value="\n".join(chain_lines("Summariser", *self.cog.api_service.model_chain(
-            compaction_model_config(self.session), "compaction_model", self.session.get("owner_id")))), inline=False)
+            compaction_model_config(self.session), "compaction_model", self.session.get("owner_id"),
+            guild_id=self.original_interaction.guild_id))), inline=False)
 
         log = self.session.get("unified_log") or []
         visible = sum(

@@ -74,6 +74,10 @@ async def on_ready():
     if bot.user.id == OFFICIAL_BOT_ID:
         # The official bot's /privacy shows no data policy (PrivacyDashboardView.embed).
         bot.tree.get_command("privacy").description = "Export or delete your data."
+    cog = bot.get_cog("MimicCog")
+    if not (cog and cog.subscriptions.billing):  # a pause keeps it for subscribers
+        # Self-hosts never show the subscription (tests/MIMIC_SUBSCRIPTION.md, Decided).
+        bot.tree.remove_command("subscribe")
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} application commands globally.")

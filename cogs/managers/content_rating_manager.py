@@ -11,7 +11,7 @@ import asyncio
 import discord
 from typing import Dict, List, Any, Optional, Tuple
 from ..utils.constants import (
-    USERS_DIR, CLASSIFIER_KEYS, defaultConfig, DEFAULT_SAFETY_SETTINGS, CONTENT_RATING_LABELS, CONTENT_RATING_REASON_LABELS, DEFAULT_CONTENT_CLASSIFIER_PROMPT, REFUSAL_CONFIRMERS, UNREVIEWED_REFUSALS, CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_GENERAL, CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED, PLACEMENT_REFUSALS, REFUSED_INDEX_FILE, CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS)
+    USERS_DIR, CLASSIFIER_KEYS, SUBSCRIPTION_MODELS, defaultConfig, DEFAULT_SAFETY_SETTINGS, CONTENT_RATING_LABELS, CONTENT_RATING_REASON_LABELS, DEFAULT_CONTENT_CLASSIFIER_PROMPT, REFUSAL_CONFIRMERS, UNREVIEWED_REFUSALS, CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_GENERAL, CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED, PLACEMENT_REFUSALS, REFUSED_INDEX_FILE, CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS)
 from ..utils.helpers import (
     resolve_thinking_params, system_model, system_settings, resolve_openrouter_endpoint, resolve_openrouter_service_tier)
 from ..utils import fixed_examples, lorebook
@@ -23,6 +23,13 @@ from .profile_manager import _carried_hold, _unchecked_declaration
 
 #: `_effective_safety_level`'s answers, least to most restrictive.
 _SAFETY_LEVEL_ORDER = ("restricted", "unrestricted", "checking", "blocked", "refused")
+
+
+def _age_restricted(channel) -> bool:
+    """Whether `channel` is marked age-restricted. A thread answers for its parent; anything
+    else -- a PartialMessageable, a DM -- is not."""
+    return (isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel))
+            and channel.is_nsfw())
 
 #: Rating jobs land in worker threads, and each read-modify-writes the whole file.
 _REFUSED_INDEX_LOCK = threading.Lock()
@@ -387,21 +394,49 @@ class ContentRatingManager:
             if src == (int(owner_id), profile_name):
                 self.cog.content_rating_cache.pop(key, None)
 
+    def channel_block(self, channel) -> Optional[str]:
+        """"subscription" when no character at all may speak in `channel`, else None.
+
+        An age-restricted channel drops <content_policy> for every profile, so the MimicAI
+        subscription never pays for a turn in one, whatever the profile's rating. A session
+        is refused it when it starts (`refuse_uninformed`), not seat by seat.
+        """
+        if _age_restricted(channel) and self.cog.storage_manager.subscription_payer(channel.guild.id, None):
+            return "subscription"
+        return None
+
+    def profile_block(self, owner_id: int, profile_name: str, channel) -> Optional[str]:
+        """Which of PLACEMENT_REFUSALS this profile's rating meets in `channel`, or None."""
+        level = self._resolve_enforced_safety_level(owner_id, profile_name)
+        if level == "restricted" or (level == "unrestricted" and _age_restricted(channel)):
+            return None
+        return level
+
     def placement_refusal(self, profile_owner_id: int, profile_name: str,
                           channel: discord.abc.Messageable) -> Optional[str]:
         """Why this profile may not speak in `channel`, to follow its name, or None if it may.
 
         The one runtime gate: every path that speaks as a character asks it, directly or
-        through _check_unrestricted_safety_policy.
+        through _check_unrestricted_safety_policy. Seating asks `seat_refusal` first, so a
+        seat this refuses got here by something changing since -- the channel's flag, a
+        rating, the server's subscription -- and a round skips it in silence.
         """
-        level = self._resolve_enforced_safety_level(profile_owner_id, profile_name)
-        if level == "restricted":
+        key = self.channel_block(channel) or self.profile_block(profile_owner_id, profile_name, channel)
+        return PLACEMENT_REFUSALS[key] if key else None
+
+    def seat_refusal(self, owner_id: int, profile_name: str, channel) -> Optional[str]:
+        """Why this profile may not be seated in `channel`, to follow its name, or None.
+
+        The rating's half of `placement_refusal`; the channel's half is the session's, asked
+        when it starts. A declaration still being checked is seated, and its check queued
+        now, so it is usually done before the first turn.
+        """
+        key = self.profile_block(owner_id, profile_name, channel)
+        if key == "checking":
+            self.schedule_content_classification(
+                *self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name))
             return None
-        if (level == "unrestricted"
-                and isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel))
-                and channel.is_nsfw()):
-            return None
-        return PLACEMENT_REFUSALS[level]
+        return PLACEMENT_REFUSALS[key] if key else None
 
     def _check_unrestricted_safety_policy(self, profile_owner_id: int, profile_name: str, channel: discord.abc.Messageable) -> bool:
         return self.placement_refusal(profile_owner_id, profile_name, channel) is None
@@ -492,7 +527,10 @@ class ContentRatingManager:
         attempts = []
         side = self.cog.user_settings.effective_provider(owner_id)
         settings = system_settings(self.cog, "classifier", side)
-        chain = dict.fromkeys(system_model(self.cog, k, side) for k in CLASSIFIER_KEYS)
+        chain = dict.fromkeys(
+            SUBSCRIPTION_MODELS[CLASSIFIER_KEYS[0]]
+            if self.cog.storage_manager.subscription_payer(None, owner_id)
+            else (system_model(self.cog, k, side) for k in CLASSIFIER_KEYS))
         for role, value in zip(("primary", "fallback"), chain):
             if value.startswith("GOOGLE/"):
                 attempts.append(("gemini", value[len("GOOGLE/"):], GoogleGenAIModel, role))

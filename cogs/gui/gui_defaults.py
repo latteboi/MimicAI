@@ -35,8 +35,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from .base_components import add_button, add_select, redraw_select
 from ..utils.helpers import resolve_openrouter_endpoint
-from ..utils.constants import PROVIDER_CHOICES, PROVIDER_NONE
-from ..utils.user_defaults import defaultable_keys, model_slot_labels, setting_label
+from ..utils.constants import PROVIDER_CHOICES, PROVIDER_NONE, PROVIDER_SUBSCRIPTION
+from ..utils.user_defaults import defaultable_keys, model_slot_labels, offered_providers, setting_label
 from .gui_profiles import (
     PROFILE_ACTIONS, PROFILE_ACTIONS_BY_VALUE, PROFILE_TABS, _ActionStagingHost,
     _BulkSession, _TAB_BUTTONS_PER_ROW, _select_chunks, ModelPickerMixin,
@@ -63,6 +63,9 @@ _ROW_VALUE_LINES = 4
 NO_PROVIDER_NOTE = ("No provider ships models to your new profiles: they start on what you set "
                     "under **Models** here, and a slot you leave on *Platform default* "
                     "starts with none.")
+#: The Provider field with the subscription chosen: it runs on OpenRouter, so ships its models.
+SUBSCRIPTION_PROVIDER_NOTE = ("New profiles start on OpenRouter's models. Wherever your "
+                              "subscription pays, it runs its curated models in their place.")
 
 
 class _SparseSeed(dict):
@@ -349,7 +352,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
 
     def _preferred(self) -> str:
         """The choice made in `/start`: `/settings` is closed to anyone without one."""
-        preferred = self.cog.user_settings.provider_preference(self.user_id)
+        preferred = self.cog.user_settings.provider_choice(self.user_id)
         return preferred if preferred in PROVIDER_CHOICES else PROVIDER_NONE
 
     def _embed_actions(self) -> discord.Embed:
@@ -358,8 +361,8 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
             "Starting settings for profiles you **create**, offered on ones you **borrow**. "
             "Existing profiles keep theirs; `/profile bulk manage` changes those.\n"
             "-# *Platform default* follows the bot's value for your provider, even if it changes.")
-        note = (NO_PROVIDER_NOTE if self._preferred() == PROVIDER_NONE
-                else PROVIDER_PREFERENCE_NOTE)
+        note = {PROVIDER_NONE: NO_PROVIDER_NOTE, PROVIDER_SUBSCRIPTION: SUBSCRIPTION_PROVIDER_NOTE
+                }.get(self._preferred(), PROVIDER_PREFERENCE_NOTE)
         e.add_field(name="Provider", value=f"`{PROVIDER_CHOICES[self._preferred()]}` — "
                                            f"{note}"[:1024], inline=False)
         rows = self._rows(self.tab)
@@ -581,9 +584,11 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         return callback
 
     async def _set_provider(self, interaction: discord.Interaction):
-        """The button beside Clear steps through Google, OpenRouter and None."""
-        choices = list(PROVIDER_CHOICES)
-        provider = choices[(choices.index(self._preferred()) + 1) % len(choices)]
+        """The button beside Clear steps through what `/start` offers. None, no longer
+        offered, steps on to the first."""
+        choices = offered_providers(self.cog.subscriptions.sells)
+        current = self._preferred()
+        provider = choices[(choices.index(current) + 1) % len(choices) if current in choices else 0]
         self.cog.user_settings.set_provider_preference(self.user_id, provider)
         self.view_mode = self.preferred_api(self.cog, self.user_id)
         await self.refresh(interaction)

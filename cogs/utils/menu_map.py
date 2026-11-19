@@ -48,11 +48,11 @@ _STATIC_DASHBOARDS = [
                 "Under it, the current step's text and buttons; a dropdown jumps to any step",
                 "Steps that cannot be done from here are greyed with the reason, not hidden",
                 "Step 1 Create your account: Create Account opens a form to accept the Terms and "
-                "Privacy Policy and choose OpenRouter (recommended), Google (paid key) or None (no "
-                "model defaults); submitting registers you, and nothing is stored before it. "
+                "Privacy Policy and choose the MimicAI Subscription (recommended, where sold), "
+                "OpenRouter or Google (paid key); submitting registers you, and nothing is stored before it. "
                 "Read the Terms opens /terms. Picked again later, the step switches provider",
                 "Step 2 Add your API key: Get a key (link), Paste key (made your Personal key), "
-                "both providers' with None; "
+                "both providers' with None (no longer offered); with the Subscription, Choose a tier (the tiers, then Stripe; a purchase is assigned Personal, and to this server where you run it); "
                 "servers you administer, ticked in a paged dropdown and saved as ticked",
                 "Step 3 Get a character: Browse Library or Generate one (after step 1)",
                 "Step 4 Add it to this channel: opens the cast editor (administrators, or Open casting)",
@@ -206,8 +206,9 @@ _STATIC_DASHBOARDS = [
             ("Profiles", ["Inspect any user's profiles; clear classifier verdicts",
                           "Reset All Content Ratings (instance-wide, one-off baseline reset)",
                           "Trace Message: who ran the character behind a message link, from its signature "
-                          "(the bot owner's View Generation Trace shows it too)"]),
-            ("Prompts", ["Override the global system prompts, including CONTENT_POLICY and HELP_MODE_INJECTION",
+                          "(the bot owner's View Generation Trace shows it too); Delete Message "
+                          "under the answer removes it, turn and all"]),
+            ("Prompts", ["Override the global system prompts, including CONTENT_POLICY, HARD_LIMITS and HELP_MODE_INJECTION",
                          "System Models: the attachment describer, content classifier and profile "
                          "generator (per provider preference), embeddings, System profiles and Gemini "
                          "key checks; each tab's Primary and Fallback, with its Thinking and Hosts & Tier",

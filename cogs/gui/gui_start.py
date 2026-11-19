@@ -10,8 +10,9 @@ the seat step has no way to learn why the bot is silent.
 exists -- the provider preference, assigned keys, the profile index, the channel's
 session -- which means the wizard cannot desynchronise from reality, "run it again to
 pick up where you left off" is literally true, and there is no new per-user dict to keep
-bounded. A stale wizard is harmless for the same reason: its buttons re-probe, so it
-needs none of the `active_session_config_views` machinery `/session config` carries.
+bounded. An open wizard re-probes on a timer (`watch`) rather than being told: a step
+finishes in a draft view, the library, the cast editor or the channel itself, and a
+poll is one place where hooks in each would be five.
 
 It is a router, not a second implementation. The key step opens `/settings`'
 `SubmitAPIKeyModal` and its server picker is `/settings`' own (`KeyScopeMixin`),
@@ -20,7 +21,8 @@ launch the real dashboard -- `HubPublicLibraryView`, `/profile generate`,
 `SessionConfigView` -- as a *separate* ephemeral message, by deferring with
 `thinking=True`. On a component interaction that sends a new message rather than
 updating this one, so those views' `edit_original_response` lands on the new message
-and the wizard survives underneath to be refreshed.
+and the wizard survives underneath to be refreshed. Home, once nothing is left to set up
+where it was run, is more of the same launchers: no screen of its own.
 
 Prose lives in `content.WIZARD_COPY`, and depth is not repeated: each step names a
 `HELP_CATEGORIES` page, and the Guide button opens the guide browser on it.
@@ -33,15 +35,20 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from ..utils.constants import (BOT_PERMISSIONS, CAST_POLICY_OPEN, CHILD_BOT_PERMISSIONS,
                                DEFAULT_CAST_POLICY, MODEL_PROVIDERS, PROVIDER_CHOICES,
-                               PROVIDER_NONE, defaultConfig)
+                               PROVIDER_SUBSCRIPTION, SUBSCRIPTION_SLOT, defaultConfig)
 from ..utils import openrouter_signin
+from ..utils.user_defaults import offered_providers
+from ..managers.subscriptions import ACTIVE, tier_name
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, PERMISSION_EFFECTS,
-                             SERVER_KEY_PITCH, SERVER_KEY_UNASSIGNED, WIZARD_COPY, WIZARD_TOUR)
-from .base_components import (BlockedGuard, DropdownContentView, TimeoutCleanupMixin, add_button,
-                              add_select, add_topgg_links)
-from .gui_settings import (SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView,
-                           SubmitAPIKeyModal, _fit_list)
+                             SERVER_KEY_PITCH, SERVER_KEY_UNASSIGNED, WIZARD_COPY, WIZARD_HOME,
+                             WIZARD_TOUR)
+from .base_components import (PAGE_NAV_VALUES, BlockedGuard, DropdownContentView, PageJumpModal,
+                              TimeoutCleanupMixin, add_button, add_select, add_topgg_links,
+                              paged_nav_options, refuse_unregistered)
+from .gui_generate import unsaved_draft
+from .gui_settings import (SLOT_PROVIDER, KeyScopeMixin, OverrideConfirmView, SettingsAPIView,
+                           SettingsHomeView, SubmitAPIKeyModal, SubscribeView, _fit_list)
 from .base_components import text_embed
 
 if TYPE_CHECKING:
@@ -51,6 +58,14 @@ if TYPE_CHECKING:
 #: Where each provider hands out keys, behind the key step's link button.
 KEY_PAGES = {"openrouter": "https://openrouter.ai/settings/keys",
              "gemini": "https://aistudio.google.com/app/apikey"}
+
+#: How often an open wizard re-probes (`StartWizardView.watch`). A probe is cached reads
+#: and one thread hop; a Discord edit is sent only when what it shows changed.
+WATCH_SECONDS = 5
+#: `step_key` for Home, picked by its button: no step is focused.
+HOME = "home"
+#: Characters per page of Home's dropdown: 25 options, less the three page controls.
+_HOME_PAGE = 22
 
 
 class _Step:
@@ -88,11 +103,14 @@ class _Step:
         self.repeatable = repeatable
 
     def blurb(self, state: Dict[str, Any]) -> str:
-        copy = WIZARD_COPY.get(self.key, "")
+        # Where the subscription is sold, a step may say so (`provider_sold`).
+        copy = (state.get("sells") and WIZARD_COPY.get(f"{self.key}_sold")) or WIZARD_COPY.get(self.key, "")
         # The key step speaks for the provider chosen before it, and only that one --
         # and, where this instance offers it, of signing in rather than making a key.
         if isinstance(copy, dict):
             provider = state.get("provider") or "openrouter"
+            if provider == PROVIDER_SUBSCRIPTION and not (state.get("sells") or state.get("subscribed")):
+                provider = "openrouter"  # not sold here, or paused: it ran on OpenRouter
             if openrouter_signin.enabled() and f"{provider}_signin" in copy:
                 provider += "_signin"
             return copy.get(provider, "")
@@ -134,7 +152,6 @@ WIZARD_STEPS = (
     _Step("provider", "Create your account",
           ("1. Getting Started", "API Keys and Where They Apply"),
           lambda s: bool(s["provider"]), repeatable=True,
-          actions=("_act_prefer_openrouter", "_act_prefer_gemini", "_act_prefer_none"),
           done_detail=lambda s: PROVIDER_CHOICES.get(s["provider"], s["provider"])),
     _Step("key", "Add your API key",
           ("1. Getting Started", "API Keys and Where They Apply"),
@@ -160,6 +177,8 @@ WIZARD_STEPS = (
           lambda s: s["has_spoken"], context="guild", requires="seated",
           done_detail=lambda s: "it has spoken here"),
 )
+#: The step Home's Session button stands for: its gates are the cast editor's.
+_SEAT = next(step for step in WIZARD_STEPS if step.key == "seat")
 
 
 def _lacking(perms, wanted: discord.Permissions) -> List[str]:
@@ -253,6 +272,8 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
 
     has_key = await cog.storage_manager._has_api_key_access(user_id, interaction.guild_id)
     session = cog.multi_profile_channels.get(channel_id)
+    sub = cog.subscriptions.row(user_id) if cog.subscriptions.enabled else None
+    subscribed = bool(sub and sub.get("status") == ACTIVE)
 
     def _sync() -> Dict[str, Any]:
         index = cog.profile_manager._get_user_index(user_id) or {}
@@ -292,8 +313,9 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
             slots = [s for s in (keys_data.get("slots") or {}).values()
                      if isinstance(s, dict) and s.get("key")]
             names = {"gemini": "Gemini", "openrouter": "OpenRouter"}
-            labels = []
-            for provider in sorted({s.get("provider", "?") for s in slots}):
+            labels = [f"Subscription · {tier_name(sub.get('tier'))}"] if subscribed else []
+            for provider in sorted({s.get("provider", "?") for s in slots},
+                                   key=lambda p: (p != "openrouter", p)):
                 mine = [s for s in slots if s.get("provider", "?") == provider]
                 tiers = "/".join(sorted({str(s.get("tier", "free")).title() for s in mine}))
                 label = f"{names.get(provider, provider)} · {tiers} tier"
@@ -342,7 +364,8 @@ async def gather_state(cog: "MimicCog", interaction: discord.Interaction) -> Dic
                 "usable_slot": (cog.storage_manager.usable_key_slot(user_id, guild.id)
                                 if guild is not None else None),
                 "seated_disk": seated_disk,
-                "cast_policy": cast_policy}
+                "cast_policy": cast_policy,
+                "sells": cog.subscriptions.sells, "subscribed": subscribed}
 
     state = await asyncio.to_thread(_sync)
 
@@ -402,6 +425,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         # The step picked from the dropdown; None follows the first one not done.
         self.step_key: Optional[str] = None
         self.tour_page = next(iter(WIZARD_TOUR))
+        self.home_page = 0
         self._init_scopes()
         if interaction.guild is not None:
             # The server it was run in first: the one its runner came here to fix.
@@ -413,7 +437,9 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
 
     @property
     def focus(self) -> Optional[_Step]:
-        """The step on screen: the one picked, else the first not done."""
+        """The step on screen: the one picked, else the first not done. None is Home."""
+        if self.step_key == HOME:
+            return None
         picked = next((s for s in WIZARD_STEPS if s.key == self.step_key), None)
         return picked or self._next_incomplete()
 
@@ -424,7 +450,15 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             return False
 
     def _next_incomplete(self) -> Optional[_Step]:
-        return next((s for s in WIZARD_STEPS if not self._done(s)), None)
+        """The first step not done that can be taken here. None opens Home: a DM, or a member
+        who can't cast here, has nothing left to do in this place, and the checklist still
+        shows the rest greyed with its reason."""
+        return next((s for s in WIZARD_STEPS
+                     if not self._done(s) and s.available(self.state)), None)
+
+    def _settled(self) -> bool:
+        """The steps that are yours rather than a channel's are done: Home has something to show."""
+        return all(self._done(s) for s in WIZARD_STEPS if s.context == "any")
 
     def _sync_slot(self):
         """The key the server picker assigns: your Personal key for the provider you
@@ -432,7 +466,11 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         since every pick here is saved as it is made."""
         keys = self.cog.storage_manager._get_user_keys_data(self.user_id) or {}
         personal = keys.get("personal_assignments") or {}
-        slot = personal.get(self.state.get("provider")) or next(iter(personal.values()), None)
+        chosen = self.state.get("provider")
+        slot = (personal.get("openrouter" if chosen == PROVIDER_SUBSCRIPTION else chosen)
+                or next(iter(personal.values()), None))
+        if not slot and chosen == PROVIDER_SUBSCRIPTION and self.state.get("subscribed"):
+            slot = SUBSCRIPTION_SLOT  # bought here, assigned nowhere yet: the picker places it
         self.selected_slot = slot if slot in SLOT_PROVIDER else None
         self._load_scopes()
 
@@ -443,6 +481,34 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         self._sync_slot()
         self._build_view()
         await self.update_display()
+
+    def watch(self):
+        """Re-probe every WATCH_SECONDS while open, so a step finished in another message --
+        a draft saved, a borrow, a cast started, the first reply, a sign-in -- ticks itself
+        and the wizard moves on. 🔄 Refresh stays as the backup."""
+        self._watcher = asyncio.create_task(self._watch())
+
+    async def _watch(self):
+        while not self.is_finished():
+            await asyncio.sleep(WATCH_SECONDS)
+            if self.screen != "setup" or self.is_finished():
+                continue
+            try:
+                shown = self.embed().to_dict()
+                self.state = await gather_state(self.cog, self.original_interaction)
+                self._sync_slot()
+                # Rebuilt only to be sent: a rebuild gives every component a new custom_id,
+                # so one Discord never saw leaves the buttons on screen dead -- and an edit
+                # closes a dropdown the user has open, so nothing unchanged is sent.
+                if self.is_finished() or self.embed().to_dict() == shown:
+                    continue
+                self._build_view()
+                await self.update_display()
+            except discord.HTTPException as e:
+                if e.status < 500:
+                    return  # dismissed, or the token lapsed: nothing left to paint
+            except Exception as e:
+                print(f"StartWizardView watch: {type(e).__name__}({e})")
 
     async def _scopes_picked(self, interaction: discord.Interaction):
         """Applied as picked, Personal kept: nothing here waits on a Save."""
@@ -492,8 +558,8 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
                                     if s.get("usable_slot") else SERVER_KEY_PITCH))
             return f"{where}🛡️ **Your role** Server administrator\n{key_line}{pitch}"
         role = "👤 **Your role** Member (not an administrator)\n"
-        # Who may seat a character, said only on the step that seats one.
-        if self.focus is None or self.focus.key != "seat":
+        # Who may seat a character, said on the step that seats one, and on Home until one is.
+        if (self.focus.key != "seat") if self.focus else s["seated"]:
             return f"{where}{role}{key_line}"
         if s["can_cast"]:
             note = ("This channel is on **Open casting** (anyone may add characters) — you "
@@ -549,22 +615,35 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
                                  color=discord.Color.blurple()
                                  ).set_author(name="MimicAI · Using it")
 
+        focus = self.focus
+        if focus is None:
+            e = discord.Embed(title="MimicAI Home", description=self._banner(),
+                              color=discord.Color.green())
+            e.add_field(name="Your setup", value=self._checklist(), inline=False)
+            e.add_field(name="Where to?", value=self._home_text(), inline=False)
+            return e
         done = sum(1 for s in WIZARD_STEPS if self._done(s))
         e = discord.Embed(title="Getting Started", description=self._banner(),
                           color=(discord.Color.green() if done == len(WIZARD_STEPS)
                                  else discord.Color.blurple()))
         e.add_field(name=f"Setup — {done} of {len(WIZARD_STEPS)} done",
                     value=self._checklist(), inline=False)
-        focus = self.focus
-        if focus is None:
-            e.add_field(name="You're set up",
-                        value="Just talk in the channel. **Using it ▸** covers what else there is.\n"
-                              "-# Enjoying MimicAI? A vote or a review on Top.gg helps others find it.",
-                        inline=False)
-        else:
-            e.add_field(name=f"Step {WIZARD_STEPS.index(focus) + 1}. {focus.title}",
-                        value=self._step_text(focus), inline=False)
+        e.add_field(name=f"Step {WIZARD_STEPS.index(focus) + 1}. {focus.title}",
+                    value=self._step_text(focus), inline=False)
         return e
+
+    def _offers_subscription(self) -> bool:
+        return bool(self.state.get("sells") or self.state.get("subscribed"))
+
+    def _home_text(self) -> str:
+        session = WIZARD_HOME["session"]
+        if not _SEAT.available(self.state):
+            session += f" · *{_SEAT.blocker(self.state)}*"
+        lines = [WIZARD_HOME["intro"], WIZARD_HOME["character"], session,
+                 WIZARD_HOME["library"], WIZARD_HOME["settings"]]
+        if self._offers_subscription():
+            lines.append(WIZARD_HOME["subscription"])
+        return "\n".join(lines + [WIZARD_HOME["help"], WIZARD_HOME["vote"]])
 
     def render(self) -> Dict[str, Any]:
         return {"content": None, "embed": self.embed(), "view": self}
@@ -602,13 +681,42 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
 
         add_button(self, "🔄 Refresh", self._act_refresh, style=discord.ButtonStyle.secondary,
                    row=3)
-        add_button(self, "📖 Guide", self._act_guide, style=discord.ButtonStyle.secondary, row=3)
         # Not before: what there is to do once it talks is noise while it cannot.
         if focus is None:
+            self._build_home()
+            add_button(self, "❓ Help", self._act_help, row=3)
             add_button(self, "Using it ▸", self._act_tour, style=discord.ButtonStyle.primary,
                        row=3)
-            # Set up is the good moment, and seen once: it asks nothing more often than that.
             add_topgg_links(self, row=4)
+        else:
+            add_button(self, "📖 Guide", self._act_guide, style=discord.ButtonStyle.secondary, row=3)
+            if self._settled():
+                add_button(self, "🏠 Home", self._act_home, row=3)
+
+    def _home_names(self) -> List[Tuple[str, str]]:
+        """(name, kind) for each character Home's dropdown offers, from the state's own read."""
+        return ([(n, "Personal") for n in self.state["personal"]]
+                + [(n, "Borrowed") for n in self.state["borrowed"]])
+
+    def _build_home(self):
+        """Home's controls. Each opens the screen its command opens, as a new message."""
+        add_button(self, "Session", self._act_cast, emoji="🎬", row=0,
+                   disabled=not _SEAT.available(self.state))
+        add_button(self, "Library", self._act_library, emoji="🏛️", row=0)
+        add_button(self, "Settings", self._act_settings, emoji="⚙️", row=0)
+        if self._offers_subscription():
+            add_button(self, "Subscription", self._act_subscribe, emoji="⭐", row=0)
+        names = self._home_names()
+        if not names:
+            return
+        pages = -(-len(names) // _HOME_PAGE)
+        self.home_page = max(0, min(self.home_page, pages - 1))
+        start = self.home_page * _HOME_PAGE
+        # Prefixed: a character may be named like a page control.
+        options = paged_nav_options(self.home_page, pages, nav_suffix=" of characters") + [
+            discord.SelectOption(label=name[:100], value=f"p:{name}", description=kind)
+            for name, kind in names[start:start + _HOME_PAGE]]
+        add_select(self, options, self._act_manage, placeholder="🎭 Manage a character...", row=1)
 
     def _build_tour(self):
         options = [discord.SelectOption(label=page, value=page,
@@ -633,9 +741,6 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         add_button(self, "📖 Guide", self._act_guide, style=discord.ButtonStyle.secondary, row=1)
 
     _ACTION_LABELS = {
-        "_act_prefer_openrouter": ("OpenRouter (recommended)", discord.ButtonStyle.success),
-        "_act_prefer_gemini": ("Google", discord.ButtonStyle.secondary),
-        "_act_prefer_none": ("None", discord.ButtonStyle.secondary),
         "_act_create_account": ("Create Account", discord.ButtonStyle.success),
         "_act_terms": ("📜 Read the Terms", discord.ButtonStyle.secondary),
         "_act_library": ("🏛️ Browse Library", discord.ButtonStyle.success),
@@ -644,12 +749,27 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
     }
 
     def _key_providers(self) -> List[str]:
-        """The provider chosen, or with None chosen, either: the key is theirs to pick."""
+        """The provider chosen, or with None chosen, either: the key is theirs to pick. The
+        subscription runs on OpenRouter, so where it is no longer sold, that key."""
         chosen = self.state.get("provider")
+        chosen = "openrouter" if chosen == PROVIDER_SUBSCRIPTION else chosen
         return [chosen] if chosen in KEY_PAGES else list(KEY_PAGES)
 
+    def _provider_buttons(self) -> List[ui.Button]:
+        """A switch of provider, one button per choice offered, the recommended first."""
+        buttons = []
+        for n, provider in enumerate(offered_providers(self.cog.subscriptions.sells)):
+            btn = ui.Button(label=PROVIDER_CHOICES[provider] + (" (recommended)" if n == 0 else ""),
+                            emoji="⭐" if provider == PROVIDER_SUBSCRIPTION else None, row=0,
+                            style=discord.ButtonStyle.success if n == 0 else discord.ButtonStyle.secondary)
+            btn.callback = lambda i, p=provider: self._prefer(i, p)
+            buttons.append(btn)
+        return buttons
+
     def _action_buttons(self, step: _Step) -> List[ui.Button]:
-        if step.key == "provider" and not self._done(step):
+        if step.key == "provider":
+            if self._done(step):
+                return self._provider_buttons()
             return [self._make_action_button(name) for name in ("_act_create_account", "_act_terms")]
         if step.key != "key":
             return [self._make_action_button(name) for name in step.actions]
@@ -657,11 +777,20 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         named = len(providers) > 1
         buttons = []
         s = self.state
+        sells = self.cog.subscriptions.sells
+        # A subscriber keeps their way to it while the owner has new sales paused.
+        subscribing = (sells or s.get("subscribed")) and s.get("provider") == PROVIDER_SUBSCRIPTION
         if s.get("usable_slot") and s["is_admin"] and not s["server_key"]:
             use = ui.Button(label=f"Use it in {s['guild'].name}"[:80],
                             style=discord.ButtonStyle.primary, row=0)
             use.callback = self._act_use_here
             buttons.append(use)
+        if subscribing:
+            sub = ui.Button(label="Your subscription" if s.get("subscribed") else "Choose a tier",
+                            emoji="⭐", style=discord.ButtonStyle.success, row=0)
+            sub.callback = self._act_subscribe
+            buttons.append(sub)
+            return buttons
         for provider in providers:
             name = MODEL_PROVIDERS[provider]
             # A link: Discord opens it, and no interaction reaches us.
@@ -675,6 +804,11 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
                               style=discord.ButtonStyle.success, row=0)
             paste.callback = lambda i, p=provider: self._act_paste_key(i, p)
             buttons.append(paste)
+        if sells:
+            # Row 0 can already hold five.
+            sub = ui.Button(label="⭐ MimicAI Subscription", style=discord.ButtonStyle.secondary, row=3)
+            sub.callback = self._act_subscribe
+            buttons.append(sub)
         return buttons
 
     def _make_action_button(self, name: str) -> ui.Button:
@@ -703,6 +837,45 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         await interaction.response.defer()
         await self._repaint()
 
+    async def _act_home(self, interaction: discord.Interaction):
+        self.step_key = HOME
+        self._build_view()
+        await interaction.response.edit_message(**self.render())
+
+    async def _act_settings(self, interaction: discord.Interaction):
+        if await refuse_unregistered(self.cog, interaction):
+            return
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        await SettingsHomeView(self.cog, interaction).update_display()
+
+    async def _act_help(self, interaction: discord.Interaction):
+        # Sends its own new message, as `_act_terms` does.
+        await self.cog.help_slash.callback(self.cog, interaction)
+
+    async def _act_manage(self, interaction: discord.Interaction):
+        value = interaction.data["values"][0]
+        prev_page, jump_page, next_page = PAGE_NAV_VALUES
+        if value == jump_page:
+            async def jump(inner: discord.Interaction, page: int):
+                self.home_page = page
+                self._build_view()
+                await inner.response.edit_message(**self.render())
+            pages = -(-len(self._home_names()) // _HOME_PAGE)
+            await interaction.response.send_modal(PageJumpModal(pages, jump, zero_indexed=True))
+            return
+        if value in (prev_page, next_page):
+            self.home_page += -1 if value == prev_page else 1
+            self._build_view()
+            await interaction.response.edit_message(**self.render())
+            return
+        # `/profile manage`'s own path: a character deleted since this was drawn is offered
+        # its closest matches, not an error.
+        deferral = asyncio.create_task(interaction.response.defer(thinking=True, ephemeral=True))
+        try:
+            await self.cog._manage_profile(interaction, value.removeprefix("p:"), deferral)
+        finally:
+            await deferral
+
     async def _act_tour(self, interaction: discord.Interaction):
         self.screen = "tour"
         self._build_view()
@@ -730,20 +903,22 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             SubmitAPIKeyModal(self.cog, self._slot_for(provider), provider, view=self,
                               assign_personal=True))
 
+    async def _act_subscribe(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        if not self.state.get("subscribed"):
+            # Straight to the tiers; a purchase assigns itself and repaints this screen.
+            await SubscribeView(self).open(interaction)
+            return
+        # The subscription slot of /settings -> API Keys, as `/subscribe` opens it.
+        view = SettingsAPIView(self.cog, interaction)
+        view.show_subscription()
+        await view.update_display()
+
     def _key_landed(self, slot: str, guild: Optional[discord.Guild]) -> str:
         if self.admin_guilds:
             # Stay on this step once it is done: the server picker appears under it.
             self.step_key = "key"
         return super()._key_landed(slot, guild)
-
-    async def _act_prefer_gemini(self, interaction: discord.Interaction):
-        await self._prefer(interaction, "gemini")
-
-    async def _act_prefer_openrouter(self, interaction: discord.Interaction):
-        await self._prefer(interaction, "openrouter")
-
-    async def _act_prefer_none(self, interaction: discord.Interaction):
-        await self._prefer(interaction, PROVIDER_NONE)
 
     async def _act_create_account(self, interaction: discord.Interaction):
         await interaction.response.send_modal(CreateAccountModal(self))
@@ -767,8 +942,6 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         self.cog.user_settings.set_provider_preference(self.user_id, provider)
         self.step_key = None
         await self._repaint()
-        if provider == PROVIDER_NONE:
-            await interaction.followup.send(embed=text_embed(WIZARD_COPY["provider_none"]), ephemeral=True)
 
     async def _act_library(self, interaction: discord.Interaction):
         from .gui_hub import HubPublicLibraryView
@@ -799,7 +972,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         await self.cog._open_session_config(interaction)
 
     async def _act_generate(self, interaction: discord.Interaction):
-        await interaction.response.send_modal(NewProfileModal(self.cog))
+        await open_generate(self.cog, interaction)
 
     async def update_display(self):
         """Paints onto the command interaction's own deferred response.
@@ -866,14 +1039,50 @@ class NewProfileModal(ui.Modal):
             avatar_url=(self.avatar_url_input.value or "").strip() or None)
 
 
-#: The Create Account form's provider choices, in the step's button order.
-_ACCOUNT_PROVIDERS = (
-    ("openrouter", "OpenRouter (recommended)",
-     "One key for replies, images, speech and search, on hundreds of models, some free."),
-    ("gemini", "Google", "Google's own models only. The key needs billing turned on."),
-    (PROVIDER_NONE, "None (choose every model yourself)",
-     "No models set for you. Still needs an OpenRouter or Google key."),
-)
+async def open_generate(cog: 'MimicCog', interaction: discord.Interaction):
+    """Generate, from any of its three ways in: the form, or while an unsaved draft is still
+    open, the offer of it first -- its message may have been dismissed by mistake."""
+    draft = unsaved_draft(cog, interaction.user.id)
+    if draft is None:
+        await interaction.response.send_modal(NewProfileModal(cog))
+        return
+    title = draft.draft.get("display_name") or draft.profile_name
+    await interaction.response.send_message(embed=text_embed(
+        f"📝 **You have an unsaved draft:** {title}, to be saved as `{draft.profile_name}`.\n"
+        "Reopen it, or start a new character."), view=ResumeDraftView(cog, interaction, draft), ephemeral=True)
+
+
+class ResumeDraftView(BlockedGuard, TimeoutCleanupMixin, ui.View):
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, draft):
+        super().__init__(timeout=120)
+        self.cog = cog
+        self.original_interaction = interaction
+        self.draft = draft
+        add_button(self, "Reopen draft", self.reopen, style=discord.ButtonStyle.green, emoji="📝")
+        add_button(self, "New character", self.new)
+
+    async def reopen(self, interaction: discord.Interaction):
+        if self.draft.is_finished() or self.draft.saved:
+            await interaction.response.edit_message(embed=text_embed(
+                "That draft was saved, discarded or has expired."), view=None)
+            return
+        await self.draft.reopen(interaction)
+        if self.draft.is_finished():
+            self.stop()
+
+    async def new(self, interaction: discord.Interaction):
+        # Not stopped: the draft stays open, and Reopen with it, until a new one replaces it.
+        await interaction.response.send_modal(NewProfileModal(self.cog))
+
+
+#: The Create Account form's choices, (label, description), offered as `offered_providers`
+#: orders them. A description is at most 100 characters.
+_ACCOUNT_PROVIDERS = {
+    PROVIDER_SUBSCRIPTION: ("MimicAI Subscription", "No key to set up. Monthly plan on curated "
+                                                    "high-performance models. No images or speech."),
+    "openrouter": ("OpenRouter", "Your own key. Hundreds of models (some free), plus images and speech."),
+    "gemini": ("Google", "Your own key, Google's models only. Needs billing turned on."),
+}
 
 #: What Create Account must have ticked, every one.
 _CONSENTS = {"terms": "I accept the Terms of Service",
@@ -898,16 +1107,18 @@ class CreateAccountModal(ui.Modal):
             options=[discord.CheckboxGroupOption(label=label, value=value)
                      for value, label in _CONSENTS.items()])
         self.add_item(ui.Label(text="Tick both to continue", component=self.consent))
+        self.offered = offered_providers(wizard.cog.subscriptions.sells)
         self.provider = ui.RadioGroup(options=[
-            discord.RadioGroupOption(label=label, value=value, description=description,
-                                     default=value == "openrouter")
-            for value, label, description in _ACCOUNT_PROVIDERS])
-        self.add_item(ui.Label(text="Your provider", component=self.provider,
-                               description="Every choice needs an OpenRouter or Google key."))
+            discord.RadioGroupOption(label=_ACCOUNT_PROVIDERS[value][0] + (" (recommended)" if n == 0 else ""),
+                                     value=value, description=_ACCOUNT_PROVIDERS[value][1], default=n == 0)
+            for n, value in enumerate(self.offered)])
+        self.add_item(ui.Label(text="How your characters run", component=self.provider, description=(
+            "The subscription needs no key. The others use your own."
+            if PROVIDER_SUBSCRIPTION in self.offered else "Both use an API key of your own.")))
 
     async def on_submit(self, interaction: discord.Interaction):
         # Discord enforces both, but this is where an account is made, so it is checked here.
-        if set(self.consent.values) != set(_CONSENTS) or self.provider.value not in PROVIDER_CHOICES:
+        if set(self.consent.values) != set(_CONSENTS) or self.provider.value not in self.offered:
             await interaction.response.send_message(
                 embed=text_embed("Tick both boxes and choose a provider to create your account."), ephemeral=True)
             return

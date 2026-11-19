@@ -17,9 +17,10 @@ from discord import ui
 
 from ..services.profile_generation import (ProfileGenerationError, generate_draft,
                                            save_draft)
-from ..utils.helpers import suppress_link_previews
-from .base_components import BlockedGuard, TimeoutCleanupMixin, add_button, add_topgg_links
-from ..utils.constants import PUBLISHED_REVIEW_LINE
+from ..utils.helpers import _estimate_text_tokens, suppress_link_previews
+from .base_components import (BlockedGuard, TimeoutCleanupMixin, add_button, add_select,
+                              add_topgg_links)
+from ..utils.constants import INSTRUCTION_TICKS, PUBLISHED_REVIEW_LINE
 from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
@@ -35,6 +36,12 @@ _PREVIEW_FIELDS = (("Backstory", "backstory"), ("Personality", "personality_trai
 
 def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
+
+
+def unsaved_draft(cog: 'MimicCog', user_id: int) -> Optional["GeneratedProfileView"]:
+    """The user's latest draft while it can still be saved: not saved, discarded or expired."""
+    view = cog.open_drafts.get(user_id)
+    return view if view is not None and not view.saved and not view.is_finished() else None
 
 
 class RefineDraftModal(ui.Modal, title="Refine the Draft"):
@@ -77,10 +84,32 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             self.timeout_message = "This draft expired, and nothing was saved. Run `/import` again."
         self.draft = {**draft, **self.appearance}
         self.model_used = model_used
+        #: The Instructions boxes, ticked here and written on Save. Kept off the draft, so
+        #: no Regenerate or Refine resets them.
+        self.ticks = {key: False for key, *_ in INSTRUCTION_TICKS}
         self.busy = False
         self.saved = False
         self.published = False
         self._build_view()
+        # Before it is shown, so a status message dismissed while drafting loses nothing.
+        cog.open_drafts[self.user_id] = self
+
+    async def reopen(self, interaction: discord.Interaction):
+        """This draft on the message `interaction` came from: an ephemeral message once
+        dismissed cannot be shown again, and nothing but this view holds the draft. The
+        old view stops, and its message, if still on screen, loses its dead buttons."""
+        if await self._refuse_while_busy(interaction):
+            return
+        view = GeneratedProfileView(self.cog, interaction, self.profile_name, self.concept, self.draft,
+                                    self.model_used, self.appearance, self.card, self.image)
+        view.ticks = dict(self.ticks)
+        view._build_view()
+        self.stop()
+        await interaction.response.edit_message(content=None, embed=view.build_embed(), view=view)
+        try:
+            await self.original_interaction.edit_original_response(view=None)
+        except discord.HTTPException:
+            pass
 
     def _build_view(self):
         self.clear_items()
@@ -101,6 +130,19 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
                    emoji="\U0001F504", disabled=self.busy)
         add_button(self, "Refine", self.refine, emoji="✏️", disabled=self.busy)
         add_button(self, "Discard", self.discard, disabled=self.busy)
+        # The Instructions editor's boxes, worded and costed as it words them.
+        add_select(self, [discord.SelectOption(
+            label=label, value=key, default=self.ticks[key],
+            description=f"{does} ~{_estimate_text_tokens(self.cog.global_prompts.get(mod_key, text)):,} tokens."[:100])
+            for key, label, mod_key, text, does in INSTRUCTION_TICKS],
+            self.pick_ticks, row=1, min_values=0, max_values=len(INSTRUCTION_TICKS),
+            placeholder="Optional: MimicAI's own guidance, kept up to date for you",
+            disabled=self.busy)
+
+    async def pick_ticks(self, interaction: discord.Interaction):
+        picked = interaction.data.get("values") or []
+        self.ticks = {key: key in picked for key in self.ticks}
+        await interaction.response.defer()
 
     def build_embed(self, status: Optional[str] = None) -> discord.Embed:
         draft = self.draft
@@ -200,7 +242,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         await interaction.response.edit_message(view=self)
 
         failure = await asyncio.to_thread(
-            save_draft, self.cog, self.user_id, self.profile_name, self.draft)
+            save_draft, self.cog, self.user_id, self.profile_name, {**self.draft, "ticks": self.ticks})
         self.busy = False
         self.saved = failure is None
         if self.saved:

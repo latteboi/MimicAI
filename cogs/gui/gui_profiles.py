@@ -21,11 +21,12 @@ from ..utils.helpers import (
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model, auto_thinking,
     _format_api_error, speaks_verbatim, stored_google_voice, _get_user_hash, neuro_levels,
+    subscription_curated,
 )
 from ..utils import fixed_examples, lorebook
 from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, profile_advice, standing_text
 from ..utils.bonds import describe as describe_bond
-from ..utils.user_defaults import auto_wording, model_provider, setting_label
+from ..utils.user_defaults import auto_wording, model_provider, setting_label, subscription_chain
 from ..utils.birthdays import MONTH_NAMES, parse_birthday, valid_birthday
 
 if TYPE_CHECKING:
@@ -869,6 +870,12 @@ def _gap_choice(key, label, where):
 
 
 
+def _subscription_note(note: str, line: str):
+    """A screen's `note`, with `line` added where the MimicAI subscription runs: a self-host
+    never mentions it."""
+    return lambda cog, _owner_id: note + ("\n" + line if cog.subscriptions.enabled else "")
+
+
 #: Each mode's options, shared by the setting's own screen and its bulk step so the two
 #: cannot describe them differently. The bulk copies were bare (label, value) pairs.
 _GROUNDING_MODES = (
@@ -1042,11 +1049,14 @@ PROFILE_ACTIONS = (
             # renaming them there would mean rewriting every profile.
             screen=_Screen(_Choice(
                 "grounding_mode", "Grounding", _GROUNDING_MODES, read=_grounding_mode, placeholder="Grounding mode..."),
-                note="-# **RAG** costs nothing on turns nobody searches, and the researcher gets "
-                     "one query, not the conversation. **Legacy RAG** pays a call every round "
-                     "to ask whether to search.\n"
-                     "-# **Native** searches through the model's own provider. Images have their "
-                     "own setting in **Image Output**."),
+                note=_subscription_note(
+                    "-# **RAG** costs nothing on turns nobody searches, and the researcher gets "
+                    "one query, not the conversation. **Legacy RAG** pays a call every round "
+                    "to ask whether to search.\n"
+                    "-# **Native** searches through the model's own provider. Images have their "
+                    "own setting in **Image Output**.",
+                    "-# Where a MimicAI subscription pays, RAG and Legacy RAG search as **Native**, "
+                    "and its web searches cost a lot of the allowance.")),
             bulk=_Bulk(_bulk_choice("Select Grounding Mode...", _GROUNDING_MODES,
                                     to_payload=lambda v: {"grounding_mode": v}),
                        scope="all", label="Grounding Mode", keys=("grounding_mode",))),
@@ -1145,10 +1155,12 @@ PROFILE_ACTIONS = (
             screen=_Screen(_Toggle("image_generation_enabled", "Image Generation"),
                            modal="ProfileImageGenSettingsModal", modal_label="Edit prompt…",
                            when=_images_on,
-                           note="-# Type `!image` or `!imagine` and a prompt. Reply to an image, or "
-                                "attach one, to work from it.\n"
-                                "-# **Edit prompt…** is its standing instruction to the image model, "
-                                "sent with every image."),
+                           note=_subscription_note(
+                               "-# Type `!image` or `!imagine` and a prompt. Reply to an image, or "
+                               "attach one, to work from it.\n"
+                               "-# **Edit prompt…** is its standing instruction to the image model, "
+                               "sent with every image.",
+                               "-# Not included in the MimicAI subscription.")),
             bulk=_Bulk(_bulk_modal("ProfileImageGenSettingsModal", action_key="update_both"),
                        scope="all",
                        keys=("image_generation_enabled",),
@@ -1171,9 +1183,11 @@ PROFILE_ACTIONS = (
             screen=_Screen(_Toggle("speech_tts_enabled", "TTS"),
                            modal="ProfileSpeechSettingsModal", modal_label="Edit temperature & speed…",
                            when=_tts_on,
-                           note="-# **Temperature** reaches Gemini voices only, **speed** OpenRouter "
-                                "voices only, and most hosts ignore speed. In a session, nothing is "
-                                "voiced unless its Text-to-Speech is on."),
+                           note=_subscription_note(
+                               "-# **Temperature** reaches Gemini voices only, **speed** OpenRouter "
+                               "voices only, and most hosts ignore speed. In a session, nothing is "
+                               "voiced unless its Text-to-Speech is on.",
+                               "-# Not included in the MimicAI subscription.")),
             bulk=_Bulk(_bulk_modal("ProfileSpeechSettingsModal"), scope="all",
                        keys=("speech_tts_enabled", "speech_temperature", "speech_speed"))),
     _Action("voice", "audio", "TTS Voice", "Pick a voice from the ones its speech model offers.",
@@ -3341,6 +3355,16 @@ class ModelPickerMixin(ReportErrorMixin):
                                 value=details[:1024], inline=False)
 
     def _create_model_options(self, current_val: str, target_config_key: str) -> List[discord.SelectOption]:
+        if self.view_mode == 'subscription':
+            catalogue = self.cog.api_service.catalogue
+            opts = [discord.SelectOption(label=catalogue.label(self.strip_prefix(m))[:100], value=m,
+                                         default=(m == current_val))
+                    for m in self._subscription_curated()]
+            if self._allows_no_fallback(target_config_key):
+                opts.append(discord.SelectOption(
+                    label=NO_FALLBACK, value=NO_FALLBACK, default=current_val is None,
+                    description="Do not try a second model when this one fails."))
+            return opts
         if self.view_mode == 'ollama' and not self._may_use_ollama():
             self.view_mode = 'google'
         if self.view_mode == 'openrouter':
@@ -3433,7 +3457,8 @@ class ModelPickerMixin(ReportErrorMixin):
         own. `guide=False` leaves the Ollama Guide off a row with no room for it.
         """
         api_modes = self._api_modes()
-        api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)'}
+        api_labels = {'google': 'API: Google', 'openrouter': 'API: OpenRouter', 'ollama': 'API: Ollama (Local)',
+                      'subscription': 'API: Subscription'}
         if self.view_mode not in api_modes:
             self.view_mode = api_modes[0]
         
@@ -3596,6 +3621,11 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
         self.user_id = user_id or interaction.user.id
         self.profile_name = profile_name
         self.view_mode = self.preferred_api(cog, self.user_id)
+        # Opens on what runs where it was opened: the subscription's stop where that pays --
+        # the server's key in a server, the user's Personal one in a DM.
+        if cog.subscriptions.enabled and cog.storage_manager.subscription_payer(
+                interaction.guild_id, self.user_id):
+            self.view_mode = 'subscription'
         self.category = 'response' # 'response', 'media', 'tools', 'ltm'
 
         if is_borrowed is not None:
@@ -3612,9 +3642,31 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
     def _ollama_host_url(self) -> str:
         return self._get_current_profile_data().get("ollama_host_url")
 
+    def _api_modes(self) -> List[str]:
+        """Plus "API: Subscription" where the MimicAI subscription runs: the curated models a
+        subscription pays for, picked apart from the profile's own (`subscription_models`), on
+        this picker alone -- the bulk wizard and Override Defaults set own models only."""
+        modes = super()._api_modes()
+        return modes + ['subscription'] if self.cog.subscriptions.enabled else modes
+
+    def _subscription_curated(self) -> tuple:
+        return subscription_curated(self.cog, self._CATEGORY_KEYS[self.category][0][0])
+
+    def _subscription_slots(self, data: Dict[str, Any]) -> List[tuple]:
+        """(config key, wording, the model it runs on a subscription) for this tab."""
+        keys = self._CATEGORY_KEYS[self.category]
+        chain = subscription_chain(self.cog, data, keys[0][0])
+        runs = (chain[0], *chain[1]) if chain else ()
+        return [(key, wording, runs[i] if i < len(runs) else None)
+                for i, (key, wording, _default) in enumerate(keys)]
+
     def _save_changes(self, key: str, value: Any):
         target_dict = self._get_current_profile_data()
         if target_dict is not None:
+            if self.view_mode == 'subscription' and any(
+                    key == k for k, _w, _d in self._CATEGORY_KEYS[self.category]):
+                key, value = "subscription_models", {
+                    **(target_dict.get("subscription_models") or {}), key: value}
             target_dict[key] = value
             # A pin goes when its model leaves the profile, and the key when no pin is
             # left, so a model picked again months later does not quietly bring one back.
@@ -3645,9 +3697,20 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
         note = self._get_selection_feedback_message()
         e.description = f"**{wording}**" + (f"\n{note}" if note else "")
 
-        for key, wording_slot, default in self._CATEGORY_KEYS[self.category]:
-            e.add_field(name=wording_slot,
-                        value=f"`{self._auto_label(data.get(key, default), key)}`", inline=True)
+        if self.view_mode == 'subscription':
+            if self._subscription_curated():
+                e.description += ("\n-# These run wherever a MimicAI subscription pays for this "
+                                  "profile. Its own models run everywhere else.")
+                for key, wording_slot, runs in self._subscription_slots(data):
+                    if runs or self._allows_no_fallback(key):
+                        e.add_field(name=wording_slot, inline=True,
+                                    value=f"`{self.strip_prefix(runs) if runs else NO_FALLBACK}`")
+            else:
+                e.description += "\n-# Not included in the MimicAI subscription."
+        else:
+            for key, wording_slot, default in self._CATEGORY_KEYS[self.category]:
+                e.add_field(name=wording_slot,
+                            value=f"`{self._auto_label(data.get(key, default), key)}`", inline=True)
         if self.category == 'response':
             state = data.get("show_fallback_indicator", True)
             e.add_field(name="Fallback Indicator",
@@ -3696,10 +3759,20 @@ class SingleProfileModelView(BlockedGuard, ModelPickerMixin, ui.View):
         first_model_row = 2 if browsing else 1
         button_row = 4 if browsing else 3
 
-        for offset, (key, wording, default) in enumerate(self._CATEGORY_KEYS[self.category]):
-            self.add_item(self.GenericModelSelect(
-                f"Select {wording} Model...",
-                self._create_model_options(data.get(key, default), key), offset + first_model_row, key))
+        if self.view_mode == 'subscription':
+            # Only what the subscription runs; a category it doesn't has no dropdowns. A
+            # Fallback set to None runs nothing and keeps its dropdown, to be set again.
+            curated = bool(self._subscription_curated())
+            for offset, (key, wording, runs) in enumerate(self._subscription_slots(data)):
+                if runs or (curated and self._allows_no_fallback(key)):
+                    self.add_item(self.GenericModelSelect(
+                        f"Select {wording} Model...",
+                        self._create_model_options(runs, key), offset + first_model_row, key))
+        else:
+            for offset, (key, wording, default) in enumerate(self._CATEGORY_KEYS[self.category]):
+                self.add_item(self.GenericModelSelect(
+                    f"Select {wording} Model...",
+                    self._create_model_options(data.get(key, default), key), offset + first_model_row, key))
 
         self._add_api_buttons(row=button_row)
 

@@ -16,7 +16,8 @@ import orjson as json
 from .constants import (
     defaultConfig, ATTACHMENT_TAG, ATTACHMENT_TAG_DEFAULT, ATTACHMENT_TAG_KINDS,
     DOCUMENT_MIME_TYPES, TEXT_ATTACHMENT_EXTENSIONS,
-    DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_TYPES,
+    DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, ERR_REASON_OPENROUTER_CREDITS,
+    VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_TYPES,
     HARM_CATEGORIES, HarmBlockThreshold, HarmCategory,
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
@@ -25,6 +26,7 @@ from .constants import (
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
     SYSTEM_MODEL_DEFAULTS_BY_PROVIDER, AUTO_MODEL_PREFIX, AUTO_SLOT_PAIRS, AUTO_TIER_KEYS,
     AUTO_ENDPOINTS_KEY, AUTO_SERVICE_TIERS_KEY, AUTO_TIER_TABS,
+    SUBSCRIPTION_MODELS, SUBSCRIPTION_SETTINGS_KEY, SUBSCRIPTION_TEXT_MODELS,
     NEURO_AXES, NEURO_DEFAULT_STATE, NEURO_HALF_LIFE_HOURS, MOOD_AVATAR_THRESHOLD, MOOD_AVATAR_MARGIN,
     IMAGE_COMMAND_PREFIXES, IMAGE_MODEL_CAPS, IMAGE_MODEL_CAPS_DEFAULT, IMAGE_THINKING_LEVELS,
     OPENROUTER_IMAGE_CAPS_UNKNOWN, IMAGE_MIME_SUFFIXES, IMAGE_SUFFIX_MIMES,
@@ -839,6 +841,11 @@ def _describe_api_error(error: Exception) -> str:
         return f"Ollama Error: {error_str.split(':', 1)[-1].strip()}"
 
     if "OpenRouter API Error" in error_str:
+        # OpenRouter's own words ("You requested up to 16384 tokens, but can only afford
+        # 9393") read as every turn costing the whole output cap, which is only the
+        # ceiling it checks the balance against before running.
+        if "OpenRouter API Error 402" in error_str:
+            return ERR_REASON_OPENROUTER_CREDITS
         try:
             err_data = json.loads(error_str[error_str.find("{"):])
             err = err_data.get("error", {})
@@ -1287,7 +1294,7 @@ def google_thinking_caps(model_name: Optional[str]) -> Dict[str, Any]:
 
 def resolve_thinking_params(config: Optional[Dict[str, Any]],
                             slot: str = "response",
-                            role: str = "primary", cog=None) -> Dict[str, Any]:
+                            role: str = "primary", cog=None, subscription: bool = False) -> Dict[str, Any]:
     """The thinking parameters one model of one slot of one profile runs at.
 
     Every generation path builds its `thinking_params` through here, which is what
@@ -1318,11 +1325,14 @@ def resolve_thinking_params(config: Optional[Dict[str, Any]],
     A SYSTEM_THINKING_SLOTS slot is read off its System Models settings, and a
     SESSION_THINKING_SLOTS slot off the session's own, under the response slot's keys. Given `cog`, a profile slot on MimicAI Auto takes what the bot
     owner set for its tier over the profile's own (`auto_thinking`): every call that
-    sends a profile's slot passes it.
+    sends a profile's slot passes it. `subscription` (a reply a MimicAI subscription pays for)
+    takes the owner's Thinking for the subscription likewise (`subscription_thinking`).
     """
     config = config or {}
     if cog is not None:
         overlay = auto_thinking(cog, config, slot)
+        if subscription:
+            overlay = {**overlay, **subscription_thinking(cog)}
         if overlay:
             config = {**config, **overlay}
     if slot not in THINKING_SLOT_DEFAULTS:
@@ -1753,6 +1763,28 @@ def system_model(cog, key: str, provider: Optional[str] = None) -> str:
     return (stored.get(side) or {}).get(key) or SYSTEM_MODEL_DEFAULTS_BY_PROVIDER[side][key]
 
 
+def subscription_curated(cog, key: str) -> Tuple[str, ...]:
+    """What a MimicAI subscription runs for `key` (a SUBSCRIPTION_MODELS key), in order: the bot
+    owner's text models from `/mod` where the category runs the shared text list, else shipped.
+    Asked at the call, as `system_model` is, so a change reaches the next turn."""
+    shipped = SUBSCRIPTION_MODELS.get(key) or ()
+    owned = system_settings(cog, SUBSCRIPTION_SETTINGS_KEY).get("models")
+    return tuple(owned) if owned and shipped == SUBSCRIPTION_TEXT_MODELS else shipped
+
+
+def subscription_allowed(cog) -> frozenset:
+    """Every model a subscription key may run, for `_instantiate_model`'s backstop."""
+    return frozenset(m for key in SUBSCRIPTION_MODELS for m in subscription_curated(cog, key))
+
+
+def subscription_thinking(cog) -> Dict[str, Any]:
+    """The Thinking the bot owner set on the subscription's tab, under the response slot's keys:
+    it runs in place of a profile's own for a reply the subscription pays for. Empty where unset."""
+    stored = system_settings(cog, SUBSCRIPTION_SETTINGS_KEY)
+    return {key: stored[key] for pair in THINKING_SLOT_KEYS["response"].values() for key in pair
+            if stored.get(key) is not None}
+
+
 def system_settings(cog, category: str, provider: Optional[str] = None) -> Dict[str, Any]:
     """One `/mod` System Models tab's own settings -- its thinking and its Hosts & Tier, under
     a profile's key names -- or {} where none are set. `provider` is the preference whose
@@ -1932,6 +1964,19 @@ def resolve_grounding_mode(config: Optional[Dict[str, Any]]) -> str:
     if raw in ("on", "on+"):
         return "rag"
     return raw if raw in ("off", "rag", "tool", "native") else "off"
+
+
+def subscription_settings(cog, config: Dict[str, Any], guild_id: Optional[int],
+                          user_id: Optional[int]) -> Dict[str, Any]:
+    """A turn's `config` as it runs where a MimicAI subscription pays: RAG and Legacy RAG
+    search as Native, the only search a subscription runs (its grounding summariser has no
+    models). A copy, never written back. Asked once per turn path, before `functions_for`, so
+    the prompt, the tools and the Legacy RAG gate all read it. `guild_id` and `user_id` as
+    the turn hands `_instantiate_model`."""
+    if (resolve_grounding_mode(config) in ("tool", "rag")
+            and cog.storage_manager.subscription_payer(guild_id, user_id)):
+        return {**config, "grounding_mode": "native"}
+    return config
 
 
 def grounding_mode_display(config: Optional[Dict[str, Any]]) -> str:

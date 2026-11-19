@@ -8,7 +8,7 @@ from ...utils.constants import (
     PLACEHOLDER_EMOJI, DEFAULT_WHISPER_INJECTION,
     SESSION_BUSY_FLAGS, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS, WHISPER_WAITING_NOTICE, is_guild_admin,
 )
-from ...utils.helpers import (_format_citation_subtext, _format_history_entry, _get_user_hash,
+from ...utils.helpers import (subscription_settings, _format_citation_subtext, _format_history_entry, _get_user_hash,
                              _resolve_zoneinfo, restamp_turn, server_context_guild,
                              turn_posted_at)
 from . import tool_loop
@@ -119,6 +119,8 @@ class WhisperMixin:
         if refusal:
             return ReplyText(text=f"**{profile_name}** {refusal}", blocked=True)
 
+        p_settings = subscription_settings(self.cog, 
+            p_settings, interaction.guild_id, interaction.user.id)
         # One tuple for the prompt and both models -- see tool_loop.
         functions = tool_loop.functions_for(p_settings)
         (system_instruction, turn_context, _, temp, top_p, top_k,

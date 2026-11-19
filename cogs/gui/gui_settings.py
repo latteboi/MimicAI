@@ -13,6 +13,10 @@ from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, vali
 from ..utils.helpers import _get_user_hash, _resolve_zoneinfo, suppress_link_previews
 from ..utils.data_policy import is_paid_gemini_slot, may_save_free_gemini_key
 from ..utils import openrouter_signin
+from ..managers.subscriptions import ACTIVE, period_usage, tier_name, used_share
+from ..utils.helpers import subscription_curated
+from ..services.api import stripe
+from ..services.api.stripe import StripeError
 from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
@@ -427,14 +431,21 @@ def _fit_list(items: List[str], sep: str, limit: int) -> str:
     return sep.join(out)
 
 
-#: The four key slots, (slot id, label, provider): two per provider.
+#: The four key slots, (slot id, label, provider): two per provider, in the order API Keys
+#: lists them, under the subscription.
 KEY_SLOTS = (
-    ("google_key_1", "Google Gemini Key 1", "gemini"),
-    ("google_key_2", "Google Gemini Key 2", "gemini"),
     ("openrouter_key_1", "OpenRouter Key 1", "openrouter"),
     ("openrouter_key_2", "OpenRouter Key 2", "openrouter"),
+    ("google_key_1", "Google Gemini Key 1", "gemini"),
+    ("google_key_2", "Google Gemini Key 2", "gemini"),
 )
-SLOT_PROVIDER = {slot: provider for slot, _label, provider in KEY_SLOTS}
+#: The MimicAI subscription is assigned like a slot, but holds no pasted key: it is not in
+#: KEY_SLOTS, so `_slot_for` never puts one there. See `StorageManager._key_in_slot`.
+SLOT_PROVIDER = {**{slot: provider for slot, _label, provider in KEY_SLOTS},
+                 SUBSCRIPTION_SLOT: "openrouter"}
+KEY_SLOT_IDS = frozenset(slot for slot, _label, _provider in KEY_SLOTS)
+SLOT_LABELS = {**{slot: label for slot, label, _provider in KEY_SLOTS},
+               SUBSCRIPTION_SLOT: "MimicAI Subscription"}
 
 
 class KeyScopeMixin:
@@ -639,22 +650,41 @@ class KeyScopeMixin:
         self.setup_items()
         await self.update_display()
 
+    @staticmethod
+    def _rival(slot: str):
+        """(provider, test on its assigned slot) of the assignment that may not share a scope
+        with `slot`, or (None, None). A scope runs on the MimicAI subscription or on its own
+        keys, never both: the subscription and a Gemini key displace each other."""
+        if slot == SUBSCRIPTION_SLOT:
+            return "gemini", lambda assigned: True
+        if SLOT_PROVIDER[slot] == "gemini":
+            return "openrouter", lambda assigned: assigned == SUBSCRIPTION_SLOT
+        return None, None
+
     def _assignment_conflicts(self, slot: str, scopes) -> List[str]:
         """Scopes in `scopes` another key or user holds now, in the confirm prompt's words."""
         provider = SLOT_PROVIDER[slot]
+        rival, displaces = self._rival(slot)
+        rival_words = ("the MimicAI subscription, which this key replaces" if rival == "openrouter"
+                       else "a Gemini key, which the subscription replaces")
         conflicts = []
         if "personal" in scopes:
             user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
-            curr_personal = user_data.get("personal_assignments", {}).get(provider)
+            personal = user_data.get("personal_assignments", {})
+            curr_personal = personal.get(provider)
             if curr_personal and curr_personal != slot:
-                conflicts.append(f"Personal Scope (Currently uses {curr_personal})")
+                conflicts.append(f"Personal Scope (Currently uses {SLOT_LABELS.get(curr_personal, curr_personal)})")
+            if rival and personal.get(rival) and displaces(personal[rival]):
+                conflicts.append(f"Personal Scope (Currently uses {rival_words})")
         for g in self.admin_guilds:
             if str(g.id) not in scopes:
                 continue
-            assigned = self.cog.server_manager._get_server_index(str(g.id)).get(
-                "assigned_keys", {}).get(provider)
+            assigned_keys = self.cog.server_manager._get_server_index(str(g.id)).get("assigned_keys", {})
+            assigned = assigned_keys.get(provider)
             if assigned and (assigned.get("user_id") != self.user_id or assigned.get("slot") != slot):
                 conflicts.append(f"Server: {g.name} (Currently assigned by another key/user)")
+            if rival and assigned_keys.get(rival) and displaces(assigned_keys[rival].get("slot")):
+                conflicts.append(f"Server: {g.name} (Currently uses {rival_words})")
         return conflicts
 
     def _apply_assignments(self, slot: str, scopes):
@@ -665,8 +695,13 @@ class KeyScopeMixin:
         server you had since stopped administering, which no dropdown could show you.
         """
         provider = SLOT_PROVIDER[slot]
+        rival, displaces = self._rival(slot)
         user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
         personal = user_data.setdefault("personal_assignments", {})
+        if ("personal" in scopes and rival and personal.get(rival)
+                and displaces(personal[rival])):
+            del personal[rival]
+            self.cog.storage_manager._save_user_keys_data(self.user_id, user_data)
         if "personal" in scopes and personal.get(provider) != slot:
             personal[provider] = slot
             self.cog.storage_manager._save_user_keys_data(self.user_id, user_data)
@@ -679,6 +714,12 @@ class KeyScopeMixin:
             guild_id_str = str(guild.id)
             server_index = self.cog.server_manager._get_server_index(guild_id_str)
             assigned = server_index.get("assigned_keys", {}).get(provider)
+            rival_assigned = server_index.get("assigned_keys", {}).get(rival) if rival else None
+            if (guild_id_str in scopes and rival_assigned
+                    and displaces(rival_assigned.get("slot"))):
+                del server_index["assigned_keys"][rival]
+                self.cog.server_manager._save_server_index(guild_id_str, server_index)
+                self.cog.server_key_pointers.pop((guild.id, rival), None)
             if guild_id_str in scopes:
                 # `/start` applies on every pick: an unchanged server is not rewritten.
                 if assigned == mine and NO_KEY_NOTICE_FLAG not in server_index:
@@ -698,7 +739,11 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
         super().__init__(cog, interaction, "api")
         self._init_scopes()
-        self.setup_items()
+        if (cog.user_settings.provider_choice(self.user_id) == PROVIDER_SUBSCRIPTION
+                and (cog.subscriptions.sells or self._subscription_row())):
+            self.show_subscription()  # what they chose in /start opens first
+        else:
+            self.setup_items()
 
     def setup_items(self):
         for item in self.children[:]:
@@ -707,8 +752,15 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
         user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
         slots_data = user_data.get("slots", {})
 
-        # Row 0: Slot Selection
+        # Row 0: Slot Selection, the subscription first where there is one
         slot_options = []
+        sub, sells = self._subscription_row(), self.cog.subscriptions.sells
+        if sub or sells:
+            slot_options.append(discord.SelectOption(
+                label=SLOT_LABELS[SUBSCRIPTION_SLOT], value=SUBSCRIPTION_SLOT, emoji="⭐",
+                description=(f"{tier_name(sub.get('tier'))}, {sub.get('status', '')}" if sub
+                             else "Not subscribed"),
+                default=(self.selected_slot == SUBSCRIPTION_SLOT)))
         for slot_id, label, provider in KEY_SLOTS:
             data = slots_data.get(slot_id)
             if data:
@@ -723,8 +775,22 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
         add_select(self, slot_options, self.slot_select_callback,
                    placeholder="Select an API Key Slot...", row=0)
 
+        if self.selected_slot == SUBSCRIPTION_SLOT:
+            if sub:
+                # Assigned like a key; there is nothing to paste or delete.
+                self._add_scope_select(row=1)
+                add_button(self, "Save Assignments", self.save_assignments_callback,
+                           style=discord.ButtonStyle.success, row=2)
+            # Anyone with an active row sees Manage, never a second Checkout -- paused or not.
+            if self.cog.subscriptions.billing and (sub or {}).get("status") == "active":
+                if (sub or {}).get("source") == "stripe" and defaultConfig.STRIPE_PORTAL_URL:
+                    self.add_item(ui.Button(label="Manage ↗", url=defaultConfig.STRIPE_PORTAL_URL,
+                                            row=2))
+            elif sells:
+                add_button(self, "Subscribe", self.subscribe_callback, emoji="⭐",
+                           style=discord.ButtonStyle.primary, row=2)
         # Row 1: Scope Multi-Select
-        if self.selected_slot and self.selected_slot in slots_data:
+        elif self.selected_slot and self.selected_slot in slots_data:
             self._add_scope_select(row=1)
 
             # Row 2: Actions
@@ -745,27 +811,75 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
                                     url=self._sign_in_link(self.selected_slot)))
 
     def _offers_sign_in(self) -> bool:
-        return (self.selected_slot is not None and openrouter_signin.enabled()
+        return (self.selected_slot in KEY_SLOT_IDS and openrouter_signin.enabled()
                 and SLOT_PROVIDER[self.selected_slot] == "openrouter")
 
+    def _subscription_row(self) -> Optional[dict]:
+        """This user's subscription record, active or lapsed, where the subscription runs."""
+        subs = self.cog.subscriptions
+        return subs.row(self.user_id) if subs.enabled else None
+
+    def show_subscription(self) -> None:
+        """Opens on the subscription slot: `/subscribe` and `/start`'s key step."""
+        self.selected_slot = SUBSCRIPTION_SLOT
+        self._load_scopes()
+        self.setup_items()
+
+    def _subscription_field(self, embed: discord.Embed) -> None:
+        sub = self._subscription_row() or {}
+        paid = sub.get("source") == "stripe"
+        if not sub and not self.cog.subscriptions.sells:
+            value = f"**Status:** Not subscribed. {SALES_PAUSED}"
+        elif not sub:
+            value = ("**Status:** Not subscribed.\nYour characters reply without an API key of "
+                     "your own, on models curated for high performance. **⭐ Subscribe** shows the "
+                     "tiers and what each includes.")
+        elif sub.get("status") == ACTIVE:
+            value = f"**Status:** ✅ Active · {tier_name(sub.get('tier'))}"
+            if sub.get("ends"):
+                value += f"\n**Ends:** <t:{sub['ends']}:D> (cancelled)"
+            elif sub.get("renews"):
+                value += f"\n**{'Renews' if paid else 'Allowance resets'}:** <t:{sub['renews']}:D>"
+            if period_usage(sub)[1] > 0:
+                share = used_share(sub)
+                value += f"\n**Used this month:** {usage_bar(share)} {share:.0%}"
+                if sub.get("synced"):
+                    value += f" (as of <t:{int(sub['synced'])}:R>)"
+            if paid and defaultConfig.STRIPE_PORTAL_URL:
+                value += ("\n-# **Manage** opens Stripe: sign in with the email you paid with to "
+                          "cancel, switch tier or change card. MimicAI catches up within the hour.")
+        else:
+            value = "**Status:** Lapsed. Where it was assigned is kept, so subscribing again restores it."
+        value += ("\n-# Runs its curated models in place of a profile's own (Set Models → API: "
+                  "Subscription), never in age-restricted channels. Web searches use the most.")
+        embed.add_field(name=f"Slot: {SLOT_LABELS[SUBSCRIPTION_SLOT]}", value=value, inline=False)
+
     async def update_display(self):
-        embed = discord.Embed(title="API Key Management", description="Manage your 4 API key slots and assign them to your Personal account or Servers you administrate.", color=discord.Color.blue())
+        description = ("Your MimicAI Subscription and 4 API key slots. Assign each to your Personal "
+                       "account or servers you run."
+                       if self.cog.subscriptions.sells or self._subscription_row() else
+                       "Manage your 4 API key slots and assign them to your Personal account or Servers you administrate.")
+        embed = discord.Embed(title="API Key Management", description=description, color=discord.Color.blue())
         
         if self.selected_slot:
             user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
             slot_data = user_data.get("slots", {}).get(self.selected_slot)
-            label = next(l for s, l, p in KEY_SLOTS if s == self.selected_slot)
-            
-            if slot_data:
-                tier = slot_data.get("tier", "free").title()
+            label = SLOT_LABELS[self.selected_slot]
+            is_sub = self.selected_slot == SUBSCRIPTION_SLOT
+            if is_sub:
+                self._subscription_field(embed)
+
+            if slot_data or (is_sub and self._subscription_row()):
                 provider = SLOT_PROVIDER[self.selected_slot]
-                value = f"**Status:** ✅ Set\n**Tier:** `{tier}`"
-                if provider == "gemini" and not is_paid_gemini_slot(slot_data):
-                    # Assigning one to a server looks like it worked, and then nothing
-                    # there can use it -- see cogs/utils/data_policy.
-                    value += ("\n-# Google may train on what a free-tier key is sent, so it "
-                              "is not used in servers or Global Chat.")
-                embed.add_field(name=f"Slot: {label}", value=value, inline=False)
+                if not is_sub:
+                    tier = slot_data.get("tier", "free").title()
+                    value = f"**Status:** ✅ Set\n**Tier:** `{tier}`"
+                    if provider == "gemini" and not is_paid_gemini_slot(slot_data):
+                        # Assigning one to a server looks like it worked, and then nothing
+                        # there can use it -- see cogs/utils/data_policy.
+                        value += ("\n-# Google may train on what a free-tier key is sent, so it "
+                                  "is not used in servers or Global Chat.")
+                    embed.add_field(name=f"Slot: {label}", value=value, inline=False)
                 
                 saved = self._saved_scopes(provider)
                 assignments = [f"- {a}" for a in self._scope_labels(saved)]
@@ -783,7 +897,7 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
                                          + _fit_list(self._scope_labels(scopes), ", ", 400))
                     lines.append("-# Nothing changes until you press Save Assignments.")
                     embed.add_field(name="Unsaved Changes", value="\n".join(lines), inline=False)
-            else:
+            elif not is_sub:
                 how = ("Click 'Submit Key' to paste a key, or 'Sign in with OpenRouter' to have "
                        "OpenRouter make one and send it here, with nothing to copy."
                        if self._offers_sign_in() else "Click 'Submit Key' to add a key to this slot.")
@@ -792,6 +906,10 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
             embed.add_field(name="Overview", value="Select a slot from the dropdown above to view or manage it.", inline=False)
 
         await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+
+    async def subscribe_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        await SubscribeView(self).open(interaction)
 
     async def slot_select_callback(self, interaction: discord.Interaction):
         self.selected_slot = interaction.data['values'][0]
@@ -846,6 +964,208 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
         self._apply_assignments(self.selected_slot, self.selected_scopes)
         await self._repaint()
         await interaction.followup.send(embed=text_embed("✅ Assignments saved successfully."), ephemeral=True)
+
+def usage_bar(share: float, width: int = 10) -> str:
+    """`▰▰▰▱▱▱▱▱▱▱` for 0.3: a period's use at a glance."""
+    filled = round(min(1.0, max(0.0, share)) * width)
+    return "▰" * filled + "▱" * (width - filled)
+
+
+#: The Subscribe screen's account of what draws on the allowance: every call where it is
+#: assigned (tests/MIMIC_SUBSCRIPTION.md, Open questions 6), not replies alone.
+ALLOWANCE_COVERS = (
+    "Everything your characters do where it's assigned, not just replies: the memories they "
+    "write, long-chat summaries (compaction), web searches, reading attachments and memory "
+    "recall, plus a session's critic or AI Director if they're on.\n"
+    "-# Web searches use the most. Assigned to a server, it pays for everyone's chats there.")
+
+STRIPE_DOWN = "Stripe didn't answer just now, so nothing changed. Try again in a minute."
+#: The owner paused new sales from `/mod` (`SubscriptionStore.paused`).
+SALES_PAUSED = "New subscriptions are paused for now. Check back soon."
+
+
+class SubscribeView(BlockedGuard, ui.View):
+    """Subscribe, from the subscription slot: the tiers at Stripe's prices, and under them Pay and
+    Check, greyed until a tier is picked. `_watch` notices the payment by itself; Check, which
+    reconciles at once, is the backup. Stripe is the seller (Managed Payments)."""
+
+    def __init__(self, parent: SettingsAPIView):
+        super().__init__(timeout=900)
+        self.parent, self.cog, self.user_id = parent, parent.cog, parent.user_id
+        self.prices: dict = {}
+        self._watcher: Optional[asyncio.Task] = None
+        # (tier, Checkout Session) behind the Pay button, once a tier is picked.
+        self._checkout: Optional[tuple] = None
+
+    async def open(self, interaction: discord.Interaction) -> None:
+        subs = self.cog.subscriptions
+        # Paid a minute ago and never pressed Check? A second Checkout would bill twice.
+        problem = await subs.reconcile(self.user_id)
+        if not problem and subs.active(self.user_id):
+            await self._subscribed(interaction)
+            return
+        if subs.paused:
+            await interaction.edit_original_response(embed=text_embed(SALES_PAUSED))
+            return
+        try:
+            self.prices = await stripe.prices(SUBSCRIPTION_TIERS)
+        except StripeError as e:
+            print(f"Subscribe: {e}")
+        if problem or not self.prices:
+            await interaction.edit_original_response(embed=text_embed(
+                STRIPE_DOWN if problem or not stripe.enabled() else
+                "The subscription isn't on sale yet."))
+            return
+        await interaction.edit_original_response(embed=self._show_tiers(), view=self)
+
+    def _show_tiers(self) -> discord.Embed:
+        """The tiers, with Pay and Check live once `_checkout` holds a pick."""
+        self.clear_items()
+        picked, session = self._checkout or (None, None)
+        lines, options = [], []
+        for tier, allowance in SUBSCRIPTION_TIERS.items():
+            price = self.prices.get(tier)
+            if not price:
+                continue
+            # Managed Payments adds tax on top unless the Price says it is included.
+            per = f" a {(price.get('recurring') or {}).get('interval', 'month')}"
+            cost = (f"{price['currency'].upper()} {price['unit_amount'] / 100:.2f}".removesuffix(".00")
+                    + ("" if price.get("tax_behavior") == "inclusive" else " + tax") + per)
+            replies = f"~{round(allowance * SUBSCRIPTION_REPLIES_PER_USD, -2):,.0f} replies"
+            lines.append(f"**{tier_name(tier)}** · {replies} · {cost}")
+            options.append(discord.SelectOption(label=f"{tier_name(tier)}: {replies}{per}", value=tier,
+                                                description=cost, default=tier == picked))
+        add_select(self, options, self._pick, placeholder="Choose a tier...", row=0)
+        if session:
+            self.add_item(ui.Button(label=f"Pay for {tier_name(picked)} on Stripe ↗",
+                                    url=session["url"], row=1))
+        else:
+            self.add_item(ui.Button(label="Pay on Stripe ↗", disabled=True, row=1))
+        add_button(self, "Check", self._check, disabled=not session, row=1)
+        embed = discord.Embed(title="⭐ MimicAI Subscription", colour=discord.Colour.gold(),
+                              description="Your characters reply without an API key of your own.")
+        embed.add_field(name="Models", inline=False, value=(
+            "Curated for high performance in roleplay." + self._models_line()))
+        embed.add_field(name="What your allowance covers", value=ALLOWANCE_COVERS, inline=False)
+        embed.add_field(name="Tiers", inline=False, value="\n".join(lines) + (
+            "\n-# Rough counts: long chats use more. Unused replies carry over, up to a month's worth."))
+        embed.add_field(name="Not included", inline=False,
+                        value="Images, speech, Adult profiles and age-restricted channels.")
+        if session:
+            embed.add_field(name="Next", inline=False, value=(
+                "Pay on Stripe's page. This updates by itself once you have; if it doesn't, "
+                "press **Check**."))
+        embed.set_footer(text="18+. Paid securely through Stripe: checkout and receipts say \"Link\". "
+                              "Cancel anytime and keep it to the end of the month. Paying accepts "
+                              "the Terms.")
+        return embed
+
+    def _models_line(self) -> str:
+        """The models the bot owner curates, by name: what a subscriber gets, kept true by a swap."""
+        catalogue = self.cog.api_service.catalogue
+        names = [catalogue.label(m.removeprefix("OPENROUTER/"), drop_author=True)
+                 for m in subscription_curated(self.cog, "primary_model")]
+        if not names:
+            return ""
+        return "\nRight now: " + (", ".join(names[:-1]) + " & " if len(names) > 1 else "") + names[-1] + "."
+
+    async def _pick(self, interaction: discord.Interaction):
+        tier = interaction.data["values"][0]
+        await interaction.response.defer()
+        if self.cog.subscriptions.paused:
+            # Paused while this was open: no new Checkout, but one already made stays payable.
+            await interaction.followup.send(embed=text_embed(SALES_PAUSED), ephemeral=True)
+            return
+        if self._checkout:
+            # A new pick ends the last one's Checkout: a tab still open on it would bill twice.
+            try:
+                await stripe.expire_checkout(self._checkout[1]["id"])
+            except StripeError:
+                await self._confirm(interaction)  # paid already, or Stripe is down: keep it
+                if not self.is_finished():
+                    await interaction.edit_original_response(embed=self._show_tiers(), view=self)
+                return
+            self._watcher.cancel()
+            self._checkout = None
+        customer = ((self.cog.subscriptions.row(self.user_id) or {}).get("ref") or {}).get("customer")
+        try:
+            session = await stripe.checkout(self.prices[tier]["id"], str(self.user_id), customer)
+        except StripeError as e:
+            print(f"Subscribe: no Checkout for {self.user_id}: {e}")
+            await interaction.edit_original_response(embed=self._show_tiers(), view=self)
+            await interaction.followup.send(embed=text_embed(STRIPE_DOWN), ephemeral=True)
+            return
+        self._checkout = (tier, session)
+        await interaction.edit_original_response(embed=self._show_tiers(), view=self)
+        self._watcher = asyncio.create_task(self._watch(interaction, session["id"]))
+
+    async def _watch(self, interaction: discord.Interaction, session_id: str) -> None:
+        """Polls the Checkout Session until it is paid, then reconciles. Stops short of the
+        interaction token's 15 minutes; past that, the hourly reconcile or `/subscribe` catches it."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 840
+        while not self.is_finished() and loop.time() < deadline:
+            await asyncio.sleep(5)
+            try:
+                status = await stripe.checkout_status(session_id)
+            except StripeError:
+                continue  # Check is still there
+            if status == "expired":
+                return
+            if status == "complete":
+                subs = self.cog.subscriptions
+                if not await subs.reconcile(self.user_id) and subs.active(self.user_id):
+                    try:
+                        await self._subscribed(interaction)
+                    except discord.HTTPException:
+                        pass
+                    return
+
+    async def _check(self, interaction: discord.Interaction):
+        await interaction.response.defer()
+        await self._confirm(interaction)
+
+    async def _confirm(self, interaction: discord.Interaction):
+        subs = self.cog.subscriptions
+        problem = await subs.reconcile(self.user_id)
+        if subs.active(self.user_id):
+            await self._subscribed(interaction)
+            return
+        await interaction.followup.send(embed=text_embed(STRIPE_DOWN if problem else (
+            "Stripe hasn't confirmed a payment yet. If you've paid, wait a moment and press "
+            "**Check** again.")), ephemeral=True)
+
+    async def _subscribed(self, interaction: discord.Interaction) -> None:
+        if self.is_finished():
+            return  # `_watch` and Check both got there
+        self.stop()
+        p = self.parent
+        guild = interaction.guild
+        # It pays where it was bought: for you, and the server you bought it in if you run it.
+        # A scope another key holds is asked about, never taken (OverrideConfirmView).
+        want = {"personal"} | ({str(guild.id)} if guild and any(
+            g.id == guild.id for g in p.admin_guilds) else set())
+        held = {s for s in want if p._assignment_conflicts(SUBSCRIPTION_SLOT, {s})}
+        saved = p._saved_scopes("openrouter", SUBSCRIPTION_SLOT)
+        if want - held:
+            p._apply_assignments(SUBSCRIPTION_SLOT, saved | (want - held))
+        where = " and ".join(f"**{l.removeprefix('Server: ')}**"
+                             for l in p._scope_labels(want - held))
+        await interaction.edit_original_response(view=None, embed=text_embed(
+            "✅ **You're subscribed. Thank you!**"
+            + (f" It's now assigned to {where}." if where else "")
+            + "\n-# `/settings` → API Keys changes where it applies."))
+        if held:
+            await interaction.followup.send(
+                embed=text_embed(OverrideConfirmView.prompt(
+                    p._assignment_conflicts(SUBSCRIPTION_SLOT, held))),
+                view=OverrideConfirmView(p, SUBSCRIPTION_SLOT, saved | want), ephemeral=True)
+        p._load_scopes()
+        try:
+            await p._repaint()
+        except discord.HTTPException:
+            pass  # that screen's 15 minutes are up; `/settings` shows the same
+
 
 class SettingsChildBotView(SettingsBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):

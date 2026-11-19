@@ -7,7 +7,7 @@ from typing import Dict, List, Any, Optional
 from ..utils.user_defaults import (
     model_provider, model_slot_defaults, other_provider, sanitise_defaults)
 from ..utils.helpers import is_real_model
-from ..utils.constants import USERS_DIR, defaultConfig, MODEL_PROVIDERS, PROVIDER_CHOICES
+from ..utils.constants import USERS_DIR, defaultConfig, MODEL_PROVIDERS, PROVIDER_CHOICES, PROVIDER_SUBSCRIPTION
 from ..utils.helpers import birth_time, is_real_model
 
 
@@ -102,11 +102,18 @@ class UserSettings:
         return self.get_user_about(user_id).get("timezone") or "UTC"
 
     def provider_preference(self, user_id: Optional[int]) -> Optional[str]:
-        """"gemini" or "openrouter" as the user chose in `/start` or About Me, else None.
+        """The provider whose models this user's profiles ship on: "gemini", "openrouter" or
+        "none", else None. The subscription runs on OpenRouter, so it reads as "openrouter"
+        here; `provider_choice` is what was chosen.
 
         Cheap enough for the turn path -- the index is cached -- which is why the chain
         reads this and not `effective_provider`.
         """
+        choice = self.provider_choice(user_id)
+        return "openrouter" if choice == PROVIDER_SUBSCRIPTION else choice
+
+    def provider_choice(self, user_id: Optional[int]) -> Optional[str]:
+        """What the user chose in `/start` or Override Defaults, as those screens show it."""
         return self.get_user_about(user_id).get("provider") if user_id else None
 
     def set_provider_preference(self, user_id: int, provider: str) -> None:
@@ -159,6 +166,9 @@ class UserSettings:
         """
         if provider == "ollama":
             return self.may_use_ollama(user_id)
+        # The MimicAI subscription is an OpenRouter key the user holds, though no slot does.
+        if provider == "openrouter" and self.cog.subscriptions.active(user_id):
+            return True
         try:
             keys_data = self.cog.storage_manager._get_user_keys_data(user_id) or {}
         except Exception:

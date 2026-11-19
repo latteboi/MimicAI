@@ -18,6 +18,7 @@ from typing import Dict, List, Optional, Tuple
 import discord
 from discord import ui
 
+from ..managers.subscriptions import row_summary
 from ..managers.ticket_store import OPERATOR, USER
 from ..utils.constants import (LIMIT_OPEN_TICKETS, LIMIT_TICKET_MESSAGES, TICKET_CATEGORIES,
                                TICKET_MESSAGE_MAX_CHARS, TICKET_OPEN_COOLDOWN_SECONDS,
@@ -236,6 +237,11 @@ class HelpView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             guild = self.cog.bot.get_guild(row["guild"]) if row.get("guild") else None
             embed.add_field(name="From", value=f"<@{row['user']}>"
                             + (f" in {guild.name}" if guild else " (not from a server)" if not row.get("guild") else ""))
+        sub = self.cog.subscriptions.row(row["user"]) if self.operator else None
+        if sub:
+            # What a refund is judged by (Terms): the share used, and when the period began.
+            began = f", period began <t:{int(sub['period'])}:d>" if sub.get("period") else ""
+            embed.add_field(name="Subscription", value=row_summary(sub) + began, inline=False)
         trace = (self.body or {}).get("trace")
         if trace:
             embed.add_field(name="Message", value=trace["url"]
@@ -365,7 +371,8 @@ class NewTicketModal(ui.Modal):
         self.view = view
         self.category = ui.RadioGroup(options=[
             discord.RadioGroupOption(label=label, value=value, default=value == "bug")
-            for value, label in TICKET_CATEGORIES.items()])
+            for value, label in TICKET_CATEGORIES.items()
+            if value != "subscription" or view.cog.subscriptions.billing])
         self.add_item(ui.Label(text="What is it about?", component=self.category))
         self.message = ui.TextInput(label="Message", style=discord.TextStyle.paragraph,
                                     max_length=TICKET_MESSAGE_MAX_CHARS,

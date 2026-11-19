@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import unquote
 
 from ...utils.constants import (
-    DEFAULT_MEDIA_DESCRIPTION, DESCRIBER_KEYS, MEDIA_DESCRIBER_RESOLUTION, GREEDY_SAMPLING,
+    DEFAULT_MEDIA_DESCRIPTION, DESCRIBER_KEYS, SUBSCRIPTION_MODELS, MEDIA_DESCRIBER_RESOLUTION, GREEDY_SAMPLING,
     MEDIA_DESCRIPTION_MAX_CHARS, MEDIA_DESCRIPTION_NONE,
 )
 from ...utils.helpers import (_resolve_safety_settings, resolve_thinking_params, system_model,
@@ -146,7 +146,11 @@ class MediaDescriptionMixin:
                 raise ValueError("The describer returned no description")
             return response, answer
 
-        primary, *fallbacks = (system_model(self.cog, k, side) for k in DESCRIBER_KEYS)
+        # Where a MimicAI subscription pays, its curated describer, whatever the owner's side.
+        primary, *fallbacks = (
+            SUBSCRIPTION_MODELS[DESCRIBER_KEYS[0]]
+            if self.cog.storage_manager.subscription_payer(channel.guild.id if channel.guild else None, user_id)
+            else [system_model(self.cog, k, side) for k in DESCRIBER_KEYS])
         try:
             (response, text), used, _was_fallback = await self.cog.api_service.run_with_fallback(
                 primary, tuple(fallbacks), run, label="Attachment describer")

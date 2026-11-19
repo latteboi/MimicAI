@@ -78,6 +78,23 @@ class DefaultConfigNamespace:
         # The Top.gg listing's project token, for /thanks's vote status (official instance).
         # Read here with the rest: the Secret Manager client is released after boot.
         self.TOPGG_TOKEN = get_config_value("TOPGG_TOKEN")
+        # OpenRouter's management key, which mints the MimicAI subscription's keys on the
+        # operator's account (cogs/managers/subscriptions). Never logged.
+        self.OPENROUTER_MANAGEMENT_KEY = get_config_value("OPENROUTER_MANAGEMENT_KEY")
+        # The OpenRouter workspace (its UUID) those keys are made and listed in. Unset is the
+        # account's Default workspace. Not secret.
+        self.OPENROUTER_SUBSCRIPTION_WORKSPACE = get_config_value("OPENROUTER_SUBSCRIPTION_WORKSPACE")
+        # Turns the subscription on for a bot other than the official one: a dev instance,
+        # from its .env. Not read through Secret Manager, which the official instance needs no
+        # second round trip to.
+        self.MIMIC_SUBSCRIPTION_DEV = os.getenv("MIMIC_SUBSCRIPTION_DEV")
+        # Stripe's restricted key, which sells the subscription (cogs/services/api/stripe).
+        # A test-mode key on dev; without one, grants are the only source. Never logged.
+        self.STRIPE_SECRET_KEY = get_config_value("STRIPE_SECRET_KEY")
+        # The Customer Portal's login link (Dashboard -> Billing -> Customer portal), behind
+        # Manage: the subscriber signs in with the email they paid with. A link, so the key
+        # needs no Billing-wide write to make Portal sessions.
+        self.STRIPE_PORTAL_URL = get_config_value("STRIPE_PORTAL_URL")
         self.PLACEHOLDER_EMOJI = get_config_value("PLACEHOLDER_EMOJI", "⏳")
         
         raw_key = get_config_value("ENCRYPTION_KEY")
@@ -258,12 +275,17 @@ UTILITY_FALLBACK_MODEL = 'GOOGLE/gemini-3.5-flash-lite'
 #: `user_defaults.model_chain`.
 MODEL_PROVIDERS = {"gemini": "Google", "openrouter": "OpenRouter"}
 
-#: What `/start` offers, stored as `index.json["about"]["provider"]`: a provider, or
-#: `none` -- no shipped models, only the user's own Override Defaults, and Google's chain
-#: wherever a model must still be read for them. Choosing any of them is registering:
-#: absent, the user may not create anything (`UserSettings.is_registered`).
+#: Every choice `index.json["about"]["provider"]` may hold, in the order offered
+#: (`user_defaults.offered_providers`). Choosing any of them is registering: absent, the user
+#: may not create anything (`UserSettings.is_registered`).
+#: - `subscription`, where it is sold: it runs on OpenRouter, so it ships OpenRouter's models
+#:   (`UserSettings.provider_preference` reads it as `openrouter`).
+#: - `none`: no longer offered, kept for those who chose it -- no shipped models, only their
+#:   own Override Defaults, and Google's chain wherever a model must still be read for them.
+PROVIDER_SUBSCRIPTION = "subscription"
 PROVIDER_NONE = "none"
-PROVIDER_CHOICES = {**MODEL_PROVIDERS, PROVIDER_NONE: "None"}
+PROVIDER_CHOICES = {PROVIDER_SUBSCRIPTION: "Subscription", "openrouter": "OpenRouter",
+                    "gemini": "Google", PROVIDER_NONE: "None"}
 
 #: What every path that would create a user's data says to someone who has not set up.
 NOT_REGISTERED = ("Run `/start` first and create your account -- it is how you set MimicAI "
@@ -474,6 +496,22 @@ OPENROUTER_TRAINING_MODEL_HIDDEN = (
 NO_MODEL_SET = (
     "This profile has no model set for this. Choose one under `/profile manage` -> Models, "
     "or pick a provider in `/start` so the profiles you make next start with a reply model."
+)
+
+#: Where a MimicAI subscription pays (`StorageManager.subscription_payer`).
+SUBSCRIPTION_LAPSED = (
+    "The MimicAI subscription that pays here has lapsed. Renewing it brings everything back as "
+    "it was; otherwise assign another key in `/settings` -> API Keys."
+)
+SUBSCRIPTION_MODEL_REFUSED = (
+    "That isn't included in the MimicAI subscription that pays here. It runs only its own models "
+    "(`/profile manage` -> Models -> API: Subscription), and no image generation or speech."
+)
+SUBSCRIPTION_USED_UP = "The MimicAI subscription paying here has used its allowance; it runs again when it renews."
+#: Follows the profile's name, as PLACEMENT_REFUSALS do.
+SUBSCRIPTION_AGE_RESTRICTED = (
+    "can't speak here: this server runs on a MimicAI subscription, which is never used in "
+    "age-restricted channels. An admin can assign their own API key here in `/settings` -> API Keys."
 )
 
 OPENROUTER_NOT_IMAGE_MODEL = (
@@ -1154,6 +1192,57 @@ SYSTEM_MODEL_DEFAULTS.update(zip(AUTO_TIER_KEYS['free', 'grounding_rag_model'],
 AUTO_ENDPOINTS_KEY = 'auto_endpoints'
 AUTO_SERVICE_TIERS_KEY = 'auto_service_tiers'
 
+#: The MimicAI subscription (cogs/managers/subscriptions): a capped OpenRouter key per
+#: subscriber on the operator's account, on the official instance only.
+#: Tier -> its monthly allowance in US$, settled 2026-11-18 at US$5, 10 and 20 a month
+#: (tests/MIMIC_SUBSCRIPTION.md, Open questions 1). The prices live on Stripe alone: each tier's
+#: Price carries its name here as its lookup key. Shown as "Tier 1" (`subscriptions.tier_name`).
+SUBSCRIPTION_TIERS = {'tier_1': 1.75, 'tier_2': 4.5, 'tier_3': 11.0}
+#: Character replies a US$ of allowance buys, roughly, for the tier list: the plan's "What US$2
+#: buys" table at 100k tokens of context, less what memories and the synopsis take.
+SUBSCRIPTION_REPLIES_PER_USD = 450
+#: Where Stripe sends the browser after Checkout (and the Customer Portal, set in its
+#: Dashboard settings): a page on the Cloudflare Worker (`cloudflare/openrouter_signin.js`)
+#: saying to go back to Discord.
+SUBSCRIPTION_RETURN_URL = 'https://www.mimic-ai.org/subscribed'
+#: The assignment slot that names the subscription, beside `openrouter_key_1`. It holds no key in
+#: `keys.json.gz`: `storage_manager._key_in_slot` asks the subscription store.
+SUBSCRIPTION_SLOT = 'subscription'
+#: Every subscription key's name on OpenRouter, the same for all, so nothing there identifies
+#: anyone. The reconcile sweep owns exactly the keys with this name.
+SUBSCRIPTION_KEY_NAME = 'MimicAI subscription'
+SUBSCRIPTION_FILE_PATH = os.path.join(DATA_DIR, 'subscriptions.json.gz')
+SUBSCRIPTION_DEEPSEEK_MODEL = 'OPENROUTER/deepseek/deepseek-v4.1-flash-1017'
+#: The text models every text category runs on a subscription, shipped. The bot owner's own list
+#: from `/mod` -> System Models -> Subscription Models replaces it: read through
+#: `helpers.subscription_curated`, never this.
+SUBSCRIPTION_TEXT_MODELS = (SUBSCRIPTION_DEEPSEEK_MODEL, CLAUDE_HAIKU_MODEL)
+#: That tab's entry in the System Models file: its `models`, Thinking and Hosts & Tier, under a
+#: profile's key names (`helpers.system_settings`).
+SUBSCRIPTION_SETTINGS_KEY = 'subscription'
+#: The only models a subscription runs, per category (Primary key), in order: the first two
+#: are the category's default Primary and Fallback, and an empty one is off on a
+#: subscription. A profile picks among them on Set Models' "API: Subscription" stop
+#: (`subscription_models`). Enforced where the key is used (`api_service.model_chain` and the
+#: backstop in `_instantiate_model`), because the list is also where model terms are checked.
+#: Grounding is Native only on a subscription, so its summariser has none.
+SUBSCRIPTION_MODELS = {
+    'primary_model': SUBSCRIPTION_TEXT_MODELS,
+    'critic_model': SUBSCRIPTION_TEXT_MODELS,
+    'ltm_model': SUBSCRIPTION_TEXT_MODELS,
+    'director_model': SUBSCRIPTION_TEXT_MODELS,
+    'training_analysis_model': SUBSCRIPTION_TEXT_MODELS,
+    'compaction_model': SUBSCRIPTION_TEXT_MODELS,
+    'grounding_rag_model': (),
+    'image_generation_model': (),
+    'speech_model': (),
+    # The System Models chains. The describer reads images, which DeepSeek cannot; the
+    # classifier keeps its steady pair (see _CLASSIFIER_CHAINS).
+    DESCRIBER_KEYS[0]: (CLAUDE_HAIKU_MODEL,),
+    CLASSIFIER_KEYS[0]: _CLASSIFIER_CHAINS['openrouter'],
+    GENERATOR_KEYS[0]: SUBSCRIPTION_TEXT_MODELS,
+}
+
 #: Greedy, for every pass that transcribes rather than writes -- the describer, the
 #: classifier, the critic, the LTM summariser and compaction: a second character reading a cached
 #: description should read what the first one did. `top_k` twice because the OpenRouter
@@ -1281,16 +1370,22 @@ MAX_URL_CONTEXT_CHARACTERS = 16000 # Approx 4000 tokens
 #: OpenRouter runs it, so a turn nobody searches costs nothing -- unlike the `web`
 #: plugin and the `:online` suffix, which search on every request.
 #:
-#: `max_uses` bounds what one reply can spend. Search takes `auto` (the model's own
+#: `max_uses` bounds what one reply can spend, except on a native search other than
+#: Anthropic's, which ignores it. Search takes `auto` (the model's own
 #: provider's search where it has one, Exa otherwise); fetch takes OpenRouter's own
 #: engine, which is free.
 OPENROUTER_SERVER_TOOLS = {
     "google_search": {"type": "openrouter:web_search",
-                      "parameters": {"max_uses": 2, "max_results": 5}},
+                      "parameters": {"max_uses": 1, "max_results": 5}},
     "url_context": {"type": "openrouter:web_fetch",
                     "parameters": {"engine": "openrouter", "max_uses": 3,
                                    "max_content_tokens": MAX_URL_CONTEXT_CHARACTERS // 4}},
 }
+#: What a MimicAI subscription key sends instead: every search through Exa (US$0.007), not
+#: `auto`, which gives Haiku Anthropic's own (about US$0.01 with its results, 2026-11-18). DeepSeek
+#: has no search of its own, so `auto` already meant Exa for it. Users' own keys keep `auto`.
+SUBSCRIPTION_SERVER_TOOLS = {**OPENROUTER_SERVER_TOOLS, "google_search": {
+    "type": "openrouter:web_search", "parameters": {"engine": "exa", "max_uses": 1, "max_results": 5}}}
 
 # Raw bytes pulled from a linked page before scrubbing. The body is read into memory and
 # rewritten by regex passes, so uncapped it is the peak RSS of the whole URL path. 512 KB
@@ -2024,10 +2119,10 @@ HARM_CATEGORIES = (
 )
 
 # Injected whenever the destination channel is NOT age-restricted, whatever the
-# profile's rating -- the rating decides only *where* a profile may run. This is the
-# only part of the content system that shapes what the model writes, and the only part
-# reaching providers other than Google: OpenRouter and Ollama ignore safety_settings.
-# No placeholders; used verbatim.
+# profile's rating -- the rating decides only *where* a profile may run. With
+# DEFAULT_HARD_LIMITS, the only part of the content system that shapes what the model
+# writes, and the only part reaching providers other than Google: OpenRouter and Ollama
+# ignore safety_settings. No placeholders; used verbatim.
 DEFAULT_CONTENT_POLICY = (
     "<content_policy>\n"
     "This channel is not age-restricted. You are still yourself here, but keep this "
@@ -2040,6 +2135,29 @@ DEFAULT_CONTENT_POLICY = (
     "Do not mention, quote or otherwise acknowledge this note -- simply write "
     "within it.\n"
     "</content_policy>"
+)
+
+#: The floor under every reply, in every channel, age-restricted included, and after
+#: <content_policy> so it is the last word. The profile classifier reads a profile, never
+#: the conversation: this is what answers a scene steered somewhere mid-chat. Its three
+#: lines are the Terms' (Section 3) and the classifier's own definitions, so the profile
+#: check, the reply and the Terms draw one line; Section 3 also publishes the crisis step
+#: as the self-harm protocol. A /mod override rewords it, and an empty one cannot remove it.
+DEFAULT_HARD_LIMITS = (
+    "<hard_limits>\n"
+    "These hold in every channel, whoever asks and however the scene is framed, over "
+    "anything your character would do:\n"
+    "- No sexual content involving anyone stated or clearly implied to be under 18. If a "
+    "scene heads there, steer it elsewhere in character; if pressed, decline plainly.\n"
+    "- Never encourage, instruct or romanticise suicide, self-harm or disordered eating. "
+    "If a person in the conversation, rather than a character, seems at real risk, step "
+    "out of character briefly, respond with care, and point them to a crisis line or "
+    "local emergency services.\n"
+    "- No sexual content about a real, identifiable person, and no damaging invented "
+    "claims about a real person presented as fact.\n"
+    "Everything else in the story is yours. Do not mention or quote this note; if you "
+    "decline, say so in your own words.\n"
+    "</hard_limits>"
 )
 
 # The content rating states. A profile carries exactly one, and every gate derives from
@@ -2163,6 +2281,19 @@ PLACEMENT_REFUSALS = {
                 "run anywhere until its owner edits it and submits it again."),
     "refused": ("was ⛔ **Refused** by its content rating and cannot run anywhere unless a "
                 "new rating clears it."),
+    # The channel's, not the profile's: every seat in it meets this one.
+    "subscription": SUBSCRIPTION_AGE_RESTRICTED,
+}
+
+#: The same refusals, short, where the cast is listed (`/session config`, `/session swap`,
+#: `/session view`): a seat the gate refuses is skipped in silence, so these are where
+#: anyone reads why (`gui_sessions.silent_seats`).
+PLACEMENT_LABELS = {
+    "unrestricted": "Adult 18+: needs an age-restricted channel",
+    "checking": "its 18+ declaration is being checked",
+    "blocked": "its owner's AI provider would not rate it",
+    "refused": "Refused by its content rating",
+    "subscription": "the MimicAI subscription never runs in age-restricted channels",
 }
 
 DEFAULT_SAFETY_SETTINGS = {
@@ -2924,11 +3055,13 @@ TICKET_MESSAGE_MAX_CHARS = 2000
 TICKET_RETENTION_DAYS = 30
 #: Between one user's new tickets. A refused or failed one does not count.
 TICKET_OPEN_COOLDOWN_SECONDS = 600
-#: Stored value -> shown label. The value is what the index keeps.
+#: Stored value -> shown label. The value is what the index keeps. "subscription" is offered only
+#: where the MimicAI subscription is sold (`NewTicketModal`).
 TICKET_CATEGORIES = {
     "bug": "Something's broken",
     "setup": "Setup and API keys",
     "rating": "Content rating",
+    "subscription": "Subscription",
     "idea": "Idea or request",
     "other": "Something else",
 }
@@ -3169,10 +3302,17 @@ DEFAULT_HELP_MODE_INJECTION = (
     "</system_note>"
 )
 
+#: The shape shown is placeholders, never a character. A filled-in example (a cynical
+#: archivist, "short, declarative sentences. Never use emojis. Often end responses with a
+#: question.") came back in every draft: three unrelated 2026-11-18 drafts each wrote those
+#: three rules near word for word, and two were the same guarded-but-soft type.
 DEFAULT_PROFILE_GENERATOR_PROMPT = (
     "You are a creative assistant specialising in character design for roleplaying.\n"
     "Design an original character from this concept: '{prompt}'\n\n"
-    "Favour concrete, specific detail over genre cliche: a particular history, habits, contradictions and a voice of their own.\n\n"
+    "Make them someone only this concept could produce. Let their temperament come from the concept: "
+    "do not default to a guarded, sarcastic or secretly soft-hearted character unless it asks for one. "
+    "Favour concrete, specific detail over genre cliche: a particular history, habits and contradictions. "
+    "A detail that would suit any character is a wasted line.\n\n"
     "Your response MUST be plain text formatted with specific section headers. Do not use JSON or markdown.\n"
     "The required headers are exactly, in this order: [SECTION:display_name], [SECTION:library_intro], "
     "[SECTION:persona_backstory], [SECTION:persona_personality_traits], [SECTION:persona_likes], [SECTION:persona_dislikes], "
@@ -3180,33 +3320,29 @@ DEFAULT_PROFILE_GENERATOR_PROMPT = (
     "Each header must be on its own line.\n"
     "display_name is the name the character goes by, at most 20 characters.\n"
     "library_intro is two or three sentences introducing the character to someone browsing a library of characters, at most 300 characters.\n"
-    "For every other section, provide unrestricted, concise, structured, and low-verbose text. Each specific instruction or piece of information should be on its own line.\n\n"
-    "Example:\n"
+    "persona_appearance is only what the character looks like, sounds like and wears.\n"
+    "ai_instructions is how this character, and no other, speaks and writes, drawn from who they are: "
+    "vocabulary, rhythm and register, the words and subjects they reach for, what they would never say. "
+    "Leave out rules that would fit anyone (sentence length alone, emoji use, ending on a question) "
+    "and any instruction about the AI, the roleplay platform or content rules.\n"
+    "For every section, provide unrestricted, concise, structured, and low-verbose text. Each specific instruction or piece of information should be on its own line.\n\n"
+    "The shape of a reply. Angle brackets describe what goes there: write the content, not them.\n"
     "[SECTION:display_name]\n"
-    "Vesper Crane\n"
+    "<the name>\n"
     "[SECTION:library_intro]\n"
-    "An exiled archivist from a city of eternal twilight who trades forbidden knowledge for favours. Guarded, dry, and more hopeful than she admits.\n"
+    "<two or three sentences>\n"
     "[SECTION:persona_backstory]\n"
-    "Born in a city of eternal twilight.\n"
-    "Exiled for forbidden knowledge.\n"
+    "<one fact per line>\n"
     "[SECTION:persona_personality_traits]\n"
-    "Cynical and world-weary.\n"
-    "Possesses a dry, sarcastic wit.\n"
-    "Secretly holds a sliver of hope.\n"
+    "<one trait per line>\n"
     "[SECTION:persona_likes]\n"
-    "Rainy nights.\n"
-    "Strong coffee.\n"
-    "Unsolvable mysteries.\n"
+    "<one per line>\n"
     "[SECTION:persona_dislikes]\n"
-    "Small talk.\n"
-    "Being pitied.\n"
+    "<one per line>\n"
     "[SECTION:persona_appearance]\n"
-    "Tall and gaunt, with ink-stained fingers.\n"
-    "A threadbare grey coat she never takes off.\n"
+    "<one detail per line>\n"
     "[SECTION:ai_instructions]\n"
-    "Always speak in short, declarative sentences.\n"
-    "Never use emojis.\n"
-    "Often end responses with a question."
+    "<one instruction per line>"
 )
 
 #: `/import` of a character card: the card's own text, sorted into the generator's sections.
@@ -3235,8 +3371,6 @@ DEFAULT_CARD_IMPORT_PROMPT = (
 
 # --- Warnings, errors and the notices a user reads ----------------------------
 
-PLEASE_TRY_AGAIN_ERROR_MESSAGE = 'There was an issue with your question please try again...'
-
 WARN_FALLBACK_USED = "**Fallback Model Used**"
 
 WARN_MAIN_MODEL_FAILED = "**Main Model Failed** ({reason})"
@@ -3256,11 +3390,12 @@ WARN_MEDIA_UNREADABLE = "**Attachment Not Read** (no model here reads {kinds})"
 WARN_MEDIA_DESCRIBED = "**Attachment Described** ({model})"
 ERR_GENERAL_ERROR = "An error has occurred."
 ERR_SAFETY_BLOCK = "**Safety Filter** ({reason})"
-ERR_RATE_LIMIT = "**API Rate Limit**"
-ERR_UNKNOWN = "**Unknown Error**"
-ERR_REASON_UNSUPPORTED_IMAGE = "Images Unsupported"
-ERR_REASON_UNSUPPORTED_AUDIO = "Audio Unsupported"
-ERR_REASON_UNSUPPORTED_VIDEO = "Video Unsupported"
+#: OpenRouter's 402 on someone's own key. Its words name the whole output cap as what was
+#: "requested", which read as every turn costing that much; a subscription's key is
+#: phrased as SUBSCRIPTION_USED_UP instead (`_with_key_cooldown_tracking`).
+ERR_REASON_OPENROUTER_CREDITS = (
+    "**OpenRouter Insufficient Credits:** not enough left for this request; "
+    "top up at https://openrouter.ai/settings/credits")
 
 #: modality -> the substrings a provider's refusal carries for that kind of input. One
 #: table, because two things read it: API_ERROR_MAPPINGS phrases the refusal, and
@@ -3382,7 +3517,7 @@ IMPORT_FILE_TOO_LARGE = "❌ That file is over the {limit} MB import limit."
 IMPORT_LOW_MEMORY = f"❌ Nothing was imported: {ERR_REASON_LOW_MEMORY}."
 
 API_ERROR_MAPPINGS = {
-    ("empty response",): "Empty Response (AI failed to output text content)",
+    ("empty response",): "Empty Response",
     # Keyed from UNREADABLE_MEDIA_KEYS so the phrasing and the retry always agree about
     # what a refusal of this kind looks like. These three come before "no endpoints
     # found": OpenRouter refuses a text-only model with both phrases at once, and the
@@ -3497,6 +3632,7 @@ SYSTEM_XML_TAGS = [
     "scene_prompt", "neuro_endocrine_engine", "neuro_update", "persona_profile",
     "technical_manual", "training_data", "session_rules", "image_context",
     "system_note", "reply_context", "negative_constraints", "variety_hint", "content_policy",
+    "hard_limits",
     "session_synopsis", "game_context", "birthday_context", "attachment_description",
     "memory_search", "web_search", "neuro_state", "memory_capture", "memory_flag", "memory_written",
     # The old names of <session_rules> and <current_time>, which a /mod override saved

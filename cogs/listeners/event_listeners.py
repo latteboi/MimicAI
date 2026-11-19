@@ -109,6 +109,9 @@ class EventListeners:
             
             if not self.api_service.pricing_sync_task.is_running():
                 self.api_service.pricing_sync_task.start()
+
+            if self.subscriptions.enabled and not self.subscriptions.hourly_reconcile_task.is_running():
+                self.subscriptions.hourly_reconcile_task.start()
             
             if not self.storage_manager.daily_cleanup_task.is_running():
                 print("Performing initial data cleanup on boot...")
@@ -1389,6 +1392,7 @@ class EventListeners:
         self.refresh_lock_task.cancel()
         self.session_manager.evict_inactive_sessions_task.cancel()
         self.profile_manager.hourly_self_repair_task.cancel()
+        self.subscriptions.hourly_reconcile_task.cancel()
         self.storage_manager.daily_cleanup_task.cancel()
 
         if self.image_finisher_worker_task:

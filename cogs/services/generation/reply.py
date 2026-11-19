@@ -319,20 +319,21 @@ class ReplyMixin:
         the safety settings of no channel, since the card can be opened in any. It brings
         its own `function_context`, which bills a search to that same key.
         """
+        server_id = getattr(getattr(channel, 'guild', None), 'id', None)
+        guild_id = None if conversation else server_id
         # The Primary too, not only the rest: a MimicAI Auto slot is a tier until this resolves it.
         primary_model, chain = self.cog.api_service.model_chain(
             {**p_settings, "primary_model": primary_model, "fallback_model": fallback_model_name},
-            "primary_model", owner_id)
+            "primary_model", owner_id, guild_id=guild_id, user_id=user_id)
         attempt = ReplyAttempt(primary_name=primary_model, fallback_name=chain[0] if chain else None,
                                private=private)
-        server_id = getattr(getattr(channel, 'guild', None), 'id', None)
-        guild_id = None if conversation else server_id
         policy = {"policy_guild_id": server_id, "conversation": True} if conversation else {}
         safety_settings = _resolve_safety_settings(None if conversation else channel)
         tools = resolve_native_tools(p_settings)
+        paid = self.cog.storage_manager.subscription_payer(guild_id, user_id)
 
         def build(name: str, role: str, **key_errors):
-            thinking = resolve_thinking_params(p_settings, "response", role, cog=self.cog)
+            thinking = resolve_thinking_params(p_settings, "response", role, cog=self.cog, subscription=paid)
             # Carried across because this dict has always held it. Nothing in any adapter
             # reads it.
             thinking["thinking_persistence"] = p_settings.get("thinking_persistence", 10)

@@ -29,16 +29,17 @@ from .gui.base_components import (ActionTextInputModal, DropdownContentView, bui
 from .gui.gui_help import GUIDE_PROFILE, HelpView, guide_refusal
 from .utils.http_client import get_shared_client
 from .managers.ticket_store import TicketStore
+from .managers.subscriptions import SubscriptionStore
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
 from .gui.gui_generate import GeneratedProfileView
 from .gui.gui_hub import HubPublicLibraryView
-from .gui.gui_start import NewProfileModal
+from .gui.gui_start import open_generate
 from .gui.gui_sessions import (
     GlobalChatPlayView, GlobalChatHistoryView, WhisperHistoryView, SessionSwapListView,
     SessionView, SessionConfigView, SessionAuditView, GenerationTraceView, last_user_message_id
 )
-from .gui.gui_settings import (SettingsHomeView, ParentPresenceView, ShutdownConfirmView,
-                                build_about_embed)
+from .gui.gui_settings import (SettingsAPIView, SettingsHomeView, ParentPresenceView,
+                                ShutdownConfirmView, build_about_embed)
 from .gui.gui_profiles import (ProfileManageView, BulkManageView, VoiceSampleConsentView, OpenDashboardView,
                                maybe_prompt_rating_after_edit)
 from .gui.gui_resolve import (
@@ -229,6 +230,7 @@ class MimicCog(EventListeners, commands.Cog):
         self.api_service = APIService(self)
         self.help_service = HelpService(self)
         self.tickets = TicketStore(self)
+        self.subscriptions = SubscriptionStore(self)
         self.game_service = GameService(self)
 
         self.server_manager._load_global_prompts()
@@ -254,6 +256,9 @@ class MimicCog(EventListeners, commands.Cog):
         #: send Discord refused (403). Cleared by the next send that lands; read by the
         #: round's delivery gate.
         self.refused_sends: LRUCache = LRUCache(max_size=500)
+        # (channel id, owner id, profile, reason) -> when someone calling that character by
+        # name was last told why it will not answer there (`_tell_blocked_caller`).
+        self.placement_notices: LRUCache = LRUCache(max_size=500)
         #: Viewer ids who pressed Show More Models on a profile dashboard. In memory on
         #: purpose: Response alone is the default, so losing this on a restart is harmless.
         self.dashboard_all_models: LRUCache = LRUCache(max_size=200)
@@ -385,6 +390,9 @@ class MimicCog(EventListeners, commands.Cog):
         self.mention_pointers_sent: LRUCache = LRUCache(max_size=256)
         # user id -> when their last profile draft started (`_generate_profile`).
         self.draft_times: LRUCache = LRUCache(max_size=256)
+        # user id -> their latest draft's GeneratedProfileView, so Generate can offer it back
+        # after its message was dismissed (`unsaved_draft`). A finished one is just ignored.
+        self.open_drafts: LRUCache = LRUCache(max_size=64)
         # user id -> when they last opened a support ticket, and their Ask MimicGuide
         # cooldown (`/help`). In memory: a restart forgives both, which costs nothing.
         self.ticket_times: LRUCache = LRUCache(max_size=256)
@@ -515,7 +523,7 @@ class MimicCog(EventListeners, commands.Cog):
         # opening a form costs nothing, and the draft is limited where it is made.
         if await refuse_unregistered(self, interaction):
             return
-        await interaction.response.send_modal(NewProfileModal(self))
+        await open_generate(self, interaction)
 
     async def _generate_profile(self, interaction: discord.Interaction, profile_name: str,
                                 prompt: Optional[str] = None,
@@ -1346,6 +1354,13 @@ class MimicCog(EventListeners, commands.Cog):
                         f"then add it back with the `use_child_bot` you want."), ephemeral=True)
                     return
                 await self._remove_session_participant(interaction, session, existing_index)
+                return
+
+            # Refused here, as the cast editor refuses it, rather than seated to be skipped
+            # every round. Removing one, above, is never refused.
+            refusal = self.content_rating.seat_refusal(participant_owner, profile_name, interaction.channel)
+            if refusal:
+                await interaction.followup.send(embed=text_embed(f"**{profile_name}** {refusal}"), ephemeral=True)
                 return
 
             # Create new session if none exists -- and start it.
@@ -2627,6 +2642,7 @@ class MimicCog(EventListeners, commands.Cog):
         state = await gather_state(self, interaction)
         view = StartWizardView(self, interaction, state)
         await view.update_display()
+        view.watch()
 
     @app_commands.command(name="news", description="What changed in each release of MimicAI.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
@@ -2816,7 +2832,8 @@ class MimicCog(EventListeners, commands.Cog):
         # one of its own.
         try:
             response_text, _used, _was_fallback = await self.api_service.run_with_fallback(
-                *self.api_service.model_chain(p_config, "primary_model", owner_id), _ask,
+                *self.api_service.model_chain(p_config, "primary_model", owner_id,
+                                              guild_id=guild_id, user_id=owner_id), _ask,
                 label="Ask MimicGuide")
         except Exception as e:
             print(f"Ask MimicGuide failed: {e}")
@@ -2965,6 +2982,22 @@ class MimicCog(EventListeners, commands.Cog):
         if await refuse_unregistered(self, interaction):
             return
         view = SettingsHomeView(self, interaction)
+        await view.update_display()
+
+    # Only where it is sold: BotManager's on_ready drops it from the tree elsewhere.
+    @app_commands.command(name="subscribe", description="The MimicAI subscription: talk to characters with no API key of your own.")
+    @cooldown_unless_refused(10, 60.0, _unregistered)
+    async def subscribe_slash(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        if interaction.user.id in self.generation_blocked:
+            await interaction.edit_original_response(
+                embed=build_about_embed(self, interaction.user.id))
+            return
+        if await refuse_unregistered(self, interaction):
+            return
+        # The subscription slot of /settings -> API Keys, not a second screen.
+        view = SettingsAPIView(self, interaction)
+        view.show_subscription()
         await view.update_display()
 
     def _record_model_usage(self, model_name: str, provider: str):

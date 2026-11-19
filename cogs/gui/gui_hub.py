@@ -11,7 +11,7 @@ from .base_components import (BlockedGuard, PageJumpModal, TabbedView, add_butto
                               build_pagination_controls, bulk_select_options,
                               paged_nav_options, refuse_unregistered, resolve_bulk_select,
                               add_topgg_links)
-from .gui_start import NewProfileModal
+from .gui_start import open_generate
 from .base_components import dismissible, text_embed
 
 if TYPE_CHECKING:
@@ -315,7 +315,7 @@ class HubPublicLibraryView(HubBaseView):
         await i.response.send_modal(LibraryIntroModal(self.cog, i.user.id, name, on_saved=repaint))
 
     async def generate_cb(self, i: discord.Interaction):
-        await i.response.send_modal(NewProfileModal(self.cog))
+        await open_generate(self.cog, i)
 
     def _matches(self, entry, term: str) -> bool:
         """The term in the profile's name, its creator's, its display name or its intro --

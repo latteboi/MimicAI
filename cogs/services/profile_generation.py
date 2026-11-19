@@ -13,9 +13,9 @@ from ..utils import fixed_examples, lorebook
 from ..utils.character_card import prompt_text
 from ..utils.constants import (AI_INSTRUCTIONS_PART_MAX_LENGTH, DEFAULT_CARD_IMPORT_PROMPT,
                                DEFAULT_PROFILE_GENERATOR_PROMPT, DEFAULT_SAFETY_SETTINGS,
-                               GENERATOR_KEYS, LIBRARY_INTRO_MAX_CHARS,
+                               GENERATOR_KEYS, INSTRUCTION_TICKS, LIBRARY_INTRO_MAX_CHARS,
                                PERSONA_TEXT_INPUT_MAX_LENGTH, defaultConfig)
-from ..utils.helpers import (_format_api_error, resolve_auto_models, resolve_thinking_params,
+from ..utils.helpers import (_format_api_error, resolve_auto_models, subscription_curated, resolve_thinking_params,
                              system_model, system_settings)
 from ..utils.user_defaults import apply_defaults, model_chain, model_provider
 
@@ -178,6 +178,10 @@ def generator_models(cog, user_id: int) -> Tuple[str, Tuple[str, ...]]:
     hold. Only models on a provider the user holds a key for are kept: a draft is billed
     to the user alone.
     """
+    if cog.storage_manager.subscription_payer(None, user_id):
+        # A MimicAI subscription runs its curated generator, whatever the user's defaults.
+        primary, *fallbacks = subscription_curated(cog, GENERATOR_KEYS[0])
+        return primary, tuple(fallbacks)
     provider = cog.user_settings.effective_provider(user_id)
     config = dict(zip(("primary_model", "fallback_model"),
                       (system_model(cog, key, provider) for key in GENERATOR_KEYS)))
@@ -299,6 +303,9 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
     if not isinstance(prompts.get("ai_instructions"), list):
         prompts["ai_instructions"] = ["", "", "", ""]
     prompts["ai_instructions"][0] = encrypt(draft["ai_instructions"][:AI_INSTRUCTIONS_PART_MAX_LENGTH])
+    # The Instructions boxes ticked on the draft screen; only their own keys are written.
+    ticks = draft.get("ticks") or {}
+    prompts.update({key: bool(ticks.get(key)) for key, *_ in INSTRUCTION_TICKS})
     if draft.get("lorebook"):
         prompts["lorebook"] = lorebook.normalise(draft["lorebook"])
     if draft.get("fixed_examples"):

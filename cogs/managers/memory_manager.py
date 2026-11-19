@@ -1117,7 +1117,8 @@ class MemoryManager:
         cfg = dict(GREEDY_SAMPLING)
 
         ltm_model_raw, ltm_fallbacks = self.cog.api_service.model_chain(
-            params_source, "ltm_model", profile_owner_id)
+            params_source, "ltm_model", profile_owner_id, guild_id=guild_id or None,
+            user_id=profile_owner_id)
 
         effective_guild_id = guild_id or 0
 
@@ -1355,7 +1356,8 @@ class MemoryManager:
                 return await model.generate_content_async([prompt])
 
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                *self.cog.api_service.model_chain(p_cfg, "training_analysis_model", owner_id),
+                *self.cog.api_service.model_chain(p_cfg, "training_analysis_model", owner_id,
+                                                  guild_id=interaction.guild_id, user_id=owner_id),
                 _attempt, label="Training analysis")
             response_text = getattr(resp, "text", None)
 

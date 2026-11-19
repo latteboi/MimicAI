@@ -9,7 +9,7 @@ from ...utils.constants import (
     DEFAULT_SYSTEM_INSTRUCTION, DEFAULT_SESSION_RULES, DEFAULT_NEURO_INSTRUCTION,
     NEURO_AXES,
     DEFAULT_TRAINING_DATA_INJECTION, DEFAULT_CURRENT_TIME, DEFAULT_NEGATIVE_CONSTRAINTS,
-    DEFAULT_CONTENT_POLICY, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_NEURO_DEFINITION,
+    DEFAULT_CONTENT_POLICY, DEFAULT_HARD_LIMITS, DEFAULT_BIRTHDAY_CONTEXT, DEFAULT_NEURO_DEFINITION,
     DEFAULT_MEMORY_CAPTURE_INSTRUCTION, DEFAULT_MEMORY_WRITTEN_NOTE, LORE_SCAN_TURNS,
     DEFAULT_BOND_DEFINITION, DEFAULT_BOND_INSTRUCTION, BOND_ROSTER_SIZE,
     DEFAULT_ENHANCE_AWARENESS,
@@ -495,6 +495,8 @@ class PromptBuilderMixin:
             policy_block = self.cog.global_prompts.get("CONTENT_POLICY", DEFAULT_CONTENT_POLICY).strip()
             if policy_block:
                 trailing_parts.append(policy_block)
+        # Every channel, age-restricted included, and last: see DEFAULT_HARD_LIMITS.
+        trailing_parts.append(self.cog.global_prompts.get("HARD_LIMITS", "").strip() or DEFAULT_HARD_LIMITS)
 
         current_instructions_str = "\n\n".join(
             p for p in (stable_parts + [rules] + slow_parts + trailing_parts) if p and p.strip()

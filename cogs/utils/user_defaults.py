@@ -39,9 +39,10 @@ import functools
 from typing import Any, Dict, List, Optional, Tuple
 
 from .constants import (AUTO_DEFAULT, AUTO_MODEL_PREFIX, AUTO_SLOT_PAIRS, AUTO_TIERS, MODEL_PROVIDERS,
+                        PROVIDER_SUBSCRIPTION,
                         OPENROUTER_SHIPPED_MODELS, UTILITY_FALLBACK_KEYS,
                         GOOGLE_SESSION_MODELS, SESSION_SLOT_PAIRS)
-from .helpers import is_real_model
+from .helpers import is_real_model, subscription_curated
 
 #: Config keys that must never be defaulted regardless of what the table says.
 #:
@@ -249,6 +250,12 @@ def other_provider(provider: Optional[str]) -> str:
     return "gemini" if provider == "openrouter" else "openrouter"
 
 
+def offered_providers(sells: bool) -> Tuple[str, ...]:
+    """What `/start` and Override Defaults offer, the recommended first: the subscription where
+    it is sold (`subscriptions.sells`), then a key of your own. None is no longer offered."""
+    return ((PROVIDER_SUBSCRIPTION,) if sells else ()) + ("openrouter", "gemini")
+
+
 def _served(primary_key: str, provider: str) -> List[str]:
     """The category's shipped models `provider` serves, Primary first."""
     if provider == "openrouter":
@@ -310,6 +317,34 @@ def model_chain(config: Optional[Dict[str, Any]], primary_key: str,
         return primary, ()
     fallback = stored or (shipped[1] if len(shipped) > 1 else None)
     return primary, (fallback,) if fallback else ()
+
+
+def subscription_chain(cog, config: Optional[Dict[str, Any]],
+                       primary_key: str) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    """`model_chain` where a MimicAI subscription pays, or None for a category it doesn't run --
+    the caller's own chain then meets `_instantiate_model`'s backstop, which says so.
+
+    Each slot runs the profile's subscription pick (`subscription_models`), else its own model,
+    while that is curated (`subscription_curated`), else the category's default. So a profile set
+    up for Gemini still runs, and a pick taken off the list falls back by itself. A Fallback
+    picked as NO_FALLBACK there is none. A session's chains are read the same way, off their
+    own keys.
+    """
+    curated = subscription_curated(cog, primary_key)
+    if not curated:
+        return None
+    config = config or {}
+    picks = config.get("subscription_models") or {}
+
+    def pick(key: str) -> Optional[str]:
+        return next((v for v in (picks.get(key), config.get(key)) if v in curated), None)
+
+    primary = pick(primary_key) or curated[0]
+    fallback_key = {**MODEL_SLOT_PAIRS, **SESSION_SLOT_PAIRS}[primary_key]
+    if fallback_key in picks and not is_real_model(picks[fallback_key]):
+        return primary, ()
+    fallback = pick(fallback_key) or next((m for m in curated if m != primary), None)
+    return primary, (fallback,) if fallback and fallback != primary else ()
 
 
 def model_slot_labels() -> Dict[str, str]:

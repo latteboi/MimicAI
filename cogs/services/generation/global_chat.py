@@ -10,7 +10,7 @@ from ...utils.constants import (
     defaultConfig, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB,
 )
-from ...utils.helpers import (
+from ...utils.helpers import (subscription_settings, 
     _format_citation_subtext, _format_history_entry, _get_user_hash, _resolve_safety_settings,
     default_profile_avatar_url, resolve_grounding_mode, resolve_url_mode,
     suppress_link_previews, turn_posted_at,
@@ -208,7 +208,10 @@ class GlobalChatMixin:
         # The host's own copy from here on, as a session reads a seated borrow's: a borrow
         # owns its config, and its models and sampling are what the host set on it.
         is_borrowed = profile_name in self.cog.profile_manager._get_user_index(host_user_id).get("borrowed", [])
-        profile_data = self.cog.profile_manager._get_profile_config(host_user_id, profile_name, is_borrowed) or {}
+        # On the host's own key: where that is the subscription, RAG searches as Native.
+        profile_data = subscription_settings(self.cog, 
+            self.cog.profile_manager._get_profile_config(host_user_id, profile_name, is_borrowed) or {},
+            None, host_user_id)
 
         user_api_key, or_key, block = self.global_chat_keys(host_user_id, interaction.guild_id, profile_data)
         if block:

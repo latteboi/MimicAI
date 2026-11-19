@@ -10,7 +10,7 @@ from ...utils.constants import (
     DEFAULT_KICKSTART_START, DEFAULT_IMAGE_PRESENT, VARIETY_HINTS,
 )
 from ...utils import follow_ups
-from ...utils.helpers import (_format_history_entry, image_command_prefix,
+from ...utils.helpers import (subscription_settings, _format_history_entry, image_command_prefix,
                              is_citation_subtext, kickstart_note,
                              resolve_critic_settings, server_context_guild, turn_posted_at,
                              whisper_recap)
@@ -302,6 +302,8 @@ class RegenerationMixin:
                 record = (setter or {}).get("meta", {}).get("follow_up")
                 follow_up_block = follow_ups.prompt_block(
                     self.cog.global_prompts, (answered, record) if record else None, log)
+            p_settings = subscription_settings(self.cog, 
+                p_settings, channel.guild.id, payload.user_id)
             # One tuple for the prompt and both models -- see tool_loop.
             functions = functions_for(p_settings)
             (system_instruction, turn_context, _, temp, top_p, top_k,

@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 import base64
 import orjson as json
 
-from ..utils.constants import SERVERS_DIR, CLEANUP_STATE_FILE, defaultConfig
+from ..utils.constants import SERVERS_DIR, CLEANUP_STATE_FILE, SUBSCRIPTION_SLOT, defaultConfig
 from ..utils.data_policy import is_paid_gemini_slot, openrouter_data_collection, training_opt_in
 from ..services.api.embeddings import EmbeddingRoute, embedding_model_ids
 from ..utils.helpers import system_model
@@ -625,7 +625,7 @@ class StorageManager:
                     or (slot.get("provider") == "gemini"
                         and self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id))):
                 return slot_id
-        return None
+        return SUBSCRIPTION_SLOT if self._key_in_slot(user_id, SUBSCRIPTION_SLOT) else None
 
     def admin_key_unassigned(self, guild, user_id: int) -> bool:
         """Whether this administrator of `guild` holds a key that would work there, only not
@@ -683,17 +683,10 @@ class StorageManager:
             # images, grounding and embeddings alike -- rather than at each of them.
             if provider == "gemini" and not self._gemini_slot_allowed_in_guild(guild_id, user_id, slot_id):
                 return None
-
-            decrypted_key = self.cog.decrypted_key_cache.get((user_id, slot_id))
-            if decrypted_key:
-                return decrypted_key
-
-            user_data = self._get_user_keys_data(user_id)
-            slot_data = user_data.get("slots", {}).get(slot_id)
-            if slot_data and slot_data.get("key"):
-                raw_key = slot_data["key"]
-                self.cog.decrypted_key_cache[(user_id, slot_id)] = raw_key
-                return raw_key
+            # A scope runs on the subscription or on its own keys, never both.
+            if provider == "gemini" and self.subscription_payer(guild_id, None):
+                return None
+            return self._key_in_slot(user_id, slot_id)
 
         return None
 
@@ -702,19 +695,40 @@ class StorageManager:
 
         user_data = self._get_user_keys_data(user_id)
         slot_id = user_data.get("personal_assignments", {}).get(provider)
+        if not slot_id or (provider == "gemini" and self.subscription_payer(None, user_id)):
+            return None
+        return self._key_in_slot(user_id, slot_id, user_data)
 
-        if slot_id:
-            decrypted_key = self.cog.decrypted_key_cache.get((user_id, slot_id))
-            if decrypted_key:
-                return decrypted_key
+    def _key_in_slot(self, user_id: int, slot_id: str,
+                     user_data: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """The key a slot holds: the only place a slot becomes a key.
 
-            slot_data = user_data.get("slots", {}).get(slot_id)
-            if slot_data and slot_data.get("key"):
-                raw_key = slot_data["key"]
-                self.cog.decrypted_key_cache[(user_id, slot_id)] = raw_key
-                return raw_key
-
+        SUBSCRIPTION_SLOT holds nothing in `keys.json.gz`; it is the user's subscription key
+        while active (`SubscriptionStore.key_for`), read from memory and never cached here, so
+        a lapse needs nothing cleared.
+        """
+        if slot_id == SUBSCRIPTION_SLOT:
+            return self.cog.subscriptions.key_for(user_id)
+        cached = self.cog.decrypted_key_cache.get((user_id, slot_id))
+        if cached:
+            return cached
+        slot = ((user_data or self._get_user_keys_data(user_id)).get("slots") or {}).get(slot_id)
+        if slot and slot.get("key"):
+            self.cog.decrypted_key_cache[(user_id, slot_id)] = slot["key"]
+            return slot["key"]
         return None
+
+    def subscription_payer(self, guild_id: Optional[int], user_id: Optional[int]) -> bool:
+        """Whether the OpenRouter key a call here bills is a MimicAI subscription: the
+        server's key in a server, else `user_id`'s Personal one -- as `_instantiate_model`
+        picks. Assigned is enough: a lapsed one pays for nothing, and says so."""
+        if guild_id:
+            pointer = self._guild_key_pointer(guild_id, "openrouter")
+            return bool(pointer) and pointer[1] == SUBSCRIPTION_SLOT
+        if not user_id:
+            return False
+        personal = self._get_user_keys_data(user_id).get("personal_assignments") or {}
+        return personal.get("openrouter") == SUBSCRIPTION_SLOT
 
     def _embedding_routes(self, guild_id: Optional[int], owner_id: Optional[int] = None) -> List[EmbeddingRoute]:
         """The keys an embedding may be billed to, in the order they are tried: the guild's,
@@ -976,7 +990,8 @@ class StorageManager:
                 except Exception:
                     pass
 
-                if is_missing or is_ghost:
+                # Someone paying for the subscription is a customer, in a server or not.
+                if (is_missing or is_ghost) and not self.cog.subscriptions.active(int(user_id_str)):
                     shutil.rmtree(user_dir, ignore_errors=True)
                     self.cog.user_appearances.pop(user_id_str, None)
                     self.cog.profile_shares.pop(user_id_str, None)
@@ -986,6 +1001,8 @@ class StorageManager:
                     self.cog.borrows._borrow_index_drop_user(int(user_id_str))
                     # Their ticket files went with it too; the ticket index names them.
                     self.cog.tickets.drop_user(int(user_id_str))
+                    # And their subscription record; its key goes on the next sweep.
+                    self.cog.subscriptions.drop_user(int(user_id_str))
                     cleaned_users_count += 1
         
 

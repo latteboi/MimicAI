@@ -12,9 +12,10 @@ from string import Formatter
 from typing import TYPE_CHECKING, Dict, List, Set, Tuple, Optional, get_args
 from ..managers.storage_manager import IOManager
 from ..managers.server_manager import record_lifted
+from ..managers.subscriptions import ACTIVE, period_usage, row_summary, tier_name, used_share
 from ..utils.helpers import (_sanitise_filename, birth_time, is_real_model, prune_openrouter_endpoints,
-                             resolve_openrouter_endpoint, resolve_thinking_params, system_model,
-                             system_settings)
+                             resolve_openrouter_endpoint, resolve_thinking_params, subscription_curated,
+                             system_model, system_settings)
 from ..utils.loop_probe import rss_bytes, snapshot as loop_probe_snapshot
 from ..utils import signatures
 from ..utils.user_defaults import auto_wording, model_slot_defaults, other_provider
@@ -678,7 +679,45 @@ _LIST_ROWS = 20
 _SESSION_ROWS = 15
 #: Each list's orders, the first its default. Cycled by the sort button.
 _SORTS = {"Servers": ("Newest", "Most sessions", "Most members"),
-          "Users": ("Most profiles", "Newest")}
+          "Users": ("Most profiles", "Newest"),
+          "Subscribed Users": ("Newest", "Most used")}
+
+
+class ModCuratedModelsModal(ui.Modal, title="Subscription Models"):
+    """The text models every MimicAI subscription runs, one OpenRouter ID a line, in order:
+    System Models' Swap model on its Subscription Models tab. Kept as the tab's `models`
+    (`subscription_curated`): empty, or the shipped list, is none."""
+    models_input = ui.TextInput(
+        label="OpenRouter model IDs, one a line", style=discord.TextStyle.paragraph,
+        required=False, max_length=2000,
+        placeholder="First: the default Primary. Second: the default Fallback. Empty: the shipped list.")
+
+    def __init__(self, view):
+        super().__init__()
+        self.parent_view = view
+        self.models_input.default = "\n".join(
+            m.removeprefix("OPENROUTER/") for m in subscription_curated(view.cog, "primary_model"))
+
+    async def on_submit(self, i: discord.Interaction):
+        cog = self.parent_view.cog
+        ids = list(dict.fromkeys(line.strip().removeprefix("OPENROUTER/")
+                                 for line in self.models_input.value.splitlines() if line.strip()))
+        catalogue = cog.api_service.catalogue
+        # Unknown, trains on prompts, or not a text model. An unsynced catalogue judges nothing.
+        refused = [m for m in ids if (catalogue.models and m not in catalogue.models)
+                   or not catalogue.open_to_all(m) or not catalogue.outputs_text_only(m)]
+        if refused or len(ids) >= DROPDOWN_MAX_OPTIONS:
+            why = (f"Not saved: {', '.join(f'`{m}`' for m in refused)[:1500]} "
+                   "isn't an OpenRouter text model that some host serves without training on prompts."
+                   if refused else f"Not saved: a profile's dropdown holds {DROPDOWN_MAX_OPTIONS - 1} at most.")
+            await i.response.send_message(embed=text_embed(why), ephemeral=True)
+            return
+        chosen = [f"OPENROUTER/{m}" for m in ids]
+        view = self.parent_view
+        view._put_settings({"models": chosen if chosen and tuple(chosen) != SUBSCRIPTION_TEXT_MODELS else None})
+        view._prune_pins()
+        view._build_view()
+        await i.response.edit_message(**view._picker_render())
 
 
 class ModFindModal(ui.Modal, title="Find by ID"):
@@ -708,7 +747,7 @@ class ModStatsView(ModBaseView):
     controls that say so.
     """
 
-    CATEGORIES = ("Overview", "Servers", "Users")
+    CATEGORIES = ("Overview", "Servers", "Users", "Subscribed Users")
 
     def __init__(self, cog, interaction, target_user_id: Optional[int] = None):
         super().__init__(cog, interaction, "stats", target_user_id=target_user_id)
@@ -834,7 +873,8 @@ class ModStatsView(ModBaseView):
 
     def _build_list(self):
         cat_opts = [discord.SelectOption(label=cat, value=cat, default=(cat == self.selected_category))
-                    for cat in self.CATEGORIES]
+                    for cat in self.CATEGORIES
+                    if cat != "Subscribed Users" or self.cog.subscriptions.enabled]
 
         async def cat_cb(i: discord.Interaction):
             await i.response.defer()
@@ -875,6 +915,22 @@ class ModStatsView(ModBaseView):
             await self._repaint(i)
         add_button(self, f"{following} ▶", sort_cb, row=2)
         self._add_find_button(2)
+        if category == "Subscribed Users":
+            async def curated_cb(i: discord.Interaction):
+                view = ModSystemModelsView(self.cog, self.original_interaction, self.target_user_id,
+                                           category="subscription")
+                await i.response.edit_message(**view._picker_render())
+            add_button(self, "Subscription Models…", curated_cb, row=3, emoji="⭐")
+            paused = self.cog.subscriptions.paused
+
+            async def pause_cb(i: discord.Interaction):
+                problem = await self.cog.subscriptions.set_paused(not paused)
+                await self._repaint(i)
+                if problem:
+                    await i.followup.send(embed=text_embed(problem), ephemeral=True)
+            add_button(self, "Resume Sales" if paused else "Pause New Sales", pause_cb, row=3,
+                       emoji="▶️" if paused else "⏸️",
+                       style=discord.ButtonStyle.success if paused else discord.ButtonStyle.secondary)
 
     def _build_detail(self):
         kind, ident = self.trail[-1]
@@ -885,6 +941,11 @@ class ModStatsView(ModBaseView):
             await self._repaint(i)
         add_button(self, "◀ Back", back_cb, row=0)
         self._add_find_button(0)
+        if kind == "user" and self.cog.subscriptions.enabled:
+            async def subscription_cb(i: discord.Interaction):
+                view = ModSubscriptionView(self.cog, ident)
+                await i.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+            add_button(self, "Subscription", subscription_cb, row=0, emoji="⭐")
         if kind == "guild":
             self._build_guild(ident)
         else:
@@ -1072,6 +1133,18 @@ class ModStatsView(ModBaseView):
                             guild.name, f"{sessions} sessions · {members} members · joined {joined}"))
             return out
 
+        if self.selected_category == "Subscribed Users":
+            key = ((lambda item: item[1].get("since", 0)) if self.sort["Subscribed Users"] == "Newest"
+                   else (lambda item: used_share(item[1])))
+            for j, (uid, row) in enumerate(sorted(self.cog.subscriptions.everyone().items(),
+                                                  key=key, reverse=True), start=1):
+                user = self.cog.bot.get_user(int(uid))
+                name, summary = user.name if user else "Unknown User", row_summary(row)
+                when = (f" · cancelled, ends <t:{int(row['ends'])}:d>" if row.get("ends")
+                        else f" · since <t:{int(row.get('since', 0))}:d>")
+                out.append((int(uid), f"{j}. **{name}** · `{uid}`\n{summary}{when}", name, summary))
+            return out
+
         key = ((lambda r: (r[2], r[3])) if self.sort["Users"] == "Most profiles"
                else (lambda r: r[4] or 0))
         for j, (uid, provider, personal, borrowed, joined) in enumerate(
@@ -1097,13 +1170,31 @@ class ModStatsView(ModBaseView):
         rows = self._rows()
         start = self.current_page * _LIST_ROWS
         embed.description = ("\n\n".join(line for _id, line, _l, _d in rows[start:start + _LIST_ROWS])
-                             or ("No server data available." if self.selected_category == "Servers"
-                                 else "No users."))
+                             or {"Servers": "No server data available.",
+                                 "Subscribed Users": "Nobody subscribes yet."}.get(self.selected_category,
+                                                                                   "No users."))
         embed.set_footer(text=f"Sorted by {self.sort[self.selected_category].lower()} · "
                               "pick one below to inspect it")
         if self.selected_category == "Users" and self._users is not None:
             embed.add_field(name="Users", inline=False, value=self._users_summary())
+        if self.selected_category == "Subscribed Users":
+            self._subscriptions_fields(embed)
         return embed
+
+    def _subscriptions_fields(self, embed: discord.Embed) -> None:
+        subs = self.cog.subscriptions
+        rows = subs.everyone().values()
+        active = Counter(r.get("tier") for r in rows if r.get("status") == ACTIVE)
+        value = (f"Active `{active.total()}` — "
+                 + " · ".join(f"{tier_name(t)} `{active[t]}`" for t in SUBSCRIPTION_TIERS)
+                 + f" · Lapsed `{len(rows) - active.total()}`")
+        value += ("\n⏸️ **New sales paused.** Subscribers keep theirs, and can still manage and cancel."
+                  if subs.paused else "\nNew sales open.")
+        if subs.credit is not None:
+            short = subs.credit < (subs.unused or 0)
+            value += (f"\n{'⚠️ ' if short else ''}US${subs.credit:.2f} on the account, "
+                      f"US${subs.unused or 0:.2f} of allowance unspent")
+        embed.add_field(name="Subscriptions", value=value, inline=False)
 
     def _users_summary(self) -> str:
         by_provider = Counter(r[1] for r in self._users)
@@ -1238,6 +1329,9 @@ class ModStatsView(ModBaseView):
         entry = sm.blacklist_entry(uid)
         lines.append(f"Strikes `{len(sm.active_strikes(uid))}` of `{STRIKE_THRESHOLD}` · "
                      + _block_line(entry, BLACKLIST_SCOPE_LABELS.get((entry or {}).get("scope"))))
+        sub = self.cog.subscriptions.row(uid) if self.cog.subscriptions.enabled else None
+        if sub:
+            lines.append(f"Subscription: {row_summary(sub)}")
 
         owns = [g for g in self.cog.bot.guilds if g.owner_id == uid]
         if owns:
@@ -1314,25 +1408,37 @@ async def _posted_by_us(cog, message: discord.Message) -> bool:
     return webhook.user is not None and webhook.user.id == cog.bot.user.id
 
 
-async def trace_message(cog, link: str) -> str:
-    """`trace_signature` for a pasted message link."""
+_NOT_OURS = ("That message was not posted by this bot, its webhooks or its child bots. Any "
+             "signature in it was copied and says nothing about the words beside it.")
+#: How much of a traced message is quoted under the answer: enough to know it is the one.
+_TRACE_QUOTE = 600
+
+
+async def trace_message(cog, link: str) -> Tuple[str, Optional[discord.Message]]:
+    """`trace_signature` for a pasted message link, and the message when it is ours to remove,
+    quoted under the answer so what Delete Message would take is seen first."""
     m = _MESSAGE_LINK.search(link or "")
     if not m:
-        return "That is not a message link. In Discord, open the message's menu and choose Copy Message Link."
+        return "That is not a message link. In Discord, open the message's menu and choose Copy Message Link.", None
     try:
         channel = cog.bot.get_channel(int(m[1])) or await cog.bot.fetch_channel(int(m[1]))
         message = await channel.fetch_message(int(m[2]))
     except (discord.HTTPException, AttributeError) as e:
-        return f"Could not fetch that message: {e}"
-    return await trace_signature(cog, message)
+        return f"Could not fetch that message: {e}", None
+    if not await _posted_by_us(cog, message):
+        return _NOT_OURS, None
+    text = await trace_signature(cog, message, posted_by_us=True)
+    quote = signatures.unsign(message.content or "").strip()
+    if quote:
+        text += "\n>>> " + (quote if len(quote) <= _TRACE_QUOTE else quote[:_TRACE_QUOTE] + "…")
+    return text, message
 
 
-async def trace_signature(cog, message: discord.Message) -> str:
+async def trace_signature(cog, message: discord.Message, *, posted_by_us: bool = False) -> str:
     """Who ran the character behind `message`, and which profile, from its signature.
     The bot owner's alone: `/mod` -> Trace Message, or the owner's View Generation Trace."""
-    if not await _posted_by_us(cog, message):
-        return ("That message was not posted by this bot, its webhooks or its child bots. Any "
-                "signature in it was copied and says nothing about the words beside it.")
+    if not posted_by_us and not await _posted_by_us(cog, message):
+        return _NOT_OURS
     root = getattr(cog.fernet, "signing", None)
     found = root and signatures.read(root, message.guild.id if message.guild else 0, message.content)
     unreadable = ("That message carries no signature this instance can read: it was sent before "
@@ -1366,8 +1472,48 @@ class ModTraceModal(ui.Modal, title="Trace a Message"):
 
     async def on_submit(self, i: discord.Interaction):
         await i.response.defer(ephemeral=True, thinking=True)
-        await i.followup.send(embed=text_embed(await trace_message(self.cog, self.link_input.value)),
-                              ephemeral=True)
+        text, message = await trace_message(self.cog, self.link_input.value)
+        extra = {"view": TraceTakedownView(self.cog, message)} if message else {}
+        await i.followup.send(embed=text_embed(text), ephemeral=True, **extra)
+
+
+class TraceTakedownView(ui.View):
+    """Under a traced message: removes it as a moderator deleting it would, so its turn leaves
+    the session log too (`on_turn_messages_deleted`). The report's 7 days (Terms, Section 3)
+    from one screen. Pressed twice: the quote above it is what goes."""
+
+    def __init__(self, cog, message: discord.Message):
+        super().__init__(timeout=600)
+        self.cog, self.message, self.armed = cog, message, False
+        self.button = add_button(self, "Delete Message", self._delete, emoji="🗑️",
+                                 style=discord.ButtonStyle.danger)
+
+    async def _delete(self, i: discord.Interaction):
+        if not self.armed:
+            self.armed = True
+            self.button.label = "Confirm: delete it"
+            await i.response.edit_message(view=self)
+            return
+        await i.response.defer()
+        channel = self.message.channel
+        me = getattr(getattr(channel, "guild", None), "me", None)
+        try:
+            if me is not None and channel.permissions_for(me).manage_messages:
+                await self.message.delete()
+                gone = True
+            else:
+                # Without Manage Messages: through the webhook, or the child bot, that posted it.
+                gone = await self.cog.generation_service._delete_own_message(channel, self.message.id)
+        except discord.NotFound:
+            gone = True
+        except discord.HTTPException:
+            gone = False
+        self.stop()
+        self.clear_items()
+        await i.edit_original_response(view=self)
+        await i.followup.send(embed=text_embed(
+            "Deleted. Its turn leaves the session log too." if gone else
+            "Discord would not delete it. A moderator of that server can remove it."), ephemeral=True)
 
 
 #: Why a refusal waits on the operator, as the Review Queue says it.
@@ -1405,6 +1551,12 @@ class ModProfilesView(ModBaseView):
         async def enter_cb(i: discord.Interaction):
             await i.response.send_modal(ModProfilesModal(self))
         add_button(self, "Enter User ID", enter_cb, style=discord.ButtonStyle.success, row=0)
+
+        if self.target_user_id and self.cog.subscriptions.enabled:
+            async def subscription_cb(i: discord.Interaction):
+                view = ModSubscriptionView(self.cog, self.target_user_id)
+                await i.response.send_message(embed=view.embed(), view=view, ephemeral=True)
+            add_button(self, "Subscription", subscription_cb, row=0, emoji="⭐")
 
         # Instance-wide maintenance, deliberately manual. Nothing runs this on boot:
         # it is a one-off baseline reset the operator performs once, which is why no
@@ -1542,6 +1694,76 @@ class ModProfilesView(ModBaseView):
     async def update_display(self):
         await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
 
+class ModSubscriptionView(BlockedGuard, ui.View):
+    """The moderated user's MimicAI subscription: grant a tier, revoke it, reconcile everyone.
+
+    A grant is how Phase 1 is tested live and how a subscription is comped. Each change
+    reconciles that user at once (`SubscriptionStore.grant`), so the key exists, or is gone,
+    by the time this repaints. Opened from `/mod` -> Profiles on a targeted user, and from a
+    user's page in Stats (Subscribed Users lists everyone with a record).
+    """
+
+    def __init__(self, cog, user_id: int):
+        super().__init__(timeout=300)
+        self.cog, self.user_id = cog, user_id
+        self.result: Optional[str] = None
+        self._build()
+
+    def embed(self) -> discord.Embed:
+        subs = self.cog.subscriptions
+        row, grant = subs.row(self.user_id) or {}, subs.grant_of(self.user_id)
+        user = self.cog.bot.get_user(self.user_id)
+        e = discord.Embed(title="MimicAI Subscription", colour=discord.Colour.gold(),
+                          description=f"**{user.name if user else 'Unknown'}** (`{self.user_id}`)")
+        if row:
+            value = f"`{row.get('status', '?')}` since <t:{int(row.get('since', 0))}:d>, `{tier_name(row.get('tier'))}`"
+            if row.get("ends"):
+                value += f", cancelled: ends <t:{row['ends']}:d>"
+            if row.get("period"):  # a refund's 7 days count from here
+                value += f"\nThis period began <t:{int(row['period'])}:d>"
+            if row.get("limit") is not None:
+                used, available = period_usage(row)
+                value += f"\nUS${used:.2f} used this period, of US${available:.2f}"
+                if row.get("synced"):
+                    value += f" (as of <t:{int(row['synced'])}:R>)"
+            e.add_field(name="Record", value=value, inline=False)
+        e.add_field(name="Grant", value=f"`{tier_name(grant['tier'])}`" if grant else "None", inline=False)
+        if subs.credit is not None:
+            short = subs.credit < (subs.unused or 0)
+            e.add_field(name="Account float", value=(
+                f"{'⚠️ ' if short else ''}US${subs.credit:.2f} on the account, US${subs.unused or 0:.2f} "
+                f"of allowance unspent (last full run <t:{int(subs.last_run or 0)}:R>)"), inline=False)
+        if subs.last_error:
+            e.add_field(name="Last error", value=subs.last_error[:1024], inline=False)
+        if self.result:
+            e.add_field(name="Result", value=self.result[:1024], inline=False)
+        return e
+
+    def _build(self):
+        self.clear_items()
+        options = [discord.SelectOption(label=f"Grant {tier_name(tier)} (US${allowance:.2f})", value=tier)
+                   for tier, allowance in SUBSCRIPTION_TIERS.items()]
+        add_select(self, options, self._grant_cb, placeholder="Grant a tier...", row=0)
+        if self.cog.subscriptions.grant_of(self.user_id):
+            add_button(self, "Revoke Grant", self._revoke_cb, style=discord.ButtonStyle.danger, row=1)
+        add_button(self, "Reconcile Everyone", self._reconcile_cb, row=1)
+
+    async def _act(self, i: discord.Interaction, work) -> None:
+        await i.response.defer()
+        self.result = await work() or "Done."
+        self._build()
+        await i.edit_original_response(embed=self.embed(), view=self)
+
+    async def _grant_cb(self, i: discord.Interaction):
+        await self._act(i, lambda: self.cog.subscriptions.grant(self.user_id, i.data["values"][0]))
+
+    async def _revoke_cb(self, i: discord.Interaction):
+        await self._act(i, lambda: self.cog.subscriptions.revoke(self.user_id))
+
+    async def _reconcile_cb(self, i: discord.Interaction):
+        await self._act(i, lambda: self.cog.subscriptions.reconcile())
+
+
 # --- Global prompt metadata -------------------------------------------------
 #
 # Every entry is (label, key, default_text). The placeholder table below records
@@ -1565,6 +1787,7 @@ MOD_PROMPT_CATEGORIES = [
         ("Bonds", "BOND_DEFINITION", DEFAULT_BOND_DEFINITION),
         ("Bond State", "BOND_STATE", DEFAULT_BOND_INSTRUCTION),
         ("Content Policy (non-18+ channels)", "CONTENT_POLICY", DEFAULT_CONTENT_POLICY),
+        ("Hard Limits (every channel)", "HARD_LIMITS", DEFAULT_HARD_LIMITS),
     ]),
     ("Turn Flow", [
         ("Whisper Injection", "WHISPER_INJECTION", DEFAULT_WHISPER_INJECTION),
@@ -1961,6 +2184,10 @@ _SYSTEM_MODEL_NOTES = {
     "system": "Saved to the System profile itself. Its other settings are in `/profile`.",
     "key_check": ("Called on Google's API with the pasted key, so Google models only. The billing "
                   "check must be one an unbilled key is refused: an image model."),
+    "subscription": ("Every text slot a MimicAI subscription pays for picks among these: the first "
+                     "is the default Primary, the second the default Fallback. Thinking set here "
+                     "replaces a profile's own for its replies, and Hosts & Tier its own for every "
+                     "call. Images are read, and profiles rated, by their own fixed models."),
     **{tab: _AUTO_NOTE + _AUTO_SLOT_NOTES.get(slot, "")
             + (" New profiles on OpenRouter start on this tier." if tier == "free" else _AUTO_UNSET_NOTE)
        for tab, _w, _d, tier, slot in _AUTO_TABS},
@@ -1982,6 +2209,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         ("system", "System Profiles", "The models behind each System profile's replies."),
         ("key_check", "Key Checks", "Tests a pasted Gemini key, then whether it has billing."),
         *((tab, wording, desc) for tab, wording, desc, _tier, _slot in _AUTO_TABS),
+        ("subscription", "Subscription Models", "The text models a MimicAI subscription runs."),
     )
     _CATEGORY_KEYS = {
         "describer": _slots(("describer_model", "Primary"), ("describer_fallback_model", "Fallback")),
@@ -1993,6 +2221,9 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
                             ("key_tier_probe_model", "Billing Check")),
         **{tab: _slots(*zip(AUTO_TIER_KEYS[tier, slot], ("Primary", "Fallback")))
            for tab, _w, _d, tier, slot in _AUTO_TABS},
+        # The list's first two, which Thinking names. Swap model edits the list.
+        "subscription": _slots(("subscription_primary", "Default Primary"),
+                               ("subscription_fallback", "Default Fallback")),
     }
     #: Everything but the System profiles runs for every user, and Ollama answers the bot
     #: owner's own profiles only -- which the System profiles are.
@@ -2007,9 +2238,12 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
 
     is_borrowed = False
 
-    def __init__(self, cog, interaction: discord.Interaction, target_user_id: Optional[int] = None):
+    def __init__(self, cog, interaction: discord.Interaction, target_user_id: Optional[int] = None,
+                 category: str = "describer"):
         super().__init__(timeout=600)
         self.cog = cog
+        if not cog.subscriptions.enabled:
+            self._CATEGORY_LABELS = tuple(c for c in self._CATEGORY_LABELS if c[0] != "subscription")
         self.original_interaction = interaction
         self.user_id = interaction.user.id
         self.target_user_id = target_user_id
@@ -2017,7 +2251,9 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         #: Whose chain the describer and classifier tabs show: the users preferring Google,
         #: or OpenRouter. Opens on the operator's own side.
         self.audience = "openrouter" if self.view_mode == "openrouter" else "gemini"
-        self.category = "describer"
+        self.category = category
+        #: Back returns where this opened: Stats' Subscribed Users, else Prompts.
+        self.from_stats = category == "subscription"
         self.ollama_working = None
         #: An embedding model waiting on the warning, or None.
         self.pending_embedding: Optional[str] = None
@@ -2037,6 +2273,10 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         return self.cog.profile_manager._get_profile_config(self.user_id, self.profile_name, False) or {}
 
     def _value(self, key: str) -> str:
+        if self.category == "subscription":
+            curated = subscription_curated(self.cog, "primary_model")
+            n = key == "subscription_fallback"
+            return curated[n] if n < len(curated) else NO_FALLBACK
         if key in _PROFILE_KEYS:
             # An unset slot runs what the owner's provider ships, as `model_chain` reads it.
             return self._system_config().get(key) or model_slot_defaults(
@@ -2045,6 +2285,8 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
 
     def _shipped(self, key: str) -> str:
         """What Reset puts back: a new System profile's model, else the build's for this audience."""
+        if self.category == "subscription":
+            return SUBSCRIPTION_TEXT_MODELS[key == "subscription_fallback"]
         if key in _PROFILE_KEYS:
             return SYSTEM_PROFILE_FALLBACK_MODEL if key == "fallback_model" else SYSTEM_PROFILE_MODEL
         return SYSTEM_MODEL_DEFAULTS.get(key) or SYSTEM_MODEL_DEFAULTS_BY_PROVIDER[self.audience][key]
@@ -2149,7 +2391,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
             return None
         settings, parts = self._settings(), []
         for role, label in (("primary", "Primary"), ("fallback", "Fallback")):
-            if self._auto_tier():
+            if self._overrides_own():
                 level_key, budget_key = THINKING_SLOT_KEYS["response"][role]
                 level, budget = settings.get(level_key), settings.get(budget_key)
                 parts.append(f"{label} `Each profile's own`" if level is None and budget is None else
@@ -2190,6 +2432,11 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
     def _auto_tier(self) -> Optional[str]:
         return _AUTO_CATEGORIES.get(self.category)
 
+    def _overrides_own(self) -> bool:
+        """Whether this tab's Thinking stands in for each profile's own, unset meaning theirs:
+        an Auto tier's, and the subscription's."""
+        return self._auto_tier() is not None or self.category == "subscription"
+
     def _put(self, key: str, value: Dict):
         """Sparse, as `_store`: an empty mapping is no entry."""
         if value:
@@ -2209,6 +2456,9 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         self._put(AUTO_ENDPOINTS_KEY, {m: tag for m, tag in pins.items() if m in held})
 
     def _pinnable_slots(self) -> List[tuple]:
+        if self.category == "subscription":
+            return [(f"model_{n}", f"Model {n}", m)
+                    for n, m in enumerate(subscription_curated(self.cog, "primary_model"), start=1)]
         return [(key, wording, self._value(key)) for key, wording, _d in self._CATEGORY_KEYS[self.category]]
 
     def _current_service_tier(self):
@@ -2240,6 +2490,8 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         self._add_hosts_button(row=row, view_cls=ModAutoHostView if auto else ModHostView, lit=lit)
 
     def _is_changed(self, key: str) -> bool:
+        if self.category == "subscription":
+            return "models" in self._settings()
         return self._value(key) != self._shipped(key)
 
     # --- Mixin contract ------------------------------------------------------
@@ -2256,7 +2508,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         # MimicAI Auto runs on OpenRouter keys.
         if self.category == "key_check":
             return ["google"]
-        return ["openrouter"] if self._auto_tier() else super()._api_modes()
+        return ["openrouter"] if self._overrides_own() else super()._api_modes()
 
     def _allows_no_fallback(self, target_config_key: str) -> bool:
         return target_config_key in self._NO_RETRY_KEYS
@@ -2338,9 +2590,15 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
         e = discord.Embed(title="System Models", colour=discord.Colour.purple(),
                           description=f"**{wording}** — {description}\n{whose}"
                                       f"-# {_SYSTEM_MODEL_NOTES[self.category]}")
-        for key, slot, _default in self._CATEGORY_KEYS[self.category]:
-            mark = " ✏️" if self._is_changed(key) else ""
-            e.add_field(name=f"{slot}{mark}", value=f"`{self.display_model(self._value(key))}`", inline=True)
+        if self.category == "subscription":
+            mark = " ✏️" if self._is_changed("") else ""
+            e.add_field(name=f"Models{mark}", inline=False, value="\n".join(
+                f"{n}. `{self.strip_prefix(m)}`" + {1: " (default Primary)", 2: " (default Fallback)"}.get(n, "")
+                for n, m in enumerate(subscription_curated(self.cog, "primary_model"), start=1))[:1024])
+        else:
+            for key, slot, _default in self._CATEGORY_KEYS[self.category]:
+                mark = " ✏️" if self._is_changed(key) else ""
+                e.add_field(name=f"{slot}{mark}", value=f"`{self.display_model(self._value(key))}`", inline=True)
         thinking = self._thinking_line()
         if thinking:
             e.add_field(name="Thinking", value=thinking, inline=False)
@@ -2349,8 +2607,8 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
             e.add_field(name="⚠️ Cannot read images", inline=False,
                         value=", ".join(f"`{m}`" for m in blind) + " -- the chain passes over "
                               f"{'them' if len(blind) > 1 else 'it'} whenever there is a file to read.")
-        self._add_openrouter_details(e, [(slot, self._value(key))
-                                         for key, slot, _d in self._CATEGORY_KEYS[self.category]])
+        # ponytail: the first six of a subscription's list, inside an embed's 25 fields.
+        self._add_openrouter_details(e, [(slot, value) for _k, slot, value in self._pinnable_slots()][:6])
         e.set_footer(text="Bot-wide · ✏️ differs from the shipped model · saves as you choose")
         return e
 
@@ -2404,7 +2662,8 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
             self._add_system_profile_select(row)
             row += 1
         slots = self._CATEGORY_KEYS[self.category]
-        for key, wording, _default in slots:
+        subscription = self.category == "subscription"
+        for key, wording, _default in () if subscription else slots:
             self.add_item(self.GenericModelSelect(
                 f"Select {wording} Model...", self._create_model_options(self._value(key), key), row, key))
             row += 1
@@ -2427,14 +2686,22 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
             add_button(self, f"For: {MODEL_PROVIDERS[self.audience]} users", audience_cb,
                        style=discord.ButtonStyle.success, row=row)
 
-        self._add_api_buttons(row=row, guide=not crowded)
+        if subscription:
+            async def swap_cb(i: discord.Interaction):
+                await i.response.send_modal(ModCuratedModelsModal(self))
+            add_button(self, "Swap model…", swap_cb, row=row, style=discord.ButtonStyle.primary)
+        else:
+            self._add_api_buttons(row=row, guide=not crowded)
         self._add_thinking_button(last_row)
         if not crowded:
             self._add_openrouter_buttons(row=last_row)
 
         async def reset_cb(i: discord.Interaction):
+            if subscription:
+                self._put_settings({"models": None})
+                self._prune_pins()
             # Through `_save_changes`, so resetting the embedding model is warned about too.
-            for key, _wording, _default in slots:
+            for key, _wording, _default in () if subscription else slots:
                 self._save_changes(key, self._shipped(key))
             self._build_view()
             await i.response.edit_message(**self._picker_render())
@@ -2443,7 +2710,12 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
                    disabled=not any(self._is_changed(key) for key, _w, _d in slots))
 
         async def back_cb(i: discord.Interaction):
-            view = ModPromptsView(self.cog, self.original_interaction, target_user_id=self.target_user_id)
+            if self.from_stats:
+                view = ModStatsView(self.cog, self.original_interaction, target_user_id=self.target_user_id)
+                view.selected_category = "Subscribed Users"
+                view._build_view()
+            else:
+                view = ModPromptsView(self.cog, self.original_interaction, target_user_id=self.target_user_id)
             await i.response.edit_message(embed=view._get_embed(), view=view)
 
         add_button(self, "Back", back_cb, row=last_row)
@@ -2465,7 +2737,8 @@ class ModThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
         self.cog = parent.cog
         self.user_id = parent.user_id
         self.slot = parent.category
-        self._OFFERS_UNCHANGED = parent._auto_tier() is not None
+        # Other screens host this too (the Director's models), so not `_overrides_own`.
+        self._OFFERS_UNCHANGED = parent._auto_tier() is not None or parent.category == "subscription"
         self._build_view()
 
     def _slot_keys(self, role: str = "primary"):
@@ -2492,8 +2765,10 @@ class ModThinkingView(BlockedGuard, ThinkingPickerMixin, ui.View):
         auto = self._OFFERS_UNCHANGED
         e = discord.Embed(title="Thinking / Reasoning", colour=discord.Colour.purple())
         e.description = f"**{parent._tab_wording()}** \u2014 " + (
-            "set here, each runs in place of a profile's own on this tier; left Unchanged, the "
-            "profile keeps its own." if auto else
+            ("set here, each runs in place of a profile's own for a reply a subscription pays for; "
+             "left Unchanged, the profile keeps its own." if parent.category == "subscription" else
+             "set here, each runs in place of a profile's own on this tier; left Unchanged, the "
+             "profile keeps its own.") if auto else
             "effort and budget are stored per model, so a cheap fallback need not think as hard "
             "as the primary it stands in for.")
         own = "`Each profile's own`"
@@ -2547,6 +2822,8 @@ class ModHostView(OpenRouterHostView):
     def _TIER_REACH(self) -> str:
         if self.parent.category == "system":
             return OpenRouterHostView._TIER_REACH
+        if self.parent.category == "subscription":
+            return "Every subscription model, in place of a profile's own, wherever a subscription pays."
         return "Every OpenRouter model on this tab, for every user it runs for."
 
     def _chosen(self, model_id: str) -> str:

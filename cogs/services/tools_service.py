@@ -299,7 +299,7 @@ class ToolsService:
             system_instruction = instructions
 
         critic_model_raw, critic_fallbacks = self.cog.api_service.model_chain(
-            store, "critic_model", owner_id)
+            store, "critic_model", owner_id, guild_id=guild_id, user_id=owner_id)
 
         try:
             critic_cfg = dict(GREEDY_SAMPLING)

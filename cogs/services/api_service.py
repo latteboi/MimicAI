@@ -18,21 +18,23 @@ from ..utils.constants import (
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     THINKING_LEVELS_TO_OLLAMA, GEMINI_FREE_TIER_BLOCKED, OLLAMA_OWNER_ONLY,
     OPENROUTER_DATA_POLICY_BLOCKED, IMAGE_MODEL_NO_OLLAMA, SPEECH_MODEL_NO_OLLAMA,
-    OPENROUTER_SERVER_TOOLS,
+    OPENROUTER_SERVER_TOOLS, SUBSCRIPTION_SERVER_TOOLS,
     API_KEY_COOLING_DOWN, NO_MODEL_SET, KEY_CHECK_MODEL_MISSING,
+    SUBSCRIPTION_LAPSED, SUBSCRIPTION_MODEL_REFUSED, SUBSCRIPTION_SETTINGS_KEY, SUBSCRIPTION_USED_UP,
 )
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
 from ..utils.helpers import (_format_api_error, _resolve_safety_settings,
-                            billable_output_tokens, is_real_model,
+                            billable_output_tokens, is_real_model, subscription_allowed, system_settings,
+                            resolve_openrouter_endpoint, resolve_openrouter_service_tier,
                             google_thinking_caps, resolve_image_output_params,
                             resolve_image_tools, resolve_media_resolution,
                             resolve_native_tools, resolve_openrouter_image_detail,
                             openrouter_routing, resolve_auto_models,
                             resolve_thinking_params, system_model)
 from ..utils.http_client import get_shared_client
-from ..utils.user_defaults import model_chain
+from ..utils.user_defaults import model_chain, subscription_chain
 from ..utils.net_guard import safe_stream
 from ..utils.memory_tuning import maybe_trim_malloc
 from ..utils import mem_probe
@@ -146,6 +148,13 @@ def _with_key_cooldown_tracking(cog, model, api_key: str, model_id: str,
             raise
         except Exception as e:
             _rest_model_on_rate_limit(cog, api_key, model_id, e)
+            # OpenRouter's own words name the operator's key page by its hash, and mean
+            # nothing to whoever is talking: a subscription's cap is phrased for them.
+            # A key near its cap is a 402 instead, which points at a credits page.
+            said = str(e).lower()
+            if (("key limit exceeded" in said or "openrouter api error 402" in said)
+                    and cog.subscriptions.is_key(api_key)):
+                e.formatted_reason = SUBSCRIPTION_USED_UP
             raise
 
     setattr(model, method, _tracked)
@@ -311,7 +320,20 @@ class APIService:
 
         if is_openrouter:
             api_key = storage._get_api_key_for_guild(guild_id, "openrouter") if guild_id else storage._get_api_key_for_user(user_id, "openrouter")
+            if not api_key and storage.subscription_payer(guild_id, user_id):
+                raise MissingKeyError(SUBSCRIPTION_LAPSED)
             if not api_key: raise MissingKeyError(openrouter_key_error or "OpenRouter API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
+            # The backstop: a subscription key runs its curated models alone, whatever the
+            # caller chose. MissingKeyError, so the fallback is still tried.
+            on_subscription = self.cog.subscriptions.is_key(api_key)
+            if on_subscription and f"OPENROUTER/{actual_name}" not in subscription_allowed(self.cog):
+                raise MissingKeyError(SUBSCRIPTION_MODEL_REFUSED)
+            if on_subscription:
+                # The bot owner's Hosts & Tier for the subscription, never the profile's own:
+                # what it sends is billed to the owner's account.
+                owned = system_settings(self.cog, SUBSCRIPTION_SETTINGS_KEY)
+                endpoint = resolve_openrouter_endpoint(owned, actual_name)
+                service_tier = resolve_openrouter_service_tier(owned)
             _refuse_if_resting(self.cog, api_key, actual_name)
             data_collection = (openrouter_data_collection(
                 self.cog.server_manager._get_server_index(str(policy_guild)) if policy_guild else None)
@@ -332,11 +354,11 @@ class APIService:
                     actual_name, api_key=api_key, system_instruction=system_instruction,
                     image_params=resolve_image_output_params(image_config, f"OPENROUTER/{actual_name}"))
                 return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
+            server = SUBSCRIPTION_SERVER_TOOLS if on_subscription else OPENROUTER_SERVER_TOOLS
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection,
                                     endpoint=endpoint,
                                     tools=declarations(functions),
-                                    server_tools=[OPENROUTER_SERVER_TOOLS[k] for t in tools or ()
-                                                  for k in t if k in OPENROUTER_SERVER_TOOLS])
+                                    server_tools=[server[k] for t in tools or () for k in t if k in server])
             model.functions = tuple(functions)
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
         elif is_ollama:
@@ -357,6 +379,9 @@ class APIService:
                 if conversation and not storage.personal_gemini_allowed_in_conversation(user_id, policy_guild):
                     raise _refusal(GEMINI_FREE_TIER_BLOCKED)
                 api_key = storage._get_api_key_for_user(user_id)
+            # A scope on the subscription runs no Gemini key (`_get_api_key_for_guild`).
+            if not api_key and storage.subscription_payer(guild_id, user_id):
+                raise MissingKeyError(SUBSCRIPTION_MODEL_REFUSED)
             if not api_key: raise MissingKeyError(google_key_error or "Google API Key not found. Run `/start` to set one up, or `/settings` if you know your way around.")
             _refuse_if_resting(self.cog, api_key, actual_name)
             if speech:
@@ -444,9 +469,18 @@ class APIService:
         raise last_error
 
     def model_chain(self, config: Optional[Dict[str, Any]], primary_key: str,
-                    owner_id: Optional[int]) -> Tuple[str, Tuple[str, ...]]:
+                    owner_id: Optional[int], *, guild_id: Optional[int] = None,
+                    user_id: Optional[int] = None) -> Tuple[str, Tuple[str, ...]]:
         """`user_defaults.model_chain` under the provider preference of `config`'s owner, with
-        a MimicAI Auto slot turned into the models its tier runs on today."""
+        a MimicAI Auto slot turned into the models its tier runs on today.
+
+        `guild_id` and `user_id` are the payer, as the caller hands them to `_instantiate_model`:
+        where a MimicAI subscription pays, the category's curated models run instead
+        (`subscription_chain`). A caller that leaves them out meets the backstop there."""
+        if (guild_id or user_id) and self.cog.storage_manager.subscription_payer(guild_id, user_id):
+            chain = subscription_chain(self.cog, config, primary_key)
+            if chain:
+                return chain
         return model_chain(resolve_auto_models(self.cog, config), primary_key,
                            self.cog.user_settings.provider_preference(owner_id))
 

@@ -27,7 +27,7 @@ from ..utils.constants import (
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE, UNASSIGNED_KEY_NOTICE,
     ROUND_URL_MESSAGES_MAX, ROUND_URLS_SKIPPED_NOTE, SPEAK_AGAIN_EMOJI,
 )
-from ..utils.helpers import (
+from ..utils.helpers import (subscription_settings, 
     _format_api_error, _format_citation_subtext, _resolve_zoneinfo, _scrub_response_text,
     restamp_turn, turn_posted_at, server_context_guild,
     _format_history_entry, _get_user_hash, _resolve_safety_settings,
@@ -44,6 +44,10 @@ from ..utils.attachment_limits import upload_limit_bytes
 #: How long a refused send keeps its sender out of that channel's rounds, unless a send
 #: lands first. Long enough to stop a run of paid replies, short enough to notice a fix.
 SEND_REFUSAL_HOLD_SECONDS = 600
+#: How long someone calling a character the placement gate refuses goes untold again, per
+#: channel, character and reason: once is an answer, every message would be the spam the
+#: silent skip replaced.
+PLACEMENT_NOTICE_HOLD_SECONDS = 3600
 from ..managers.session_manager import (commit_reactions, director_enabled, director_model_config,
                                         drop_reaction_turns, feature_access, intern_turn,
                                         keep_url_context, log_user_turn, pin_grounding,
@@ -561,59 +565,33 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 return min(called, key=lambda c: c[0])[1]
         return None
 
-    #: Sent to the channel and logged verbatim. Names the rating the way the dashboard
-    #: does -- "Adult 18+", the content rating -- rather than the retired
-    #: "Unrestricted 18+ safety", which was the old per-profile safety toggle and has
-    #: not been the thing this gate reads for some time. It also says what to do about
-    #: it, because the previous wording stated a rule and left the reader with no next
-    #: step.
-    async def _refuse_placement(self, session, channel, owner_id: int, profile_name: str,
-                                refusal: str) -> None:
-        """Post why the runtime gate refused a participant, and record it as a real turn.
-
-        It used to be a bare channel message that nothing wrote down. Everything that
-        reads a session back -- `/session view`, `/session audit`, the history browser,
-        the synopsis -- derives from `unified_log`, so the transcript showed the
-        character being addressed and simply saying nothing, and the one explanation
-        for the silence lived in Discord's scrollback until somebody scrolled past it.
-
-        A SYSTEM turn, shaped like the ones `triggers.py` writes: no `profile_name`, so
-        it can never be mistaken for the character speaking or be picked up as one of
-        its turns, and `speaker_pid` "SYSTEM" so the whisper and compaction walks treat
-        it the way they treat every other note. It carries the `message_ids` it was
-        delivered under, which is what lets 🔇 and a delete reach it like anything else.
-
-        Flushed rather than marked dirty: this is the end of the operation for that
-        participant -- there is no later write in this round guaranteed to supersede it,
-        and for a round where *every* participant was blocked there is no later write
-        at all.
-
-        `refusal` is the gate's answer when it refused, never asked again here: the trigger
-        intake awaits in between, and a declaration's check landing there made the gate say
-        None -- which fell back to "mark this channel age-restricted", posted in one that was.
-        """
-        pm = self.cog.profile_manager
+    def _queue_declaration_check(self, owner_id: int, profile_name: str, refusal: str) -> None:
+        """A declaration's check, queued by a round it stopped: one made in bulk, or by
+        `/profile generate`, has nobody else to ask."""
         if refusal == PLACEMENT_REFUSALS["checking"]:
-            # The check a declaration waits on, queued by the first round it stopped: a
-            # declaration made in bulk, or by `/profile generate`, has nobody else to ask.
-            self.cog.content_rating.schedule_content_classification(*pm._resolve_effective_profile(owner_id, profile_name))
-        text = f"**{profile_name}** {refusal}"
+            self.cog.content_rating.schedule_content_classification(
+                *self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name))
 
-        sent = await self._send_channel_message(channel, text) or []
+    async def _tell_blocked_caller(self, channel, seat) -> None:
+        """Say in the channel why a character someone called will not answer there.
 
-        if session is None:
+        A round skips a seat the placement gate refuses without a word: it used to post the
+        reason every round and log it as a turn every later prompt re-read. Called by name --
+        a wakeword, a reply, an @ of its child bot -- silence reads as the bot being broken,
+        so the caller is told: once an hour per reason, and never into the log. The cast
+        listings say it for good (`silent_seats`).
+        """
+        if seat is None:
             return
-        turn = {
-            "turn_id": str(uuid.uuid4()),
-            "is_user": False,
-            "speaker_pid": "SYSTEM",
-            "message_ids": [m.id for m in sent if m],
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "content": f"<system_note>\n{text}\n</system_note>",
-        }
-        session.setdefault("unified_log", []).append(intern_turn(turn))
-        await self.cog.session_manager.flush_session(
-            (channel.id, None, None), session.get("type", "multi"))
+        refusal = self.cog.content_rating.placement_refusal(seat['owner_id'], seat['profile_name'], channel)
+        if not refusal:
+            return
+        key = (channel.id, seat['owner_id'], seat['profile_name'], refusal)
+        told = self.cog.placement_notices.get(key)
+        if told is not None and time.monotonic() - told < PLACEMENT_NOTICE_HOLD_SECONDS:
+            return
+        self.cog.placement_notices[key] = time.monotonic()
+        await self._send_channel_message(channel, f"**{seat['profile_name']}** {refusal}")
 
     def _director_history(self, session: dict) -> str:
         """What the AI Director reads: the scene, its synopsis, and the last ten public turns.
@@ -686,7 +664,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
         try:
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
-                *self.cog.api_service.model_chain(director_model_config(pro), "director_model", owner_id),
+                *self.cog.api_service.model_chain(director_model_config(pro), "director_model", owner_id,
+                                                  guild_id=guild_id or None, user_id=owner_id),
                 _attempt, label="AI Director")
         except Exception as e:
             print(f"AI Director failed: {e}")
@@ -989,9 +968,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # profile used to flash its emoji or a "typing..." bubble and then fall
                 # silent. Worse, profile_order[0] could itself be blocked, so the placeholder
                 # wore the name and avatar of a profile that was never going to speak.
-                # Filtering first also collapses the refusal notice to one per profile per
-                # round instead of one per turn. The notices themselves wait for the trigger
-                # intake, so each lands in unified_log after the message it answers.
+                # A blocked seat is skipped in silence (`_tell_blocked_caller`).
                 blocked_participants = [
                     (p, refusal) for p in profile_order
                     if (refusal := self.cog.content_rating.placement_refusal(
@@ -1069,13 +1046,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if commit_reactions(session, batch_start_index):
                     self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
-                seen_blocked = set()
                 for p, refusal in blocked_participants:
-                    key = (p['owner_id'], p['profile_name'])
-                    if key in seen_blocked:
-                        continue
-                    seen_blocked.add(key)
-                    await self._refuse_placement(session, channel, p['owner_id'], p['profile_name'], refusal)
+                    self._queue_declaration_check(p['owner_id'], p['profile_name'], refusal)
+                # After the intake, so it lands below the message it answers. Asked of the
+                # seat called, not of the order: one that lost its roll was called all the same.
+                await self._tell_blocked_caller(channel, self._user_called_seat(session, all_triggers_for_round))
 
                 if not profile_order:
                     for trigger in all_triggers_for_round:
@@ -1153,7 +1128,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     g_profile_name = grounding_target_participant['profile_name']
                     g_index = self.cog.profile_manager._get_user_index(g_owner_id)
                     g_is_borrowed = g_profile_name in g_index.get("borrowed", [])
-                    g_profile_settings = self.cog.profile_manager._get_profile_config(g_owner_id, g_profile_name, g_is_borrowed) or {}
+                    g_profile_settings = subscription_settings(self.cog, 
+                        self.cog.profile_manager._get_profile_config(g_owner_id, g_profile_name, g_is_borrowed) or {},
+                        channel.guild.id, g_owner_id)
                     
                     grounding_mode = resolve_grounding_mode(g_profile_settings)
                     
@@ -1554,7 +1531,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             # this fires only if the channel's age-restricted flag is flipped mid-round.
             refusal = self.cog.content_rating.placement_refusal(owner_id, profile_name, channel)
             if refusal:
-                await self._refuse_placement(session, channel, owner_id, profile_name, refusal)
+                self._queue_declaration_check(owner_id, profile_name, refusal)
                 return True
 
             user_index = self.cog.profile_manager._get_user_index(owner_id)
@@ -1725,6 +1702,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # itself, so the critic has to have run by now. It reads only
                 # contents_for_api_call and the log tail, both of which are built
                 # above, so moving it ahead of this call costs nothing.
+                p_settings = subscription_settings(self.cog, 
+                    p_settings, channel.guild.id, rnd.triggering_user_id)
                 # One tuple for the prompt and both models -- see tool_loop.
                 functions = functions_for(p_settings)
                 follow_up_block = None
@@ -2362,6 +2341,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 if called is not None:
                     self._give_next_turn(session, channel, rnd.profile_order, i, called,
                                          capped=False)
+                    await self._tell_blocked_caller(channel, called)
 
                 # Pipelined visual feedback for next participant
                 next_p = rnd.profile_order[i + 1]

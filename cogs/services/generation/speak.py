@@ -10,7 +10,7 @@ from ...utils.constants import (
     SPEAK_REWRITE_HISTORY_TURNS, SPEAK_REWRITE_MAX_INPUT_CHARS,
     PLACEHOLDER_EMOJI, EDIT_ATTRIBUTION, PROFILE_MESSAGE_MAX_LENGTH, SESSION_BUSY_FLAGS,
 )
-from ...utils.helpers import (
+from ...utils.helpers import (subscription_settings, 
     _format_history_entry, _resolve_safety_settings, _scrub_response_text,
     expand_server_emojis, resolve_native_tools, resolve_thinking_params, server_context_guild,
     split_turn, suppress_link_previews, tighten_line_spacing,
@@ -219,8 +219,9 @@ class SpeakAsMixin:
         profile_name = ctx["profile_name"]
         guild_id = channel.guild.id if getattr(channel, "guild", None) else 0
 
-        p_settings = self.cog.profile_manager._get_profile_config(
-            owner_id, profile_name, ctx["is_borrowed"]) or {}
+        p_settings = subscription_settings(self.cog, 
+            self.cog.profile_manager._get_profile_config(owner_id, profile_name, ctx["is_borrowed"]) or {},
+            guild_id or None, owner_id)
 
         template = (DEFAULT_SPEAK_REWRITE_LOOSE if fidelity == 'loose'
                     else DEFAULT_SPEAK_REWRITE_STRICT)
@@ -281,7 +282,9 @@ class SpeakAsMixin:
             model = self.cog.api_service._instantiate_model(
                 model_name, guild_id, owner_id, system_instruction, safety_settings,
                 resolve_thinking_params(p_settings, "response",
-                                        "fallback" if is_fallback else "primary", cog=self.cog),
+                                        "fallback" if is_fallback else "primary", cog=self.cog,
+                                        subscription=self.cog.storage_manager.subscription_payer(
+                                            guild_id, owner_id)),
                 tools, p_settings, config_owner_id=owner_id, functions=functions,
             )
 
@@ -299,7 +302,7 @@ class SpeakAsMixin:
         try:
             primary_model, fallbacks = self.cog.api_service.model_chain(
                 {**p_settings, "primary_model": primary_model, "fallback_model": fallback_model},
-                "primary_model", owner_id)
+                "primary_model", owner_id, guild_id=guild_id, user_id=owner_id)
             result, model_used, _was_fallback = await self.cog.api_service.run_with_fallback(
                 primary_model, fallbacks, _attempt, label="Speak rewrite")
             response, _state = result

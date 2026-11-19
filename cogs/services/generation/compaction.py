@@ -462,7 +462,8 @@ class SessionCompactionMixin:
         try:
             resp, _used, _was_fallback = await self.cog.api_service.run_with_fallback(
                 *self.cog.api_service.model_chain(
-                    compaction_model_config(session), "compaction_model", session.get("owner_id")),
+                    compaction_model_config(session), "compaction_model", session.get("owner_id"),
+                    guild_id=guild_id, user_id=session.get("owner_id")),
                 _attempt, label="Session synopsis")
         except Exception as e:
             print(f"[Compaction] Synopsis generation failed for channel {channel_id}: {e}")
