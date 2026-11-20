@@ -1198,9 +1198,11 @@ AUTO_SERVICE_TIERS_KEY = 'auto_service_tiers'
 #: (tests/MIMIC_SUBSCRIPTION.md, Open questions 1). The prices live on Stripe alone: each tier's
 #: Price carries its name here as its lookup key. Shown as "Tier 1" (`subscriptions.tier_name`).
 SUBSCRIPTION_TIERS = {'tier_1': 1.75, 'tier_2': 4.5, 'tier_3': 11.0}
-#: Character replies a US$ of allowance buys, roughly, for the tier list: the plan's "What US$2
-#: buys" table at 100k tokens of context, less what memories and the synopsis take.
-SUBSCRIPTION_REPLIES_PER_USD = 450
+#: Character replies a US$ of allowance buys, roughly, for the tier list. Measured 2026-11-20 by
+#: `prod_tests/subscription_cost_live.py` (DeepSeek V4.1 Flash on DeepInfra, STM 50, rolling
+#: synopsis, 91% cached, folds included): 4,035 to 4,624 a US$ across thinking none/low/high.
+#: Set below that for what it leaves out: memories, searches, attachments, a longer persona.
+SUBSCRIPTION_REPLIES_PER_USD = 3000
 #: Where Stripe sends the browser after Checkout (and the Customer Portal, set in its
 #: Dashboard settings): a page on the Cloudflare Worker (`cloudflare/openrouter_signin.js`)
 #: saying to go back to Discord.

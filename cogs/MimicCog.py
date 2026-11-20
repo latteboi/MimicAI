@@ -29,7 +29,7 @@ from .gui.base_components import (ActionTextInputModal, DropdownContentView, bui
 from .gui.gui_help import GUIDE_PROFILE, HelpView, guide_refusal
 from .utils.http_client import get_shared_client
 from .managers.ticket_store import TicketStore
-from .managers.subscriptions import SubscriptionStore
+from .managers.subscriptions import ACTIVE, SubscriptionStore
 from .gui.gui_data import PrivacyDashboardView, ImportPassphraseModal, BulkExportView
 from .gui.gui_generate import GeneratedProfileView
 from .gui.gui_hub import HubPublicLibraryView
@@ -39,7 +39,7 @@ from .gui.gui_sessions import (
     SessionView, SessionConfigView, SessionAuditView, GenerationTraceView, last_user_message_id
 )
 from .gui.gui_settings import (SettingsAPIView, SettingsHomeView, ParentPresenceView,
-                                ShutdownConfirmView, build_about_embed)
+                                ShutdownConfirmView, SubscribeView, build_about_embed)
 from .gui.gui_profiles import (ProfileManageView, BulkManageView, VoiceSampleConsentView, OpenDashboardView,
                                maybe_prompt_rating_after_edit)
 from .gui.gui_resolve import (
@@ -2995,9 +2995,13 @@ class MimicCog(EventListeners, commands.Cog):
             return
         if await refuse_unregistered(self, interaction):
             return
-        # The subscription slot of /settings -> API Keys, not a second screen.
+        # The subscription's own screen, never API Key Management: a buyer lands on it too.
         view = SettingsAPIView(self, interaction)
-        view.show_subscription()
+        view.show_subscription(dedicated=True)
+        if (view._subscription_row() or {}).get("status") != ACTIVE:
+            # Straight to the tiers, as /start does: the key screen is friction for a buyer.
+            await SubscribeView(view).open(interaction)
+            return
         await view.update_display()
 
     def _record_model_usage(self, model_name: str, provider: str):

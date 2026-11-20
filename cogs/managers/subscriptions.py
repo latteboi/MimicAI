@@ -76,6 +76,26 @@ def used_share(row: Dict[str, Any]) -> float:
     return min(1.0, used / available) if available > 0 else 0.0
 
 
+def runs_out_at(row: Dict[str, Any], now: Optional[float] = None) -> Optional[int]:
+    """When this period's allowance runs out at the pace so far, if that is before the period
+    ends. None while on pace, used up already, or too early to tell: under 3 days in and under
+    20% used, a day-one burst would read as "runs out tomorrow"."""
+    now = time.time() if now is None else now
+    start, end, share = row.get("period"), row.get("ends") or row.get("renews"), used_share(row)
+    if not start or not end or now <= start or not 0 < share < 1:
+        return None
+    if now - start < 3 * 86400 and share < 0.2:
+        return None
+    out = start + (now - start) / share
+    return int(out) if out < end else None
+
+
+def carried_over(row: Dict[str, Any]) -> bool:
+    """Whether this period's allowance includes some the last one left unspent."""
+    allowance = SUBSCRIPTION_TIERS.get(row.get("tier") or "")
+    return allowance is not None and period_usage(row)[1] > allowance + 0.005
+
+
 def row_summary(row: Dict[str, Any]) -> str:
     """A row as one plain line for the owner: tier, status, this period's use."""
     grant = " (grant)" if row.get("source") == "grant" else ""

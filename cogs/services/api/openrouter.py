@@ -307,12 +307,15 @@ class OpenRouterModel:
         budget = int(self.thinking_params.get("thinking_budget", -1))
         level = self.thinking_params.get("thinking_level", "high").lower()
 
-        if include_thoughts or budget > 0 or level != "none":
-            payload["reasoning"] = {"exclude": not include_thoughts}
-            if budget > 0:
-                payload["reasoning"]["max_tokens"] = min(budget, THINKING_BUDGET_MAX)
-            elif level != "none":
-                payload["reasoning"]["effort"] = level
+        if budget > 0:
+            payload["reasoning"] = {"exclude": not include_thoughts,
+                                    "max_tokens": min(budget, THINKING_BUDGET_MAX)}
+        elif level == "none":
+            # Sent, not omitted: an absent field is the model's own default, and
+            # DeepSeek V4.1 Flash thinks at high on it (measured 2026-11-20).
+            payload["reasoning"] = {"effort": "none"}
+        else:
+            payload["reasoning"] = {"exclude": not include_thoughts, "effort": level}
 
         # Set before the advanced splice, so an operator who puts `service_tier` in
         # the advanced params still wins over the picker rather than being overwritten

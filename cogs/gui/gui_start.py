@@ -909,9 +909,9 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             # Straight to the tiers; a purchase assigns itself and repaints this screen.
             await SubscribeView(self).open(interaction)
             return
-        # The subscription slot of /settings -> API Keys, as `/subscribe` opens it.
+        # The subscription's own screen, as `/subscribe` opens it.
         view = SettingsAPIView(self.cog, interaction)
-        view.show_subscription()
+        view.show_subscription(dedicated=True)
         await view.update_display()
 
     def _key_landed(self, slot: str, guild: Optional[discord.Guild]) -> str:

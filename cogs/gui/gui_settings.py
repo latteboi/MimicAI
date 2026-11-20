@@ -13,7 +13,8 @@ from ..utils.birthdays import MONTH_NAMES, format_birthday, parse_birthday, vali
 from ..utils.helpers import _get_user_hash, _resolve_zoneinfo, suppress_link_previews
 from ..utils.data_policy import is_paid_gemini_slot, may_save_free_gemini_key
 from ..utils import openrouter_signin
-from ..managers.subscriptions import ACTIVE, period_usage, tier_name, used_share
+from ..managers.subscriptions import (ACTIVE, carried_over, period_usage, runs_out_at, tier_name,
+                                      used_share)
 from ..utils.helpers import subscription_curated
 from ..services.api import stripe
 from ..services.api.stripe import StripeError
@@ -739,6 +740,10 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction):
         super().__init__(cog, interaction, "api")
         self._init_scopes()
+        #: Opened as the subscription's own screen (`/subscribe`, `/start`): no slot list, no tabs.
+        self.dedicated = False
+        #: One line over the card, once: the thanks after a purchase on this same message.
+        self.notice: Optional[str] = None
         if (cog.user_settings.provider_choice(self.user_id) == PROVIDER_SUBSCRIPTION
                 and (cog.subscriptions.sells or self._subscription_row())):
             self.show_subscription()  # what they chose in /start opens first
@@ -747,7 +752,7 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
 
     def setup_items(self):
         for item in self.children[:]:
-            if item.row != 4: self.remove_item(item)
+            if item.row != 4 or self.dedicated: self.remove_item(item)
 
         user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
         slots_data = user_data.get("slots", {})
@@ -772,8 +777,9 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
                 emoji = "⚪"
             slot_options.append(discord.SelectOption(label=label, value=slot_id, description=desc, emoji=emoji, default=(self.selected_slot == slot_id)))
 
-        add_select(self, slot_options, self.slot_select_callback,
-                   placeholder="Select an API Key Slot...", row=0)
+        if not self.dedicated:
+            add_select(self, slot_options, self.slot_select_callback,
+                       placeholder="Select an API Key Slot...", row=0)
 
         if self.selected_slot == SUBSCRIPTION_SLOT:
             if sub:
@@ -819,55 +825,85 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
         subs = self.cog.subscriptions
         return subs.row(self.user_id) if subs.enabled else None
 
-    def show_subscription(self) -> None:
-        """Opens on the subscription slot: `/subscribe` and `/start`'s key step."""
+    def show_subscription(self, dedicated: bool = False) -> None:
+        """Opens on the subscription slot. `dedicated` (`/subscribe`, `/start`) makes it the
+        subscription's own screen, with no slot list or tabs to read as API Key Management."""
         self.selected_slot = SUBSCRIPTION_SLOT
+        self.dedicated = self.dedicated or dedicated
         self._load_scopes()
         self.setup_items()
 
-    def _subscription_field(self, embed: discord.Embed) -> None:
+    def _subscription_card(self) -> discord.Embed:
+        """The subscription's card: tier, use as a share (never US$: the allowance reads as usage,
+        not a balance), pace, and what happens at 100%. Its colour is its state."""
         sub = self._subscription_row() or {}
-        paid = sub.get("source") == "stripe"
-        if not sub and not self.cog.subscriptions.sells:
-            value = f"**Status:** Not subscribed. {SALES_PAUSED}"
-        elif not sub:
-            value = ("**Status:** Not subscribed.\nYour characters reply without an API key of "
-                     "your own, on models curated for high performance. **⭐ Subscribe** shows the "
-                     "tiers and what each includes.")
+        paid, ends, renews = sub.get("source") == "stripe", sub.get("ends"), sub.get("renews")
+        colour = discord.Colour.gold()
+        if not sub:
+            lines = ["**Not subscribed.** " + (
+                "Your characters reply without an API key of your own, on models curated for "
+                "roleplay. **⭐ Subscribe** shows the tiers." if self.cog.subscriptions.sells
+                else SALES_PAUSED)]
         elif sub.get("status") == ACTIVE:
-            value = f"**Status:** ✅ Active · {tier_name(sub.get('tier'))}"
-            if sub.get("ends"):
-                value += f"\n**Ends:** <t:{sub['ends']}:D> (cancelled)"
-            elif sub.get("renews"):
-                value += f"\n**{'Renews' if paid else 'Allowance resets'}:** <t:{sub['renews']}:D>"
+            head = f"**{tier_name(sub.get('tier'))}** · ✅ Active"
+            if ends:
+                head += f" · Ends <t:{ends}:D> (cancelled)"
+                colour = discord.Colour.dark_gold()
+            elif renews:
+                head += f" · {'Renews' if paid else 'Allowance resets'} <t:{renews}:D>"
+            lines = [head]
             if period_usage(sub)[1] > 0:
                 share = used_share(sub)
-                value += f"\n**Used this month:** {usage_bar(share)} {share:.0%}"
+                bar = f"{usage_bar(share)} {share:.0%} used"
                 if sub.get("synced"):
-                    value += f" (as of <t:{int(sub['synced'])}:R>)"
-            if paid and defaultConfig.STRIPE_PORTAL_URL:
-                value += ("\n-# **Manage** opens Stripe: sign in with the email you paid with to "
-                          "cancel, switch tier or change card. MimicAI catches up within the hour.")
+                    bar += f" (as of <t:{int(sub['synced'])}:R>)"
+                lines.append(bar)
+                until = f" until <t:{renews}:D>" if renews and not ends else ""
+                notes = []
+                if share >= 1:
+                    notes.append(f"**Used up:** your characters don't reply where it's assigned{until}.")
+                elif share >= 0.8:
+                    notes.append(f"At 100%, your characters stop replying where it's assigned{until}.")
+                out = runs_out_at(sub)
+                if out:
+                    notes.append(f"Running fast: at this rate it runs out around <t:{out}:D>.")
+                if carried_over(sub):
+                    notes.append("Includes last month's unused allowance.")
+                lines += [f"-# * {n}" for n in notes]
+                if share >= 0.8:
+                    colour = discord.Colour.orange()
         else:
-            value = "**Status:** Lapsed. Where it was assigned is kept, so subscribing again restores it."
-        value += ("\n-# Runs its curated models in place of a profile's own (Set Models → API: "
+            lines = ["**Lapsed.** Where it was assigned is kept, so **⭐ Subscribe** restores it."]
+            colour = discord.Colour.greyple()
+        if self.notice:
+            lines.insert(0, self.notice + "\n")
+        embed = discord.Embed(title="⭐ MimicAI Subscription", colour=colour, description="\n".join(lines))
+        footer = ("Runs its curated models in place of a profile's own (Set Models → API: "
                   "Subscription), never in age-restricted channels. Web searches use the most.")
-        embed.add_field(name=f"Slot: {SLOT_LABELS[SUBSCRIPTION_SLOT]}", value=value, inline=False)
+        if paid and sub.get("status") == ACTIVE and defaultConfig.STRIPE_PORTAL_URL:
+            footer += (" Manage opens Stripe: sign in with the email you paid with to cancel, "
+                       "switch tier or change card. MimicAI catches up within the hour.")
+        return embed.set_footer(text=footer)
 
     async def update_display(self):
-        description = ("Your MimicAI Subscription and 4 API key slots. Assign each to your Personal "
-                       "account or servers you run."
-                       if self.cog.subscriptions.sells or self._subscription_row() else
-                       "Manage your 4 API key slots and assign them to your Personal account or Servers you administrate.")
-        embed = discord.Embed(title="API Key Management", description=description, color=discord.Color.blue())
-        
+        await self.original_interaction.edit_original_response(content=None, embed=self.build_embed(),
+                                                               view=self)
+
+    def build_embed(self) -> discord.Embed:
+        if self.selected_slot == SUBSCRIPTION_SLOT:
+            embed = self._subscription_card()
+        else:
+            description = ("Your MimicAI Subscription and 4 API key slots. Assign each to your "
+                           "Personal account or servers you run."
+                           if self.cog.subscriptions.sells or self._subscription_row() else
+                           "Manage your 4 API key slots and assign them to your Personal account or Servers you administrate.")
+            embed = discord.Embed(title="API Key Management", description=description, color=discord.Color.blue())
+
         if self.selected_slot:
             user_data = self.cog.storage_manager._get_user_keys_data(self.user_id)
             slot_data = user_data.get("slots", {}).get(self.selected_slot)
             label = SLOT_LABELS[self.selected_slot]
             is_sub = self.selected_slot == SUBSCRIPTION_SLOT
-            if is_sub:
-                self._subscription_field(embed)
 
             if slot_data or (is_sub and self._subscription_row()):
                 provider = SLOT_PROVIDER[self.selected_slot]
@@ -884,7 +920,8 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
                 saved = self._saved_scopes(provider)
                 assignments = [f"- {a}" for a in self._scope_labels(saved)]
                 assign_str = _fit_list(assignments, "\n", 1000) if assignments else "None"
-                embed.add_field(name="Current Assignments", value=assign_str, inline=False)
+                embed.add_field(name="Paying for" if is_sub else "Current Assignments",
+                                value=assign_str, inline=False)
 
                 # Ticks on another page are out of sight, and an unsaved tick is the
                 # most common way a key ends up doing nothing, so say what Save will do.
@@ -904,8 +941,7 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
                 embed.add_field(name=f"Slot: {label}", value=f"**Status:** ❌ Empty\n{how}", inline=False)
         else:
             embed.add_field(name="Overview", value="Select a slot from the dropdown above to view or manage it.", inline=False)
-
-        await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+        return embed
 
     async def subscribe_callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -974,10 +1010,13 @@ def usage_bar(share: float, width: int = 10) -> str:
 #: The Subscribe screen's account of what draws on the allowance: every call where it is
 #: assigned (tests/MIMIC_SUBSCRIPTION.md, Open questions 6), not replies alone.
 ALLOWANCE_COVERS = (
-    "Everything your characters do where it's assigned, not just replies: the memories they "
-    "write, long-chat summaries (compaction), web searches, reading attachments and memory "
-    "recall, plus a session's critic or AI Director if they're on.\n"
-    "-# Web searches use the most. Assigned to a server, it pays for everyone's chats there.")
+    "-# * The memories your characters write (LTMs)\n"
+    "-# * Long-chat summaries (compaction)\n"
+    "-# * Web searches *(uses more allowance)*\n"
+    "-# * Reading attachments and recalling memories\n"
+    "-# * A session's critic or proactivity, if on.\n"
+    "-# ***Assigned to a server, it pays for everyone's chats there.***\n"
+    "-# ***Not included: image gen, text-to-speech, Adult-rated profiles and use in age-restricted channels.***\n")
 
 STRIPE_DOWN = "Stripe didn't answer just now, so nothing changed. Try again in a minute."
 #: The owner paused new sales from `/mod` (`SubscriptionStore.paused`).
@@ -1031,10 +1070,12 @@ class SubscribeView(BlockedGuard, ui.View):
             per = f" a {(price.get('recurring') or {}).get('interval', 'month')}"
             cost = (f"{price['currency'].upper()} {price['unit_amount'] / 100:.2f}".removesuffix(".00")
                     + ("" if price.get("tax_behavior") == "inclusive" else " + tax") + per)
-            replies = f"~{round(allowance * SUBSCRIPTION_REPLIES_PER_USD, -2):,.0f} replies"
-            lines.append(f"**{tier_name(tier)}** · {replies} · {cost}")
+            count = round(allowance * SUBSCRIPTION_REPLIES_PER_USD, -2)
+            replies, daily = f"~{count:,.0f} replies", f"about {round(count / 30, -1):,.0f} a day"
+            lines.append(f"**{tier_name(tier)}** · {replies} · {daily} · {cost}")
             options.append(discord.SelectOption(label=f"{tier_name(tier)}: {replies}{per}", value=tier,
-                                                description=cost, default=tier == picked))
+                                                description=f"{cost} · {daily}"[:100],
+                                                default=tier == picked))
         add_select(self, options, self._pick, placeholder="Choose a tier...", row=0)
         if session:
             self.add_item(ui.Button(label=f"Pay for {tier_name(picked)} on Stripe ↗",
@@ -1042,32 +1083,30 @@ class SubscribeView(BlockedGuard, ui.View):
         else:
             self.add_item(ui.Button(label="Pay on Stripe ↗", disabled=True, row=1))
         add_button(self, "Check", self._check, disabled=not session, row=1)
-        embed = discord.Embed(title="⭐ MimicAI Subscription", colour=discord.Colour.gold(),
-                              description="Your characters reply without an API key of your own.")
-        embed.add_field(name="Models", inline=False, value=(
-            "Curated for high performance in roleplay." + self._models_line()))
-        embed.add_field(name="What your allowance covers", value=ALLOWANCE_COVERS, inline=False)
-        embed.add_field(name="Tiers", inline=False, value="\n".join(lines) + (
-            "\n-# Rough counts: long chats use more. Unused replies carry over, up to a month's worth."))
-        embed.add_field(name="Not included", inline=False,
-                        value="Images, speech, Adult profiles and age-restricted channels.")
+        description = "Your characters reply without an API key of your own."
         if session:
-            embed.add_field(name="Next", inline=False, value=(
-                "Pay on Stripe's page. This updates by itself once you have; if it doesn't, "
-                "press **Check**."))
-        embed.set_footer(text="18+. Paid securely through Stripe: checkout and receipts say \"Link\". "
-                              "Cancel anytime and keep it to the end of the month. Paying accepts "
-                              "the Terms.")
+            description += ("\n\n✅ Choose a tier → **② Pay on Stripe** → ③ Done\n-# This updates by "
+                            "itself once you've paid; if it doesn't, press **Check**.")
+        embed = discord.Embed(title="⭐ MimicAI Subscription", colour=discord.Colour.gold(),
+                              description=description)
+        embed.add_field(name="Tiers", inline=False, value="\n".join(lines) + (
+            "\n-# Rough counts: long chats, extra features, and models may use more. Measured on a simulated chat of 100 replies "
+            "(50 messages of memory, a rolling summary) on DeepSeek V4.1 Flash, then trimmed for "
+            "memories and searches.\n"))
+        embed.add_field(name="Models · curated for casual talk and roleplay", inline=False,
+                        value=self._models_line() or "-# * Curated for high performance in roleplay.")
+        embed.add_field(name="Your allowance also covers", value=ALLOWANCE_COVERS, inline=False)
+        embed.set_footer(text="18+ · Paid securely through Stripe: checkout and receipts say \"Link\" · "
+                              "Cancel anytime and keep it to the end of the month · Unused replies "
+                              "carry over, up to a month's worth · Paying accepts the Terms.")
         return embed
 
     def _models_line(self) -> str:
-        """The models the bot owner curates, by name: what a subscriber gets, kept true by a swap."""
+        """The models the bot owner curates, one bullet each: what a subscriber gets, kept true
+        by a swap."""
         catalogue = self.cog.api_service.catalogue
-        names = [catalogue.label(m.removeprefix("OPENROUTER/"), drop_author=True)
-                 for m in subscription_curated(self.cog, "primary_model")]
-        if not names:
-            return ""
-        return "\nRight now: " + (", ".join(names[:-1]) + " & " if len(names) > 1 else "") + names[-1] + "."
+        return "\n".join(f"-# * {catalogue.label(m.removeprefix('OPENROUTER/'), drop_author=True)}"
+                         for m in subscription_curated(self.cog, "primary_model"))
 
     async def _pick(self, interaction: discord.Interaction):
         tier = interaction.data["values"][0]
@@ -1151,15 +1190,27 @@ class SubscribeView(BlockedGuard, ui.View):
             p._apply_assignments(SUBSCRIPTION_SLOT, saved | (want - held))
         where = " and ".join(f"**{l.removeprefix('Server: ')}**"
                              for l in p._scope_labels(want - held))
-        await interaction.edit_original_response(view=None, embed=text_embed(
-            "✅ **You're subscribed. Thank you!**"
-            + (f" It's now assigned to {where}." if where else "")
-            + "\n-# `/settings` → API Keys changes where it applies."))
+        thanks = ("✅ **You're subscribed. Thank you!**"
+                  + (f" It's now assigned to {where}." if where else ""))
+        dedicated = getattr(p, "dedicated", False)
+        if dedicated:
+            # `/subscribe`'s own message: it becomes the card, carrying the thanks this once
+            # (a repaint through `p` would paint over them).
+            p.notice = thanks
+            p._load_scopes()
+            p.setup_items()
+            await interaction.edit_original_response(embed=p.build_embed(), view=p)
+            p.notice = None
+        else:
+            await interaction.edit_original_response(view=None, embed=text_embed(
+                thanks + "\n-# `/subscribe` changes where it applies."))
         if held:
             await interaction.followup.send(
                 embed=text_embed(OverrideConfirmView.prompt(
                     p._assignment_conflicts(SUBSCRIPTION_SLOT, held))),
                 view=OverrideConfirmView(p, SUBSCRIPTION_SLOT, saved | want), ephemeral=True)
+        if dedicated:
+            return
         p._load_scopes()
         try:
             await p._repaint()
