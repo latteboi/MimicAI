@@ -17,7 +17,8 @@ from ..utils.constants import (
     DEFAULT_IMAGE_APPEARANCE, DEFAULT_IMAGE_GROUNDING, DEFAULT_IMAGE_MODEL,
     IMAGE_OUTPUT_KEYS, IMAGE_SAMPLING_KEYS, PROFILE_MESSAGE_MAX_LENGTH,
 )
-from ..utils.helpers import (_resolve_safety_settings, _split_into_sentences_with_abbreviations,
+from ..utils.constants import SAFETY_SETTINGS
+from ..utils.helpers import (_split_into_sentences_with_abbreviations,
                              _yield_message_chunks, apply_typing_cursor, attachment_mime, image_command_prompt, image_rag_enabled,
                              typing_cursor_cost, upload_too_large)
 from ..utils.attachment_limits import over_attachment_limit
@@ -1123,7 +1124,7 @@ class ChildBotManager:
             if not profile_data.get("image_generation_enabled", False):
                 return
 
-            dynamic_safety_settings = _resolve_safety_settings(self.cog.bot.get_channel(channel_id))
+            dynamic_safety_settings = SAFETY_SETTINGS
 
             source_owner_id, source_profile_name = \
                 self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)

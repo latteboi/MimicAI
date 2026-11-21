@@ -879,7 +879,7 @@ class SettingsAPIView(KeyScopeMixin, SettingsBaseView):
             lines.insert(0, self.notice + "\n")
         embed = discord.Embed(title="⭐ MimicAI Subscription", colour=colour, description="\n".join(lines))
         footer = ("Runs its curated models in place of a profile's own (Set Models → API: "
-                  "Subscription), never in age-restricted channels. Web searches use the most.")
+                  "Subscription). Web searches use the most.")
         if paid and sub.get("status") == ACTIVE and defaultConfig.STRIPE_PORTAL_URL:
             footer += (" Manage opens Stripe: sign in with the email you paid with to cancel, "
                        "switch tier or change card. MimicAI catches up within the hour.")
@@ -1016,7 +1016,7 @@ ALLOWANCE_COVERS = (
     "-# * Reading attachments and recalling memories\n"
     "-# * A session's critic or proactivity, if on.\n"
     "-# ***Assigned to a server, it pays for everyone's chats there.***\n"
-    "-# ***Not included: image gen, text-to-speech, Adult-rated profiles and use in age-restricted channels.***\n")
+    "-# ***Not included: image gen and text-to-speech.***\n")
 
 STRIPE_DOWN = "Stripe didn't answer just now, so nothing changed. Try again in a minute."
 #: The owner paused new sales from `/mod` (`SubscriptionStore.paused`).

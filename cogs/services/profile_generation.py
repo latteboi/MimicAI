@@ -281,8 +281,8 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
     Blocking file I/O; callers run it through `asyncio.to_thread`. The name and the
     profile limit are checked again because a draft can sit open for minutes. Every field
     is cut to the editor's own cap, which an imported card can run past. A card's
-    lorebook, its fixed examples and its 18+ tag (`adult`) are written here too, before
-    anyone can seat it.
+    lorebook and fixed examples are written here too, and its NSFW tag (`adult`) holds the
+    profile for its content rating, before anyone can seat it.
     """
     pm = cog.profile_manager
     index = pm._get_user_index(user_id)
@@ -312,7 +312,7 @@ def save_draft(cog, user_id: int, profile_name: str, draft: Dict[str, Any]) -> O
         prompts["fixed_examples"] = fixed_examples.normalise(draft["fixed_examples"])
     pm._save_profile_prompts(user_id, profile_name, prompts)
     if draft.get("adult"):
-        cog.content_rating.set_owner_adult_declaration(user_id, profile_name, True)
+        cog.content_rating.hold_for_rating(user_id, profile_name)
 
     extras = {"custom_display_name": draft.get("display_name"),
               "custom_avatar_url": draft.get("avatar_url"),

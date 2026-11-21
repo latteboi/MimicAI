@@ -1,5 +1,6 @@
 from ...utils.constants import PLACEHOLDER_EMOJI, DEFAULT_IMAGE_APPEARANCE, STATUS_IMAGINING_IMAGE
-from ...utils.helpers import (_format_api_error, _resolve_safety_settings, image_suffix_for_mime,
+from ...utils.constants import SAFETY_SETTINGS
+from ...utils.helpers import (_format_api_error, image_suffix_for_mime,
                              resolve_url_mode)
 from ...utils.attachment_limits import refuse_oversized_upload
 from ...utils.memory_tuning import maybe_trim_malloc
@@ -84,7 +85,7 @@ class ImageRoundMixin:
                 parts.append({"url": ref["url"], "mime_type": ref.get("mime_type", "image/png")})
 
             # Determine safety
-            dynamic_safety_settings = _resolve_safety_settings(channel)
+            dynamic_safety_settings = SAFETY_SETTINGS
 
             # Built per attempt by the model factory, which keys it for whichever provider
             # the attempt names -- so a primary that cannot run here still hands over to its

@@ -1,0 +1,10 @@
+v0.8.1 Beta — 2026-11-21 (UTC)
+MimicAI no longer hosts adult content: every character, in every channel, writes for a general audience.
+## **Changed**
+- **MimicAI no longer hosts adult content, on any bot or in any channel.** Age-restricted channels now work exactly like every other: every reply is written for a general audience, Google's filters stay on, and image requests ask for a general audience too.
+- **Ratings are now Allowed and Not Allowed.** A profile rated Adult before is Not Allowed and runs nowhere: edit it and submit it again from Content Safety. Editing it, or exporting and importing it, no longer clears the rating; it's rated again instead, and Set to Unrated isn't offered. Not Allowed is never a strike.
+- **Not Allowed covers more than sexual content:** characters built as your romantic partner, possessive or manipulative ones, real private people, characters posing as real therapists, doctors or lawyers, real weapons, hacking or fraud instructions, dangerous stunts, extremist recruitment, and promoting drink or drugs. Sexualised avatars count too.
+- **The 18+ declaration is gone.** A profile declared 18+, a character card tagged NSFW, or a generated character tagged so is held until it's rated, which starts when it's next added to a session.
+- **The MimicAI Subscription works in age-restricted channels too**, now that they're like every other channel.
+- **`/mod` → Prompts: an emptied content policy falls back to the shipped wording**, as the limits already did. It can be reworded, not removed.
+- **The Terms of Service are revised, effective 21 November 2026.** Terms 3 says MimicAI hosts no adult content and prohibits sexually explicit content anywhere, covers copyright complaints, and says the table games have no stakes or real money. Terms 7 describes Allowed and Not Allowed, and Terms 11 says the Subscription is sold through Link. The Privacy Policy is unchanged. `/terms` shows all of it. No need to accept again.

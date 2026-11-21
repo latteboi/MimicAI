@@ -22,8 +22,9 @@ from ...utils.constants import (
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_MODEL_FAILED,
     WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_MEDIA_DESCRIBED, WARN_MEDIA_UNREADABLE,
 )
+from ...utils.constants import SAFETY_SETTINGS
 from ...utils.helpers import (
-    _add_inline_citations, _format_api_error, _resolve_safety_settings, _scrub_response_text,
+    _add_inline_citations, _format_api_error, _scrub_response_text,
     clean_model_name, expand_server_emojis, is_real_model, media_kinds, record_billed_usage,
     resolve_native_tools,
     resolve_thinking_params, resolve_unreadable_media_mode, split_media_parts,
@@ -328,7 +329,7 @@ class ReplyMixin:
         attempt = ReplyAttempt(primary_name=primary_model, fallback_name=chain[0] if chain else None,
                                private=private)
         policy = {"policy_guild_id": server_id, "conversation": True} if conversation else {}
-        safety_settings = _resolve_safety_settings(None if conversation else channel)
+        safety_settings = SAFETY_SETTINGS
         tools = resolve_native_tools(p_settings)
         paid = self.cog.storage_manager.subscription_payer(guild_id, user_id)
 

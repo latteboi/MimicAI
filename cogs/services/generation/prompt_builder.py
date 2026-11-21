@@ -53,23 +53,6 @@ class PromptBuilderMixin:
         avatar_url = app.get("custom_avatar_url") or default_profile_avatar_url(profile_name)
         return display_name, avatar_url
 
-    def _channel_allows_adult_content(self, channel_id: int) -> bool:
-        """True only when the destination channel is flagged age-restricted.
-
-        DMs, group channels and anything the gateway cache cannot resolve count as
-        not age-restricted -- the same direction _check_unrestricted_safety_policy
-        already fails in, so the two agree on every channel type.
-
-        get_channel is an in-memory cache hit, so this is safe on the turn path.
-        """
-        channel = self.cog.bot.get_channel(channel_id)
-        if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
-            return False
-        try:
-            return channel.is_nsfw()
-        except Exception:
-            return False
-
     async def _send_session_warning(self, channel: discord.abc.Messageable, message: str):
         # Not while shutting down: Discord is still connected, but `delete_after` would
         # never run, and the notice would stay in the channel for good.
@@ -483,19 +466,11 @@ class PromptBuilderMixin:
         rules = rule_block.format(profile_id_placeholder=profile_id_val).strip()
         trailing_parts = []
 
-        # Channel-level content shaping, gated on the destination rather than the
-        # profile: an Adult-rated profile is already confined to age-restricted
-        # channels by _check_unrestricted_safety_policy, so anything that reaches a
-        # general channel should be written for one. _resolve_safety_settings keys
-        # the provider thresholds off the same channel, so the two content controls
-        # now move together. Appended last for recency, and it is the only one of
-        # them with any effect on OpenRouter and Ollama, which ignore
-        # safety_settings entirely.
-        if not self._channel_allows_adult_content(channel_id):
-            policy_block = self.cog.global_prompts.get("CONTENT_POLICY", DEFAULT_CONTENT_POLICY).strip()
-            if policy_block:
-                trailing_parts.append(policy_block)
-        # Every channel, age-restricted included, and last: see DEFAULT_HARD_LIMITS.
+        # Every channel and every profile: nothing is cleared for more (DEFAULT_CONTENT_POLICY).
+        # Appended last for recency, and the only content control with any effect on
+        # OpenRouter and Ollama, which ignore safety_settings. An empty /mod override falls
+        # back to the shipped wording, as HARD_LIMITS does, rather than removing it.
+        trailing_parts.append(self.cog.global_prompts.get("CONTENT_POLICY", "").strip() or DEFAULT_CONTENT_POLICY)
         trailing_parts.append(self.cog.global_prompts.get("HARD_LIMITS", "").strip() or DEFAULT_HARD_LIMITS)
 
         current_instructions_str = "\n\n".join(

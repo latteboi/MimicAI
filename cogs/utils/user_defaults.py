@@ -30,9 +30,8 @@ Two properties of that table do the work:
   own, so those keys default onto new profiles only. Nothing new had to be decided
   for the Director's Desk or the training parameters -- they were already declared.
 
-A row that declares neither is not offered, which is how the 18+ declaration excludes
-itself: `_Bulk.copyable` is False for it deliberately, and a content rating is no more
-a default than it is a thing to propagate in bulk.
+A row that declares neither is not offered. A content rating is no more a default than
+it is a thing to propagate in bulk, so no row writes one.
 """
 
 import functools

@@ -40,15 +40,15 @@ def _carried_hold(rating: Dict[str, Any]) -> Dict[str, str]:
     return {"provider_blocked": rating["provider_blocked"]} if rating.get("provider_blocked") else {}
 
 
-def _unchecked_declaration() -> Dict[str, Any]:
-    """An 18+ declaration, as a content_rating. No hash, and not checked: it runs nowhere
-    until the classifier has checked it for what Refused catches, and that check stamps the
-    hash it read (_store_content_rating). The caller, or the next resolve_stale_rating,
-    queues it."""
+def _held_for_rating() -> Dict[str, Any]:
+    """A profile that arrived marked 18+, held as a content_rating until the classifier rates
+    it: it runs nowhere meanwhile (`content_rating_manager._held`), and the verdict replaces
+    it. `owner_declared` is the source an 18+ declaration was stored under before adult
+    content was removed, which old records still carry. The caller, or the next
+    resolve_stale_rating, queues the check."""
     return {"verdict": CONTENT_RATING_ADULT, "hash": None, "model": None,
             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "reason": "Declared 18+ by the profile owner", "source": "owner_declared",
-            "checked": False}
+            "reason": "Held for its content rating", "source": "owner_declared"}
 
 
 class ProfileManager:

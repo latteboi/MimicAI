@@ -309,7 +309,7 @@ class SharingManager:
             return False
         if len(prep) == 2:
             refused_name, verdict = prep
-            reason = ("Adult profiles cannot be shared." if verdict == CONTENT_RATING_ADULT
+            reason = ("A profile rated Not Allowed cannot be shared." if verdict == CONTENT_RATING_ADULT
                       else "It is not rated for sharing right now. Its owner needs to have it rated first.")
             await interaction.followup.send(
                 embed=text_embed(f"❌ **'{refused_name}' cannot be borrowed.** {reason}"), ephemeral=True)

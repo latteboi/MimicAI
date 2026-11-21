@@ -26,7 +26,7 @@ try:
     import orjson as json
 except ImportError:
     import json
-from ..managers.profile_manager import _carried_hold, _unchecked_declaration
+from ..managers.profile_manager import _carried_hold, _held_for_rating
 
 #: The most a .mimic payload may inflate to. A real export is at most one Discord
 #: upload -- 10 MiB, a few times that inflated -- and every inflated byte costs several
@@ -254,22 +254,22 @@ class TransferService:
                 prompts = p_data.get("prompts") if isinstance(p_data.get("prompts"), dict) else {}
                 new_pid = self.cog.profile_manager._mint_pid(user_id, "A")
                 config["created_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                # Adult and Refused alone cross: dropping either would let the profile run
-                # where it may not, and an export-import round trip must not launder a
-                # refusal. Refused crosses as written, since claiming it gains nothing. Adult
-                # crosses as an unchecked declaration: a passphrase file is anyone's to
-                # write, and a verdict it claimed -- hash and all, which the file's own text
-                # computes -- ran without the check for what Refused catches. Any other was
-                # made about another copy, perhaps on another instance. Unrated runs the
-                # same and waits to be submitted before sharing. A provider's hold crosses
-                # with whatever it rode on, for the same reason Refused does.
+                # Not Allowed and Refused alone cross: dropping either would let the profile
+                # run where it may not, and an export-import round trip must not launder a
+                # refusal. Refused crosses as written, since claiming it gains nothing. Not
+                # Allowed -- or a record one left behind (`was`) -- crosses as a hold for
+                # rating: a passphrase file is anyone's to write, so it runs nowhere until
+                # rated here. Any other verdict was made about another copy, perhaps on another
+                # instance. Unrated runs the same and waits to be submitted before sharing. A
+                # provider's hold crosses with whatever it rode on, for the same reason.
                 rating = config.pop("content_rating", None)
                 verdict = rating.get("verdict") if isinstance(rating, dict) else None
                 hold = _carried_hold(rating) if isinstance(rating, dict) else {}
                 if verdict == CONTENT_RATING_REFUSED:
                     config["content_rating"] = rating
-                elif verdict == CONTENT_RATING_ADULT:
-                    config["content_rating"] = {**_unchecked_declaration(), **hold}
+                elif verdict == CONTENT_RATING_ADULT or (
+                        isinstance(rating, dict) and rating.get("was") == CONTENT_RATING_ADULT):
+                    config["content_rating"] = {**_held_for_rating(), **hold}
                     declared.append(local_name)
                 elif hold:
                     config["content_rating"] = {"verdict": CONTENT_RATING_UNRATED, **hold}
@@ -299,11 +299,11 @@ class TransferService:
             else:
                 lines = ["Nothing was imported."]
             if unrated:
-                lines.append(f"-# Content ratings other than Adult 18+ do not carry over: submit "
+                lines.append(f"-# Content ratings do not carry over: submit "
                              f"{', '.join(f'`{n}`' for n in unrated)} again before sharing.")
             if declared:
-                lines.append(f"-# {', '.join(f'`{n}`' for n in declared)} came in as Adult 18+, and "
-                             "runs once the content check has read it.")
+                lines.append(f"-# {', '.join(f'`{n}`' for n in declared)} came in rated Not Allowed, "
+                             "so it runs only once it is rated again here.")
             if skipped:
                 lines.append("**Not imported:**")
                 lines += skipped

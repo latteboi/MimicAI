@@ -604,8 +604,8 @@ class HubShareManagerView(HubBaseView):
         self.processing = False
         
         #: What the dropdown offers, filled by `load_profiles`: whatever is rated for it,
-        #: plus whatever has no verdict yet -- rated by the press that sends it. Adult is
-        #: left out, because listing it offered a choice every button then refused.
+        #: plus whatever has no verdict yet -- rated by the press that sends it. Not Allowed
+        #: is left out, because listing it offered a choice every button then refused.
         self.personal_profiles: List[str] = []
         #: The listed ones a press will rate first, so the dropdown can say so.
         self.needs_rating: Set[str] = set()
@@ -710,7 +710,7 @@ class HubShareManagerView(HubBaseView):
 
     def build_embed(self) -> discord.Embed:
         rating = ("Profiles not rated yet are rated when you press it, which takes a few "
-                  "seconds; Adult 18+ profiles cannot be ")
+                  "seconds; Not Allowed profiles cannot be ")
         if self.PUBLISH:
             title = "Publish to the Library"
             desc = ("List your profiles in the Public Library for anyone to borrow, and deselect "

@@ -1586,11 +1586,11 @@ class ModProfilesView(ModBaseView):
 
             await i.response.send_message(
                 embed=text_embed("**Reset every content rating on this instance?**\n"
-                "Every profile becomes **Unrated** — including Adult and Refused ones — and the "
-                "entire Public Library is delisted, because an Unrated profile cannot be "
-                "published. Existing borrows keep working.\n\n"
-                "Owners re-submit their own profiles afterwards; an 18+ declaration can be "
-                "re-applied in one click with no API call.\n\n"
+                "Every profile becomes **Unrated**, and the entire Public Library is delisted, "
+                "because an Unrated profile cannot be published. Existing borrows keep working. "
+                "A Not Allowed or Refused profile is held instead: it still runs nowhere until "
+                "it is rated again.\n\n"
+                "Owners re-submit their own profiles afterwards.\n\n"
                 "This cannot be undone."),
                 view=build_confirm_view("Reset Everything", confirm, i), ephemeral=True)
         add_button(self, "Reset All Content Ratings", reset_cb, style=discord.ButtonStyle.danger,
@@ -1786,7 +1786,7 @@ MOD_PROMPT_CATEGORIES = [
         ("Neuro-Endocrine State", "NEURO_ENGINE", DEFAULT_NEURO_INSTRUCTION),
         ("Bonds", "BOND_DEFINITION", DEFAULT_BOND_DEFINITION),
         ("Bond State", "BOND_STATE", DEFAULT_BOND_INSTRUCTION),
-        ("Content Policy (non-18+ channels)", "CONTENT_POLICY", DEFAULT_CONTENT_POLICY),
+        ("Content Policy", "CONTENT_POLICY", DEFAULT_CONTENT_POLICY),
         ("Hard Limits (every channel)", "HARD_LIMITS", DEFAULT_HARD_LIMITS),
     ]),
     ("Turn Flow", [
@@ -1821,7 +1821,7 @@ MOD_PROMPT_CATEGORIES = [
         ("Legacy RAG Payload", "GROUNDING_RAG_PAYLOAD", DEFAULT_GROUNDING_RAG_PAYLOAD),
         ("Attachment Describer (Simulated vision)", "MEDIA_DESCRIPTION", DEFAULT_MEDIA_DESCRIPTION),
         ("Anti-Repetition Critic", "ANTI_REPETITION", DEFAULT_ANTI_REPETITION_PROMPT),
-        ("Content Classifier (18+ gating)", "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT),
+        ("Content Classifier", "CONTENT_CLASSIFIER", DEFAULT_CONTENT_CLASSIFIER_PROMPT),
         ("Content Classifier · Minor Check", "CONTENT_CONFIRMER", DEFAULT_CONTENT_CONFIRMER_PROMPT),
         ("Content Classifier · Real Person Check", "CONTENT_CONFIRMER_REAL_PERSON",
          DEFAULT_REAL_PERSON_CONFIRMER_PROMPT),
@@ -2203,7 +2203,7 @@ class ModSystemModelsView(BlockedGuard, TimeoutCleanupMixin, ModelPickerMixin, u
 
     _CATEGORY_LABELS = (
         ("describer", "Attachment Describer", "Reads an attachment for a profile whose models cannot."),
-        ("classifier", "Content Classifier", "Rates every profile General or 18+."),
+        ("classifier", "Content Classifier", "Rates every profile Allowed or Not Allowed."),
         ("generator", "Profile Generator", "Drafts profiles, and sorts imported character cards."),
         ("embedding", "Embeddings", "The vectors behind memory, training-example and /help recall."),
         ("system", "System Profiles", "The models behind each System profile's replies."),

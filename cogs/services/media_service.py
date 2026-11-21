@@ -18,7 +18,8 @@ from ..utils.constants import (
     TEXT_ATTACHMENT_EXTENSIONS, GOOGLE_VOICE_PREFIX, VOICE_KEY_REUSE_SECONDS, ERR_REASON_LOW_MEMORY,
     VOICE_SAMPLE_GEMINI_ACCEPTED, VOICE_SAMPLE_GEMINI_REFUSED, VOICE_SAMPLE_GEMINI_UNCHECKED,
 )
-from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _resolve_safety_settings, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor, speaks_verbatim, tighten_line_spacing
+from ..utils.constants import IMAGE_CONTENT_POLICY, SAFETY_SETTINGS
+from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor, speaks_verbatim, tighten_line_spacing
 from ..utils.attachment_limits import over_attachment_limit, refuse_oversized_upload, skipped_attachment_note
 from .api.google_rest import GoogleSpeechModel
 from .generation import tool_loop
@@ -65,9 +66,13 @@ class MediaService:
         `image_config` is the profile's raw IMAGE_OUTPUT_KEYS and IMAGE_SAMPLING_KEYS, not
         a validated payload: validation depends on `raw_name`, and the factory is the one
         place that knows both.
+
+        Every image is drawn under IMAGE_CONTENT_POLICY, put ahead of the profile's own
+        style here, where all three image paths pass.
         """
         if low_memory():
             raise LowMemory(ERR_REASON_LOW_MEMORY)
+        system_instruction = "\n\n".join(p for p in (IMAGE_CONTENT_POLICY, system_instruction) if p)
         return self.cog.api_service._instantiate_model(
             raw_name, guild_id, user_id, system_instruction=system_instruction,
             safety_settings=safety_settings, image_config=image_config or {},
@@ -463,7 +468,7 @@ class MediaService:
                         fn_ctx = tool_loop.FunctionContext(
                             owner_id=owner_id, profile_name=profile_name, author_dn=app_name,
                             guild_id=package['guild_id'], triggering_user_id=package['author_id'],
-                            safety_settings=_resolve_safety_settings(channel),
+                            safety_settings=SAFETY_SETTINGS,
                             channel_id=getattr(channel, "id", None))
 
                         async def send(turn, cfg, _model=text_model, _state=state_container,
@@ -914,7 +919,7 @@ class MediaService:
             index = self.cog.profile_manager._get_user_index(effective_profile_owner_id)
             is_borrowed = effective_profile_name in index.get("borrowed", [])
             profile_data = self.cog.profile_manager._get_profile_config(effective_profile_owner_id, effective_profile_name, is_borrowed) or {}
-            dynamic_safety_settings = _resolve_safety_settings(message.channel)
+            dynamic_safety_settings = SAFETY_SETTINGS
 
             # Get appearance text
             source_owner_id, source_profile_name = self.cog.profile_manager._resolve_effective_profile(

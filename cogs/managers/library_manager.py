@@ -204,7 +204,7 @@ class LibraryManager:
     def _delist_unless_publishable(self, owner_id: int, profile_name: str) -> bool:
         """Takes a profile out of the Public Library once its rating no longer allows it.
 
-        Called by every write that can leave a listed profile Unrated or Adult. Nothing
+        Called by every write that can leave a listed profile Unrated or Not Allowed. Nothing
         else re-reads the rating of a listing, so without this the Library went on
         offering a profile its own rating said could not be shared. True if an entry
         was removed. Pending is left listed: it is a verdict on its way, and the write

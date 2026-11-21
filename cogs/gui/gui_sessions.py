@@ -1431,23 +1431,20 @@ def turn_order(session: Dict) -> List[Tuple[Optional[int], str]]:
 TURN_ORDER_LEGEND = "✓ spoke · ▶ speaking · slot = /session swap slot:"
 
 
-def silent_seats(cog, channel, profiles, indices) -> Tuple[Optional[str], Dict[int, str]]:
-    """(why nobody speaks in `channel`, {seat index: why that seat does not}), for the seats
-    at `indices`, in PLACEMENT_LABELS' words. A round skips a seat the placement gate refuses
-    without a word in the channel, so the cast listings are where anyone reads why. Asked a
-    page at a time, never for a whole 200-seat cast: an uncached answer parses a profile."""
+def silent_seats(cog, channel, profiles, indices) -> Dict[int, str]:
+    """{seat index: why that seat does not speak}, for the seats at `indices`, in
+    PLACEMENT_LABELS' words. A round skips a seat the placement gate refuses without a word
+    in the channel, so the cast listings are where anyone reads why. Asked a page at a time,
+    never for a whole 200-seat cast: an uncached answer parses a profile."""
     if channel is None:
-        return None, {}
-    whole = cog.content_rating.channel_block(channel)
-    if whole:
-        return PLACEMENT_LABELS[whole], {}
+        return {}
     reasons = {}
     for n in dict.fromkeys(indices):
         p = profiles[n]
         key = cog.content_rating.profile_block(p['owner_id'], p['profile_name'], channel)
         if key:
             reasons[n] = PLACEMENT_LABELS[key]
-    return None, reasons
+    return reasons
 
 
 class _TurnOrderView(BlockedGuard, ui.View):
@@ -1472,7 +1469,7 @@ class _TurnOrderView(BlockedGuard, ui.View):
         self.current_page = min(self.current_page, self.num_pages - 1)
         start = self.current_page * self.items_per_page
         page = entries[start:start + self.items_per_page]
-        self.nobody_speaks, why = silent_seats(
+        why = silent_seats(
             self.cog, self.cog.bot.get_channel(self.channel_id), self.session.get('profiles') or [],
             [n for n, _ in page if n is not None])
         self.page = [(n, f"{text} · ⛔ {why[n]}" if n in why else text) for n, text in page]
@@ -1491,8 +1488,7 @@ class _TurnOrderView(BlockedGuard, ui.View):
     def order_text(self) -> str:
         if not self.session.get('profiles'):
             return "*No participants*"
-        lines = "\n".join(text for _, text in self.page)
-        return f"⛔ **No one speaks here:** {self.nobody_speaks}.\n\n{lines}" if self.nobody_speaks else lines
+        return "\n".join(text for _, text in self.page)
 
     def footer(self) -> str:
         return f"Page {self.current_page + 1} of {self.num_pages} · {TURN_ORDER_LEGEND}"
@@ -1839,7 +1835,7 @@ class SessionConfigView(BlockedGuard, ui.View):
 
     def _live_channel(self):
         """This channel as the gateway keeps it: discord.py updates a cached channel in place,
-        so its age-restricted flag is current, where the interaction's copy is a snapshot."""
+        so it is current, where the interaction's copy is a snapshot."""
         return (self.cog.bot.get_channel(self.original_interaction.channel_id)
                 or self.original_interaction.channel)
 
@@ -2256,7 +2252,7 @@ class SessionConfigView(BlockedGuard, ui.View):
         profiles = self.session.get('profiles', [])
         start_p = self.current_page * 20 if len(profiles) > 20 else 0
         shown = range(start_p, min(start_p + 20, len(profiles)))
-        nobody, why = silent_seats(self.cog, self._live_channel(), profiles, shown)
+        why = silent_seats(self.cog, self._live_channel(), profiles, shown)
 
         def _cast_line(n, p):
             method_lbl = 'Child Bot' if p.get('method') == 'child_bot' else 'Webhook'
@@ -2268,9 +2264,8 @@ class SessionConfigView(BlockedGuard, ui.View):
         cast_list = "\n".join(_cast_line(n, profiles[n]) for n in shown) or "*No participants*"
         embed.add_field(name="Current Cast", value=cast_list, inline=False)
         # Beside the cast rather than on its lines: that field is near its 1,024 characters.
-        if nobody or why:
-            value = (f"No one in this channel: {nobody}." if nobody
-                     else _fit_list([f"`{profiles[n]['profile_name']}`: {w}" for n, w in why.items()], "\n", 1000))
+        if why:
+            value = _fit_list([f"`{profiles[n]['profile_name']}`: {w}" for n, w in why.items()], "\n", 1000)
             embed.add_field(name="⛔ Won't speak here", value=value, inline=False)
 
     def _render_config(self, embed: discord.Embed):

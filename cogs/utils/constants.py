@@ -511,11 +511,6 @@ SUBSCRIPTION_MODEL_REFUSED = (
     "(`/profile manage` -> Models -> API: Subscription), and no image generation or speech."
 )
 SUBSCRIPTION_USED_UP = "The MimicAI subscription paying here has used its allowance; it runs again when it renews."
-#: Follows the profile's name, as PLACEMENT_REFUSALS do.
-SUBSCRIPTION_AGE_RESTRICTED = (
-    "can't speak here: this server runs on a MimicAI subscription, which is never used in "
-    "age-restricted channels. An admin can assign their own API key here in `/settings` -> API Keys."
-)
 
 OPENROUTER_NOT_IMAGE_MODEL = (
     "That is not one of the OpenRouter image models this bot can use. Choose one from the "
@@ -1962,36 +1957,48 @@ DEFAULT_ANTI_REPETITION_PROMPT = (
 # The first word of the reply is the verdict, so parsing stays trivial; anything
 # after the colon becomes the reason shown to the profile's owner.
 DEFAULT_CONTENT_CLASSIFIER_PROMPT = (
-    "You classify a roleplay character profile for a Discord bot. Decide whether the "
-    "character, as written, is intended for adult audiences and should therefore be "
-    "confined to age-restricted (18+) channels.\n\n"
+    "You classify a roleplay character profile for a Discord bot open to anyone aged 13 "
+    "and over. The bot hosts nothing beyond a general audience, in any channel. Decide "
+    "whether the character, as written, is ALLOWED on it or NOT_ALLOWED.\n\n"
     "You may be given the profile's avatar images alongside its text: its usual one, and "
-    "any it switches to with its mood. Judge them together: any explicit image makes the "
-    "profile ADULT whatever the text says, and "
-    "a suggestive or revealing image on its own does not. If no image is provided, "
-    "judge the text alone and do not treat the absence as suspicious.\n\n"
-    "Answer ADULT if the profile does any of the following:\n"
-    "- Directs or invites explicit sexual content, or describes sexual acts in graphic detail.\n"
-    "- Is defined primarily around sexual availability, fetish content, or erotic roleplay.\n"
+    "any it switches to with its mood. Judge them together: a nude or sexualised image "
+    "makes the profile NOT_ALLOWED whatever the text says, and a revealing outfit or an "
+    "attractive appearance on its own does not. If no image is provided, judge the text "
+    "alone and do not treat the absence as suspicious.\n\n"
+    "Answer NOT_ALLOWED if the profile does any of the following:\n"
+    "- Directs or invites sexual content of any kind, or describes sexual acts.\n"
+    "- Is defined around sexual availability, fetish content, or erotic roleplay.\n"
+    "- Is built to be the user's own romantic or sexual partner -- their girlfriend, "
+    "boyfriend, spouse or lover -- rather than a character with romance in its story.\n"
+    "- Is possessive, jealous or controlling towards the user, or fosters dependence on "
+    "itself: urging the user to cut off other people, keep secrets from parents or carers, "
+    "or avoid real help.\n"
     "- Directs graphic gore, torture, or sexualised violence.\n"
     "- Portrays a real person known for genocide, mass atrocity or terrorism -- Adolf "
-    "Hitler, or another such dictator, war criminal or terrorist -- as its character.\n"
+    "Hitler, or another such dictator, war criminal or terrorist -- as its character, or "
+    "recruits for or promotes an extremist cause.\n"
     "- Encourages, instructs or glorifies self-harm, suicide or disordered eating: a "
     "character who urges the user towards it, not one who struggles with it.\n"
+    "- Promotes illegal drug use or alcohol abuse, such as a dealer or a \"trip sitter\" "
+    "urging use, or urges the user towards dangerous stunts or challenges.\n"
+    "- Exists to give real instructions for weapons, explosives, hacking, fraud or other "
+    "serious real-world harm.\n"
     "- Is built around hatred of a real group of people -- slurs or contempt for a race, "
     "ethnicity, religion, nationality, sexuality, gender or disability -- rather than a "
     "prejudiced villain within a story.\n"
     "- Is built to abuse the user: degradation, humiliation, coercive control or stalking "
     "as the point of the character.\n"
-    "- Glorifies or pushes hard drug use as its purpose, such as a dealer or a \"trip "
-    "sitter\" urging use.\n"
+    "- Portrays a real private individual -- someone who is not a public figure, such as a "
+    "classmate, neighbour or coworker.\n"
+    "- Presents itself as a real licensed therapist, doctor or lawyer giving real treatment "
+    "or advice, rather than a character in a story.\n"
     "- Sexualises a character stated or clearly implied to be under 18, in any framing.\n"
     "- Sexualises a real, identifiable person -- alive or within living memory, public "
     "figure or private individual -- who is named, unmistakably described, or shown in a "
     "photograph as the avatar.\n\n"
-    "Answer GENERAL for everything else, including:\n"
-    "- Romance, flirtation, attraction, innuendo and suggestive humour, and possessive or "
-    "jealous romance that stops short of abusing the user.\n"
+    "Answer ALLOWED for everything else, including:\n"
+    "- Romance between characters in a story, crushes, affection, and light flirtation as "
+    "part of a personality, without sexual content.\n"
     "- Adult characters with a youthful look, a petite build or an anime art style, when "
     "stated to be adults.\n"
     "- Grief, depression, trauma and abuse written with care, and characters who live "
@@ -2001,32 +2008,39 @@ DEFAULT_CONTENT_CLASSIFIER_PROMPT = (
     "- Religion, politics, and satire of public figures without sexual content.\n"
     "- Dark, violent, horror, morally grey or villainous characters, where the violence "
     "is narrative rather than gratuitous physical detail.\n"
-    "- Other historical, political and real-world figures portrayed as characters, and "
-    "fictional villains however monstrous.\n"
+    "- Other historical, political and real-world public figures portrayed as characters, "
+    "and fictional villains however monstrous.\n"
+    "- Doctors, detectives, lawyers and other professionals as characters in a story.\n"
     "- Rude, abrasive, profane or unpleasant personalities.\n"
-    "- Suggestive artwork, revealing outfits, or an attractive appearance.\n\n"
+    "- Revealing outfits or an attractive appearance.\n\n"
     "Judge what the profile is FOR, not whether individual words are coarse. A blunt or "
-    "crude character is GENERAL; a character written to produce explicit content is ADULT. "
-    "When genuinely balanced, answer GENERAL.\n\n"
-    "Reply with exactly one line and nothing else: the single word GENERAL or ADULT, "
+    "crude character is ALLOWED; a character written to produce anything listed above is "
+    "NOT_ALLOWED. When genuinely balanced, answer ALLOWED.\n\n"
+    "Reply with exactly one line and nothing else: the single word ALLOWED or NOT_ALLOWED, "
     "then a colon, then one category code from this list and nothing more.\n"
-    "  SEXUAL_EXPLICIT   -- explicit sexual content or graphic sexual acts\n"
+    "  SEXUAL_EXPLICIT   -- sexual content or sexual acts, or a nude or sexualised image\n"
     "  SEXUAL_FOCUS      -- the persona is built around sexual availability, fetish or erotica\n"
+    "  ROMANTIC_PARTNER  -- built to be the user's own romantic or sexual partner\n"
+    "  MANIPULATION      -- possessive or controlling, or fosters dependence, isolation or secrecy\n"
     "  GRAPHIC_VIOLENCE  -- gore, torture or sexualised violence\n"
     "  REAL_ATROCITY     -- a real dictator, war criminal or terrorist known for mass killing\n"
+    "  EXTREMISM         -- recruits for or promotes an extremist cause\n"
     "  SELF_HARM         -- encourages self-harm, suicide or disordered eating\n"
+    "  DRUGS             -- promotes illegal drug use or alcohol abuse\n"
+    "  DANGEROUS         -- real weapons, explosives, hacking or fraud instructions, or dangerous stunts\n"
     "  HATE              -- built around hatred of a real group of people\n"
-    "  ABUSIVE           -- built to abuse, degrade or control the user\n"
-    "  DRUGS             -- glorifies or pushes hard drug use\n"
+    "  ABUSIVE           -- built to abuse, degrade or humiliate the user\n"
+    "  PRIVATE_PERSON    -- portrays a real private individual\n"
+    "  PROFESSIONAL      -- poses as a real licensed professional giving real treatment or advice\n"
     "  MINOR_SAFETY      -- sexualises a character stated or clearly implied to be under 18;"
     " never for violence, cruelty or extremism alone\n"
     "  REAL_PERSON       -- sexualises a real, identifiable person; never a fictional "
     "character, a parody without sexual content, or a figure from centuries ago\n"
-    "  NONE              -- use this for GENERAL\n"
+    "  NONE              -- use this for ALLOWED\n"
     "Never quote, paraphrase or describe the profile itself. The category code is the "
     "entire reason; do not add words to it.\n"
-    "Example: ADULT: SEXUAL_EXPLICIT\n"
-    "Example: GENERAL: NONE"
+    "Example: NOT_ALLOWED: SEXUAL_EXPLICIT\n"
+    "Example: ALLOWED: NONE"
 )
 
 #: The second model's one question about a MINOR_SAFETY finding, which refuses a profile
@@ -2043,8 +2057,8 @@ DEFAULT_CONTENT_CONFIRMER_PROMPT = (
     "- That character is sexualised: sexual content, sexual availability, or a sexualised "
     "description involving them.\n\n"
     "Answer NO for everything else, including violent, cruel, extremist and historical "
-    "figures however dark, adults in sexual content, and minors written with no sexual "
-    "content.\n\n"
+    "figures however dark, adults in sexual content (another rule handles those), and "
+    "minors written with no sexual content.\n\n"
     "Reply with exactly one word: YES or NO."
 )
 
@@ -2066,7 +2080,7 @@ DEFAULT_REAL_PERSON_CONFIRMER_PROMPT = (
 )
 
 #: The codes that refuse a profile, each with the /mod prompt key and shipped wording of
-#: the second model's check. A code missing here rates Adult and is never refused.
+#: the second model's check. A code missing here rates Not Allowed and is never refused.
 REFUSAL_CONFIRMERS = {
     "MINOR_SAFETY": ("CONTENT_CONFIRMER", DEFAULT_CONTENT_CONFIRMER_PROMPT),
     "REAL_PERSON": ("CONTENT_CONFIRMER_REAL_PERSON", DEFAULT_REAL_PERSON_CONFIRMER_PROMPT),
@@ -2081,19 +2095,25 @@ UNREVIEWED_REFUSALS = frozenset({"MINOR_SAFETY"})
 # opened the dashboard. Anything unrecognised falls back to the generic label, so no
 # unvetted model text ever reaches the embed.
 CONTENT_RATING_REASON_LABELS = {
-    "SEXUAL_EXPLICIT": "Explicit sexual content",
+    "SEXUAL_EXPLICIT": "Sexual content",
     "SEXUAL_FOCUS": "Sexually-focused persona",
+    "ROMANTIC_PARTNER": "Built as the user's romantic partner",
+    "MANIPULATION": "Possessive or manipulative towards the user",
     "GRAPHIC_VIOLENCE": "Graphic violence",
     "REAL_ATROCITY": "Real-world atrocity",
+    "EXTREMISM": "Extremist promotion",
     "SELF_HARM": "Self-harm encouragement",
+    "DRUGS": "Drug or alcohol promotion",
+    "DANGEROUS": "Dangerous instructions or stunts",
     "HATE": "Hatred of a real group",
     "ABUSIVE": "Abusive towards the user",
-    "DRUGS": "Drug glorification",
+    "PRIVATE_PERSON": "Portrays a private person",
+    "PROFESSIONAL": "Poses as a real licensed professional",
     "MINOR_SAFETY": "Minor safety",
     "REAL_PERSON": "Sexualises a real person",
 }
 
-CONTENT_RATING_REASON_FALLBACK = "Adult themes"
+CONTENT_RATING_REASON_FALLBACK = "Content MimicAI does not host"
 
 # google-genai is gone, and with it the enums these were keyed on. The REST API takes
 # the bare strings the enums wrapped, so these hold the same values without the 70 MB
@@ -2123,26 +2143,38 @@ HARM_CATEGORIES = (
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
 )
 
-# Injected whenever the destination channel is NOT age-restricted, whatever the
-# profile's rating -- the rating decides only *where* a profile may run. With
-# DEFAULT_HARD_LIMITS, the only part of the content system that shapes what the model
-# writes, and the only part reaching providers other than Google: OpenRouter and Ollama
-# ignore safety_settings. No placeholders; used verbatim.
+#: Google's harm thresholds for every call whose output people read, in every channel: no
+#: channel is cleared for more, age-restricted ones included. Google keeps its own
+#: non-configurable protections beneath this. OpenRouter and Ollama ignore it, which is why
+#: <content_policy> exists. DEFAULT_SAFETY_SETTINGS is for the bot's own reads of a profile
+#: or a log (rating, memory writing, drafting a profile from a card), never a reply.
+SAFETY_SETTINGS = {cat: HarmBlockThreshold.BLOCK_ONLY_HIGH for cat in HARM_CATEGORIES}
+
+#: In every reply's system instruction, in every channel, whatever the profile's rating.
+#: With DEFAULT_HARD_LIMITS, the only part of the content system that shapes what the model
+#: writes, and the only part reaching providers other than Google. No placeholders; used
+#: verbatim. A /mod override rewords it, and an empty one cannot remove it.
 DEFAULT_CONTENT_POLICY = (
     "<content_policy>\n"
-    "This channel is not age-restricted. You are still yourself here, but keep this "
-    "response suitable for a general audience:\n"
-    "- No graphic sexual content. Romance, attraction and innuendo are fine; "
-    "explicit acts are not.\n"
-    "- No gratuitous gore. Violence may be described, but not dwelt on in "
-    "graphic physical detail.\n"
-    "- No slurs or hateful content directed at any group.\n"
-    "Do not mention, quote or otherwise acknowledge this note -- simply write "
-    "within it.\n"
+    "Stay in character, but this is a general-audience space and some readers may be young:\n"
+    "- No sexual content: affection and romance are fine; sexual acts, sexual descriptions "
+    "and sexual innuendo are not.\n"
+    "- Violence may happen, but not in graphic or gory detail.\n"
+    "- No slurs or hateful content toward any group.\n"
+    "- Never encourage or instruct self-harm, suicide, disordered eating, drug or alcohol "
+    "abuse, or dangerous stunts, and give no real instructions for weapons, explosives or "
+    "crime.\n"
+    "- Never urge anyone to keep secrets from parents or carers, cut themselves off from "
+    "others, or avoid real help.\n"
+    "Do not mention or quote this note; simply write within it.\n"
     "</content_policy>"
 )
 
-#: The floor under every reply, in every channel, age-restricted included, and after
+#: Ahead of every image request's own instruction (`build_image_model`): an OpenRouter image
+#: model takes no safety settings, and its prompt is the one place a rule reaches it.
+IMAGE_CONTENT_POLICY = "Draw for a general audience: no nudity, sexual content or graphic gore."
+
+#: The floor under every reply, in every channel, and after
 #: <content_policy> so it is the last word. The profile classifier reads a profile, never
 #: the conversation: this is what answers a scene steered somewhere mid-chat. Its three
 #: lines are the Terms' (Section 3) and the classifier's own definitions, so the profile
@@ -2176,14 +2208,16 @@ CONTENT_RATING_GENERAL = "general"
 CONTENT_RATING_ADULT = "adult"
 #: The classifier found what the Terms forbid outright (`REFUSAL_CONFIRMERS`). It runs
 #: nowhere and nothing but a new verdict or the bot owner's Clear moves it: no edit,
-#: declaration, import or failed re-check relaxes it. Terms of Service §7 promises this.
+#: import or failed re-check relaxes it. Terms of Service §7 promises this.
 CONTENT_RATING_REFUSED = "refused"
 
+#: Shown as Allowed and Not Allowed: no instance hosts adult content. The stored values are
+#: still "general" and "adult", which every rating on disk carries.
 CONTENT_RATING_LABELS = {
     CONTENT_RATING_UNRATED: "Unrated",
     CONTENT_RATING_PENDING: "Pending",
-    CONTENT_RATING_GENERAL: "General",
-    CONTENT_RATING_ADULT: "Adult 18+",
+    CONTENT_RATING_GENERAL: "Allowed",
+    CONTENT_RATING_ADULT: "Not Allowed",
     CONTENT_RATING_REFUSED: "Refused",
 }
 
@@ -2191,7 +2225,7 @@ CONTENT_RATING_EMOJI = {
     CONTENT_RATING_UNRATED: "⚪",
     CONTENT_RATING_PENDING: "⏳",
     CONTENT_RATING_GENERAL: "✅",
-    CONTENT_RATING_ADULT: "🔞",
+    CONTENT_RATING_ADULT: "🚫",
     CONTENT_RATING_REFUSED: "⛔",
 }
 
@@ -2199,22 +2233,21 @@ CONTENT_RATING_EMOJI = {
 # separately from the matrix below, so these do not enumerate them.
 CONTENT_RATING_BLURBS = {
     CONTENT_RATING_UNRATED: (
-        "This profile has not been submitted for a content rating. It runs normally "
-        "in your own servers, but it cannot be shared, published, or used in Global "
-        "Chat until it has been rated."
+        "This profile has not been submitted for a content rating. It runs normally, "
+        "but it cannot be shared, published, or used in Global Chat until it has been rated."
     ),
     CONTENT_RATING_PENDING: (
         "This profile has been submitted and is waiting on a verdict. This normally "
         "takes a few seconds."
     ),
     CONTENT_RATING_GENERAL: (
-        "This profile is rated for a general audience. It can run anywhere, be "
-        "shared or published, and be used in Global Chat."
+        "This profile is allowed on MimicAI. It can run anywhere, be shared or "
+        "published, and be used in Global Chat."
     ),
     CONTENT_RATING_ADULT: (
-        "This profile is rated for adult audiences. It runs only in age-restricted "
-        "channels, and cannot be shared, published to the Public Library, or used in "
-        "Global Chat."
+        "This profile's content rating found something MimicAI does not host. It cannot "
+        "run anywhere, be shared, be published to the Public Library, or be used in "
+        "Global Chat until it is edited and rated again."
     ),
     CONTENT_RATING_REFUSED: (
         "This profile's content rating found that it sexualises a minor or a real person, "
@@ -2227,17 +2260,16 @@ CONTENT_RATING_BLURBS = {
 # verdicts inline, so the dashboard renders exactly what is enforced -- the same
 # decision used to be spread across the hub, global chat and the turn gate, and drifted.
 #
-# `runs` and `age_restricted_only` are the runtime gates (`_effective_safety_level`).
-# Note that UNRATED and GENERAL are deliberately identical at runtime: a rating governs
-# distribution, not execution. Refused alone stops a profile running at all.
-# The provider harm threshold is NOT here -- it follows the destination channel via
-# _resolve_safety_settings, and always has.
+# `runs` is the runtime gate (`_effective_safety_level`). UNRATED and GENERAL are
+# deliberately identical at runtime: a rating governs distribution, and <content_policy>
+# governs what every profile writes. Not Allowed and Refused stop a profile running at all.
+# The provider harm threshold is not here: it is SAFETY_SETTINGS, the same for everyone.
 CONTENT_RATING_CAPABILITIES = {
-    CONTENT_RATING_UNRATED:  {"runs": True,  "age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
-    CONTENT_RATING_PENDING:  {"runs": True,  "age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
-    CONTENT_RATING_GENERAL:  {"runs": True,  "age_restricted_only": False, "share": True,  "publish": True,  "global_chat": True},
-    CONTENT_RATING_ADULT:    {"runs": True,  "age_restricted_only": True,  "share": False, "publish": False, "global_chat": False},
-    CONTENT_RATING_REFUSED:  {"runs": False, "age_restricted_only": False, "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_UNRATED:  {"runs": True,  "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_PENDING:  {"runs": True,  "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_GENERAL:  {"runs": True,  "share": True,  "publish": True,  "global_chat": True},
+    CONTENT_RATING_ADULT:    {"runs": False, "share": False, "publish": False, "global_chat": False},
+    CONTENT_RATING_REFUSED:  {"runs": False, "share": False, "publish": False, "global_chat": False},
 }
 
 # Why a capability is unavailable, shown against the failed row and reused verbatim by
@@ -2252,24 +2284,24 @@ CONTENT_CAPABILITY_LABELS = {
 CONTENT_CAPABILITY_DENIALS = {
     ("share", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
     ("share", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
-    ("share", CONTENT_RATING_ADULT): "Adult profiles cannot be shared, privately or publicly.",
+    ("share", CONTENT_RATING_ADULT): "A profile rated Not Allowed cannot be shared, privately or publicly.",
     ("publish", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
     ("publish", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
-    ("publish", CONTENT_RATING_ADULT): "Adult profiles cannot be shared, privately or publicly.",
+    ("publish", CONTENT_RATING_ADULT): "A profile rated Not Allowed cannot be shared, privately or publicly.",
     ("global_chat", CONTENT_RATING_UNRATED): "Submit this profile for a content rating first.",
     ("global_chat", CONTENT_RATING_PENDING): "Waiting on the content rating verdict.",
-    ("global_chat", CONTENT_RATING_ADULT): "A Global Chat can be opened in any channel, and none of them is guaranteed age-restricted, so Adult profiles cannot be used here.",
+    ("global_chat", CONTENT_RATING_ADULT): "A profile rated Not Allowed cannot be used in Global Chat.",
     ("share", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Its Content Safety page in `/profile manage` says why, and what you can do.",
     ("publish", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Its Content Safety page in `/profile manage` says why, and what you can do.",
     ("global_chat", CONTENT_RATING_REFUSED): "This profile was refused by its content rating. Its Content Safety page in `/profile manage` says why, and what you can do.",
 }
 
 # What the rating means for placement, phrased as the consequence rather than a second
-# setting: "Restricted / Unrestricted 18+" read like a level the owner could set.
+# setting. Keyed by `_effective_safety_level`; "restricted" is every profile that runs.
 CHANNEL_ACCESS_LABELS = {
     "restricted": "Any channel",
-    "unrestricted": "Age-restricted only",
     "checking": "Nowhere until rated",
+    "not_allowed": "Nowhere",
     "blocked": "Nowhere until rated",
     "refused": "Nowhere",
 }
@@ -2277,28 +2309,24 @@ CHANNEL_ACCESS_LABELS = {
 #: Why the runtime gate refused a profile, by `_effective_safety_level`, written to follow
 #: the profile's name: every path that refuses to speak as one says the same thing.
 PLACEMENT_REFUSALS = {
-    "unrestricted": ("is rated 🔞 **Adult 18+**, which only runs in age-restricted channels. "
-                     "Mark this channel age-restricted (Edit Channel -> Age-Restricted Channel), "
-                     "or seat the character somewhere that already is."),
-    "checking": ("is declared 🔞 **Adult 18+** and is rated before it runs, on its owner's "
-                 "own API key. That usually takes a few seconds."),
+    "checking": ("is waiting on its content rating, which runs on its owner's own API key "
+                 "before it can speak. That usually takes a few seconds."),
+    "not_allowed": ("is rated 🚫 **Not Allowed** by its content rating and cannot run anywhere "
+                    "until its owner edits it and it is rated again."),
     "blocked": ("could not be rated: its owner's AI provider refused to read it. It cannot "
                 "run anywhere until its owner edits it and submits it again."),
     "refused": ("was ⛔ **Refused** by its content rating and cannot run anywhere unless a "
                 "new rating clears it."),
-    # The channel's, not the profile's: every seat in it meets this one.
-    "subscription": SUBSCRIPTION_AGE_RESTRICTED,
 }
 
 #: The same refusals, short, where the cast is listed (`/session config`, `/session swap`,
 #: `/session view`): a seat the gate refuses is skipped in silence, so these are where
 #: anyone reads why (`gui_sessions.silent_seats`).
 PLACEMENT_LABELS = {
-    "unrestricted": "Adult 18+: needs an age-restricted channel",
-    "checking": "its 18+ declaration is being checked",
+    "checking": "its content rating is still being checked",
+    "not_allowed": "rated Not Allowed by its content rating",
     "blocked": "its owner's AI provider would not rate it",
     "refused": "Refused by its content rating",
-    "subscription": "the MimicAI subscription never runs in age-restricted channels",
 }
 
 DEFAULT_SAFETY_SETTINGS = {
@@ -3544,8 +3572,7 @@ API_ERROR_MAPPINGS = {
 
 #: The official instance's application. Any other instance is self-hosted.
 OFFICIAL_BOT_ID = 1376696185947164854
-#: `/thanks`. The project's links, so every instance hands out the same ones. The Ko-fi page
-#: is about the software only, never Adult profiles: payment processors drop adult content.
+#: `/thanks`. The project's links, so every instance hands out the same ones.
 KOFI_URL = "https://ko-fi.com/latteboi"
 TOPGG_URL = f"https://top.gg/bot/{OFFICIAL_BOT_ID}"
 #: Its vote and review pages, as link buttons: `/thanks`, and the few screens someone sees at a

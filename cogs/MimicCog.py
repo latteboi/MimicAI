@@ -93,7 +93,8 @@ import math
 import platform
 from collections import OrderedDict
 import pathlib
-from .utils.helpers import (_resolve_safety_settings, _scrub_response_text, resolve_thinking_params,
+from .utils.constants import SAFETY_SETTINGS
+from .utils.helpers import (_scrub_response_text, resolve_thinking_params,
                             suppress_link_previews, voice_sample_mime_type, check_portrait_upload)
 
 #: A Discord message link: (server or @me, channel, message). `_ticket_trace`.
@@ -2815,7 +2816,7 @@ class MimicCog(EventListeners, commands.Cog):
             # a lookup, so it keeps its own default rather than the slot's.
             t_params_worker["thinking_level"] = "none"
         
-        d_safe = _resolve_safety_settings(interaction.channel)
+        d_safe = SAFETY_SETTINGS
         
         custom_error = p_config.get("error_response", "An error has occurred.")
 

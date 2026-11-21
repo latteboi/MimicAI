@@ -10,9 +10,9 @@ from ...utils.constants import (
     defaultConfig, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB,
 )
+from ...utils.constants import SAFETY_SETTINGS
 from ...utils.helpers import (subscription_settings, 
-    _format_citation_subtext, _format_history_entry, _get_user_hash, _resolve_safety_settings,
-    default_profile_avatar_url, resolve_grounding_mode, resolve_url_mode,
+    _format_citation_subtext, _format_history_entry, _get_user_hash, default_profile_avatar_url, resolve_grounding_mode, resolve_url_mode,
     suppress_link_previews, turn_posted_at,
 )
 from . import tool_loop
@@ -194,10 +194,8 @@ class GlobalChatMixin:
             await interaction.followup.send(embed=text_embed(f"The source for '{profile_name}' could not be found."), ephemeral=True)
             return
 
-        # The embed goes wherever the command was run, and nothing constrains that
-        # to an age-restricted channel, so an adult-rated profile has nowhere
-        # compliant to run here. Read through the resolver rather than off the
-        # config, so a borrowed profile is judged by its source's rating.
+        # Global Chat takes an Allowed profile alone. Read through the resolver rather
+        # than off the config, so a borrowed profile is judged by its source's rating.
         allowed, deny_reason = self.cog.content_rating.content_capability(
             host_user_id, profile_name, "global_chat")
         if not allowed:
@@ -227,9 +225,7 @@ class GlobalChatMixin:
             # prompt and every model -- see tool_loop.
             functions = tool_loop.functions_for(profile_data, has_server=False,
                                                 can_search=bool(user_api_key or or_key))
-            # Channel 0 resolves to no channel, so the builder takes the not-age-restricted
-            # branch and injects <content_policy>: the card can be opened in any channel,
-            # which is why content_capability refuses an Adult profile.
+            # Channel 0 resolves to no channel: the card can be opened in any.
             (system_instruction, turn_context, _, temp, top_p, top_k,
              primary_model, fallback_model_name) = await asyncio.to_thread(
                 self._construct_system_instructions, host_user_id, profile_name, 0,
@@ -318,10 +314,7 @@ class GlobalChatMixin:
                 if g_stm_capped > 0:
                     g_hist = rebuilt_history[-(g_stm_capped * 2):]
 
-                # Always a DM: not age-restricted, so BLOCK_ONLY_HIGH. (`safety_level`
-                # was never defined in this scope -- this line raised NameError for
-                # any global-chat profile with RAG grounding enabled.)
-                d_safe = _resolve_safety_settings(None)
+                d_safe = SAFETY_SETTINGS
 
                 # No owner: guild 0 is falsy, so one here would bill the host's own key
                 # with no data policy -- this call does not take Global Chat's yet.
@@ -362,7 +355,7 @@ class GlobalChatMixin:
                 owner_id=host_user_id, profile_name=profile_name, author_dn=app_name,
                 guild_id=None,
                 triggering_user_id=queued_turns[-1]["user_id"] if queued_turns else host_user_id,
-                safety_settings=_resolve_safety_settings(None),
+                safety_settings=SAFETY_SETTINGS,
                 policy={"policy_guild_id": interaction.guild_id, "conversation": True})
             chat_participant_names = [app_name] + [t['display_name'] for t in queued_turns]
             state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg,

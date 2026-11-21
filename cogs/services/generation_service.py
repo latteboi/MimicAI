@@ -27,11 +27,11 @@ from ..utils.constants import (
     GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE, UNASSIGNED_KEY_NOTICE,
     ROUND_URL_MESSAGES_MAX, ROUND_URLS_SKIPPED_NOTE, SPEAK_AGAIN_EMOJI,
 )
+from ..utils.constants import SAFETY_SETTINGS
 from ..utils.helpers import (subscription_settings, 
     _format_api_error, _format_citation_subtext, _resolve_zoneinfo, _scrub_response_text,
     restamp_turn, turn_posted_at, server_context_guild,
-    _format_history_entry, _get_user_hash, _resolve_safety_settings,
-    _split_into_sentences_with_abbreviations, generated_image_attachment, sent_file_name,
+    _format_history_entry, _get_user_hash, _split_into_sentences_with_abbreviations, generated_image_attachment, sent_file_name,
     resolve_critic_settings, own_replies, variety_hint, ltm_flag_enabled,
     image_command_prompt, image_rag_enabled, is_gateway_shutdown, kickstart_note, whisper_recap,
     resolve_grounding_mode,
@@ -578,9 +578,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 return min(called, key=lambda c: c[0])[1]
         return None
 
-    def _queue_declaration_check(self, owner_id: int, profile_name: str, refusal: str) -> None:
-        """A declaration's check, queued by a round it stopped: one made in bulk, or by
-        `/profile generate`, has nobody else to ask."""
+    def _queue_rating_check(self, owner_id: int, profile_name: str, refusal: str) -> None:
+        """The rating of a profile held for one, queued by a round it stopped: one held by
+        an import or `/profile generate` has nobody else to ask."""
         if refusal == PLACEMENT_REFUSALS["checking"]:
             self.cog.content_rating.schedule_content_classification(
                 *self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name))
@@ -1068,7 +1068,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     self.cog.session_manager.mark_session_dirty((channel_id, None, None), session_type)
 
                 for p, refusal in blocked_participants:
-                    self._queue_declaration_check(p['owner_id'], p['profile_name'], refusal)
+                    self._queue_rating_check(p['owner_id'], p['profile_name'], refusal)
                 # After the intake, so it lands below the message it answers. Asked of the
                 # seat called, not of the order: one that lost its roll was called all the same.
                 await self._tell_blocked_caller(channel, self._user_called_seat(session, all_triggers_for_round))
@@ -1168,7 +1168,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             session, grounding_target_participant, g_profile_settings, len(profile_order))
 
                         # Safety Logic for Grounding
-                        g_dynamic_safety_settings = _resolve_safety_settings(channel)
+                        g_dynamic_safety_settings = SAFETY_SETTINGS
 
                         is_for_image_flag = is_image_gen_round
                         grounding_query = image_gen_prompt if is_image_gen_round else initial_round_context
@@ -1548,10 +1548,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             fallback_model_name = None
 
             # Backstop only. profile_order was filtered before the feedback step, so
-            # this fires only if the channel's age-restricted flag is flipped mid-round.
+            # this fires only if the profile's rating changes mid-round.
             refusal = self.cog.content_rating.placement_refusal(owner_id, profile_name, channel)
             if refusal:
-                self._queue_declaration_check(owner_id, profile_name, refusal)
+                self._queue_rating_check(owner_id, profile_name, refusal)
                 return True
 
             user_index = self.cog.profile_manager._get_user_index(owner_id)
@@ -1602,7 +1602,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             self.cog.tools_service._get_hybrid_grounding_context(
                                 rnd.image_gen_prompt, channel.guild.id,
                                 self._grounding_history(session, participant, p_settings, len(rnd.profile_order)),
-                                p_settings, owner_id, safety_settings=_resolve_safety_settings(channel),
+                                p_settings, owner_id, safety_settings=SAFETY_SETTINGS,
                                 is_for_image=True, warning_channel=channel),
                             STATUS_SEARCHING_WEB, channel, participant, state_container)
                         if grounded:

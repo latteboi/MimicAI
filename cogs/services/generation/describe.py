@@ -18,7 +18,8 @@ from ...utils.constants import (
     DEFAULT_MEDIA_DESCRIPTION, DESCRIBER_KEYS, SUBSCRIPTION_MODELS, MEDIA_DESCRIBER_RESOLUTION, GREEDY_SAMPLING,
     MEDIA_DESCRIPTION_MAX_CHARS, MEDIA_DESCRIPTION_NONE,
 )
-from ...utils.helpers import (_resolve_safety_settings, resolve_thinking_params, system_model,
+from ...utils.constants import SAFETY_SETTINGS
+from ...utils.helpers import (resolve_thinking_params, system_model,
                               system_settings)
 
 
@@ -120,11 +121,8 @@ class MediaDescriptionMixin:
             model = self.cog.api_service._instantiate_model(
                 name, channel.guild.id if channel.guild else None, user_id,
                 system_instruction=instruction,
-                # The destination channel's settings, exactly as the reply itself
-                # resolves them. Built with the defaults instead, every attachment in an
-                # age-restricted session comes back refused, which reads as the feature
-                # being broken rather than as a filter doing its job.
-                safety_settings=_resolve_safety_settings(channel),
+                # The reply's own settings: a description is read into the reply.
+                safety_settings=SAFETY_SETTINGS,
                 # Its own slot: a one-shot internal pass with no character in it to
                 # configure, set in /mod rather than on any profile.
                 thinking_params=resolve_thinking_params(

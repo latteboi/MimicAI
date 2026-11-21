@@ -112,12 +112,12 @@ class ProfileDashboard:
                     held, self.cog.profile_manager._get_user_appearance(eff_owner, eff_name),
                     self.cog.content_rating._resolve_enforced_safety_level(user_id, profile_name),
                     self.cog.content_rating._content_rating_state(user_id, profile_name),
-                    self.cog.content_rating._is_owner_declared_adult(user_id, profile_name),
+                    self.cog.content_rating.is_held(user_id, profile_name),
                     self.cog.library.distribution_of(user_id, profile_name), ids,
                     self.cog.user_settings.provider_preference(user_id),
                     self.cog.storage_manager.subscription_payer(guild_id, user_id))
         (is_borrowed, effective_owner_id, effective_profile_name, config, ltm_count, train_count,
-         held, appearance_data, enforced, (verdict, verdict_reason), declared,
+         held, appearance_data, enforced, (verdict, verdict_reason), awaiting_rating,
          (is_public, borrowers), (pid_a, pid_b), preferred, paid) = await asyncio.to_thread(_read)
 
         embed = discord.Embed(title=f"Profile Dashboard: '{profile_name}'", color=discord.Color.blue())
@@ -155,12 +155,8 @@ class ProfileDashboard:
             embed.add_field(name=f"How {display_name} feels about you"[:256],
                             value=describe_bond(held.get(_get_user_hash(viewer_id))), inline=False)
 
-        rating_display = (f"{CONTENT_RATING_EMOJI[verdict]} "
-                          f"`{CONTENT_RATING_LABELS[verdict]}`")
-        # The padlock marks a verdict the owner cannot move themselves, which is
-        # every adult verdict except their own declaration.
-        if verdict == CONTENT_RATING_ADULT and not declared:
-            rating_display += " 🔒"
+        rating_display = ("⏳ `Held for rating`" if awaiting_rating else
+                          f"{CONTENT_RATING_EMOJI[verdict]} `{CONTENT_RATING_LABELS[verdict]}`")
 
         # Discord packs inline fields three to a row, so these are emitted as two
         # deliberate rows rather than in the order they were computed: identity in
@@ -193,25 +189,23 @@ class ProfileDashboard:
         embed.add_field(name="Public Library", value=library_value, inline=True)
         embed.add_field(name="\u200b", value="\u200b", inline=True)
 
-        if verdict == CONTENT_RATING_PENDING and verdict_reason:
+        if verdict == CONTENT_RATING_PENDING and verdict_reason and not awaiting_rating:
             # Surface why a profile is stuck on Pending. A silent Pending was
             # indistinguishable from one still in flight. This reason describes an
             # operational failure rather than the persona, so it is shown as stored.
             embed.description = ((embed.description or "") +
                                  f"\n\u23f3 **Classification unavailable:** {verdict_reason}").strip()
-        if verdict == "adult" and declared:
+        if awaiting_rating:
             embed.description = ((embed.description or "") +
-                                 "\n\U0001f51e **Declared as adult content by you.** This profile is "
-                                 "limited to age-restricted channels and cannot be shared or published. "
-                                 "Withdraw the declaration from Content Safety to have it "
-                                 "classified normally.").strip()
-        elif verdict == "adult":
+                                 "\n\u23f3 **Held for its content rating.** It runs nowhere until the "
+                                 "rating is in; Content Safety says where that stands.").strip()
+        elif verdict == CONTENT_RATING_ADULT:
             # A category, never the classifier's own words about the persona.
             embed.description = ((embed.description or "") +
-                                 "\n\U0001f51e **Classified as adult content: "
+                                 "\n\U0001f6ab **Not Allowed: "
                                  + CONTENT_RATING_REASON_LABELS.get(
                                      verdict_reason, CONTENT_RATING_REASON_FALLBACK) +
-                                 ".** This profile is limited to age-restricted channels. "
+                                 ".** MimicAI does not host this, so the profile runs nowhere. "
                                  "To have it rated again, edit the persona and submit it "
                                  "from Content Safety.").strip()
 

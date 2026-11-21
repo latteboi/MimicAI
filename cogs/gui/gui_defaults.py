@@ -148,8 +148,7 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         Three kinds fall out on their own, with no list naming them. A terminal row
         deletes files. A prompt-only row writes something a borrow does not own, which
         `defaultable_keys` already refuses. And a row whose every key is denied --
-        the 18+ declaration, the neuro engine's live hormone vector -- has nothing
-        left to store. What remains is gated on `_Bulk.needs` exactly as in bulk, so
+        the neuro engine's live hormone vector -- has nothing left to store. What remains is gated on `_Bulk.needs` exactly as in bulk, so
         the voice picker appears once a speech model is the user's default and not
         before: a voice list means nothing without the model that offers it.
         """
@@ -180,14 +179,13 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         return _SparseSeed(self.defaults) if isinstance(current, dict) else current
 
     def _stage_change(self, action_value: str, config: Optional[Dict] = None,
-                      prompts: Optional[Dict] = None, declaration: Optional[bool] = None,
-                      pins: Optional[Dict] = None):
+                      prompts: Optional[Dict] = None, pins: Optional[Dict] = None):
         """Writes one row's output into the stored defaults, and says what it could not.
 
         A `_Bulk` form hands back everything its screen collected, and against a
-        selection of profiles all of it is writable. Here three kinds are not: a prompt
-        (a borrow stores none, so a default prompt is a write nothing reads), a content
-        rating, and a key `DEFAULT_DENY` holds back. Dropping them silently would leave
+        selection of profiles all of it is writable. Here two kinds are not: a prompt
+        (a borrow stores none, so a default prompt is a write nothing reads), and a key
+        `DEFAULT_DENY` holds back. Dropping them silently would leave
         someone who typed an image-generation prompt on this screen with no prompt and
         no message, so the row that ignored something says so on the panel it returns to.
 
@@ -206,8 +204,6 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
                 self.defaults[key] = value
         ignored += [setting_label(k) for k in (prompts or {})]
         ignored += [setting_label(k) for k in (pins or {})]
-        if declaration is not None:
-            ignored.append("Adult 18+ Declaration")
 
         self._persist()
         action = PROFILE_ACTIONS_BY_VALUE.get(action_value)

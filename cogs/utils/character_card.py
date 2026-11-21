@@ -1,11 +1,11 @@
-"""Character cards (SillyTavern, Chub, RisuAI; spec V1 to V3), read for `/import`.
+"""Character cards (the V1 to V3 card spec), read for `/import`.
 
 A card is text someone else wrote, and it becomes only what its importer could have typed:
 persona text, fixed examples and a lorebook, each through `clean_imported_text` at the
 editor's own caps. Nothing in a card sets a config key or a model, nothing in it is a URL
 the bot fetches (a V3 card's `assets` are ignored, bar the main icon a CHARX carries inside
-itself), and the only rating it carries is the strictest: a card tagged NSFW is declared
-18+ on save. `system_prompt` and `post_history_instructions` are dropped -- they are
+itself), and the only rating it carries is the strictest: a card tagged NSFW is held for
+its content rating on save, and runs nowhere until rated. `system_prompt` and `post_history_instructions` are dropped -- they are
 written for another engine's prompt layout, and are where a card's jailbreak lives.
 
 The PNG is walked chunk by chunk and its image is never decoded or copied: only the

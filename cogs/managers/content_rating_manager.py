@@ -1,5 +1,5 @@
-"""Content ratings: the classifier, verdicts and their holds, refusals and appeals, owner
-declarations, and the channel access a rating allows."""
+"""Content ratings: the classifier, verdicts and their holds, refusals and appeals, and
+whether a rating lets a profile run."""
 
 import os
 import time
@@ -19,24 +19,22 @@ from ..utils.discord_cdn import signed_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
 from .storage_manager import IOManager
 from ..services.api_service import OpenRouterModel, GoogleGenAIModel
-from .profile_manager import _carried_hold, _unchecked_declaration
+from .profile_manager import _carried_hold, _held_for_rating
 
 #: `_effective_safety_level`'s answers, least to most restrictive.
-_SAFETY_LEVEL_ORDER = ("restricted", "unrestricted", "checking", "blocked", "refused")
-
-
-def _age_restricted(channel) -> bool:
-    """Whether `channel` is marked age-restricted. A thread answers for its parent; anything
-    else -- a PartialMessageable, a DM -- is not."""
-    return (isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel))
-            and channel.is_nsfw())
+_SAFETY_LEVEL_ORDER = ("restricted", "checking", "not_allowed", "blocked", "refused")
 
 #: Rating jobs land in worker threads, and each read-modify-writes the whole file.
 _REFUSED_INDEX_LOCK = threading.Lock()
 
 #: The one line the classifier is asked for, bolded or quoted at most. Anything else is no
-#: verdict -- never General: a model declining in words must not rate a profile clean.
-_VERDICT_LINE = re.compile(r"\W*(GENERAL|ADULT)\b[^\w:]*(?::\W*(\w+))?")
+#: verdict -- never Allowed: a model declining in words must not rate a profile clean.
+#: GENERAL and ADULT are the shipped prompt's words before Allowed and Not Allowed, which a
+#: /mod override written then still asks for.
+_VERDICT_LINE = re.compile(r"\W*(NOT[_ ]ALLOWED|ALLOWED|GENERAL|ADULT)\b[^\w:]*(?::\W*(\w+))?")
+_VERDICTS = {"ALLOWED": CONTENT_RATING_GENERAL, "GENERAL": CONTENT_RATING_GENERAL,
+             "NOT_ALLOWED": CONTENT_RATING_ADULT, "NOT ALLOWED": CONTENT_RATING_ADULT,
+             "ADULT": CONTENT_RATING_ADULT}
 #: The refusal check's one word, matched the same way.
 _CONFIRM_LINE = re.compile(r"\W*(YES|NO)\b", re.IGNORECASE)
 #: OpenRouter's out-of-credit refusal, as a classifier failure carries it (`openrouter.py`).
@@ -71,12 +69,21 @@ def _awaits_review(rating: Dict[str, Any]) -> bool:
 _STRICTNESS = {CONTENT_RATING_GENERAL: 0, CONTENT_RATING_ADULT: 1, CONTENT_RATING_REFUSED: 2}
 
 
+def _held(rating: Dict[str, Any]) -> bool:
+    """Whether `rating` keeps its profile from running until a verdict lands: a hold for
+    rating (`_held_for_rating`: an NSFW-tagged card, a generated profile tagged 18+, an
+    import rated Not Allowed elsewhere, or an 18+ declaration made before adult content was
+    removed), or an Unrated or Pending record a Not Allowed verdict left behind (`was`), so
+    an edit or a resubmission is no way back to running before it is rated again."""
+    return rating.get("source") == "owner_declared" or rating.get("was") == CONTENT_RATING_ADULT
+
+
 def _rating_floor(rating: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     """(verdict, reason) a re-rating may not go below on one model's word (`_hold_floor`).
 
-    A standing Refused, or an Adult the classifier or the operator gave -- a declaration is
-    its owner's to withdraw -- or the Adult an Unrated or Pending record carries as `was`, so
-    dropping to Unrated and submitting again is no way round it.
+    A standing Refused, or a Not Allowed the classifier or the operator gave -- a hold for
+    rating is no verdict -- or the Not Allowed an Unrated or Pending record carries as `was`,
+    so dropping to Unrated and submitting again is no way round it.
     """
     verdict = rating.get("verdict")
     if verdict == CONTENT_RATING_REFUSED or (
@@ -95,9 +102,8 @@ def _carried_floor(rating: Dict[str, Any]) -> Dict[str, str]:
 
 
 class ContentRatingManager:
-    """Content ratings: the classifier, verdicts and their holds, refusals and appeals,
-    owner declarations, and the channel access a rating allows. Reached as
-    `cog.content_rating`."""
+    """Content ratings: the classifier, verdicts and their holds, refusals and appeals, and
+    whether a rating lets a profile run. Reached as `cog.content_rating`."""
 
     def __init__(self, cog):
         self.cog = cog
@@ -184,11 +190,11 @@ class ContentRatingManager:
         profiles have already been through it, and no schema marker to carry
         forward in every rating record for the rest of the bot's life.
 
-        **Unconditional.** Every profile, including Adult ones. The point is a clean
-        baseline: a rating now means "the owner asked for this and got an answer", and
-        no verdict predating that rule qualifies, however it was reached. Sparing Adult
-        profiles would leave verdicts nobody consented to, and an owner can re-declare
-        18+ in one click with no API call.
+        **Unconditional.** Every profile, including Not Allowed and held ones. The point is a
+        clean baseline: a rating now means "the owner asked for this and got an answer", and
+        no verdict predating that rule qualifies, however it was reached. A profile that ran
+        nowhere -- Not Allowed, Refused, or held -- is held for its new rating rather than
+        made Unrated, which runs.
 
         Also strips the retired `safety_level`, which is the last of the pre-rating
         fields.
@@ -234,14 +240,17 @@ class ContentRatingManager:
                     if config.pop("safety_level", None) is not None:
                         counts["legacy_fields"] += 1
 
-                    config["content_rating"] = {
+                    old = config.get("content_rating") or {}
+                    ran_nowhere = (_held(old) or old.get("verdict") in
+                                   (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED))
+                    config["content_rating"] = ({**_held_for_rating(), **_carried_hold(old)} if ran_nowhere else {
                         "verdict": CONTENT_RATING_UNRATED,
                         "hash": None,
                         "model": None,
                         "at": now,
                         "reason": None,
                         "source": "reset",
-                    }
+                    })
                     p_data["config"] = config
                     # Through the one writer, or the catalogue keeps the old verdict.
                     self.cog.profile_manager._save_profile_by_pid(int(user_id_str), pid, p_data)
@@ -287,26 +296,25 @@ class ContentRatingManager:
         return CONTENT_RATING_UNRATED
 
     def _effective_safety_level(self, config: Dict[str, Any]) -> str:
-        """Where this profile may run, derived from its content rating alone: a key of
+        """Whether this profile may run, from its content rating alone: a key of
         CHANNEL_ACCESS_LABELS and, bar "restricted", of PLACEMENT_REFUSALS.
 
-        Adult restricts placement; Refused, and a declared 18+ not yet checked by the
-        classifier, stop it altogether. Unrated, Pending and General are identical at
-        runtime -- the rating governs distribution, not execution -- so a profile whose
-        owner has never submitted it is not silenced, it is merely undistributable. One its
-        provider would not even read (`provider_blocked`) runs nowhere until a model does.
+        "restricted" runs, under <content_policy> like every profile. Not Allowed and Refused
+        run nowhere, and nor does a profile `_held` for a verdict. Unrated, Pending and
+        Allowed are otherwise identical at runtime -- the rating governs distribution -- so
+        a profile whose owner has never submitted it is not silenced, it is merely
+        undistributable. One its provider would not even read (`provider_blocked`) runs
+        nowhere until a model does.
         """
         rating = config.get("content_rating") or {}
         if rating.get("provider_blocked"):
             return "blocked"
-        capabilities = CONTENT_RATING_CAPABILITIES[self._verdict_of(config)]
-        if not capabilities["runs"]:
+        verdict = self._verdict_of(config)
+        if verdict == CONTENT_RATING_REFUSED:
             return "refused"
-        if capabilities["age_restricted_only"]:
-            if rating.get("source") == "owner_declared" and not rating.get("checked"):
-                return "checking"
-            return "unrestricted"
-        return "restricted"
+        if _held(rating):
+            return "checking"
+        return "restricted" if CONTENT_RATING_CAPABILITIES[verdict]["runs"] else "not_allowed"
 
     def _content_rating_state(self, owner_id: int, profile_name: str) -> Tuple[str, Optional[str]]:
         """(verdict, reason) as last recorded, for display and for the UI gates.
@@ -394,42 +402,30 @@ class ContentRatingManager:
             if src == (int(owner_id), profile_name):
                 self.cog.content_rating_cache.pop(key, None)
 
-    def channel_block(self, channel) -> Optional[str]:
-        """"subscription" when no character at all may speak in `channel`, else None.
-
-        An age-restricted channel drops <content_policy> for every profile, so the MimicAI
-        subscription never pays for a turn in one, whatever the profile's rating. A session
-        is refused it when it starts (`refuse_uninformed`), not seat by seat.
-        """
-        if _age_restricted(channel) and self.cog.storage_manager.subscription_payer(channel.guild.id, None):
-            return "subscription"
-        return None
-
+    # ponytail: `channel` is unread below -- no channel widens or narrows what a rating lets
+    # run, age-restricted ones included -- but kept for the ~50 callers and test doubles that
+    # pass it. Drop it from them in a cleanup.
     def profile_block(self, owner_id: int, profile_name: str, channel) -> Optional[str]:
-        """Which of PLACEMENT_REFUSALS this profile's rating meets in `channel`, or None."""
+        """Which of PLACEMENT_REFUSALS this profile's rating meets, or None if it runs."""
         level = self._resolve_enforced_safety_level(owner_id, profile_name)
-        if level == "restricted" or (level == "unrestricted" and _age_restricted(channel)):
-            return None
-        return level
+        return None if level == "restricted" else level
 
     def placement_refusal(self, profile_owner_id: int, profile_name: str,
                           channel: discord.abc.Messageable) -> Optional[str]:
-        """Why this profile may not speak in `channel`, to follow its name, or None if it may.
+        """Why this profile may not speak, to follow its name, or None if it may.
 
         The one runtime gate: every path that speaks as a character asks it, directly or
         through _check_unrestricted_safety_policy. Seating asks `seat_refusal` first, so a
-        seat this refuses got here by something changing since -- the channel's flag, a
-        rating, the server's subscription -- and a round skips it in silence.
+        seat this refuses got here by a rating changing since, and a round skips it in silence.
         """
-        key = self.channel_block(channel) or self.profile_block(profile_owner_id, profile_name, channel)
+        key = self.profile_block(profile_owner_id, profile_name, channel)
         return PLACEMENT_REFUSALS[key] if key else None
 
     def seat_refusal(self, owner_id: int, profile_name: str, channel) -> Optional[str]:
-        """Why this profile may not be seated in `channel`, to follow its name, or None.
+        """Why this profile may not be seated, to follow its name, or None.
 
-        The rating's half of `placement_refusal`; the channel's half is the session's, asked
-        when it starts. A declaration still being checked is seated, and its check queued
-        now, so it is usually done before the first turn.
+        A profile held for its rating is seated, and its check queued now, so it is usually
+        done before the first turn.
         """
         key = self.profile_block(owner_id, profile_name, channel)
         if key == "checking":
@@ -654,7 +650,7 @@ class ContentRatingManager:
                 failures.append(why)
 
         if answered_by is None:
-            # A model replying with no verdict is never General and never Refused: the
+            # A model replying with no verdict is never Allowed and never Refused: the
             # operator reviews it, bar a provider refusing to read it, which holds it.
             # Retrying cannot help within the backoff window either -- a key is not going
             # to appear in fifteen seconds, credit is not bought, and a block is not
@@ -668,7 +664,7 @@ class ContentRatingManager:
             return None
 
         match = _VERDICT_LINE.match(raw)
-        verdict = match.group(1).lower()
+        verdict = _VERDICTS[match.group(1)]
 
         # Only a recognised category code survives. The prompt asks for one, but a
         # model that answers in prose anyway must not have that prose stored and
@@ -687,7 +683,7 @@ class ContentRatingManager:
             "source": "classifier",
         }
         if reason in REFUSAL_CONFIRMERS:
-            # Refused whatever the head said: a GENERAL beside this code is a model
+            # Refused whatever the head said: an ALLOWED beside this code is a model
             # contradicting itself, and the operator's review settles it either way. What
             # the head said is kept for that review to restore (`clear_classifier_verdict`).
             record.update(verdict=CONTENT_RATING_REFUSED, underlying=verdict)
@@ -712,7 +708,7 @@ class ContentRatingManager:
         """`record`, if a second model agrees it may go below `floor`; else the stricter answer.
 
         One answer is one draw -- each model judges at its own sampling defaults -- so small
-        edits resubmitted could walk a refusal or an Adult rating down until a draw came back
+        edits resubmitted could walk a refusal or a Not Allowed down until a draw came back
         lighter. Tightening needs no second opinion. Asked of the other model, or of the same
         one again when the chain has only one: a refusal its own confirmer's question, anything
         else the classifier's. Held Refused, it waits on the operator with no strike, or on
@@ -734,7 +730,7 @@ class ContentRatingManager:
             held, reason = floor, floor_reason  # no answer: the stricter stands
             if answer:
                 code = (answer.group(2) or "").upper()
-                held = CONTENT_RATING_REFUSED if code in REFUSAL_CONFIRMERS else answer.group(1).lower()
+                held = CONTENT_RATING_REFUSED if code in REFUSAL_CONFIRMERS else _VERDICTS[answer.group(1)]
                 reason = code if code in CONTENT_RATING_REASON_LABELS else None
                 if _STRICTNESS[held] <= _STRICTNESS[record["verdict"]]:
                     return record
@@ -763,21 +759,8 @@ class ContentRatingManager:
             # override lapses with the content it was granted for.
             return False
 
-        if (existing.get("verdict") == "adult"
-                and existing.get("source") == "owner_declared"
-                and rating.get("verdict") != CONTENT_RATING_REFUSED):
-            # The owner volunteered 18+, and the check every declaration gets has found
-            # nothing to refuse: the declaration stands, now checked against this text.
-            # A General or Adult verdict changes nothing else -- the classifier escalates,
-            # it does not relax. Rebuilt rather than mutated: _duplicate_profile
-            # shallow-copies the config, so a duplicate can share this dict with its source.
-            checked = {k: v for k, v in existing.items()
-                       if k not in ("retry_after", "check_failure", "flagged", "provider_blocked")}
-            config["content_rating"] = {**checked, "hash": rating.get("hash"), "checked": True}
-            self.cog.profile_manager._save_profile_config(owner_id, profile_name, config, False)
-            self._invalidate_content_rating(owner_id, profile_name)
-            return False
-
+        # A hold for rating (`_held`) takes whatever lands, as any record does: it was a
+        # wait for this verdict, never a verdict of its own.
         config["content_rating"] = rating
         self.cog.profile_manager._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
@@ -799,14 +782,12 @@ class ContentRatingManager:
         verdict = self._verdict_of(config)
 
         # Unrated has nothing to be stale against; Pending is mid-flight; Refused moves
-        # only on a resubmission or the operator's Clear, never on an edit; and a
-        # declaration not checked yet has no checked text to compare (resolve_stale_rating
-        # queues its check). A checked declaration goes stale like any verdict: what was
-        # checked is one revision of the text.
+        # only on a resubmission or the operator's Clear, never on an edit; and a hold for
+        # rating is no verdict, so has no rated text to compare (resolve_stale_rating
+        # queues its check).
         if verdict in (CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_REFUSED):
             return False
-        if (verdict == CONTENT_RATING_ADULT and rating.get("source") == "owner_declared"
-                and not rating.get("checked")):
+        if _held(rating):
             return False
         retry_after = rating.get("retry_after")
         if retry_after and time.time() < retry_after:
@@ -833,9 +814,13 @@ class ContentRatingManager:
           using the profile exactly as before and re-submits when they next want to
           share it.
         * **Distributed** -- re-classify. Other people are running this profile on
-          the strength of its verdict, so the verdict has to keep up. This is the
-          only path that spends a call without being asked to, and it is bounded by
-          the number of profiles that are actually shared.
+          the strength of its verdict, so the verdict has to keep up.
+        * **Not Allowed** -- re-classify too: dropped to Unrated it would run again
+          unrated. It stays Not Allowed until the new verdict lands.
+
+        A profile `_held` for its rating is checked whether edited or not: it runs nowhere
+        until it is. These are the only paths that spend a call without being asked to, and
+        they are bounded by the profiles actually shared, refused a run, or held.
         """
         eff_owner, eff_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
         if (int(eff_owner), eff_name) in self.cog.rating_prompts_open:
@@ -847,37 +832,21 @@ class ContentRatingManager:
         stale = await self.rating_is_stale(owner_id, profile_name)
         rating = (await asyncio.to_thread(self.cog.profile_manager._get_profile_config, eff_owner, eff_name, False)
                   or {}).get("content_rating") or {}
-        if rating.get("verdict") == CONTENT_RATING_ADULT and rating.get("source") == "owner_declared":
-            # A declaration runs only once checked, so it is never dropped to Unrated --
-            # that would let it out of age-restricted channels. An edit un-checks it.
-            if stale:
-                await asyncio.to_thread(self._uncheck_declaration, eff_owner, eff_name)
-            if stale or not rating.get("checked"):
-                self.schedule_content_classification(eff_owner, eff_name)
-                return "reclassify"
-            return None
+        if _held(rating):
+            self.schedule_content_classification(eff_owner, eff_name)
+            return "reclassify"
 
         if not stale:
             return None
 
         distributed = await asyncio.to_thread(
             self.cog.library.is_profile_distributed, eff_owner, eff_name)
-        if distributed:
+        if distributed or rating.get("verdict") == CONTENT_RATING_ADULT:
             self.schedule_content_classification(eff_owner, eff_name)
             return "reclassify"
 
         await asyncio.to_thread(self.drop_to_unrated, eff_owner, eff_name)
         return "unrated"
-
-    def _uncheck_declaration(self, owner_id: int, profile_name: str) -> None:
-        """An edited 18+ declaration runs nowhere again until its new text is checked."""
-        config = self.cog.profile_manager._get_profile_config(owner_id, profile_name, False)
-        rating = (config or {}).get("content_rating") or {}
-        if rating.get("source") != "owner_declared" or not rating.get("checked"):
-            return
-        config["content_rating"] = {**rating, "checked": False}
-        self.cog.profile_manager._save_profile_config(owner_id, profile_name, config, False)
-        self._invalidate_content_rating(owner_id, profile_name)
 
     # --- Refused profiles, for /mod ----------------------------------------------
     #
@@ -962,8 +931,8 @@ class ContentRatingManager:
         hold = {"provider_blocked": blocked} if blocked else {}
         verdict = self._verdict_of(config)
         if verdict == CONTENT_RATING_ADULT and rating.get("source") == "owner_declared":
-            # A declaration's check failed. The declaration stands, still unchecked, and
-            # the retry-after stops every session setup re-queueing the same failure.
+            # A hold's check failed. The hold stands, so it still runs nowhere, and the
+            # retry-after stops every session setup re-queueing the same failure.
             config["content_rating"] = {
                 **rating, "check_failure": reason[:200],
                 "retry_after": time.time() + defaultConfig.CONTENT_CLASSIFY_RETRY_AFTER, **flag, **hold}
@@ -972,7 +941,7 @@ class ContentRatingManager:
         elif verdict in (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED) or (
                 verdict == CONTENT_RATING_GENERAL and not (flagged or blocked)):
             # A real verdict already stands; a later failure must not erase it. Bar a
-            # General one re-checked after an edit that the model would not rate: the
+            # Allowed one re-checked after an edit that the model would not rate: the
             # edited text is what its borrowers run, so it waits on review as Pending.
             return
         else:
@@ -1010,11 +979,11 @@ class ContentRatingManager:
     def clear_classifier_verdict(self, owner_id: int, profile_name: str, moderator_id: int) -> bool:
         """Operator appeal: pins a lighter verdict for exactly the content that was flagged.
 
-        An Adult verdict clears to General. A Refusal clears to what the classifier's own
-        verdict was beside its refusing code -- a false positive on an adult persona
-        stays Adult. Keyed to the current surface hash, so the override lapses the moment
-        the persona changes -- a cleared profile cannot be edited into what was flagged
-        and keep its clearance.
+        A Not Allowed verdict clears to Allowed. A Refusal clears to what the classifier's
+        own verdict was beside its refusing code -- a false positive on a persona that is
+        Not Allowed anyway stays Not Allowed. Keyed to the current surface hash, so the
+        override lapses the moment the persona changes -- a cleared profile cannot be edited
+        into what was flagged and keep its clearance.
         """
         config = self.cog.profile_manager._get_profile_config(owner_id, profile_name, False)
         if config is None:
@@ -1022,9 +991,9 @@ class ContentRatingManager:
         verdict = self._verdict_of(config)
         if verdict not in (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED):
             return False
-        if self._is_owner_declared_adult(owner_id, profile_name):
-            # An owner's own declaration is theirs to withdraw, not a moderator's to
-            # overrule -- clearing it would silently un-declare their profile.
+        if _held(config.get("content_rating") or {}):
+            # Waiting on a rating, not a review: nobody has read it to clear. Force
+            # Re-classify rates it, and a flagged one takes the operator's verdict.
             return False
         cleared = CONTENT_RATING_GENERAL
         if verdict == CONTENT_RATING_REFUSED:
@@ -1049,7 +1018,7 @@ class ContentRatingManager:
                           moderator_id: int) -> bool:
         """Operator review of a flagged profile: the verdict the model would not give,
         pinned to exactly this content as `clear_classifier_verdict` pins its own, and
-        landed as any verdict does -- a declaration stands, checked, unless Refused.
+        landed as any verdict does, a hold for rating included.
         True when it was stored as given, so the caller strikes a Refusal."""
         config = self.cog.profile_manager._get_profile_config(owner_id, profile_name, False)
         if (not ((config or {}).get("content_rating") or {}).get("flagged")
@@ -1098,70 +1067,31 @@ class ContentRatingManager:
         self._set_refused_entry(owner_id, self.cog.profile_manager._get_pid_from_name(owner_id, profile_name), None)
         return True
 
-    def _is_owner_declared_adult(self, owner_id: int, profile_name: str) -> bool:
-        """True when the adult verdict came from the owner rather than the classifier.
-
-        The two are stored identically and enforced identically; they differ only
-        in who may move them. An owner may take their own declaration back; a
-        classifier verdict is appealed to a moderator via _handle_clear_verdict.
-        """
+    def is_held(self, owner_id: int, profile_name: str) -> bool:
+        """Whether the profile runs nowhere until its rating lands (`_held`), read at the
+        source as a borrow's rating is."""
         eff_owner, eff_name = self.cog.profile_manager._resolve_effective_profile(owner_id, profile_name)
         config = self.cog.profile_manager._get_profile_config(eff_owner, eff_name, False) or {}
-        rating = config.get("content_rating") or {}
-        return rating.get("verdict") == "adult" and rating.get("source") == "owner_declared"
+        return _held(config.get("content_rating") or {})
 
-    def set_owner_adult_declaration(self, owner_id: int, profile_name: str, declared: bool) -> bool:
-        """The owner's own 18+ declaration, recorded as a content_rating verdict.
+    def hold_for_rating(self, owner_id: int, profile_name: str) -> bool:
+        """Holds a profile that arrived marked 18+ -- a card tagged NSFW, a generated profile
+        tagged 18+ -- so it runs nowhere until the classifier has rated it. Not queued here:
+        this may run in a thread, and the next seat or resolve_stale_rating queues it.
 
-        This is what the retired safety_level toggle became. Declaring costs no API
-        call and needs no classifier agreement, which is the point: an owner who
-        wants the age-restricted lane should not have to write a persona
-        inflammatory enough to trip a flash-lite model into agreeing with them.
-
-        Refuses rather than silently doing nothing where the verdict is not the
-        owner's to move -- a classifier 'adult' (appealed via /mod) or a borrowed
-        profile (not the borrower's content).
-        Returns True only when the stored rating now matches what was asked for.
+        A borrow is not the borrower's to hold, and a Not Allowed or Refused profile already
+        runs nowhere. True when the profile is now held or already runs nowhere.
         """
         index = self.cog.profile_manager._get_user_index(owner_id)
         if profile_name in index.get("borrowed", []):
             return False
-
         config = self.cog.profile_manager._get_profile_config(owner_id, profile_name, False)
         if config is None:
             return False
-
         rating = config.get("content_rating") or {}
-        verdict, source = rating.get("verdict"), rating.get("source")
-
-        if verdict == "adult" and source != "owner_declared":
-            return False
-        if verdict == CONTENT_RATING_REFUSED:
-            return False  # neither a declaration nor its withdrawal outranks a refusal
-
-        if declared:
-            if verdict == "adult":
-                return True
-            # Not queued here: this may run in a thread.
-            config["content_rating"] = {**_unchecked_declaration(), **_carried_hold(rating)}
-        else:
-            if source != "owner_declared":
-                return False
-            # Dropped rather than rewritten to 'general': the owner withdrawing a
-            # declaration is not a judgement that the content is general, it is a
-            # Withdrawing a declaration is not a judgement that the content is
-            # general, it is a request to stop asserting otherwise. The profile
-            # returns to Unrated and its owner submits it when they want a verdict.
-            config["content_rating"] = {
-                "verdict": CONTENT_RATING_UNRATED,
-                "hash": None,
-                "model": None,
-                "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-                "reason": None,
-                "source": "declaration_withdrawn",
-                **_carried_hold(rating),
-            }
-
+        if rating.get("verdict") in (CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED):
+            return True
+        config["content_rating"] = {**_held_for_rating(), **_carried_hold(rating)}
         self.cog.profile_manager._save_profile_config(owner_id, profile_name, config, False)
         self._invalidate_content_rating(owner_id, profile_name)
         self.cog.library._delist_unless_publishable(owner_id, profile_name)
@@ -1188,27 +1118,30 @@ class ContentRatingManager:
             return False, "A borrowed profile is rated by its owner, not by you."
 
         verdict, _ = await asyncio.to_thread(self._content_rating_state, owner_id, profile_name)
-        if verdict == CONTENT_RATING_REFUSED:
+        if verdict in (CONTENT_RATING_REFUSED, CONTENT_RATING_ADULT):
             # Re-rated in place: written Pending, it would run in the meantime -- and stay
-            # running if the check never landed.
+            # running if the check never landed. A hold for rating is one of these too.
             if (int(owner_id), profile_name) in self.cog.pending_classifications:
                 return False, "This profile is already being re-rated."
-            # Only once edited: the same text asked again is a re-roll, until one answer
-            # comes back clean. An owner who thinks the refusal wrong appeals it instead.
             rating = (await asyncio.to_thread(self.cog.profile_manager._get_profile_config, owner_id, profile_name, False)
                       or {}).get("content_rating") or {}
-            current = await asyncio.to_thread(
-                lambda: self._surface_hash(self._moderated_surface(owner_id, profile_name)))
-            if rating.get("hash") == current:
-                if rating.get("review"):
-                    return False, "The bot operator is reviewing this refusal."
-                return False, ("This profile has not changed since it was refused, so it would "
-                               "be judged on the same text. Edit it first"
-                               + ("." if rating.get("upheld_by")
-                                  or rating.get("reason") in UNREVIEWED_REFUSALS else
-                                  ", or choose Request Review if you think the refusal is a mistake."))
+            if verdict == CONTENT_RATING_REFUSED:
+                # Only once edited: the same text asked again is a re-roll, until one answer
+                # comes back clean. An owner who thinks the refusal wrong appeals it instead.
+                # A Not Allowed needs no such guard: going lighter takes a second model.
+                current = await asyncio.to_thread(
+                    lambda: self._surface_hash(self._moderated_surface(owner_id, profile_name)))
+                if rating.get("hash") == current:
+                    if rating.get("review"):
+                        return False, "The bot operator is reviewing this refusal."
+                    return False, ("This profile has not changed since it was refused, so it would "
+                                   "be judged on the same text. Edit it first"
+                                   + ("." if rating.get("upheld_by")
+                                      or rating.get("reason") in UNREVIEWED_REFUSALS else
+                                      ", or choose Request Review if you think the refusal is a mistake."))
             self.schedule_content_classification(owner_id, profile_name)
-            return True, ("Submitted. It stays Refused until the new verdict lands, which "
+            state = "held" if _held(rating) else CONTENT_RATING_LABELS[verdict]
+            return True, (f"Submitted. It stays {state} until the new verdict lands, which "
                           "usually takes a few seconds.")
         if verdict == CONTENT_RATING_PENDING:
             # A Pending profile is either genuinely in flight or a submission that
@@ -1226,12 +1159,8 @@ class ContentRatingManager:
             if time.time() < retry_after:
                 return False, (f"The last attempt failed and it will retry "
                                f"<t:{int(retry_after)}:R>. {self.rating_failure_hint(rating)}")
-        if verdict == CONTENT_RATING_ADULT and await asyncio.to_thread(
-                self._is_owner_declared_adult, owner_id, profile_name):
-            return False, ("You have declared this profile 18+. Withdraw the declaration "
-                           "first if you want it classified instead.")
 
-        config = await asyncio.to_thread(self.cog.profile_manager._get_profile_config, owner_id, profile_name, False)
+        config =await asyncio.to_thread(self.cog.profile_manager._get_profile_config, owner_id, profile_name, False)
         if config is None:
             return False, "Profile not found."
 
@@ -1302,16 +1231,15 @@ class ContentRatingManager:
         """Returns a profile to Unrated without spending a call.
 
         What an edit to an undistributed profile does. The owner keeps using it
-        exactly as before -- Unrated and General are identical at runtime -- and
+        exactly as before -- Unrated and Allowed are identical at runtime -- and
         re-submits whenever they next want to share it.
         """
         config = self.cog.profile_manager._get_profile_config(owner_id, profile_name, False)
         if config is None:
             return False
         rating = config.get("content_rating") or {}
-        if (self._verdict_of(config) == CONTENT_RATING_REFUSED
-                or rating.get("source") == "owner_declared"):
-            return False  # dropping either would let it run where it may not
+        if self._verdict_of(config) in (CONTENT_RATING_REFUSED, CONTENT_RATING_ADULT):
+            return False  # it runs nowhere, and dropped it would run unrated (a hold too)
 
         config["content_rating"] = {
             "verdict": CONTENT_RATING_UNRATED,
@@ -1330,18 +1258,14 @@ class ContentRatingManager:
     def schedule_content_classification(self, owner_id: int, profile_name: str):
         """Queues a profile for classification. Never awaited.
 
-        No longer called from the edit paths. Classification now starts in exactly
-        two places: an owner submitting via the Content Safety dashboard, and the
-        re-check of a *distributed* profile whose text has changed underneath its
-        borrowers. Every other edit either drops the profile to Unrated or, for a
-        distributed one, asks the owner which they want.
+        Not called from the edit paths: an owner submitting, the re-check of a profile that
+        is distributed or Not Allowed (`resolve_stale_rating`), or a profile held for its
+        rating being seated or settled. Every other edit either drops the profile to Unrated
+        or, for a distributed one, asks the owner which they want.
         """
         index = self.cog.profile_manager._get_user_index(owner_id)
         if profile_name in index.get("borrowed", []):
             return
-        # A declared 18+ profile is classified too: not to rate it -- the classifier
-        # cannot relax a declaration -- but to find what Refused catches, which no
-        # declaration may skip. _store_content_rating keeps the declaration otherwise.
         if self._classification_on_cooldown(owner_id, profile_name):
             return
 

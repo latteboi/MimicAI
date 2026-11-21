@@ -7,7 +7,7 @@ from discord import ui
 from typing import Awaitable, Callable, Optional, Sequence, Tuple
 
 from ..utils.constants import (CAST_POLICY_OPEN, CAST_REFUSAL, MEMBERS_INFORMED_PROMPT,
-                               NOT_REGISTERED, PLACEHOLDER_EMOJI, PLACEMENT_REFUSALS, TOPGG_LINKS,
+                               NOT_REGISTERED, PLACEHOLDER_EMOJI, TOPGG_LINKS,
                                defaultConfig)
 from ..utils.helpers import suppress_link_previews
 
@@ -161,26 +161,17 @@ def cast_refusal(cog, interaction: discord.Interaction) -> Optional[str]:
     return CAST_REFUSAL
 
 async def refuse_uninformed(cog, interaction: discord.Interaction) -> bool:
-    """True, having asked, when nobody has yet confirmed this server's members were told --
-    or, having said why, when no character could speak in this channel at all.
+    """True, having asked, when nobody has yet confirmed this server's members were told.
 
     Asked of whoever starts a session in a server, once for the server: every path that
     takes a channel from no session, or a draft, to a running one asks this first (the
     cast editor's Start, `/session swap`'s new session, MimicGuide in `/help`). Confirming
     records who and when in the server's index, and they press Start again: the start is
     not carried through, so no path needs a second copy of its own. Terms 3.
-
-    The channel's half of the placement gate (`channel_block`) rides here because every
-    start path already asks this: a session started where every seat is refused would be
-    skipped round after round, in silence.
     """
     guild = interaction.guild
     if guild is None:
         return False
-    block = cog.content_rating.channel_block(interaction.channel)
-    if block:
-        await _reply(interaction, embed=text_embed(f"Characters {PLACEMENT_REFUSALS[block]}"))
-        return True
     server_id = str(guild.id)
     if cog.server_manager._get_server_index(server_id).get("members_informed"):
         return False
@@ -774,12 +765,9 @@ class BaseBulkProfileView(BlockedGuard, ui.View):
         index = self.cog.profile_manager._get_user_index(self.user_id)
         self.personal_profiles = sorted(list(index.get("personal", [])))
 
-        # Profiles held in the Public Library are withheld from settings that would
-        # invalidate their listing -- the 18+ declaration being the one that does. A
-        # bulk sweep over "all my profiles" silently flipped published profiles to
-        # 18+, which the publish gate rejects, so they had to be found and reverted
-        # one at a time. Resolved in a single pass over the public index rather than
-        # a _is_profile_public call per profile.
+        # Profiles held in the Public Library can be withheld from a setting that would
+        # invalidate their listing. Resolved in a single pass over the public index
+        # rather than a _is_profile_public call per profile.
         self.excluded_public = []
         if self.exclude_public:
             published = {d["profile_name"]

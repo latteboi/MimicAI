@@ -10,8 +10,9 @@ from ...utils.constants import (
     SPEAK_REWRITE_HISTORY_TURNS, SPEAK_REWRITE_MAX_INPUT_CHARS,
     PLACEHOLDER_EMOJI, EDIT_ATTRIBUTION, PROFILE_MESSAGE_MAX_LENGTH, SESSION_BUSY_FLAGS,
 )
+from ...utils.constants import SAFETY_SETTINGS
 from ...utils.helpers import (subscription_settings, 
-    _format_history_entry, _resolve_safety_settings, _scrub_response_text,
+    _format_history_entry, _scrub_response_text,
     expand_server_emojis, resolve_native_tools, resolve_thinking_params, server_context_guild,
     split_turn, suppress_link_previews, tighten_line_spacing,
 )
@@ -259,7 +260,7 @@ class SpeakAsMixin:
         else:
             contents.append({'role': 'user', 'parts': final_parts})
 
-        safety_settings = _resolve_safety_settings(channel)
+        safety_settings = SAFETY_SETTINGS
         tools = resolve_native_tools(p_settings)
         fn_ctx = tool_loop.FunctionContext(
             owner_id=owner_id, profile_name=profile_name,

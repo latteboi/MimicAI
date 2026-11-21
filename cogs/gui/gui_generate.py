@@ -73,7 +73,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.profile_name = profile_name
         self.concept = concept
         #: The display name and avatar the user gave, laid over every draft -- and for a
-        #: card, its lorebook, fixed examples and 18+ tag, which no redraft changes.
+        #: card, its lorebook, fixed examples and NSFW tag, which no redraft changes.
         self.appearance = appearance or {}
         #: The card being imported (`character_card.read_card`), or None for a concept.
         self.card = card
@@ -117,7 +117,7 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             add_button(self, "Open Dashboard", self.open_dashboard,
                        style=discord.ButtonStyle.blurple)
             # A concept's draft only: a card is someone else's character, and one tagged
-            # 18+ could not be published anyway.
+            # NSFW is held for its rating anyway.
             if not self.card and not self.published:
                 add_button(self, "Publish to Library", self.publish, style=discord.ButtonStyle.green,
                            emoji="🌐", disabled=self.busy)
@@ -181,7 +181,8 @@ class GeneratedProfileView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             if draft.get("fixed_examples"):
                 extras.append(f"**Fixed examples:** {len(draft['fixed_examples'])}")
             if draft.get("adult"):
-                extras.append("**Adult 18+:** the card is tagged NSFW, so it is declared 18+ on Save")
+                extras.append("**Held for rating:** the card is tagged NSFW, so the profile runs "
+                              "only once its content rating allows it. MimicAI hosts no adult content.")
             if extras:
                 embed.add_field(name="Also from the card", value="\n".join(extras), inline=False)
             sorted_by = f"Sorted by {self.model_used}" if self.model_used else "Filed as written"

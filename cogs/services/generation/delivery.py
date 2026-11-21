@@ -93,8 +93,8 @@ class DeliveryMixin:
             signer = None   # nothing of the character's: the reply that replaces it is signed
 
         # Seeded before the appearance block, which is the only place they were bound.
-        # A caller that passes no profile -- the unrestricted-in-general-channel refusal
-        # notice in _multi_profile_worker is the one such call site -- skipped that block
+        # A caller that passes no profile -- a refusal notice in _multi_profile_worker
+        # is the one such call site -- skipped that block
         # entirely and then hit `if is_realistic_typing` and `if use_webhook`, raising
         # UnboundLocalError while trying to deliver the very message explaining the
         # refusal. Defaults describe a plain bot-authored message with no typing

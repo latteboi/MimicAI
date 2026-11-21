@@ -25,8 +25,8 @@ from ..utils.constants import (
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
-from ..utils.helpers import (_format_api_error, _resolve_safety_settings,
-                            billable_output_tokens, is_real_model, subscription_allowed, system_settings,
+from ..utils.constants import SAFETY_SETTINGS
+from ..utils.helpers import (_format_api_error, billable_output_tokens, is_real_model, subscription_allowed, system_settings,
                             resolve_openrouter_endpoint, resolve_openrouter_service_tier,
                             google_thinking_caps, resolve_image_output_params,
                             resolve_image_tools, resolve_media_resolution,
@@ -671,7 +671,7 @@ class APIService:
 
         model_instance, model_init_error = None, True
         
-        dynamic_safety_settings = _resolve_safety_settings(channel)
+        dynamic_safety_settings = SAFETY_SETTINGS
 
         model_to_create = primary_model
         

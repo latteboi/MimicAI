@@ -18,7 +18,6 @@ from .constants import (
     DOCUMENT_MIME_TYPES, TEXT_ATTACHMENT_EXTENSIONS,
     DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, ERR_REASON_OPENROUTER_CREDITS,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_TYPES,
-    HARM_CATEGORIES, HarmBlockThreshold, HarmCategory,
     PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
     PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
@@ -69,61 +68,6 @@ def default_profile_avatar_url(name: str) -> str:
     """
     index = zlib.crc32(str(name).encode("utf-8")) % DEFAULT_AVATAR_COUNT
     return f"https://cdn.discordapp.com/embed/avatars/{index}.png"
-
-
-def _channel_is_age_restricted(channel: Any) -> bool:
-    """True only when a resolved channel object is flagged age-restricted.
-
-    DMs, group channels, and anything the gateway cache could not resolve count
-    as not age-restricted -- the same direction
-    ContentRatingManager._check_unrestricted_safety_policy already fails in, so the
-    placement gate and the provider thresholds agree on every channel type.
-    """
-    if not isinstance(channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
-        return False
-    try:
-        return channel.is_nsfw()
-    except Exception:
-        return False
-
-
-def _resolve_safety_settings(channel: Any) -> Dict[HarmCategory, HarmBlockThreshold]:
-    """Maps the *destination channel* onto the provider harm thresholds.
-
-    This used to key off the profile's own safety_level, which diverged from the
-    placement gate in the worst possible direction: a profile the classifier
-    ruled 'adult' was confined to an age-restricted channel and *still* sent
-    BLOCK_ONLY_HIGH, so the provider filtered content the channel had already
-    been cleared for -- surfacing as empty candidates and a generic generation
-    failure. Keying off the channel makes the filter agree with the gate by
-    construction, and puts it on the same axis as the <content_policy> block
-    that prompt_builder injects for non-age-restricted channels.
-
-    An age-restricted channel only ever receives profiles the gate has already
-    cleared for it, so standing the filter down re-litigates nothing. Everything else
-    keeps BLOCK_ONLY_HIGH, which is what the old 'low' default resolved to.
-
-    The permissive branch sends OFF rather than BLOCK_NONE. Google documents them as
-    different states -- OFF disables the filter, BLOCK_NONE leaves the classifier
-    running and never blocks on it -- and on Gemini 2.5 and 3 the *unset* default is
-    already OFF, so BLOCK_NONE was quietly asking for a filter this branch exists to
-    stand down. Note that community reports disagree with the documentation about
-    which of the two is looser in practice; if an age-restricted session starts
-    returning empty candidates where it did not before, this constant is the first
-    thing to put back. The strict branch is unaffected either way.
-
-    Neither value reaches Google's non-configurable protections -- core harms such as
-    child safety are always blocked -- so no setting here makes a model unfiltered.
-
-    No profile is carved out. The bot owner's Exempt rating sent OFF everywhere, a
-    filter no later edit could bring back, and was removed.
-    """
-    threshold = (
-        HarmBlockThreshold.OFF
-        if _channel_is_age_restricted(channel)
-        else HarmBlockThreshold.BLOCK_ONLY_HIGH
-    )
-    return {cat: threshold for cat in HARM_CATEGORIES}
 
 
 def _split_into_sentences_with_abbreviations(text: str) -> List[str]:
