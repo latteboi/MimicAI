@@ -402,7 +402,18 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 and starting_profile_override not in active_participants):
             active_participants.insert(0, starting_profile_override)
 
-        if not active_participants:
+        # A guest -- the child bot an @ named, or the one a reply was to -- is named, not rolled
+        # for: it speaks whatever the cast rolled, and with no cast at all (a child bot's answer in
+        # a channel with no session runs on an empty one). Read ahead of the early return, which
+        # used to drop it along with the seats that missed their roll.
+        ephemeral_participant = None
+        if isinstance(initial_trigger, tuple):
+            if initial_trigger[0] in ['child_mention']:
+                _, _, ephemeral_participant = initial_trigger
+            elif initial_trigger[0] == 'reply' and starting_profile_override and starting_profile_override.get('ephemeral'):
+                ephemeral_participant = starting_profile_override
+
+        if not active_participants and not ephemeral_participant:
             return []
 
         # Where nothing else named who goes first, the seat called earliest does -- and as a
@@ -410,7 +421,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         if called and not starting_profile_override:
             starting_profile_override = min(called, key=lambda c: c[0])[1]
 
-        if starting_profile_override:
+        if not active_participants:
+            profile_order = []  # only the guest speaks
+        elif starting_profile_override:
             start_p = starting_profile_override
             if start_p.get('is_skipped') or start_p not in active_participants:
                 # A ▶️ or 🍿 asks for the next turn, not that seat's: lost, it walks on round
@@ -443,13 +456,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
         if len(profile_order) > max_responses:
             profile_order = profile_order[:max_responses]
 
-        # --- Ephemeral Participant Injection ---
-        ephemeral_participant = None
-        if isinstance(initial_trigger, tuple):
-            if initial_trigger[0] in ['child_mention']:
-                _, _, ephemeral_participant = initial_trigger
-            elif initial_trigger[0] == 'reply' and starting_profile_override and starting_profile_override.get('ephemeral'):
-                ephemeral_participant = starting_profile_override
+        # --- Ephemeral Participant Injection (the guest was read above) ---
 
         if ephemeral_participant:
             # For child bots, bot_id is the key. For parent bot (webhook), profile_name/owner_id is the key.
@@ -476,6 +483,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             return True
         identity = self.cog.session_manager.participant_identity
         return identity(participant) in {identity(p) for p in session.get('profiles') or []}
+
+    def _seat_settings(self, seat) -> dict:
+        """The stored config of the profile a seat speaks as, `{}` when it has none."""
+        profiles = self.cog.profile_manager
+        borrowed = seat['profile_name'] in profiles._get_user_index(seat['owner_id']).get("borrowed", [])
+        return profiles._get_profile_config(seat['owner_id'], seat['profile_name'], borrowed) or {}
 
     def _turn_cast_to(self, session, seat) -> None:
         """Turns the cast to start at `seat`, and saves it: the place a seat that was called
@@ -772,13 +785,20 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             try:
                 initial_trigger = None
                 is_proactive_auto_round = False
+                rnd = None  # the round, once built; the `finally` below reads it
                 
                 try:
                     initial_trigger = await session['task_queue'].get()
 
-                    while (session.get('is_purging') or session.get('is_regenerating') or session.get('is_memorising')
-                           or session.get('is_compacting')):
-                        await asyncio.sleep(0.5)
+                    # Bounded, as the whisper wait below is: a flag a dead task leaked must make this
+                    # round late, never stop the channel answering for the life of the process. Long
+                    # enough for a compaction or a regeneration to finish.
+                    busy = ('is_purging', 'is_regenerating', 'is_memorising', 'is_compacting')
+                    if any(session.get(f) for f in busy):
+                        if not await self.cog.session_manager._wait_for_session_flags(
+                                session, busy, WHISPER_BUSY_WAIT_TIMEOUT_SECONDS):
+                            print(f"Channel {channel_id} is still flagged {[f for f in busy if session.get(f)]} "
+                                  f"after {WHISPER_BUSY_WAIT_TIMEOUT_SECONDS:.0f}s; proceeding with the round.")
 
                     # Yield to a whisper that is already queued for this channel. Without
                     # this the whisper polls for an idle instant that a busy channel never
@@ -884,15 +904,17 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 has_gemini = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "gemini")
                 has_openrouter = self.cog.storage_manager._get_api_key_for_guild(channel.guild.id, "openrouter")
                 
+                # Ollama is the one route no server key stands behind, so it is only looked for where
+                # there is no key: a server with one need not read every seat's profile each round. A
+                # guest the round names (an @'d child bot) counts as much as the cast.
                 has_ollama = False
-                for p in session['profiles']:
-                    p_index = self.cog.profile_manager._get_user_index(p['owner_id'])
-                    p_is_b = p['profile_name'] in p_index.get("borrowed", [])
-                    p_cfg = self.cog.profile_manager._get_profile_config(p['owner_id'], p['profile_name'], p_is_b) or {}
-                    if (p_cfg.get("primary_model", "").upper().startswith("OLLAMA/")
-                            and self.cog.user_settings.may_use_ollama(p['owner_id'])):
-                        has_ollama = True
-                        break
+                if not (has_gemini or has_openrouter):
+                    guest = self._starting_override(all_triggers_for_round)
+                    for p in [*session['profiles'], *([guest] if guest and guest.get('ephemeral') else [])]:
+                        if (self._seat_settings(p).get("primary_model", "").upper().startswith("OLLAMA/")
+                                and self.cog.user_settings.may_use_ollama(p['owner_id'])):
+                            has_ollama = True
+                            break
                 
                 if not has_gemini and not has_openrouter and not has_ollama:
                     await self._notify_no_server_key(
@@ -915,7 +937,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 triggering_user_id = session.get("owner_id")
 
                 # [NEW] Standardized initialization to prevent UnboundLocalErrors
-                url_media_parts = []
                 pre_generation_warnings = []
                 pending_url_fetches = []
                 urls_skipped = 0
@@ -1115,7 +1136,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     try:
                         last_mid = session.get('last_bot_message_id')
                         if last_mid: anchor_message = await channel.fetch_message(last_mid)
-                    except: pass
+                    except Exception: pass
 
                 grounding_sources = []
                 grounding_profile_key = None
@@ -1221,7 +1242,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             round_url_turns.append(fetch_info["turn_object"])
 
                     if u_m:
-                        url_media_parts.extend(u_m)
                         # Update new_round_turn_data
                         idx = fetch_info["turn_data_index"]
                         user_line, old_url_text, old_media = new_round_turn_data[idx]
@@ -1277,25 +1297,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                         except (ValueError, RuntimeError):
                             pass
 
-                # [FIXED] Round-End Memory Purge: Purge all generated and context data after all participants finish
-                if 'new_round_turn_data' in locals():
-                    for i in range(len(new_round_turn_data)):
-                        base, url, media = new_round_turn_data[i]
-                        media.clear()
-                    del new_round_turn_data
-                
-                if 'url_media_parts' in locals():
-                    url_media_parts.clear()
-                    del url_media_parts
-
-                if 'shared_media_content_obj' in locals():
-                    del shared_media_content_obj
+                # Round-end memory purge: the pictures this round carried go now, not when the next
+                # round rebinds the name. In place, because `rnd` shares the list.
+                for _, _, media in new_round_turn_data:
+                    media.clear()
 
                 if generated_image_path_for_round:
                     if os.path.exists(generated_image_path_for_round):
                         try: os.remove(generated_image_path_for_round)
                         except OSError: pass
-                    generated_image_path_for_round = None
+                    generated_image_path_for_round = rnd.generated_image_path_for_round = None
 
                 guild_id = channel.guild.id
                 
@@ -1325,9 +1336,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     participant["_ltm_running"] = True
                     asyncio.create_task(background_ltm_gen(participant, p_settings, round_author_name, guild_id, triggering_user_id))
 
-                # AGGRESSIVE GC: Clear references
-                if 'new_round_content_objects' in locals(): del new_round_content_objects
-                if 'all_triggers_for_round' in locals(): del all_triggers_for_round
+                # Let go of the round: the worker idles on the queue until the next one.
+                rnd = new_round_turn_data = all_triggers_for_round = None
 
                 # [NEW] Mandatory Round-End Persistence
                 # Ensures the transcript is saved immediately after the last participant speaks.
@@ -1361,6 +1371,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     try: os.remove(audio_path)
                     except OSError: pass
                 round_audio_paths.clear()
+                # The round's generated image, if it died holding one. The normal path removes it
+                # and clears this, so only an abnormal exit finds it set.
+                if rnd is not None and rnd.generated_image_path_for_round:
+                    try: os.remove(rnd.generated_image_path_for_round)
+                    except OSError: pass
+                    rnd.generated_image_path_for_round = None
                 # Nothing this round published is in flight any more. Each seat's turn
                 # tears its own container down (`_run_seat_turn`'s finally); this catches
                 # the ones no turn owned yet -- the feedback step's, when the round dies
@@ -1440,6 +1456,8 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             contents_for_api_call = [] 
             response_text = ""
             was_blocked = False
+            # The generation `try` raised: the turn is the profile's error text, not a reply.
+            generation_failed = False
             placeholder_message = None
             # Critic audit trail: a turn that failed before the critic ran still writes
             # a turn object, and the meta block records these.
@@ -1481,7 +1499,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # owner for a round nobody started.
                     await self._notify_no_server_key(
                         channel, self._first_human_author(rnd.all_triggers_for_round))
-                return False
+                # Skipped, not the end of the round: a seat after it may route through Ollama, which
+                # no server key stands behind.
+                return True
 
             # Ensure custom_main is safely bound early for error fallback
             custom_main = p_settings.get("error_response", "An error has occurred.")
@@ -1856,6 +1876,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 print(f"Multi-profile generation error for '{profile_name}': {e}")
                 traceback.print_exc()
                 response_text = f"{custom_main}\n\n-# Blocked due to: **Unknown**."
+                # Not a reply, so it is not voiced (a paid call), not handed to the seats after it
+                # as what this one said, and no handoff reads it for names.
+                generation_failed = True
                 # `was_blocked` stays False here, and the turn is the error text: a
                 # follow-up raised to it was never answered, nor one set by it.
                 raised_follow_up = set_follow_up = None
@@ -1955,7 +1978,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             session['last_speaker_key'] = participant_key
             # What the seats after this one search their memories with, and the
             # speech that voices them hears as the round so far.
-            if not was_blocked:
+            if not (was_blocked or generation_failed):
                 rnd.responses_this_round.append((speaker_display_name, response_text))
 
             # Append only. The delivery branches below flush as soon as the
@@ -1973,7 +1996,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             # voicing it bought a second paid call and held the failure back for
             # the half-minute synthesis takes.
             if (profile_settings.get("speech_tts_enabled", False) and session.get("audio_mode", "off") == "on"
-                    and not was_blocked):
+                    and not was_blocked and not generation_failed):
                 s_voice = profile_settings.get("speech_voice", DEFAULT_SPEECH_VOICE)
                 s_model = profile_settings.get("speech_model")
                 if s_model and "none" not in s_model.lower():
@@ -2315,7 +2338,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 return False
 
             # Ahead of `next_p`, so the placeholder that goes up is the named seat's.
-            if not was_blocked and not rnd.single_turn_round:
+            if not (was_blocked or generation_failed) and not rnd.single_turn_round:
                 self._hand_on(session, channel, rnd.profile_order, i, response_text)
 
             # Seats removed while this one wrote leave the order before the next
@@ -2391,6 +2414,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     opened, links_skipped = self._round_links(linked)
                     rnd.urls_skipped += links_skipped
 
+                    # Whether any seat fetches links itself: asked once for the batch, and only when a
+                    # message in it has a link to open.
+                    any_url_enabled_batch = bool(opened) and any(
+                        resolve_url_mode(self._seat_settings(p)) == "rag" for p in session['profiles'])
                     for batch_index, (trigger, msg) in enumerate(batched):
                         if msg is not None:
                             # None when there is nothing to draw, which queues no
@@ -2407,19 +2434,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                                 msg.typed, msg.attachments)
                             content, batch_msg_media = batch_turn.content, batch_turn.media_parts
                             
-                            # [NEW] Batch URL Context Logic
-                            any_url_enabled_batch = False
-                            for p in session['profiles']:
-                                p_index_batch = self.cog.profile_manager._get_user_index(p['owner_id'])
-                                p_is_b_batch = p['profile_name'] in p_index_batch.get("borrowed", [])
-                                p_settings_batch = self.cog.profile_manager._get_profile_config(p['owner_id'], p['profile_name'], p_is_b_batch) or {}
-                                
-                                u_mode = p_settings_batch.get("url_mode", "off")
-                                if "url_mode" not in p_settings_batch:
-                                    u_mode = "rag" if p_settings_batch.get("url_fetching_enabled", False) else "off"
-                                    
-                                if u_mode == "rag":
-                                    any_url_enabled_batch = True; break
                             
                             url_text_batch = None
                             url_media_batch = []

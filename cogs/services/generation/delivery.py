@@ -196,11 +196,11 @@ class DeliveryMixin:
                 try:
                     typing_cps_float = float(typing_cps)
                     if typing_cps_float <= 0: typing_cps_float = 30.0
-                except: typing_cps_float = 30.0
+                except Exception: typing_cps_float = 30.0
 
                 try:
                     typing_max_delay_float = float(typing_max_delay)
-                except: typing_max_delay_float = 2.5
+                except Exception: typing_max_delay_float = 2.5
 
                 # The standard send's parts, so no sentence outgrows a message: typing paces
                 # the sentences inside each part. The marker rides every step but a part's
@@ -232,7 +232,7 @@ class DeliveryMixin:
 
                             if first and target_message_to_edit:
                                 try: await target_message_to_edit.delete()
-                                except: pass
+                                except Exception: pass
 
                             try:
                                 sent_message = await webhook(channel, "send", signer=signer, **send_kwargs)
@@ -276,7 +276,7 @@ class DeliveryMixin:
 
                     if target_message_to_edit:
                         try: await target_message_to_edit.delete()
-                        except: pass
+                        except Exception: pass
 
                     # If we already sent a partial message, edit it to show the full text instead of double sending
                     if sent_messages_list:

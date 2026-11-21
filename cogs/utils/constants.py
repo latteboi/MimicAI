@@ -98,6 +98,9 @@ class DefaultConfigNamespace:
         self.PLACEHOLDER_EMOJI = get_config_value("PLACEHOLDER_EMOJI", "⏳")
         
         raw_key = get_config_value("ENCRYPTION_KEY")
+        # BotManager refuses to start on a throwaway key: the lock would record it and every
+        # file sealed with it would be unreadable on the next start.
+        self.ENCRYPTION_KEY_GENERATED = not raw_key
         if not raw_key:
             print("WARNING: No ENCRYPTION_KEY found. Generating a temporary session key.")
             self.ENCRYPTION_KEY = Fernet.generate_key()

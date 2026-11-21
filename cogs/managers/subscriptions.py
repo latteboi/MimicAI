@@ -306,7 +306,7 @@ class SubscriptionStore:
                 period = since + (now - since) // GRANT_PERIOD * GRANT_PERIOD
                 offer(uid, {"tier": g["tier"], "source": "grant", "period": period,
                             "renews": period + GRANT_PERIOD})
-        if self.sells:
+        if self.billing:  # never `sells`: a pause would lapse every paying subscriber
             # ponytail: lists every subscription even for one user's Check; fine to a few
             # hundred subscribers, then fetch that user's by the ID in their row.
             for sub in await stripe.subscriptions():

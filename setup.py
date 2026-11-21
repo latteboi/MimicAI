@@ -21,12 +21,6 @@ def run_pip(python_exe, command):
 def setup_mimic():
     print("--- MimicAI Self-Hosted Setup ---")
 
-    print("\n[0/5] Configuration Mode")
-    print("Manual Authentication Mode stores session keys in volatile memory only.")
-    print("It requires manual STDIN injection on every boot.")
-    print("Do NOT use unless you understand the service implications.")
-    manual_auth = input("Enable Manual Authentication Mode? [y/N]: ").strip().lower() == 'y'
-
     # 0. Linux-specific preparation
     if platform.system() == "Linux":
         print("\n[1/5] Checking Linux system dependencies...")
@@ -117,16 +111,8 @@ def setup_mimic():
         
         sdk_token = _clean_key(input("Enter your Discord Bot Token (SDK): "))
         owner_id = _clean_key(input("Enter your Discord User ID (Owner): "))
-        
-        if manual_auth:
-            print("\n" + "!"*70)
-            print("MANUAL AUTHENTICATION MODE ACTIVE")
-            print("Your generated Fernet Encryption Key is:")
-            print(f"\n{fernet_key}\n")
-            print("SAVE THIS KEY NOW IN A SECURE LOCATION.")
-            print("It will NOT be saved to disk. If you lose it, your data is permanently corrupted.")
-            print("!"*70)
-            input("\nPress Enter to confirm you have safely stored the key...")
+        while not owner_id.isdigit():  # the lock below records it: a blank one fails every later start
+            owner_id = _clean_key(input("That is not a numeric Discord User ID. Enter it again: "))
         
         import hashlib
         import json
@@ -141,16 +127,11 @@ def setup_mimic():
         
         env_content = (
             f"PLACEHOLDER_EMOJI=⌛\n"
-            f"MANUAL_AUTH_MODE={'True' if manual_auth else 'False'}\n"
+            f"DISCORD_SDK={sdk_token}\n"
+            f"DISCORD_OWNER_ID={owner_id}\n"
+            f"ENCRYPTION_KEY={fernet_key}\n"
         )
-        
-        if not manual_auth:
-            env_content += (
-                f"DISCORD_SDK={sdk_token}\n"
-                f"DISCORD_OWNER_ID={owner_id}\n"
-                f"ENCRYPTION_KEY={fernet_key}\n"
-            )
-            
+
         with open(".env", "w", encoding="utf-8") as f:
             f.write(env_content)
         print("\nSUCCESS: .env file and system lock created.")

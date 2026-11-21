@@ -11,7 +11,6 @@ import asyncio
 import gc
 import discord
 from discord.ext import commands
-import orjson as json
 from cryptography.fernet import Fernet
 import signal
 import platform
@@ -29,12 +28,6 @@ faulthandler.enable()
 
 # Load variables from .env file if it exists
 load_dotenv()
-
-# Pre-emptively suppress warnings if Manual Auth is flagged
-if os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true":
-    if not os.getenv("DISCORD_SDK"): os.environ["DISCORD_SDK"] = "MANUAL_MODE_PENDING"
-    if not os.getenv("DISCORD_OWNER_ID"): os.environ["DISCORD_OWNER_ID"] = "MANUAL_MODE_PENDING"
-    if not os.getenv("ENCRYPTION_KEY"): os.environ["ENCRYPTION_KEY"] = "MANUAL_MODE_PENDING"
 
 from cogs.utils.constants import OFFICIAL_BOT_ID, defaultConfig
 from cogs.utils.discord_retry import install_retries
@@ -87,87 +80,35 @@ async def on_ready():
 
 # --- Main asynchronous function to setup and run the bot ---
 async def main():
-    import hashlib
-    
-    manual_auth = os.getenv("MANUAL_AUTH_MODE", "False").lower() == "true"
-    
     def _clean_key(val):
         if not val: return ""
         import re
         if isinstance(val, bytes):
             val = val.decode('utf-8')
         return re.sub(r'\s+', '', str(val).replace('"', '').replace("'", ""))
-    
-    if manual_auth:
-        print("\n--- Manual Authentication Mode ---")
-        defaultConfig.DISCORD_SDK = _clean_key(input("Enter DISCORD_SDK: "))
-        defaultConfig.DISCORD_OWNER_ID = _clean_key(input("Enter DISCORD_OWNER_ID: "))
-        defaultConfig.ENCRYPTION_KEY = _clean_key(input("Enter ENCRYPTION_KEY: "))
-        print("----------------------------------\n")
-    else:
-        defaultConfig.DISCORD_SDK = _clean_key(defaultConfig.DISCORD_SDK)
-        defaultConfig.DISCORD_OWNER_ID = _clean_key(defaultConfig.DISCORD_OWNER_ID)
-        defaultConfig.ENCRYPTION_KEY = _clean_key(defaultConfig.ENCRYPTION_KEY)
-        
-        if not defaultConfig.DISCORD_SDK or not defaultConfig.ENCRYPTION_KEY:
-            print("CRITICAL ERROR: MANUAL_AUTH_MODE is False, but your keys are missing from the .env file and GCP Secret Manager.")
-            return
 
-    # System Lock Verification
-    lock_path = os.path.join(os.path.dirname(__file__), "cogs", "data", "system_lock.json")
-    if os.path.exists(lock_path):
-        try:
-            with open(lock_path, "rb") as f:
-                lock_data = json.loads(f.read())
-            
-            s_h = hashlib.sha256(defaultConfig.DISCORD_SDK.encode()).hexdigest()
-            o_h = hashlib.sha256(defaultConfig.DISCORD_OWNER_ID.encode()).hexdigest()
-            k_h = hashlib.sha256(defaultConfig.ENCRYPTION_KEY.encode()).hexdigest()
-            
-            mismatches = []
-            # We no longer strictly lock the DISCORD_SDK token, as it doesn't encrypt data and can be reset.
-            if lock_data.get("owner_hash") != o_h: mismatches.append("DISCORD_OWNER_ID")
-            if lock_data.get("key_hash") != k_h: mismatches.append("ENCRYPTION_KEY")
-            
-            if mismatches:
-                print(f"\nCRITICAL ERROR: Authentication mismatch in: {', '.join(mismatches)}")
-                print("The provided credentials do not match the original setup. Bot startup aborted to prevent data corruption.")
-                return
-                
-            # If only the SDK token changed, update the lock file silently
-            if lock_data.get("sdk_hash") != s_h:
-                lock_data["sdk_hash"] = s_h
-                try:
-                    with open(lock_path, "wb") as f:
-                        f.write(json.dumps(lock_data))
-                except Exception as e:
-                    print(f"Warning: Failed to update system lock file with new SDK hash: {e}")
-                    
-        except Exception as e:
-            print(f"\nCRITICAL ERROR: Failed to read system lock file: {e}")
-            return
-    else:
-        # Create lock if missing (first run recovery)
-        try:
-            lock_data = {
-                "sdk_hash": hashlib.sha256(defaultConfig.DISCORD_SDK.encode()).hexdigest(),
-                "owner_hash": hashlib.sha256(defaultConfig.DISCORD_OWNER_ID.encode()).hexdigest(),
-                "key_hash": hashlib.sha256(defaultConfig.ENCRYPTION_KEY.encode()).hexdigest()
-            }
-            os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-            with open(lock_path, "wb") as f:
-                f.write(json.dumps(lock_data))
-        except Exception as e:
-            print(f"\nCRITICAL ERROR: Failed to create system lock file: {e}")
-            return
+    defaultConfig.DISCORD_SDK = _clean_key(defaultConfig.DISCORD_SDK)
+    defaultConfig.DISCORD_OWNER_ID = _clean_key(defaultConfig.DISCORD_OWNER_ID)
+    defaultConfig.ENCRYPTION_KEY = _clean_key(defaultConfig.ENCRYPTION_KEY)
 
-    # Load encryption key
-    global fernet
-    try:
-        fernet = Fernet(defaultConfig.ENCRYPTION_KEY)
-    except Exception as e:
-        print(f"\nCRITICAL ERROR: Failed to load encryption key: {e}")
+    # ENCRYPTION_KEY_GENERATED: none was configured, so constants.py made a throwaway one.
+    if not defaultConfig.DISCORD_SDK or not defaultConfig.ENCRYPTION_KEY or defaultConfig.ENCRYPTION_KEY_GENERATED:
+        print("CRITICAL ERROR: DISCORD_SDK or ENCRYPTION_KEY is missing from the .env file and GCP Secret Manager.")
         return
+
+    # System Lock Verification. Imported here, not at the top: it loads storage_manager, which
+    # until now first loaded with the cog, after the keys above were cleaned.
+    from cogs.utils.system_lock import verify_system_lock
+    problem = verify_system_lock(
+        os.path.join(os.path.dirname(__file__), "cogs", "data", "system_lock.json"),
+        defaultConfig.DISCORD_SDK, defaultConfig.DISCORD_OWNER_ID, defaultConfig.ENCRYPTION_KEY)
+    if problem:
+        print(f"\nCRITICAL ERROR: {problem}")
+        return
+
+    # Load encryption key (verify_system_lock has already shown that it loads)
+    global fernet
+    fernet = Fernet(defaultConfig.ENCRYPTION_KEY)
 
     # Child bot configs are NOT preloaded here any more. This block used to open,
     # decrypt and zstd-decompress every profile.json.gz on disk to build
@@ -239,20 +180,11 @@ async def main():
         print("Starting main bot...")
         await runner()
     finally:
-        # Graceful shutdown
+        # The session flush and the child-bot shutdown are MimicCog.cog_unload's: bot.close()
+        # removes every cog before this runs, so a get_cog("MimicCog") here is always None.
         print("Shutting down bot instance...")
         if loop_probe_task:
             loop_probe_task.cancel()
-        mimic_cog = bot.get_cog("MimicCog")
-        if mimic_cog and hasattr(mimic_cog, "session_manager"):
-            # Mid-round appends are coalesced rather than written per turn, so the last
-            # few turns of every active session live only in memory until now.
-            try:
-                await mimic_cog.session_manager.flush_all_dirty()
-            except Exception as e:
-                print(f"Error flushing session logs on shutdown: {e}")
-        if mimic_cog and hasattr(mimic_cog, "child_bot_manager"):
-            await mimic_cog.child_bot_manager.shutdown_all()
         print("All processes terminated. Exiting.")
 
 # --- Run the bot ---
