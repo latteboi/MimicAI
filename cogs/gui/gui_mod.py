@@ -1477,7 +1477,7 @@ class ModTraceModal(ui.Modal, title="Trace a Message"):
         await i.followup.send(embed=text_embed(text), ephemeral=True, **extra)
 
 
-class TraceTakedownView(ui.View):
+class TraceTakedownView(BlockedGuard, ui.View):
     """Under a traced message: removes it as a moderator deleting it would, so its turn leaves
     the session log too (`on_turn_messages_deleted`). The report's 7 days (Terms, Section 3)
     from one screen. Pressed twice: the quote above it is what goes."""

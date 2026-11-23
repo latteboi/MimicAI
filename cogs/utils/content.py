@@ -1555,7 +1555,7 @@ WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")
 #: Keep this in step with the site. It is the same document, not a summary of one:
 #: shortening a clause here would leave the bot and the website disagreeing about what
 #: the operator has undertaken.
-LEGAL_EFFECTIVE_DATE = "21 November, 2026 (UTC)"
+LEGAL_EFFECTIVE_DATE = "22 November, 2026 (UTC)"
 
 LEGAL_DOCUMENTS = {
     "Terms of Service": {
@@ -1619,7 +1619,8 @@ LEGAL_DOCUMENTS = {
             "\n"
             "**Voices.** Upload a voice sample only of your own voice, or of a speaker "
             "who has given you permission to clone theirs. A profile's cloned voice is "
-            "used by anyone who borrows that profile.\n"
+            "used by anyone who borrows that profile. Never use a cloned voice to "
+            "impersonate its speaker, or to pass off what it says as their real words.\n"
             "\n"
             "**Copyright.** Upload or publish only characters, images, voices and text "
             "you have the right to use. To report material that infringes your "
@@ -1706,7 +1707,8 @@ LEGAL_DOCUMENTS = {
             "acts. A profile rated Not Allowed runs nowhere and cannot be published, "
             "shared, or used in Global Chat until it is edited and rated Allowed. A "
             "profile that arrives marked 18+, such as a character card tagged NSFW, "
-            "runs only once the same model has rated it. A profile the rating finds "
+            "is held: it runs nowhere until the same model has rated it, and then only "
+            "if it is rated Allowed. A profile the rating finds "
             "sexualises a minor, or a real, identifiable person, is refused: it runs "
             "nowhere and cannot be published, shared, or used in Global Chat until a "
             "new rating or the instance owner's review clears it. A second model checks "
@@ -1769,7 +1771,8 @@ LEGAL_DOCUMENTS = {
             "1). Stripe sells it to you as merchant of record through Stripe Managed "
             "Payments, under the name Link: checkout, receipts and your card statement "
             "(LINK.COM*) say Link. Stripe takes the payment, charges any tax, issues "
-            "receipts and handles payment disputes, under its own terms."
+            "receipts and handles payment disputes, under its own terms "
+            "(https://link.com/terms)."
         ),
         "11.2 Who may buy it": (
             "You must be 18 or older. Ticking the box at checkout accepts these Terms."
@@ -1802,8 +1805,9 @@ LEGAL_DOCUMENTS = {
             "works."
         ),
         "11.6 Billing and cancelling": (
-            "The Subscription is billed monthly in US dollars, with tax added where it "
-            "applies, and renews each month until you cancel. Cancel any time through "
+            "The Subscription is priced in US dollars, which checkout may convert to your "
+            "local currency. It is billed monthly, with tax added where it applies, and "
+            "renews each month until you cancel. Cancel any time through "
             "Manage in /settings: it then runs to the end of the month already paid for and "
             "is not renewed. Switching tier takes effect at once, and Stripe shows the "
             "adjusted charge before you confirm."
@@ -1820,7 +1824,9 @@ LEGAL_DOCUMENTS = {
             "Otherwise, a refund is the price multiplied by the share of that month's "
             "allowance left unused. A refund ends the Subscription at once, and so does a "
             "payment disputed with your bank; after a dispute, we may refuse you a new "
-            "Subscription. Ask Stripe through the link on your receipt, or open a ticket in "
+            "Subscription. You can also ask Link for a refund under its own refund policy "
+            "(https://support.link.com/questions/sold-through-link-refunds), within 60 "
+            "days of the payment. Ask Stripe through the link on your receipt, or open a ticket in "
             "/help. Nothing in these Terms excludes, restricts or modifies any right you "
             "have under the Australian Consumer Law or other law that cannot lawfully be "
             "excluded."
@@ -1949,8 +1955,9 @@ LEGAL_DOCUMENTS = {
             "deletes uploaded files under Google's own terms.\n"
             "\n"
             "**Payments:** Buying the MimicAI Subscription takes you to Stripe's checkout. "
-            "Stripe, the merchant of record, collects your payment details, email address "
-            "and billing address, and processes them under its own privacy policy. The bot "
+            "Stripe, the merchant of record (under the name Link), collects your payment "
+            "details, email address and billing address, and processes them under Link's "
+            "privacy policy (https://link.com/privacy). The bot "
             "sends Stripe your Discord ID, to match the payment to your account, and reads "
             "back your Stripe customer and subscription IDs, the tier, its status and its "
             "billing dates.\n"

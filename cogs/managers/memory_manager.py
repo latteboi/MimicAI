@@ -1155,11 +1155,14 @@ class MemoryManager:
             return [] if _is_abstention(response_text) else split_memories(response_text)
         except Exception as e:
             err_str = str(e)
+            # A hosted provider dropping the connection is as passing as a 503, and the
+            # bookmark retries; Ollama's is its tunnel being down, which persists.
+            dropped = "Network Error" in err_str and not err_str.startswith("Ollama")
             # A missing/misconfigured key is a configuration state, not a transient
             # failure -- same treatment as the rate-limit/unavailable cases below, since
             # both primary and fallback routinely miss a key on a server that has only
             # configured one provider, and that should not read as a crash.
-            if (not self.cog.shutting_down
+            if (not self.cog.shutting_down and not dropped
                     and "429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str and "503" not in err_str
                     and "UNAVAILABLE" not in err_str and "API Key not found" not in err_str
                     and not getattr(e, "rate_limited", False)):

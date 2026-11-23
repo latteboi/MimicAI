@@ -879,12 +879,15 @@ class SessionManager:
 
     async def _delete_session_from_disk(self, session_key: Any, session_type: str):
         try:
-            path = self._get_session_path(session_key, session_type)
-            if path is not None:
-                await asyncio.to_thread(_delete_file_shard, str(path))
-            hot_path = self._get_session_hot_path(session_key, session_type)
-            if hot_path is not None:
-                await asyncio.to_thread(_delete_file_shard, str(hot_path))
+            # Filed under no server there is no directory to find: a left server's tree
+            # went whole in cleanup step 5, and step 8 sweeps a live server's orphans.
+            if session_type == 'global_chat' or self._session_server(session_key[0]):
+                path = self._get_session_path(session_key, session_type)
+                if path is not None:
+                    await asyncio.to_thread(_delete_file_shard, str(path))
+                hot_path = self._get_session_hot_path(session_key, session_type)
+                if hot_path is not None:
+                    await asyncio.to_thread(_delete_file_shard, str(hot_path))
             self._note_cold_length(session_key, session_type, None, 0)
             # A queued flush predates the delete, so honouring it would write the file
             # back -- with whatever the delete was meant to remove still in it.
