@@ -41,8 +41,8 @@ from ..utils.user_defaults import offered_providers
 from ..managers.subscriptions import ACTIVE, tier_name
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
 from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, PERMISSION_EFFECTS,
-                             SERVER_KEY_PITCH, SERVER_KEY_UNASSIGNED, WIZARD_COPY, WIZARD_HOME,
-                             WIZARD_TOUR)
+                             SERVER_KEY_UNASSIGNED, WIZARD_COPY, WIZARD_HOME, WIZARD_TOUR,
+                             server_key_pitch)
 from .base_components import (PAGE_NAV_VALUES, BlockedGuard, DropdownContentView, PageJumpModal,
                               TimeoutCleanupMixin, add_button, add_select, add_topgg_links,
                               paged_nav_options, refuse_unregistered)
@@ -539,15 +539,17 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
 
         guild, channel = s["guild"], s["channel"]
         where = f"📍 **You're in** #{getattr(channel, 'name', 'this channel')} · **{guild.name}**\n"
+        # A subscription is assigned to a server like any key, so where it is sold it is named.
+        what = "subscription or API key" if s.get("sells") else "API key"
         if s["server_has_key"]:
-            key_line = "🔑 **This server** has an API key assigned"
+            key_line = f"🔑 **This server** has a {what} assigned"
             if s["server_key_held"]:
                 key_line += " (its free-tier Google key is not used here)"
         elif s["server_key_held"]:
             key_line = ("🔑 **This server**'s only key is a free-tier Google key, which is not "
                         "used for server messages — nothing here can generate")
         else:
-            key_line = "🔑 **This server** has no API key assigned yet — nothing here can generate"
+            key_line = f"🔑 **This server** has no {what} assigned yet — nothing here can generate"
         if s["missing_perms"] or s["child_gaps"]:
             key_line += "\n" + _permission_warning(s["missing_perms"], s["child_gaps"])
 
@@ -555,7 +557,7 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
             # In the banner, not the key step: that field is near Discord's 1024 cap.
             pitch = ("" if s["server_has_key"]
                      else "\n\n" + (SERVER_KEY_UNASSIGNED.format(server=guild.name)
-                                    if s.get("usable_slot") else SERVER_KEY_PITCH))
+                                    if s.get("usable_slot") else server_key_pitch(s.get("sells"))))
             return f"{where}🛡️ **Your role** Server administrator\n{key_line}{pitch}"
         role = "👤 **Your role** Member (not an administrator)\n"
         # Who may seat a character, said on the step that seats one, and on Home until one is.

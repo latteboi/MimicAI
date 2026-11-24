@@ -2925,14 +2925,28 @@ class MimicCog(EventListeners, commands.Cog):
         # Not SERVER_KEY_PITCH: its "everyone here" means the server /invite was run in, not
         # the one the link is for.
         from .utils.content import PERMISSION_EFFECTS
+        if self.subscriptions.sells:
+            # Where it is sold the subscription leads, as /start's `provider_sold` does. Its
+            # price is Stripe's, read live by SubscribeView, so none is named here; nor is
+            # the allowance a balance or the key anything but the bot's (tests/MIMIC_SUBSCRIPTION.md).
+            paying = (
+                "**No API key needed.** The MimicAI Subscription pays for your server's replies: "
+                "a monthly plan on curated models.\n"
+                "**Or bring your own.** Your own OpenRouter or Google key works too, and you pay "
+                "that provider for what you use.\n"
+                "**One plan or key covers the whole server.** An admin sets it up; everyone else "
+                "just talks.\n")
+        else:
+            paying = (
+                "**Every feature is free.** Replies run on your own OpenRouter or Google key, and "
+                "you pay the provider for what you use.\n"
+                "**One key runs the whole server.** An admin adds theirs; everyone else just talks.\n")
         embed = discord.Embed(
             title=f"Add MimicAI to your server {PLACEHOLDER_EMOJI}",
             description=(
                 "AI characters with their own persona, memory, name and face, talking with your "
                 "members and with each other.\n\n"
-                "**Every feature is free.** Replies run on your own OpenRouter or Google key, and "
-                "you pay the provider for what you use.\n"
-                "**One key runs the whole server.** An admin adds theirs; everyone else just talks.\n"
+                + paying +
                 f"**Then run {self.command_mention('start')}.** It sets up the rest. Seating a "
                 "character takes Administrator, so if you don't have it anywhere, make your own "
                 "server."),

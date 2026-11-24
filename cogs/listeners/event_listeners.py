@@ -15,7 +15,7 @@ from ..utils.constants import *
 from ..utils import data_policy, mem_probe, openrouter_signin
 from ..utils.content import (
     MENTION_POINTER_REGISTERED, MENTION_POINTER_UNREGISTERED, WELCOME_MESSAGE,
-    WELCOME_CHANNEL_HINTS,
+    WELCOME_CHANNEL_HINTS, server_key_pitch,
 )
 from ..utils.helpers import (
     _format_history_entry, _get_user_hash, image_command_prompt,
@@ -193,7 +193,8 @@ class EventListeners:
         await self._cache_command_ids()
         try:
             await channel.send(WELCOME_MESSAGE.format(
-                start=self.command_mention("start"), help=self.command_mention("help")))
+                start=self.command_mention("start"), help=self.command_mention("help"),
+                pitch=server_key_pitch(self.subscriptions.sells)))
         except discord.Forbidden:
             pass
         except Exception as e:

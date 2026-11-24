@@ -721,6 +721,19 @@ SERVER_KEY_PITCH = (
     "server's, and everyone here can talk to the characters, with no key of their own."
 )
 
+#: The same where the subscription is sold (`subscriptions.sells`): it is named, since it is the
+#: first thing `/start` offers. Ask `server_key_pitch`, so the welcome and the banner agree.
+SERVER_KEY_PITCH_SOLD = (
+    "**One MimicAI Subscription or API key covers the whole server.** An administrator's "
+    "subscription or key added here becomes this server's, and everyone here can talk to the "
+    "characters, with no key of their own."
+)
+
+
+def server_key_pitch(sells: bool) -> str:
+    return SERVER_KEY_PITCH_SOLD if sells else SERVER_KEY_PITCH
+
+
 #: The banner's line instead, to an administrator holding a key that would work here.
 SERVER_KEY_UNASSIGNED = (
     "**Your key isn't assigned here yet.** Press **Use it in {server}** and everyone here can "
@@ -1522,12 +1535,13 @@ OLLAMA_GUIDE_TEXT = (
 #
 # {start} and {help} are substituted with clickable command mentions where the ids are
 # known, and with plain code spans where they are not -- see MimicCog.command_mention.
+# {pitch} is `server_key_pitch(...)`.
 WELCOME_MESSAGE = (
     "Hey! I run AI characters (profiles) — each with its own persona, memory, name, and face in your channels.\n\n"
     "In a channel with a session running, I read the messages posted there, keep a log of them, and send them to an AI "
     "provider to write replies — so whoever starts a session should let members know.\n\n"
     "**New to this bot? Run {start}.** This will guide you through setting up MimicAI in your server.\n\n"
-    + SERVER_KEY_PITCH + "\n\n"
+    "{pitch}\n\n"
     "Activating a character *in a channel* requires a user with **Administrator** permissions — so if you do not have them here, feel free to build yours in a server of your own.\n\n"
     "{help} has the manual, MimicGuide to answer questions about the bot, and support tickets."
 )
