@@ -19,6 +19,7 @@ spoofed User-Agent — belongs on the individual request, not on the client, so
 nothing here is baked in beyond a conservative default timeout.
 """
 
+import time
 from typing import NamedTuple, Optional
 
 import httpx
@@ -107,16 +108,30 @@ class CappedBody(NamedTuple):
     content: Optional[bytes]
 
 
+#: The whole of one `get_capped` body, as `streaming.DOWNLOAD_SECONDS` is of a download.
+#: `timeout` is per read, so a host sending a chunk every few seconds held the caller -- and,
+#: for the classifier's avatar, `pending_classifications` -- for as long as it liked.
+CAPPED_SECONDS = 60.0
+
+
+class CappedTooSlow(Exception):
+    """A `get_capped` body still arriving at its deadline. Raised, not cut short: every
+    caller already treats a body it could not read as one it does not have."""
+
+
 async def get_capped(client: httpx.AsyncClient, url: str, max_bytes: int, *, timeout,
-                     headers: Optional[dict] = None, truncate: bool = False) -> CappedBody:
+                     headers: Optional[dict] = None, truncate: bool = False,
+                     deadline: Optional[float] = None) -> CappedBody:
     """GETs `url`, holding no more than `max_bytes` of its body.
 
     `(await client.get(url)).content` has buffered the whole body before any size test can
     run, so a limit checked afterwards bounds nothing: an avatar URL can serve a gigabyte.
     The body is read in chunks and the read stops at the cap. Past it `content` is None, or
     with `truncate` the first `max_bytes`. A stated Content-Length over the cap is refused
-    before a byte is read, and a body under any status but 200 is not read at all.
+    before a byte is read, and a body under any status but 200 is not read at all. A body
+    still arriving after `deadline` seconds (CAPPED_SECONDS) raises `CappedTooSlow`.
     """
+    ends = time.monotonic() + (CAPPED_SECONDS if deadline is None else deadline)
     async with client.stream("GET", url, follow_redirects=True, timeout=timeout,
                              headers=headers) as response:
         if response.status_code != 200:
@@ -132,4 +147,8 @@ async def get_capped(client: httpx.AsyncClient, url: str, max_bytes: int, *, tim
                 if not truncate:
                     return CappedBody(response.status_code, response.headers, None)
                 break
+            # Per chunk, not wait_for: README still promises 3.10, and a stall between
+            # chunks is the per-read timeout's to catch.
+            if time.monotonic() > ends:
+                raise CappedTooSlow(f"still reading after {CAPPED_SECONDS if deadline is None else deadline:.0f}s")
         return CappedBody(response.status_code, response.headers, b"".join(chunks)[:max_bytes])

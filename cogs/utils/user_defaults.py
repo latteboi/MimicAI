@@ -416,7 +416,6 @@ SETTING_LABELS = {
     "show_fallback_indicator": "Fallback Indicator",
     "openrouter_service_tier": "OpenRouter Service Tier",
     "openrouter_endpoints": "OpenRouter Host Pins",
-    "child_bot_placeholder": "Child Bot Placeholder",
     "ollama_host_url": "Ollama Host URL",
 }
 

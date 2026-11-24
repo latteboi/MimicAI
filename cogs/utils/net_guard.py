@@ -35,6 +35,14 @@ import httpx
 #: Hops allowed before a redirect chain is treated as hostile.
 MAX_REDIRECTS = 5
 
+#: How long one name may take to resolve. A resolver's own timeout is several seconds a try.
+DNS_SECONDS = 5.0
+
+#: Asked of every server, and a body sent compressed anyway is refused unread. httpx
+#: decodes a whole network chunk before any caller's byte cap sees it: 8 KB of zstd came
+#: out as 768 MiB, an OOM kill on the 1 GB host. `tests/test_attachment_limits.py`.
+_IDENTITY = {"Accept-Encoding": "identity"}
+
 
 class UnsafeURL(Exception):
     """A URL that resolves somewhere the bot must not fetch from."""
@@ -61,12 +69,18 @@ async def assert_public_url(url: str) -> None:
     try:
         addresses = [ipaddress.ip_address(host)]
     except ValueError:
-        # getaddrinfo blocks. On 0.25 vCPU a stalled resolver is a stalled
-        # heartbeat, so it goes to a thread like every other blocking call here.
+        # The loop's own resolver, never `to_thread`: that is the default executor, two
+        # workers (BotManager) which every session flush, profile read and lock refresh
+        # shares, and a name whose nameserver never answers held one for the resolver's
+        # whole timeout -- three links in one round held both. Under uvloop this runs on
+        # libuv's pool instead, and the bound stops the wait as well. `tests/test_net_guard.py`.
+        # ponytail: plain asyncio (MIMIC_UVLOOP=0) still uses that executor, so there the
+        # bound frees the caller and not the thread; a dedicated DNS executor if that is ever prod.
         try:
-            infos = await asyncio.to_thread(
-                socket.getaddrinfo, host, port, 0, socket.SOCK_STREAM)
-        except (socket.gaierror, UnicodeError):
+            infos = await asyncio.wait_for(
+                asyncio.get_running_loop().getaddrinfo(host, port, type=socket.SOCK_STREAM),
+                DNS_SECONDS)
+        except (socket.gaierror, UnicodeError, asyncio.TimeoutError):
             raise UnsafeURL("host does not resolve")
         addresses = [ipaddress.ip_address(info[4][0]) for info in infos]
 
@@ -92,12 +106,14 @@ async def safe_stream(client: httpx.AsyncClient, method: str, url: str, *,
     for _ in range(max_redirects + 1):
         await assert_public_url(url)
         async with client.stream(method, url, follow_redirects=False,
-                                 timeout=timeout) as response:
+                                 timeout=timeout, headers=_IDENTITY) as response:
             if response.has_redirect_location:
                 # Relative Locations are legal and common, so join against the URL
                 # actually requested rather than trusting the header alone.
                 url = urljoin(str(response.url), response.headers["location"])
                 continue
+            if response.headers.get("content-encoding", "").strip().lower() not in ("", "identity"):
+                raise httpx.DecodingError("compressed response refused", request=response.request)
             yield response
             return
     raise UnsafeURL("too many redirects")

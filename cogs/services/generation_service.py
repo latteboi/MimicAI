@@ -24,7 +24,8 @@ from ..utils.constants import (
     DEFAULT_SPEECH_VOICE, TTS_SYNTHESIS_PREAMBLE, CRITIC_AUDIT_TEXT_MAX,
     LOG_TRIM_TARGET, LOG_TRIM_HIGH_WATER,
     PLACEMENT_REFUSALS,
-    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE, UNASSIGNED_KEY_NOTICE,
+    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, STATUS_THINKING, STATUS_READING,
+    STATUS_REMEMBERING, STATUS_SPEAKING, NO_KEY_NOTICE_FLAG, NO_SERVER_KEY_NOTICE, UNASSIGNED_KEY_NOTICE,
     ROUND_URL_MESSAGES_MAX, ROUND_URLS_SKIPPED_NOTE, SPEAK_AGAIN_EMOJI,
 )
 from ..utils.constants import SAFETY_SETTINGS
@@ -1042,7 +1043,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             isinstance(initial_trigger, tuple)
                             and initial_trigger[0] in ('reply', 'child_mention')):
                         queue = session['task_queue']
-                        await self._settle_round(session)
+                        await self._await_with_status(
+                            self._settle_round(session), STATUS_THINKING,
+                            channel, first_participant, pending_state_container)
                         while not queue.empty():
                             all_triggers_for_round.append(queue.get_nowait())
                         all_triggers_for_round = self.cog.session_manager.withdraw_cancelled_triggers(
@@ -1095,8 +1098,12 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 # Bounded, and proceeds anyway on timeout -- a leaked is_whispering must
                 # degrade to "the round runs late", never to a channel that stops answering.
                 if session.get('is_whispering'):
-                    if not await self.cog.session_manager._wait_for_session_flags(
-                        session, ('is_whispering',), WHISPER_BUSY_WAIT_TIMEOUT_SECONDS
+                    # Thinking, not named: a whisper is private, and naming the wait
+                    # would tell the channel one is under way.
+                    if not await self._await_with_status(
+                        self.cog.session_manager._wait_for_session_flags(
+                            session, ('is_whispering',), WHISPER_BUSY_WAIT_TIMEOUT_SECONDS),
+                        STATUS_THINKING, channel, profile_order[0], pending_state_container,
                     ):
                         print(f"Whisper barrier timed out in channel {channel_id}; proceeding with the round.")
 
@@ -1187,18 +1194,16 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     for fetch in pending_url_fetches:
                         url_tasks.append(self.cog.tools_service._process_urls_in_content(fetch["content"], fetch["guild_id"], {"url_fetching_enabled": True}))
 
-                # Gather Grounding and URL tasks to run concurrently
-                tasks_to_gather = []
-                if grounding_task:
-                    tasks_to_gather.append(self._await_with_status(
-                        grounding_task, STATUS_SEARCHING_WEB, channel,
-                        first_participant, pending_state_container))
-                for ut in url_tasks:
-                    tasks_to_gather.append(ut)
+                # Gather Grounding and URL tasks to run concurrently, under one status: two
+                # would take turns rewriting the same placeholder. The search names it.
+                tasks_to_gather = ([grounding_task] if grounding_task else []) + url_tasks
 
                 gathered_results = []
                 if tasks_to_gather:
-                    gathered_results = await asyncio.gather(*tasks_to_gather)
+                    gathered_results = await self._await_with_status(
+                        asyncio.gather(*tasks_to_gather),
+                        STATUS_SEARCHING_WEB if grounding_task else STATUS_READING,
+                        channel, first_participant, pending_state_container)
 
                 grounding_result = None
                 if grounding_task:
@@ -1517,19 +1522,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
             t1_start_mono = time.monotonic()
             self.cog.session_manager._mark_session_accessed(channel_id)
             participant_key = (participant['owner_id'], participant['profile_name'])
-            
-            if participant.get('method') == 'child_bot':
-                p_owner_id_typing = participant['owner_id']
-                p_name_typing = participant['profile_name']
-                p_index_typing = self.cog.profile_manager._get_user_index(p_owner_id_typing)
-                p_is_b_typing = p_name_typing in p_index_typing.get("borrowed", [])
-                p_settings_typing = self.cog.profile_manager._get_profile_config(p_owner_id_typing, p_name_typing, p_is_b_typing) or {}
-                
-                if not p_settings_typing.get("child_bot_placeholder", False):
-                    await self.cog.manager_queue.put({
-                        "action": "send_to_child", "bot_id": participant['bot_id'],
-                        "payload": {"action": "start_typing", "channel_id": channel_id}
-                    })
 
             owner_id = participant['owner_id']
             profile_name = participant['profile_name']
@@ -1661,8 +1653,10 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                 
                 tasks_to_gather = [ltm_task, training_task]
                 if help_task: tasks_to_gather.append(help_task)
-                    
-                gathered_results = await asyncio.gather(*tasks_to_gather)
+
+                gathered_results = await self._await_with_status(
+                    asyncio.gather(*tasks_to_gather), STATUS_REMEMBERING,
+                    channel, participant, state_container)
                 ltm_recall = gathered_results[0]
                 training_examples_list = gathered_results[1]
                 help_context_text = gathered_results[2] if help_task else None
@@ -1702,10 +1696,11 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                         # _run_critic scans recent role=='model' turns; contents_for_api_call is
                         # already the unified_log-derived history for this participant.
-                        critic_constraints, critic_source = await self.cog.tools_service._run_critic(
-                            contents_for_api_call, speaker_display_name, channel.guild.id,
-                            session, session_transcript=session_transcript,
-                        )
+                        critic_constraints, critic_source = await self._await_with_status(
+                            self.cog.tools_service._run_critic(
+                                contents_for_api_call, speaker_display_name, channel.guild.id,
+                                session, session_transcript=session_transcript),
+                            STATUS_THINKING, channel, participant, state_container)
                         if critic_constraints and critic_settings["persistence"] > 0:
                             session["critic_cache"][participant_key] = {
                                 "text": critic_constraints,
@@ -2051,7 +2046,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     # round trip reads as "Sending..." for half a minute, which is
                     # both wrong and the least informative thing it could say.
                     if state_container:
-                        state_container['phase_label'] = "Synthesising speech"
+                        state_container['phase_label'] = STATUS_SPEAKING
                     try:
                         turn_audio_path = await self.cog.media_service.synthesise_speech(
                             response_text,
@@ -2366,15 +2361,6 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                 # Pipelined visual feedback for next participant
                 next_p = rnd.profile_order[i + 1]
-                if next_p.get('method') == 'child_bot':
-                    next_p_index = self.cog.profile_manager._get_user_index(next_p['owner_id'])
-                    next_p_is_b = next_p['profile_name'] in next_p_index.get("borrowed", [])
-                    next_p_settings = self.cog.profile_manager._get_profile_config(next_p['owner_id'], next_p['profile_name'], next_p_is_b) or {}
-                    if not next_p_settings.get("child_bot_placeholder", False):
-                        await self.cog.manager_queue.put({
-                            "action": "send_to_child", "bot_id": next_p['bot_id'],
-                            "payload": {"action": "start_typing", "channel_id": channel_id}
-                        })
 
                 # Yield briefly to ensure Discord orders messages correctly
                 await asyncio.sleep(0.2)
@@ -2389,7 +2375,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
 
                 # Someone who began typing while this seat was writing is waited
                 # for behind the next placeholder, as the round's opening is.
-                await self._settle_round(session, handoff=True)
+                await self._await_with_status(
+                    self._settle_round(session, handoff=True), STATUS_THINKING,
+                    channel, next_p, rnd.pending_state_container)
 
                 while not session['task_queue'].empty():
                     try: batched_triggers.append(session['task_queue'].get_nowait())
@@ -2439,7 +2427,9 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                             if any_url_enabled_batch and batch_index in opened:
                                 # The message's own text, not the quoted reply folded into
                                 # `content` above -- see _collect_round_triggers.
-                                url_text_list, url_media, _ = await self.cog.tools_service._process_urls_in_content(msg.typed, msg.guild_id, {"url_fetching_enabled": True}, warning_channel=channel)
+                                url_text_list, url_media, _ = await self._await_with_status(
+                                    self.cog.tools_service._process_urls_in_content(msg.typed, msg.guild_id, {"url_fetching_enabled": True}, warning_channel=channel),
+                                    STATUS_READING, channel, next_p, rnd.pending_state_container)
                                 if url_text_list: url_text_batch = "\n".join(url_text_list)
                                 url_media_batch = url_media
 

@@ -1,5 +1,6 @@
 import re
 import collections
+import time
 from html.parser import HTMLParser
 import asyncio
 import httpx
@@ -9,7 +10,7 @@ from typing import List, Dict, Any, Optional, Tuple
 from ..utils.constants import (
     GREEDY_SAMPLING,
     MAX_GROUNDING_SUMMARY_CHARACTERS, MAX_URL_CONTEXT_CHARACTERS,
-    MAX_URL_FETCH_BYTES, WARN_URL_FETCHING_FAILED,
+    MAX_URL_FETCH_BYTES, WARN_URL_FETCHING_FAILED, SYSTEM_XML_TAGS,
     WARN_GROUNDING_FAILED, DEFAULT_WEB_GROUNDING_VISUAL,
     DEFAULT_WEB_GROUNDING_TEXT, DEFAULT_WEB_SEARCH_RESEARCH,
     DEFAULT_GROUNDING_RAG_PAYLOAD,
@@ -131,6 +132,16 @@ _BLOCK_TAGS = frozenset((
 _CELL_TAGS = frozenset(("td", "th"))
 _WORD_SPLIT = re.compile(r"[^a-z0-9]+")
 _WHITESPACE = re.compile(r"\s+")
+#: A page sits inside our <document_context> and its entities decode to real brackets, so
+#: its own `</document_context>` ended the block early -- in the prompt, and in the LTM and
+#: grounding filters, which read the rest as speech. Only the `<` is dropped, with no scan for
+#: a `>`: far cheaper than PATTERN_SYSTEM_XML_ORPHANS on a hostile 512 KB page, and one regex
+#: call holds the GIL, so the loop waits on it whichever thread it runs in.
+_SYSTEM_TAG_OPEN = re.compile(rf"<(?=/?(?:{'|'.join(SYSTEM_XML_TAGS)})\b)", re.IGNORECASE)
+#: How long a page may take to reduce to text, checked by the parser as it goes. A
+#: `wait_for` around `to_thread` stops waiting, not parsing: html.parser rescans an unclosed
+#: tag to the end, and 512 KB of `<a` held one of the two I/O workers (BotManager) 265 s.
+PAGE_TEXT_SECONDS = 3.0
 
 
 class _PageText(HTMLParser):
@@ -138,8 +149,9 @@ class _PageText(HTMLParser):
     anything marked as chrome, and everything -- so `page_text` can take the best that
     is not empty. Each open element is a frame of flags its children inherit."""
 
-    def __init__(self):
+    def __init__(self, deadline: float):
         super().__init__(convert_charrefs=True)
+        self._deadline = deadline
         # (tag, never, skip, main, pre). The root frame stands in for the document.
         self._stack = [("", False, False, False, False)]
         # How many of each tag are open, so a stray end tag is refused without walking
@@ -192,6 +204,9 @@ class _PageText(HTMLParser):
             self._break("\n")
 
     def handle_data(self, data):
+        # Every rescan of an unparseable `<` ends here, so this is where a slow page stops.
+        if time.monotonic() > self._deadline:
+            raise TimeoutError("page took too long to parse")
         _, never, skip, main, pre = self._stack[-1]
         if never:
             return
@@ -203,21 +218,51 @@ class _PageText(HTMLParser):
                 self.main.append(text)
 
 
-def page_text(markup: str) -> str:
+def page_text(markup: str, seconds: float = PAGE_TEXT_SECONDS) -> str:
     """A linked page's readable text, one line per block.
 
     The article when the page marks one (<article>, <main>, role="main", WordPress's
     `hentry`); otherwise everything not marked as chrome; and only if that leaves
     nothing -- a wrapper mistaken for chrome -- the whole page, as the regex scrub gave.
+    Raises TimeoutError past `seconds`.
     """
-    parser = _PageText()
+    parser = _PageText(time.monotonic() + seconds)
     parser.feed(markup)
     parser.close()
     for pieces in (parser.main, parser.kept, parser.raw):
-        text = "\n".join(line.strip() for line in "".join(pieces).splitlines() if line.strip())
+        joined = _SYSTEM_TAG_OPEN.sub("", "".join(pieces))
+        text = "\n".join(line.strip() for line in joined.splitlines() if line.strip())
         if text:
             return text
     return ""
+
+
+#: The whole fetch of one link, redirects included. httpx's own timeout restarts with every
+#: chunk, so a server trickling a byte every few seconds held the round open indefinitely.
+URL_FETCH_SECONDS = 15.0
+
+
+async def _fetch_page(client: httpx.AsyncClient, url: str) -> Tuple[str, Optional[str]]:
+    """One GET, typed by its own headers: (content type, markup if it is HTML, else None).
+
+    A HEAD first lost the page wherever a server refuses HEAD but serves GET (403/405/501,
+    common behind bot managers).
+    """
+    async with safe_stream(client, "GET", url, timeout=10.0) as response:
+        response.raise_for_status()
+        content_type = response.headers.get('content-type', '').lower()
+        if 'text/html' not in content_type:
+            return content_type, None
+        # Streamed with a hard byte cap. Reading .text on an unbounded body made peak RSS
+        # a function of whatever page the user linked.
+        chunks, total = [], 0
+        async for chunk in response.aiter_bytes(65536):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= MAX_URL_FETCH_BYTES:
+                break
+        encoding = response.encoding or 'utf-8'
+        return content_type, b"".join(chunks)[:MAX_URL_FETCH_BYTES].decode(encoding, errors='replace')
 
 
 class ToolsService:
@@ -343,37 +388,20 @@ class ToolsService:
                 if not url.startswith(('http://', 'https://')):
                     url = 'http://' + url
 
-                # One GET, typed by its own headers; only an HTML body is read. A HEAD
-                # first lost the page wherever a server refuses HEAD but serves GET
-                # (403/405/501, common behind bot managers).
-                async with safe_stream(client, "GET", url, timeout=10.0) as response:
-                    response.raise_for_status()
-                    content_type = response.headers.get('content-type', '').lower()
-                    is_html = 'text/html' in content_type
-                    if is_html:
-                        # Streamed with a hard byte cap. Reading .text on an unbounded body
-                        # made peak RSS a function of whatever page the user linked.
-                        chunks, total = [], 0
-                        async for chunk in response.aiter_bytes(65536):
-                            chunks.append(chunk)
-                            total += len(chunk)
-                            if total >= MAX_URL_FETCH_BYTES:
-                                break
-                        encoding = response.encoding or 'utf-8'
-                        page_content = b"".join(chunks)[:MAX_URL_FETCH_BYTES].decode(encoding, errors='replace')
-                        del chunks
+                # wait_for, not asyncio.timeout: README still promises Python 3.10.
+                content_type, page_content = await asyncio.wait_for(
+                    _fetch_page(client, url), URL_FETCH_SECONDS)
 
                 # Strictly handle images and text
                 if content_type.startswith('image/'):
                     # Tagged so a profile with URL Context off is not sent it: `_round_media`.
                     media_parts.append({"url": url, "mime_type": content_type, "from_link": True})
 
-                elif is_html:
+                elif page_content is not None:
                     try:
-                        # Offloaded to a worker thread (parsing a full page body is CPU-bound);
-                        # signal.alarm-based Timeout can't be used off the main thread, so the timeout is
-                        # enforced here via wait_for instead.
-                        clean_content = await asyncio.wait_for(asyncio.to_thread(page_text, page_content), timeout=3.0)
+                        # CPU-bound, so off the loop. page_text stops itself at its deadline:
+                        # a wait_for here would stop waiting and leave the thread parsing.
+                        clean_content = await asyncio.to_thread(page_text, page_content)
                         truncated_content = _truncate_text_by_char(clean_content, MAX_URL_CONTEXT_CHARACTERS)
                         url_context = f"Source URL: {url}\nExtracted Content:\n{truncated_content}"
                         text_contexts.append(url_context)
@@ -386,6 +414,9 @@ class ToolsService:
                 # distinguishing "refused" from "timed out" would tell whoever
                 # posted the link which internal hosts exist.
                 warnings.append(WARN_URL_FETCHING_FAILED.format(reason="destination not permitted"))
+            except asyncio.TimeoutError:
+                # Not the builtin before 3.11. _format_api_error reads it as a model's timeout.
+                warnings.append(WARN_URL_FETCHING_FAILED.format(reason="the site took too long to answer"))
             except httpx.HTTPStatusError as e:
                 # The site answered with an error. Its status is the whole story -- the link
                 # is the one they just posted -- and _format_api_error reads statuses as a

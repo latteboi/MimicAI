@@ -218,19 +218,22 @@ class RegenerationMixin:
                 pass
 
             # Visual feedback before the context gathering.
+            placeholder_at = time.monotonic()
             if participant.get('method') == 'child_bot':
                 child_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(bot_id, custom_emoji)
                 await self.cog.manager_queue.put({
                     "action": "send_to_child", "bot_id": bot_id,
                     "payload": {
                         "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": payload.message_id, "content": child_emoji, "signer": None
+                        "message_id": payload.message_id, "content": self._placeholder(child_emoji),
+                        "signer": None
                     }
                 })
             else:
                 try:
                     await self.cog.server_manager.run_webhook(
-                        channel, "edit_message", payload.message_id, content=custom_emoji,
+                        channel, "edit_message", payload.message_id,
+                        content=self._placeholder(custom_emoji),
                         signer=None, attachments=original_attachments)
                 except Exception: pass
 
@@ -335,6 +338,7 @@ class RegenerationMixin:
                 # _abandon_state_container must never delete it -- this path puts the
                 # original text back instead, through _restore_regenerated_message.
                 'placeholder_owned': False,
+                'started': placeholder_at,
             }
             # Published so /cancel can tell "still generating, safe to undo" from
             # "applying, too late". Released in the finally.
@@ -352,9 +356,8 @@ class RegenerationMixin:
                 functions=functions)
 
             # The post-generation phase, as the worker and global chat both run it, so the
-            # message does not sit frozen on the last "Still generating" tick through the
+            # message does not sit frozen on the last "Thinking" tick through the
             # rest of this.
-            state_container['phase_label'] = "Applying"
             await self._update_sending_placeholder(
                 channel, participant.get('method', 'webhook'), bot_id, state_container, time.monotonic())
 

@@ -839,14 +839,15 @@ def build_speak_placeholder_embed(cog: 'MimicCog', ctx: Dict[str, Any], source_t
     """The waiting state of the preview card, built here so it is the same card.
 
     `_generate_with_heartbeat` rewrites `description` in place every ten seconds, so
-    the emoji is the whole description and everything else is the frame the finished
+    the placeholder is the whole description and everything else is the frame the finished
     take will keep: the author watches one embed fill in rather than a spinner that
     says nothing about whether the model is still alive.
     """
     name, avatar = cog.generation_service._resolve_appearance_data(
         ctx["effective_owner_id"], ctx["effective_profile_name"])
     embed = discord.Embed(
-        description=ctx.get("placeholder_emoji") or PLACEHOLDER_EMOJI,
+        description=cog.generation_service._placeholder(
+            ctx.get("placeholder_emoji") or PLACEHOLDER_EMOJI),
         color=discord.Color.dark_grey())
     embed.set_author(name=name, icon_url=avatar)
     embed.add_field(name="Your line", value=source_text[:1024], inline=False)
@@ -3455,6 +3456,9 @@ class SessionAuditView(BlockedGuard, ui.View):
             # `😂 ×2 · :partyblob:`: a reaction turn has no content, only its entries.
             content = " · ".join(f"{emoji} ×{len(names)}" if len(names) > 1 else emoji
                                  for _, emoji, names, *_ in turn.get("reactions") or ())
+        # The preview is 15 characters, and each pattern below scans to the end per tag it
+        # cannot close -- quadratic, on the loop, over a turn that may hold a 40 KB file.
+        content = content[:2000]
         if self._system_kind(turn):
             # A note is its tags' contents, so only the tags go.
             content = re.sub(r"</?[^>]+>", "", content).replace("Director's Note:", "")

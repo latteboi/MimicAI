@@ -22,7 +22,7 @@ from ...utils.constants import (
     WARN_BOTH_MODELS_FAILED, WARN_FALLBACK_MODEL_FAILED,
     WARN_FALLBACK_USED, WARN_MAIN_MODEL_FAILED, WARN_MEDIA_DESCRIBED, WARN_MEDIA_UNREADABLE,
 )
-from ...utils.constants import SAFETY_SETTINGS
+from ...utils.constants import SAFETY_SETTINGS, STATUS_THINKING
 from ...utils.helpers import (
     _add_inline_citations, _format_api_error, _scrub_response_text,
     clean_model_name, expand_server_emojis, is_real_model, media_kinds, record_billed_usage,
@@ -355,6 +355,11 @@ class ReplyMixin:
             safety_settings=safety_settings,
             channel_id=getattr(channel, "id", None))
 
+        def ticking(label, awaitable, quiet=False):
+            """`awaitable`, with the placeholder ticking under `label` -- unless `quiet`."""
+            return self._await_with_status(awaitable, label, channel, participant,
+                                           None if quiet else state_container)
+
         async def generate(run: _Run, contents: Optional[List] = None,
                            slow_after: Optional[float] = None, on_slow=None):
             # `history` is the caller's and is reused by the fallback attempt, which must
@@ -370,8 +375,13 @@ class ReplyMixin:
                     raise ValueError("Response blocked or empty")
                 return run.response
 
-            run.looped = await tool_loop.run(self.cog, run.model, history if contents is None else contents,
-                                              gen_config, fn_ctx, send)
+            # A primary being raced leaves the placeholder to the fallback, as it does
+            # while generating.
+            run.looped = await tool_loop.run(
+                self.cog, run.model, history if contents is None else contents,
+                gen_config, fn_ctx, send,
+                step=lambda label, lookups: ticking(label, lookups, quiet=not run.is_fallback and bool(
+                    (state_container or {}).get('fallback_racing'))))
             text = getattr(run.response, 'text', "").strip()
             if private:
                 text = _PRIVATE_WRAPPERS.sub('', text)
@@ -527,7 +537,7 @@ class ReplyMixin:
                     await self._retry_without_media(
                         attempt, generate_once, blind_model, history, p_settings=p_settings,
                         channel=channel, owner_id=owner_id, user_id=user_id,
-                        is_fallback=blind_model is not attempt.primary)
+                        is_fallback=blind_model is not attempt.primary, ticking=ticking)
         finally:
             # A run still going is the loser of a race, or this turn is being cancelled.
             losers = [r.task for r in (primary, fallback)
@@ -547,7 +557,7 @@ class ReplyMixin:
 
     async def _retry_without_media(self, attempt: ReplyAttempt, generate, model, history: List,
                                    *, p_settings: Dict, channel, owner_id: int, user_id: int,
-                                   is_fallback: bool) -> None:
+                                   is_fallback: bool, ticking=None) -> None:
         """Run the turn again with the attachments taken out, and say so in their place.
 
         The reply used to be abandoned here: the profile posted its `error_response` and
@@ -573,9 +583,12 @@ class ReplyMixin:
         parts: List[Any] = [MEDIA_UNREADABLE_NOTE.format(kinds=kinds)]
         described_by = None
         if resolve_unreadable_media_mode(p_settings) == "simulated":
-            description, describer = await self._describe_media(
+            describing = self._describe_media(
                 media, channel=channel, p_settings=p_settings, owner_id=owner_id,
                 user_id=user_id, meta=attempt.extra_meta)
+            # Thinking, not named: a model being shown the file is the bot's business.
+            description, describer = await (ticking(STATUS_THINKING, describing)
+                                             if ticking else describing)
             if description:
                 described_by = describer
                 parts = [MEDIA_DESCRIBED_NOTE.format(kinds=kinds),

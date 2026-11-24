@@ -289,9 +289,8 @@ class MimicCog(EventListeners, commands.Cog):
         self.borrow_index: Dict[str, Dict[str, List[str]]] = {}
         self.borrow_index_inverse: Dict[str, Dict[str, str]] = {}
         self.borrows._load_borrow_index()
-        # Before the gateway, so no turn reads or writes a memory while files move.
+        # Before the gateway, so no turn reads an entry before its baseline is set.
         self.memory_manager.load_embedding_baseline()
-        self.memory_manager.migrate_ltm_files()
         # Sweep tombstones once at boot. Deletion normally cascades, so a survivor
         # here came from a crash mid-delete or an older build; left alone it renders
         # in the hub as an unborrowable "Unknown" entry forever. A listing whose rating

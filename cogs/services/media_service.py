@@ -273,15 +273,13 @@ class MediaService:
                          p_is_b = package['effective_profile_name'] in p_index.get("borrowed", [])
                          p_settings = self.cog.profile_manager._get_profile_config(package['effective_profile_owner_id'], package['effective_profile_name'], p_is_b) or {}
 
-                         if p_settings.get("child_bot_placeholder", False):
-                             custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-                             msg_id = await self.cog.generation_service._send_child_bot_placeholder(package['bot_id'], channel.id, custom_emoji)
-                             if msg_id:
-                                 try: placeholder_message = await channel.fetch_message(msg_id)
-                                 except: pass
-                         else:
-                             # Typing was already started for non-ref images. For ref-images, start it now.
-                             await self.cog.manager_queue.put({"action": "send_to_child", "bot_id": package['bot_id'], "payload": {"action": "start_typing", "channel_id": channel.id}})
+                         custom_emoji = p_settings.get("placeholder_emoji") or PLACEHOLDER_EMOJI
+                         msg_id = await self.cog.generation_service._send_child_bot_placeholder(package['bot_id'], channel.id, custom_emoji)
+                         if msg_id:
+                             try: placeholder_message = await channel.fetch_message(msg_id)
+                             except: pass
+                         # After the post, which ended any typing already running.
+                         await self.cog.child_bot_manager.execute_typing(package['bot_id'], {"channel_id": channel.id})
 
                     try:
                         # --- Just-in-Time Generation for Reference Images ---

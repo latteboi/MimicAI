@@ -488,47 +488,6 @@ class StorageManager:
         if path:
             _delete_file_shard(path)
 
-    def _purge_legacy_default_profile(self):
-        users_path = pathlib.Path(self.cog.USERS_DIR)
-        if not users_path.exists(): return
-
-        for user_dir in users_path.iterdir():
-            if not user_dir.is_dir() or not user_dir.name.isdigit(): continue
-
-            profiles_dir = user_dir / "profiles"
-            if profiles_dir.exists():
-                for p_dir in list(profiles_dir.iterdir()):
-                    if p_dir.is_dir() and p_dir.name.lower() == "mimic":
-                        shutil.rmtree(str(p_dir), ignore_errors=True)
-
-            index_path = user_dir / "index.json"
-            if index_path.exists():
-                index = IOManager.read_json(str(index_path))
-                if index:
-                    changed = False
-                    for key in ["personal", "borrowed"]:
-                        mapping = index.get(key, {})
-                        to_remove = []
-                        if isinstance(mapping, dict):
-                            for k, v in mapping.items():
-                                if k.lower() == "mimic":
-                                    to_remove.append(k)
-                            for k in to_remove:
-                                pid = mapping.pop(k)
-                                changed = True
-                                shutil.rmtree(str(profiles_dir / pid), ignore_errors=True)
-                        elif isinstance(mapping, list):
-                            new_mapping = []
-                            for k in mapping:
-                                if k.lower() == "mimic":
-                                    changed = True
-                                else:
-                                    new_mapping.append(k)
-                            index[key] = new_mapping
-
-                    if changed:
-                        IOManager.write_json(index, str(index_path))
-
     def _get_user_keys_data(self, user_id: int) -> Dict[str, Any]:
         path = os.path.join(self.cog.USERS_DIR, str(user_id), "keys.json.gz")
         if not os.path.exists(path):

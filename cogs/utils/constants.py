@@ -2451,13 +2451,20 @@ CAST_POLICIES = (
 
 CAST_POLICY_LABELS = {value: label for value, label, _desc, _emoji in CAST_POLICIES}
 
-# What a placeholder says during a slow step that is not writing a reply. Three only:
-# each is the bot narrating itself mid-scene, so only the waits a person would wonder
-# about are named.
-STATUS_SEARCHING_WEB = "Searching the web"
-
-STATUS_IMAGINING_IMAGE = "Imagining image"
-STATUS_QUEUED = "Queued ({position} of {waiting})"
+# What a placeholder says under its emoji (`_placeholder`), posted under the character's
+# name: each reads as "<character> is ...". Only what the character could be doing in the
+# scene is named, in words that fit any setting; the bot's own machinery -- fallbacks, the
+# critic, retries, a file being described -- reads as Thinking, every turn's first line.
+# The queue is the one exception: a wait nothing in the scene explains.
+STATUS_THINKING = "Thinking"
+STATUS_SEARCHING_WEB = "Looking it up"
+STATUS_REMEMBERING = "Remembering"
+STATUS_READING = "Reading"
+STATUS_IMAGINING_IMAGE = "Drawing"
+STATUS_SPEAKING = "Speaking"
+STATUS_QUEUED = "Waiting ({position} of {waiting})"
+# How often a placeholder's status line is rewritten, on the turn's clock.
+HEARTBEAT_SECONDS = 5
 
 # Model calls in flight at once, bot-wide -- see services/generation/gate. Past this a
 # reply waits its turn in order, rather than every reply in a busy minute starting at
@@ -3654,7 +3661,7 @@ def cooldown_unless_refused(rate: int, per: float, refused):
 #: `_scrub_response_text` and reaches the user -- see ARCHITECTURE.md.
 #:
 #: The persona sub-tags are nested inside `<persona_profile>`, so a model echoing the
-#: whole block was already caught by PATTERN_SYSTEM_XML_BLOCKS; what leaked was a bare
+#: whole block was already caught by strip_tag_blocks; what leaked was a bare
 #: `<backstory>...</backstory>` with nothing for that pattern to anchor on.
 #: `_scrub_response_text` runs on model output alone, so listing ordinary words here
 #: strips nothing a user wrote.
@@ -3692,10 +3699,13 @@ SYSTEM_XML_TAGS = [
 
 _tags_pattern = "|".join(SYSTEM_XML_TAGS)
 #: An opening tag may carry attributes: `<reply_context to='Name #1'>` is emitted with one,
-#: and a model copying it matched neither pattern, so the tag reached the channel.
-PATTERN_SYSTEM_XML_BLOCKS = re.compile(rf'<({_tags_pattern})(?:\s[^>]*)?>.*?</\1>', flags=re.DOTALL | re.IGNORECASE)
-PATTERN_SYSTEM_XML_ORPHANS = re.compile(rf'</?({_tags_pattern})(?:\s[^>]*)?>', flags=re.IGNORECASE)
-PATTERN_REASONING_BLOCKS = re.compile(r'<(think|thought|reasoning)>.*?</\1>', flags=re.DOTALL | re.IGNORECASE)
+#: and a model copying it matched neither pattern, so the tag reached the channel. Capped at
+#: 256: run to the next `>`, each `<tag ` with none rescanned the rest (134 s on 512 KB).
+#: A block is taken by `helpers.strip_tag_blocks` from its opening tag, never by a
+#: `<tag>.*?</tag>` regex: that scans to the end for every opening tag with no close.
+PATTERN_SYSTEM_XML_OPEN = re.compile(rf'<({_tags_pattern})(?:\s[^>]{{0,256}})?>', flags=re.IGNORECASE)
+PATTERN_SYSTEM_XML_ORPHANS = re.compile(rf'</?({_tags_pattern})(?:\s[^>]{{0,256}})?>', flags=re.IGNORECASE)
+PATTERN_REASONING_OPEN = re.compile(r'<(think|thought|reasoning)>', flags=re.IGNORECASE)
 PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=re.IGNORECASE)
 #: The colon is optional only where the header ends its line: a model copying the header
 #: sometimes drops it, and the ID and time then reached the channel.
@@ -3705,8 +3715,22 @@ PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=r
 #: only a line shaped like a header is taken. The timestamp form wants an `hh:mm` inside its
 #: brackets: "Notes [Mon 5pm]: bring cookies" is a sentence, and lost its opening to the
 #: looser test.
-PATTERN_SYSTEM_HEADER = re.compile(r'(?i)(?:^|\n)(?:\[#\d+\][ \t]*)?(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\]){0,3}(?::\s*|[ \t]*(?:\r?\n|$))')
-PATTERN_TIMESTAMP_HEADER = re.compile(r'(?i)(?:^|\n)(?:\[#\d+\][ \t]*)?(?:<[^>\r\n]+>|[^[\r\n]+)?\s*\[(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]*\d{1,2}:\d{2}[^\]\r\n]*\](?:\s*\[#\d+\])?:\s*')
+#:
+#: These run on user text with no timeout (`strip_history_envelope`), so no run may be split
+#: two ways. `(?=(x))\N` is an atomic group (3.10 has no `++`): the name, the whitespace and
+#: the timestamp bracket each end at the same `[`, `]` or line end however they are split.
+#: Overlapping, `[#1]` and 4,000 spaces took 24 s (cubic). A newline opening a blank line is no
+#: start: the next one finds the same header, without rescanning the run from each.
+#: `tests/test_scrub_cost.py` holds both to the patterns they replaced.
+_HEADER_LEAD = (r'(?i)(?:^|\n(?![ \t]*\r?\n))'
+                r'(?:\[#\d+\][ \t]*<[^>\r\n]+>|<[^>\r\n]+>|(?:\[#\d+\])?(?=([^[\r\n]*))\1)'
+                r'(?=(\s*))\2\[')
+PATTERN_SYSTEM_HEADER = re.compile(
+    _HEADER_LEAD + r'ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\]){0,3}(?::\s*|[ \t]*(?:\r?\n|$))')
+PATTERN_TIMESTAMP_HEADER = re.compile(
+    _HEADER_LEAD + r'(?=[^\]\r\n]*\])'
+    r'(?=((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[^\]\r\n]*\d{1,2}:\d{2}[^\]\r\n]*\]))\3'
+    r'(?:\s*\[#\d+\])?:\s*')
 #: The turn number alone, which a model copies onto the front of its reply with no header
 #: after it: "[#2] If you value...". Line-leading, and not when a lowercase word follows:
 #: "[#1] is what I called him" is the model naming a turn on purpose.

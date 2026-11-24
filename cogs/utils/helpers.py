@@ -18,8 +18,8 @@ from .constants import (
     DOCUMENT_MIME_TYPES, TEXT_ATTACHMENT_EXTENSIONS,
     DISCORD_MAX_MESSAGE_LENGTH, API_ERROR_MAPPINGS, ERR_REASON_OPENROUTER_CREDITS,
     VOICE_SAMPLE_SLOTS, VOICE_SAMPLE_TYPES,
-    PATTERN_SYSTEM_XML_BLOCKS, PATTERN_SYSTEM_XML_ORPHANS,
-    PATTERN_REASONING_BLOCKS, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
+    PATTERN_SYSTEM_XML_OPEN, PATTERN_SYSTEM_XML_ORPHANS,
+    PATTERN_REASONING_OPEN, PATTERN_REASONING_ORPHANS, PATTERN_SYSTEM_HEADER,
     PATTERN_TIMESTAMP_HEADER, PATTERN_METADATA, PATTERN_MESSAGE_LINK,
     PATTERN_SPEAKER_CLOSE, PATTERN_STRAY_WRAPPERS, PATTERN_BARE_TURN_TAG,
     PATTERN_WHITESPACE_CLEANUP, NO_FALLBACK, SYSTEM_MODEL_DEFAULTS,
@@ -353,6 +353,33 @@ def _compile_name_scrub_patterns(escaped_names: Tuple[str, ...]) -> Tuple[re.Pat
     return pattern_name_prefix, pattern_name_xml
 
 
+@functools.lru_cache(maxsize=128)
+def _closing_tag(tag: str) -> re.Pattern:
+    return re.compile(rf"</{re.escape(tag)}>", re.IGNORECASE)
+
+
+def strip_tag_blocks(text: str, opener: re.Pattern = PATTERN_SYSTEM_XML_OPEN) -> str:
+    """Every block `opener` opens removed with its contents, up to the first `</tag>` after
+    it -- what `re.sub(r'<(tag)...>.*?</\\1>', '', text)` did, in linear time.
+
+    That regex scanned to the end for each opening tag with no close: 2.7 s on 100 KB of
+    unclosed tags, on the loop. A tag with no close after one point has none after any
+    later one, so here each tag searches to the end at most once. `tests/test_scrub_cost.py`.
+    """
+    out, start, pos, unclosed = [], 0, 0, set()
+    while (m := opener.search(text, pos)):
+        tag = m.group(1).lower()
+        close = None if tag in unclosed else _closing_tag(tag).search(text, m.end())
+        if close is None:
+            unclosed.add(tag)
+            pos = m.start() + 1  # as the regex resumed: an opening tag may sit inside this one
+            continue
+        out.append(text[start:m.start()])
+        start = pos = close.end()
+    out.append(text[start:])
+    return "".join(out)
+
+
 def strip_history_envelope(text: str) -> str:
     """A stored turn reduced to what the character actually wrote.
 
@@ -391,9 +418,9 @@ def _scrub_response_text(text: str, participant_names: Optional[List[str]] = Non
         with Timeout(seconds=2, error_message="Scrubbing timed out due to complex regex."):
             scrubbed_text = raw_original.replace("&#x20;", " ")
 
-            scrubbed_text = PATTERN_SYSTEM_XML_BLOCKS.sub('', scrubbed_text)
+            scrubbed_text = strip_tag_blocks(scrubbed_text)
             scrubbed_text = PATTERN_SYSTEM_XML_ORPHANS.sub('', scrubbed_text)
-            scrubbed_text = PATTERN_REASONING_BLOCKS.sub('', scrubbed_text)
+            scrubbed_text = strip_tag_blocks(scrubbed_text, PATTERN_REASONING_OPEN)
             scrubbed_text = PATTERN_REASONING_ORPHANS.sub('', scrubbed_text)
             scrubbed_text = PATTERN_SYSTEM_HEADER.sub('', scrubbed_text)
             scrubbed_text = PATTERN_TIMESTAMP_HEADER.sub('', scrubbed_text)
@@ -416,15 +443,17 @@ def _scrub_response_text(text: str, participant_names: Optional[List[str]] = Non
             # `<private_response>` written into a public round -- the whispered text, tags
             # and all -- or, with a header beside it, an empty header as the turn.
             if not scrubbed_text and raw_original:
-                fallback_text = strip_history_envelope(PATTERN_SYSTEM_XML_BLOCKS.sub('', raw_original))
+                fallback_text = strip_history_envelope(strip_tag_blocks(raw_original))
                 if fallback_text:
                     print("[SCRUBBER DIAGNOSTIC] Warning: Aggressive scrubbing deleted response text. Falling back to sanitized raw text.")
                 return fallback_text
 
             return scrubbed_text
     except TimeoutError as e:
-        print(f"Warning: {e}. Returning original text.")
-        return raw_original
+        # Fails closed, as a reply that scrubs to nothing. The raw text posted whatever the
+        # scrub was there to take out: a 78 KB reply leaked a `<private_response>` whisper.
+        print(f"Warning: {e}. Dropping the reply.")
+        return ""
 
 
 #: A line Discord draws as empty: whitespace, or the zero-width characters a model pads with.

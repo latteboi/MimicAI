@@ -857,45 +857,6 @@ class ProfileManager:
         if force:
             self.cog.borrows._rebuild_borrow_index()
 
-    def backfill_name_sidecars(self) -> int:
-        """Write the plaintext name sidecar for every profile that has not got one.
-
-        Proactive, once at boot, rather than left to heal profile-by-profile on the
-        next rebuild. The point of the sidecar is that a rebuild never has to decrypt
-        anything; a population that is half migrated still pays the old cost for the
-        half that has not been touched, and the profiles least likely to be written
-        again are exactly the ones a rebuild would otherwise keep opening.
-
-        Blocking, and proportional to the profiles missing a sidecar -- zero after the
-        first run. Returns how many it wrote.
-        """
-        if not os.path.isdir(USERS_DIR):
-            return 0
-
-        written = 0
-        for user_id_str in os.listdir(USERS_DIR):
-            if not user_id_str.isdigit():
-                continue
-            profiles_dir = os.path.join(USERS_DIR, user_id_str, "profiles")
-            if not os.path.isdir(profiles_dir):
-                continue
-            for pid_folder in os.listdir(profiles_dir):
-                p_dir = os.path.join(profiles_dir, pid_folder)
-                if not os.path.isdir(p_dir):
-                    continue
-                if not os.path.exists(os.path.join(p_dir, "profile.json.gz")):
-                    continue
-                if os.path.exists(os.path.join(p_dir, PROFILE_NAME_SIDECAR)):
-                    continue
-                try:
-                    # _describe_shard writes the sidecar itself on the fallback path,
-                    # which is the path every profile takes here by definition.
-                    if self._describe_shard(int(user_id_str), pid_folder) is not None:
-                        written += 1
-                except Exception as e:
-                    print(f"Name sidecar: backfill failed for {user_id_str}/{pid_folder} ({e})")
-        return written
-
     def _get_user_index(self, user_id: int) -> Dict[str, Any]:
         user_id_str = str(user_id)
         if user_id_str in self.cog.user_indices: return self.cog.user_indices[user_id_str]

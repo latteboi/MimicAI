@@ -4,7 +4,8 @@ import asyncio
 import discord
 from typing import Optional
 
-from ...utils.constants import PLACEHOLDER_EMOJI, DELIVERY_HARD_TIMEOUT_SECONDS, STATUS_QUEUED
+from ...utils.constants import (PLACEHOLDER_EMOJI, DELIVERY_HARD_TIMEOUT_SECONDS, STATUS_QUEUED,
+                                STATUS_THINKING, HEARTBEAT_SECONDS)
 from ...utils.loop_probe import note_reply
 from . import latency
 from .gate import generation_gate
@@ -76,7 +77,7 @@ class HeartbeatMixin:
         custom_emoji = await self.cog.child_bot_manager.resolve_emoji_for_child(bot_id, custom_emoji)
         sent = await self.cog.child_bot_manager.execute_send(bot_id, {
             "channel_id": channel_id,
-            "content": f"{custom_emoji}\n\n{text}" if text else custom_emoji,
+            "content": self._placeholder(custom_emoji, text),
             "realistic_typing": False, "signer": None,
         })
         if sent:
@@ -120,16 +121,13 @@ class HeartbeatMixin:
             # time it sweeps.
             'bot_id': participant.get('bot_id'),
             'placeholder_owned': True,
+            # The turn's clock: every status line on this placeholder counts from here,
+            # so it reads 0:00 when posted and never restarts between steps.
+            'started': time.monotonic(),
         }
         self.cog.session_manager.register_in_flight(session, state_container)
 
         is_child = participant.get('method') == 'child_bot'
-        if is_child and not p_settings.get("child_bot_placeholder", False):
-            await self.cog.manager_queue.put({
-                "action": "send_to_child", "bot_id": participant['bot_id'],
-                "payload": {"action": "start_typing", "channel_id": channel.id}
-            })
-            return state_container
 
         async def _post():
             if is_child:
@@ -144,6 +142,8 @@ class HeartbeatMixin:
                 msg_id = sent[0].id if sent else None
             if msg_id:
                 state_container['msg_a_id'] = msg_id
+            # Recorded first: the id is the only thing that can take the placeholder down.
+            await self._keep_typing(participant, channel.id)
             return msg_id
 
         state_container['feedback_task'] = asyncio.create_task(_post())
@@ -169,10 +169,32 @@ class HeartbeatMixin:
         if not task.cancelled() and task.exception() is not None:
             print(f"Feedback task error: {task.exception()}")
 
+    async def _keep_typing(self, participant, channel_id):
+        """A child bot types beside its placeholder, from the moment it posts to the reply.
+
+        After the post, never before it: a child bot's send ends its own typing, and
+        Discord clears the indicator on any message. Called again on every tick, which
+        restarts it if a send in between (a warning) ended it, and costs nothing while it
+        runs. Direct rather than through manager_queue: a start queued on the last tick
+        could run after the reply's send, which is direct, and type on beneath the answer.
+        """
+        if participant and participant.get('method') == 'child_bot' and participant.get('bot_id'):
+            await self.cog.child_bot_manager.execute_typing(
+                participant['bot_id'], {"channel_id": channel_id})
+
     @staticmethod
     def _status_line(label: str, elapsed: float) -> str:
         """`-# Searching the web... (0:20)`: the line a heartbeat writes under the emoji."""
         return f"-# {label}... ({int(elapsed) // 60}:{int(elapsed) % 60:02d})"
+
+    @classmethod
+    def _placeholder(cls, emoji: str, line: Optional[str] = None) -> str:
+        """Every placeholder's whole content: `# <emoji>` over its status line, one message.
+
+        The heading keeps the emoji large once text sits beside it (an emoji alone is
+        drawn large anyway; with text it shrinks). No line is the turn's first, at 0:00.
+        """
+        return f"# {emoji}\n{line or cls._status_line(STATUS_THINKING, 0)}"
 
     async def _edit_placeholder_status(self, channel, participant, state_container, text):
         """Writes `text` under the emoji of a placeholder that already exists.
@@ -192,7 +214,8 @@ class HeartbeatMixin:
                     "action": "send_to_child", "bot_id": bot_id,
                     "payload": {
                         "action": "regenerate_message", "channel_id": channel.id,
-                        "message_id": msg_a_id, "content": f"{child_emoji}\n\n{text}", "signer": None
+                        "message_id": msg_a_id, "content": self._placeholder(child_emoji, text),
+                        "signer": None
                     }
                 })
         elif state_container.get('message_type') == "embed" and state_container.get('placeholder_msg'):
@@ -200,30 +223,28 @@ class HeartbeatMixin:
                 msg_obj = state_container['placeholder_msg']
                 if msg_obj and msg_obj.embeds:
                     embed = msg_obj.embeds[0]
-                    embed.description = f"{custom_emoji}\n\n{text}"
+                    embed.description = self._placeholder(custom_emoji, text)
                     await msg_obj.edit(embed=embed)
             except Exception: pass
         elif msg_a_id:
             await self.cog.server_manager.run_webhook(
                 channel, "edit_message", msg_a_id,
-                content=f"{custom_emoji}\n\n{text}", signer=None)
+                content=self._placeholder(custom_emoji, text), signer=None)
 
     async def _await_with_status(self, awaitable, label, channel, participant, state_container):
-        """Awaits `awaitable`, naming the step on the turn's placeholder once it passes ten seconds.
+        """Awaits `awaitable`, naming the step on the turn's placeholder at the next heartbeat.
 
-        For a slow step before a reply is written; the labels are in constants.py beside
-        STATUS_SEARCHING_WEB, and why there are so few. Anything under ten seconds shows
-        nothing. A child bot with no placeholder is kept typing instead, the same as
-        during generation.
+        For a step that is not the model writing; the labels are in constants.py beside
+        STATUS_SEARCHING_WEB, and a step the character is not doing passes STATUS_THINKING,
+        which keeps the clock moving and names nothing. The time shown is the turn's
+        (`started`), so a step that ends before the next mark never shows.
         """
         task = asyncio.ensure_future(awaitable)
         if not state_container:
             return await task
 
-        is_child = bool(participant) and participant.get('method') == 'child_bot'
-        start = time.monotonic()
-        last_interval = 0
-        last_typing = 0.0
+        start = state_container.setdefault('started', time.monotonic())
+        last_interval = int((time.monotonic() - start) // HEARTBEAT_SECONDS)
         try:
             while not task.done():
                 # A wait rather than a sleep, so the step's result is not held up to a
@@ -233,17 +254,11 @@ class HeartbeatMixin:
                     break
                 elapsed = time.monotonic() - start
 
-                if is_child and not state_container.get('msg_a_id') and elapsed - last_typing >= 5:
-                    last_typing = elapsed
-                    await self.cog.manager_queue.put({
-                        "action": "send_to_child", "bot_id": participant.get('bot_id'),
-                        "payload": {"action": "start_typing", "channel_id": channel.id}
-                    })
-
-                interval = int(elapsed // 10)
+                interval = int(elapsed // HEARTBEAT_SECONDS)
                 if interval > last_interval:
                     last_interval = interval
                     try:
+                        await self._keep_typing(participant, channel.id)
                         await self._edit_placeholder_status(
                             channel, participant, state_container, self._status_line(label, elapsed))
                     except Exception:
@@ -258,7 +273,7 @@ class HeartbeatMixin:
             raise
 
     async def _generate_with_heartbeat(self, model, contents, gen_config, channel, participant, msg_a_id, is_fallback=False, app_name='Bot', app_avatar=None, existing_state=None, message_type="text", status_label=None, slow_after=None, on_slow=None):
-        """Runs one generation, writing a running timer onto its placeholder every ten seconds.
+        """Runs one generation, writing a running timer onto its placeholder every heartbeat.
 
         `status_label` names what is being made when it is not a reply
         (STATUS_IMAGINING_IMAGE), and holds through a fallback attempt, which is the same
@@ -284,6 +299,9 @@ class HeartbeatMixin:
         state_container.setdefault('app_avatar', app_avatar)
         state_container.setdefault('message_type', message_type)
         state_container.setdefault('custom_emoji', PLACEHOLDER_EMOJI)
+        # What the placeholder shows, and when it ticks: the turn's clock, not this call's.
+        # `start_time` below is this call's, for its timeouts.
+        turn_start = state_container.setdefault('started', time.monotonic())
 
         # A fallback's turn has already waited once, so it goes to the front.
         ticket = generation_gate().ticket(front=is_fallback)
@@ -298,7 +316,7 @@ class HeartbeatMixin:
 
         gen_task = asyncio.create_task(_gated_call())
         start_time = time.time()
-        last_interval = 0
+        last_interval = int((time.monotonic() - turn_start) // HEARTBEAT_SECONDS)
 
         try:
             # The Absolute Watchdog Loop
@@ -334,26 +352,19 @@ class HeartbeatMixin:
                     await asyncio.wait((gen_task,), timeout=1)
                     continue
 
-                # Periodic typing pulse for Child Bots without a placeholder (Discord typing expires in 9s)
-                if participant and participant.get('method') == 'child_bot':
-                    bot_id = participant.get('bot_id')
-                    current_msg_a_id = state_container.get('msg_a_id')
-                    if not current_msg_a_id and int(elapsed) > 0 and int(elapsed) % 5 == 0:
-                        await self.cog.manager_queue.put({
-                            "action": "send_to_child", "bot_id": bot_id,
-                            "payload": {"action": "start_typing", "channel_id": channel.id}
-                        })
-
-                # Every 10 seconds, update or create the placeholder message
-                current_interval = int(elapsed // 10)
+                # On every heartbeat of the turn, update or create the placeholder message
+                shown = time.monotonic() - turn_start
+                current_interval = int(shown // HEARTBEAT_SECONDS)
                 if current_interval > last_interval:
                     last_interval = current_interval
 
                     if queued:
                         base_text = STATUS_QUEUED.format(position=queued, waiting=ticket.waiting)
                     else:
-                        base_text = status_label or ("Using fallback model" if is_fallback else "Still generating")
-                    text = self._status_line(base_text, elapsed)
+                        # A fallback reads as the primary did: which model answers is the
+                        # bot's business, and the reply's fallback indicator says it.
+                        base_text = status_label or STATUS_THINKING
+                    text = self._status_line(base_text, shown)
 
                     msg_a_id = state_container.get('msg_a_id')
                     custom_emoji = state_container.get('custom_emoji', PLACEHOLDER_EMOJI)
@@ -373,6 +384,7 @@ class HeartbeatMixin:
                                         msg_a_id = new_msg_id
                         else:
                             await self._edit_placeholder_status(channel, participant, state_container, text)
+                        await self._keep_typing(participant, channel.id)
                     except Exception:
                         pass
 
@@ -414,6 +426,9 @@ class HeartbeatMixin:
             return
 
         sending_started = time.monotonic()
+        # The turn's clock where it has one, so this phase carries on the time the
+        # placeholder was already showing.
+        start_time_mono = state_container.get('started', start_time_mono)
         # The watchdog below cancels this task if delivery never finishes. register_in_flight
         # stamps the same thing, but global chat has no in-flight entry to stamp it from, so
         # claim it here for anything that reaches this without one.
@@ -423,11 +438,8 @@ class HeartbeatMixin:
             try:
                 # Immediate initial update
                 elapsed = time.monotonic() - start_time_mono
-                mins = int(elapsed) // 60
-                secs = int(elapsed) % 60
-                time_str = f"{mins}:{secs:02d}"
                 label = state_container.get('phase_label') or "Sending"
-                sending_text = f"-# {label}... ({time_str})"
+                sending_text = self._status_line(label, elapsed)
 
                 async def do_update(text):
                     emoji = state_container.get('custom_emoji', PLACEHOLDER_EMOJI)
@@ -437,7 +449,7 @@ class HeartbeatMixin:
                             msg_obj = state_container['placeholder_msg']
                             if msg_obj and msg_obj.embeds:
                                 embed = msg_obj.embeds[0]
-                                embed.description = f"{emoji}\n\n{text}"
+                                embed.description = self._placeholder(emoji, text)
                                 await msg_obj.edit(embed=embed)
                         except Exception: pass
                         return
@@ -458,29 +470,28 @@ class HeartbeatMixin:
                                 "action": "send_to_child", "bot_id": bot_id,
                                 "payload": {
                                     "action": "regenerate_message", "channel_id": channel.id,
-                                    "message_id": target_msg_id, "content": f"{emoji}\n\n{text}",
+                                    "message_id": target_msg_id,
+                                    "content": self._placeholder(emoji, text),
                                     "signer": None,
                                 }
                             })
                         else:
                             await self.cog.server_manager.run_webhook(
-                                channel, "edit_message", target_msg_id, content=f"{emoji}\n\n{text}",
-                                signer=None)
+                                channel, "edit_message", target_msg_id,
+                                content=self._placeholder(emoji, text), signer=None)
                     except Exception:
                         pass
 
                 await do_update(sending_text)
 
-                # Fixed 10-second heartbeat loop
+                # On the turn clock's heartbeats, as generation ticks
                 while True:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(
+                        HEARTBEAT_SECONDS - (time.monotonic() - start_time_mono) % HEARTBEAT_SECONDS)
 
                     elapsed = time.monotonic() - start_time_mono
-                    mins = int(elapsed) // 60
-                    secs = int(elapsed) % 60
-                    time_str = f"{mins}:{secs:02d}"
                     label = state_container.get('phase_label') or "Sending"
-                    sending_text = f"-# {label}... ({time_str})"
+                    sending_text = self._status_line(label, elapsed)
 
                     if spawn_after is not None and elapsed >= spawn_after:
                         await maybe_spawn(sending_text)
@@ -610,6 +621,10 @@ class HeartbeatMixin:
                 # delete from, and _safe_delete_placeholder would spend its retry
                 # backoff finding that out once per placeholder.
                 return
+            if bot_id:
+                # Its typing runs beside the placeholder and only a send ends it. A turn
+                # that ends with no reply sends nothing, and would type on for minutes.
+                await self.cog.child_bot_manager.stop_typing(bot_id, channel.id)
             keys = ['msg_b_id']
             if state_container.get('placeholder_owned', True):
                 keys.insert(0, 'msg_a_id')

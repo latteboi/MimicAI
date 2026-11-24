@@ -698,7 +698,7 @@ a busy spell had the next reply and the attachments a turn needed waiting for a 
 How many model calls run at once is bounded by the generation gate
 (`services/generation/gate.py`, `GENERATION_SLOTS`), not by the pool: every
 `_generate_with_heartbeat` call takes a slot, in arrival order, and a reply past the
-limit waits with `Queued (n of m)` on its placeholder. The calls a turn makes around it
+limit waits with `Waiting (n of m)` on its placeholder. The calls a turn makes around it
 (critic, recall, synopsis, Director) take none, so a turn holding a slot never waits on
 a second.
 
@@ -715,10 +715,8 @@ not.
 
 **A memory lives in its server's file**, `ltm/<guild_id>.json.gz`, because it is only ever
 recalled there: a turn reads one server's memories and nothing else, and `LIMIT_LTM` applies
-to each server on its own, so a busy server never trims a quiet one. Before v0.7.12 every
-server shared one `ltm.json.gz`; `migrate_ltm_files` splits any it finds at boot, merging by
-id so a re-run or a rollback's leftovers lose nothing. A `.mimic` still carries one list
-(`read_ltm_dir` / `write_imported_ltm`).
+to each server on its own, so a busy server never trims a quiet one. A `.mimic` still
+carries one list (`read_ltm_dir` / `write_imported_ltm`).
 
 **Retrieval reads the vector cache, not the file.** `_cached_vectors` holds, per file, the
 unit rows and the few fields a recall shows (`_Vectors`), built from one read and stored

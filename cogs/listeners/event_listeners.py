@@ -78,16 +78,6 @@ class EventListeners:
             activity = self.server_manager._build_activity_from_dict(presence)
             await self.bot.change_presence(status=status_map.get(status_val, discord.Status.online), activity=activity)
             
-            await asyncio.to_thread(self.storage_manager._purge_legacy_default_profile)
-
-            # Before the repair, not after: the repair reads names through the sidecar,
-            # so backfilling first is what makes this boot's repair -- and every one
-            # after it -- a plaintext read instead of a decrypt per profile.
-            written = await asyncio.to_thread(self.profile_manager.backfill_name_sidecars)
-            if written:
-                print(f"Name sidecars: backfilled {written} profile"
-                      f"{'' if written == 1 else 's'}.")
-
             print("Running initial index.json self-repair on boot...")
             await asyncio.to_thread(self.profile_manager._repair_all_user_indices)
             print("Initial index.json self-repair complete.")
@@ -368,16 +358,11 @@ class EventListeners:
                 return
 
             for bot_id in mentioned_child_ids:
-                bot_config = self.child_bots.get(bot_id)
-                if bot_config:
-                    p_index = self.profile_manager._get_user_index(bot_config['owner_id'])
-                    p_is_b = bot_config['profile_name'] in p_index.get("borrowed", [])
-                    p_settings = self.profile_manager._get_profile_config(bot_config['owner_id'], bot_config['profile_name'], p_is_b) or {}
-                    if not p_settings.get("child_bot_placeholder", False):
-                        asyncio.create_task(self.manager_queue.put({
-                            "action": "send_to_child", "bot_id": bot_id,
-                            "payload": {"action": "start_typing", "channel_id": message.channel.id}
-                        }))
+                if self.child_bots.get(bot_id):
+                    asyncio.create_task(self.manager_queue.put({
+                        "action": "send_to_child", "bot_id": bot_id,
+                        "payload": {"action": "start_typing", "channel_id": message.channel.id}
+                    }))
 
             # A bare `!image` is not an image request: the image handler has nothing to
             # draw and answers with silence, where an ordinary mention gets a reply.

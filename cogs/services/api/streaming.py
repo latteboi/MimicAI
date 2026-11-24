@@ -8,6 +8,7 @@ Content-Length that count buys is what keeps httpx off chunked encoding.
 
 import base64
 import os
+import time
 import orjson as json
 from typing import Any, List, Optional, Tuple
 
@@ -26,6 +27,11 @@ _UPLOAD_CHUNK_BYTES = 256 * 1024
 # cycles for a single phone photo; 64 KB cuts that by a factor of eight without
 # meaningfully raising the peak.
 _DOWNLOAD_CHUNK_BYTES = 64 * 1024
+
+#: The whole of one download. httpx's timeout is per read, so a server trickling a chunk
+#: every few seconds held the turn as long as it liked, and a fallback model fetched again.
+#: A 25 MB attachment needs ~420 KB/s to make it, which Discord's CDN clears easily.
+DOWNLOAD_SECONDS = 60.0
 
 
 def _discard_staged(staged_files: List[str]) -> None:
@@ -163,6 +169,10 @@ class DownloadTooLarge(Exception):
     not the file that was sent, and every caller drops a media part it cannot resolve."""
 
 
+class DownloadTooSlow(Exception):
+    """A download still running at DOWNLOAD_SECONDS. Dropped as a too-large one is."""
+
+
 async def _stream_to_tempfile(url: str, client, timeout: float = 15.0,
                               max_bytes: Optional[int] = None) -> str:
     """Downloads `url` to a temp file without ever holding it in RAM. Returns the
@@ -171,11 +181,13 @@ async def _stream_to_tempfile(url: str, client, timeout: float = 15.0,
     Raises `DownloadTooLarge` past `max_bytes`, which is `LIMIT_ATTACHMENT_BYTES` unless
     given. An attachment is refused on its stated size before it gets here; this bounds
     what arrives with none, such as an image linked in a message. The timeout is per read,
-    so without a limit a slow, steady download of any size went through.
+    so without a limit a slow, steady download of any size went through; `DownloadTooSlow`
+    likewise bounds how long one takes.
     """
     import tempfile
 
     limit = defaultConfig.LIMIT_ATTACHMENT_BYTES if max_bytes is None else max_bytes
+    deadline = time.monotonic() + DOWNLOAD_SECONDS
     fd, path = tempfile.mkstemp(suffix=".tmp")
     try:
         # Opened before the request, so a refusal before the body closes the descriptor too.
@@ -192,6 +204,10 @@ async def _stream_to_tempfile(url: str, client, timeout: float = 15.0,
                     written += len(chunk)
                     if written > limit:
                         raise DownloadTooLarge(f"over the {limit}-byte limit")
+                    # Per chunk, not wait_for: README still promises 3.10, and a stall
+                    # between chunks is the per-read timeout's to catch.
+                    if time.monotonic() > deadline:
+                        raise DownloadTooSlow(f"still downloading after {DOWNLOAD_SECONDS:.0f}s")
                     f.write(chunk)
     except BaseException:
         try:

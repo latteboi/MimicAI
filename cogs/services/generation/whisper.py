@@ -249,7 +249,7 @@ class WhisperMixin:
         contents_for_api_call = self._whisper_history(
             session, session.get("unified_log", []), bot_pid, p_settings, whisper_turn)
 
-        placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url,
+        placeholder_embed = self._whisper_embed(interaction, self._placeholder(custom_emoji), display_name, avatar_url,
                                                 whisper_message, interaction.created_at)
         if waiting_msg is not None:
             placeholder_msg = await waiting_msg.edit(content=None, embed=placeholder_embed)
@@ -390,7 +390,7 @@ class WhisperMixin:
         # When the whisper was sent, not this press: from the log, which the card was drawn from.
         whispered_at = next((turn_posted_at(t) for t in session.get("unified_log", [])
                              if t.get("turn_id") == whisper_turn_id), None)
-        placeholder_embed = self._whisper_embed(interaction, custom_emoji, display_name, avatar_url,
+        placeholder_embed = self._whisper_embed(interaction, self._placeholder(custom_emoji), display_name, avatar_url,
                                                 whisper_message, whispered_at)
         if answered:
             # The waiting notice already consumed the interaction response.

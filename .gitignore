@@ -1,5 +1,6 @@
 # Security & Config
 .env
+.mcp.json
 *.lock
 mimicai.service
 
@@ -12,6 +13,10 @@ __pycache__/
 cogs/data/
 cogs/mixins/data/
 changelog/releases/
+
+# Tooling: Claude Code state rides along in any folder it ran from
+.claude/
+.pytest_cache/
 
 # OS Specific
 .DS_Store

@@ -1,0 +1,15 @@
+v0.8.2 Beta — 2026-11-24 (UTC)
+Placeholders show what a character is doing from the moment they appear, and linked pages, linked files and long messages can no longer stall the bot or slip past its checks.
+## **Changed**
+- **URL Context set to RAG asks sites for uncompressed pages, and refuses one sent compressed anyway**, with "URL Fetching Failed (compressed response refused)". Linked images and files are fetched the same way.
+- **A reply's placeholder is one message that starts at 0:00.** The emoji shows large, with what the character is doing underneath and a timer that updates every 5 seconds, counting from when the placeholder appeared.
+- **The placeholder says what the character is doing:** Thinking, Looking it up, Remembering, Reading, Drawing, Speaking or Sending. Work behind the scenes, like switching to the Fallback model, shows as Thinking. "Waiting (2 of 3)" means the bot is busy with other replies.
+- **Child bots always post a placeholder, and type beside it.** It goes up at the same moment a webhook character's would. The **Child Bot Placeholder** setting (Edit Profile → Generation Visual) is gone.
+## **Fixed**
+- **URL Context set to RAG gives up on a slow site after 15 seconds** and says so ("the site took too long to answer"), instead of holding the round until the site finished.
+- **A linked image or file still downloading after 60 seconds is skipped**, as one over the size limit is, instead of holding the reply.
+- **A linked page can no longer write the bot's own prompt tags.** Anything shaped like one reaches the character as plain page text, so a page can't break out of the block it's quoted in, into the conversation or the character's memories.
+- **A reply the bot can't finish checking in time is no longer posted unchecked.** It's treated as an empty reply.
+- **The placeholder's timer no longer stops** while a character searches the web or its memories, reads a link, waits on a whisper or on someone still typing, or while the critic runs. It no longer starts again from zero partway through a reply either.
+## **Performance**
+- **Pages, files and messages that are slow to read no longer freeze the bot.** Reading a linked page stops after 3 seconds and frees the bot for other work. The checks run on every reply, and on stored messages for whisper previews and the critic, now take milliseconds on text that could take minutes before.

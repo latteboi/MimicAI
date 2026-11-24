@@ -32,6 +32,16 @@ MAX_EMOJI_SIZE_BYTES = 256 * 1024  # Discord's limit on an uploaded emoji, app o
 # Not PLACEHOLDER_EMOJI: that is the value this whole path exists to translate, and it is
 # itself a custom mention whenever the deployment has set one.
 UNRESOLVABLE_EMOJI_FALLBACK = "\u23f3"
+# One typing beat shows for ten seconds; the loop re-sends inside that. The cap is the
+# backstop for a loop nothing stopped, so it is longer than any turn but not unbounded.
+TYPING_REFRESH_SECONDS = 7.0
+TYPING_MAX_SECONDS = 300.0
+
+
+def _cancel_typing(typing_tasks: Dict[Tuple[str, int], asyncio.Task], key: Tuple[str, int]) -> None:
+    task = typing_tasks.pop(key, None)
+    if task:
+        task.cancel()
 
 
 class ChildBotManager:
@@ -625,7 +635,9 @@ class ChildBotManager:
                     elif child_action == "delete_message":
                         asyncio.create_task(self.execute_delete(bot_id, payload))
                     elif child_action == "start_typing":
-                        asyncio.create_task(self.execute_typing(bot_id, payload))
+                        # Awaited, not a task: it never suspends, and as a task a stop_typing
+                        # queued right behind it ran first and left a loop nothing stopped.
+                        await self.execute_typing(bot_id, payload)
                     elif child_action == "stop_typing":
                         ch_id = payload.get("channel_id")
                         t_key = (bot_id, ch_id)
@@ -663,17 +675,17 @@ class ChildBotManager:
     async def execute_send(self, bot_id: str, payload: Dict[str, Any]) -> List[discord.Message]:
         channel_id = payload.get("channel_id")
         task_key = (str(bot_id), channel_id)
-        if task_key in self.typing_tasks:
-            self.typing_tasks[task_key].cancel()
-            self.typing_tasks.pop(task_key, None)
-
         bot = self.clients.get(str(bot_id))
+        content = payload.get("content", "")
+        realistic_typing = payload.get("realistic_typing", False)
+        # A paced reply sleeps before its first post: the indicator stays up through that
+        # (stopped below, just before the post), where any other send posts at once.
+        if not (realistic_typing and content.strip()) or not bot or not bot.is_ready():
+            _cancel_typing(self.typing_tasks, task_key)
         if not bot or not bot.is_ready():
             return []
 
-        content = payload.get("content", "")
         attachment_data = payload.get("attachment")
-        realistic_typing = payload.get("realistic_typing", False)
         typing_cps = payload.get("typing_cps", 30.0)
         typing_max_delay = payload.get("typing_max_delay", 2.5)
         typing_mode = payload.get("typing_mode", "sentence")
@@ -690,9 +702,10 @@ class ChildBotManager:
 
         try:
             channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
-            if not channel:
-                return []
         except Exception:
+            channel = None
+        if not channel:
+            _cancel_typing(self.typing_tasks, task_key)
             return []
 
         signer = self._signer(bot_id, payload)
@@ -777,6 +790,9 @@ class ChildBotManager:
                         kwargs = {"content": wire_text}
                         if sent_message is None:
                             if not sent_messages:
+                                # Before the first post, or the next beat lands after it.
+                                # Not the later ones: a loop up by then is the next turn's.
+                                _cancel_typing(self.typing_tasks, task_key)
                                 if file_to_send:
                                     kwargs["file"] = file_to_send
                                 if reply_to_id:
@@ -845,7 +861,9 @@ class ChildBotManager:
             print(f"[ChildBotManager] Delivery error for {bot_id}: {e}")
             return sent_messages
         finally:
-            if sent_messages:
+            if not sent_messages:
+                _cancel_typing(self.typing_tasks, task_key)  # a paced send that died before its post
+            else:
                 self.cog.refused_sends.pop((str(bot_id), channel_id), None)
             if file_to_send:
                 file_to_send.close()
@@ -865,12 +883,16 @@ class ChildBotManager:
                 channel = bot.get_channel(channel_id) or await bot.fetch_channel(channel_id)
                 if not channel:
                     return
-                start_time = asyncio.get_running_loop().time()
-                while True:
-                    if asyncio.get_running_loop().time() - start_time > 60:
-                        break
-                    await channel.typing()
-                    await asyncio.sleep(7)
+                deadline = asyncio.get_running_loop().time() + TYPING_MAX_SECONDS
+                while asyncio.get_running_loop().time() < deadline:
+                    try:
+                        await channel.typing()
+                    except (discord.Forbidden, discord.NotFound):
+                        raise  # will not come right on its own
+                    except Exception as e:
+                        # One failed beat is one missed beat, not the end of the indicator.
+                        print(f"[ChildBotManager] Typing beat failed for {bot_id}: {e}")
+                    await asyncio.sleep(TYPING_REFRESH_SECONDS)
             except asyncio.CancelledError:
                 pass
             except Exception as e:
@@ -1106,16 +1128,15 @@ class ChildBotManager:
 
             placeholder_message_obj = None
             placeholder_emoji = profile_data.get("placeholder_emoji") or PLACEHOLDER_EMOJI
-            if profile_data.get("child_bot_placeholder", False):
-                msg_id = await self.cog.generation_service._send_child_bot_placeholder(bot_id, channel_id, placeholder_emoji)
-                if msg_id:
-                    try:
-                        ch = self.cog.bot.get_channel(channel_id)
-                        placeholder_message_obj = await ch.fetch_message(msg_id)
-                    except Exception:
-                        pass
-            else:
-                await self.execute_typing(bot_id, {"channel_id": channel_id})
+            msg_id = await self.cog.generation_service._send_child_bot_placeholder(bot_id, channel_id, placeholder_emoji)
+            if msg_id:
+                try:
+                    ch = self.cog.bot.get_channel(channel_id)
+                    placeholder_message_obj = await ch.fetch_message(msg_id)
+                except Exception:
+                    pass
+            # After the post, which ended the typing started above.
+            await self.execute_typing(bot_id, {"channel_id": channel_id})
 
             prompt_text = image_command_prompt(message_data.get("content", ""))
             if not prompt_text:

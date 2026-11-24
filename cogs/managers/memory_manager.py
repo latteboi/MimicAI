@@ -6,7 +6,6 @@ from __future__ import annotations
 import os
 import re
 import uuid
-import glob
 import base64
 import shutil
 import asyncio
@@ -313,9 +312,8 @@ def _closest_rows(unit, query, top: int) -> List[Tuple[float, int]]:
 #
 # One file per server, `profiles/<pid>/ltm/<guild_id>.json.gz`, holding a list. A memory
 # is only ever recalled in the server it formed in, so that is the only file a turn
-# reads, and LIMIT_LTM applies to each server on its own: a busy server no longer
-# trims a quiet one's oldest memories. A single `ltm.json.gz` of every server is the
-# layout before v0.7.12, which `migrate_ltm_files` splits at boot.
+# reads, and LIMIT_LTM applies to each server on its own: a busy server never
+# trims a quiet one's oldest memories.
 
 #: Length of the ".json.gz" suffix.
 _GZ = len(".json.gz")
@@ -1408,54 +1406,3 @@ class MemoryManager:
         async with _SHARD_WRITE_LOCK:
             reset_count = await asyncio.to_thread(_reset)
         return f"Reset all Long-Term Memories for {reset_count} profile(s)."
-
-    def migrate_ltm_files(self) -> None:
-        """Splits every `ltm.json.gz` -- all of a profile's servers in one file, the layout
-        before v0.7.12 -- into one file per server. Blocking: run at boot, before the gateway,
-        so no turn reads or writes a memory meanwhile.
-
-        Proactive, so no reader carries the old layout. Each server's memories are merged by
-        id into whatever its file already holds, and the old file goes only once all are
-        written: a crash part-way is redone on the next boot, and an `ltm.json.gz` an older
-        build writes after a rollback is folded in on the way back. Nothing is trimmed -- a
-        server over LIMIT_LTM is cut to it by its next new memory. A memory with no server
-        was never recalled or listed anywhere, and is dropped.
-        """
-        fernet = self.cog.storage_manager.fernet
-        legacy_files = glob.glob(os.path.join(self.cog.USERS_DIR, "*", "profiles", "*", "ltm.json.gz"))
-        moved, unfiled, over = 0, 0, []
-        for legacy in legacy_files:
-            try:
-                # One that will not decode is moved to .corrupt by the read, and skipped.
-                data = IOManager.read_json_gzip(legacy, fernet)
-                if data is None:
-                    continue
-                by_guild: Dict[str, List[Dict[str, Any]]] = {}
-                for entry in (data.get("guild") if isinstance(data, dict) else None) or ():
-                    gid = str(entry.get("context_id") or "") if isinstance(entry, dict) else ""
-                    if not gid.isdigit():
-                        unfiled += 1
-                        continue
-                    self._compact_ltm_entry(entry)
-                    by_guild.setdefault(gid, []).append(entry)
-                p_dir = os.path.dirname(legacy)
-                for gid, entries in by_guild.items():
-                    path = os.path.join(p_dir, "ltm", f"{gid}.json.gz")
-                    have = IOManager.read_json_gzip(path, fernet)
-                    have = have if isinstance(have, list) else []
-                    known = {e.get("id") for e in have if isinstance(e, dict)}
-                    merged = have + [e for e in entries if e.get("id") not in known]
-                    merged.sort(key=lambda e: e.get("created_ts") or "")
-                    IOManager.write_json_gzip(merged, path, fernet)
-                    moved += len(merged) - len(have)
-                    if len(merged) > defaultConfig.LIMIT_LTM:
-                        over.append(f"{os.path.relpath(path, self.cog.USERS_DIR)} ({len(merged)})")
-                os.remove(legacy)
-            except Exception as e:
-                print(f"LTM migration: {legacy} left in place ({e!r}); it is tried again next boot.")
-        if legacy_files:
-            print(f"LTM migration: {len(legacy_files)} profile file(s) split into one file per "
-                  f"server, {moved} memories moved, {unfiled} with no server dropped.")
-        if over:
-            print(f"LTM migration: {len(over)} server file(s) over LIMIT_LTM "
-                  f"({defaultConfig.LIMIT_LTM}), trimmed by their next memory: {', '.join(over[:10])}")

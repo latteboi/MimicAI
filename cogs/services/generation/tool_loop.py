@@ -28,7 +28,8 @@ from typing import Any, Awaitable, Callable, Dict, List, NamedTuple, Optional, S
 from ...utils.constants import (
     DEFAULT_RECALL_INSTRUCTION, DEFAULT_SEARCH_INSTRUCTION, LIMIT_FUNCTION_CALL_ROUNDS,
     LTM_AUTO_THRESHOLD_WITH_TOOL, RECALL_TOOL_DECLARATION, RECALL_TOOL_NAME,
-    SEARCH_TOOL_DECLARATION, SEARCH_TOOL_NAME,
+    SEARCH_TOOL_DECLARATION, SEARCH_TOOL_NAME, STATUS_REMEMBERING, STATUS_SEARCHING_WEB,
+    STATUS_THINKING,
 )
 from ...utils.helpers import provider_takes_functions, resolve_grounding_mode
 from ..api.function_calls import (FunctionCall, call_part, forbid_calls, result_part,
@@ -95,6 +96,8 @@ class CharacterFunction:
     handler: Callable[[Any, str, FunctionContext], Awaitable[Dict[str, Any]]]
     #: The list a result holds that the turn's trace keeps: memories, or sources.
     found_key: str
+    #: What the placeholder says while it runs (constants.py, beside STATUS_THINKING).
+    status: str
     #: Memories are filed per server, so off one -- Global Chat -- `recall` could only
     #: ever come back empty, and each empty answer would cost a request.
     needs_server: bool = False
@@ -107,14 +110,14 @@ RECALL = CharacterFunction(
     name=RECALL_TOOL_NAME, declaration=RECALL_TOOL_DECLARATION,
     instruction_key="RECALL_INSTRUCTION", default_instruction=DEFAULT_RECALL_INSTRUCTION,
     enabled=lambda config: bool(config.get("ltm_recall_tool_enabled")),
-    handler=_recall, found_key="memories", needs_server=True)
+    handler=_recall, found_key="memories", status=STATUS_REMEMBERING, needs_server=True)
 
 SEARCH_WEB = CharacterFunction(
     name=SEARCH_TOOL_NAME, declaration=SEARCH_TOOL_DECLARATION,
     instruction_key="SEARCH_INSTRUCTION", default_instruction=DEFAULT_SEARCH_INSTRUCTION,
     # Grounding's "tool" mode is this declaration and nothing else: shown as RAG.
     enabled=lambda config: resolve_grounding_mode(config) == "tool",
-    handler=_search_web, found_key="sources")
+    handler=_search_web, found_key="sources", status=STATUS_SEARCHING_WEB)
 
 #: Every function a character can call, in the order they are declared and described.
 FUNCTIONS: Tuple[CharacterFunction, ...] = (RECALL, SEARCH_WEB)
@@ -308,13 +311,16 @@ def spaced(content: Any) -> Any:
 
 async def run(cog, model, contents: List[Any], gen_config: Optional[Dict[str, Any]],
               ctx: FunctionContext,
-              send: Callable[[List[Any], Dict[str, Any]], Awaitable[Any]]) -> LoopResult:
+              send: Callable[[List[Any], Dict[str, Any]], Awaitable[Any]],
+              step: Optional[Callable[[str, Awaitable[Any]], Awaitable[Any]]] = None) -> LoopResult:
     """One character reply: generate, answer what it asks for, and generate again.
 
     `send(contents, gen_config)` makes one request on `model` and returns the response;
     the caller owns everything a request means on its path -- the placeholder it ticks,
     the gate slot, what counts as blocked -- and raises as it always did. This owns only
     the conversation between requests, and answers exactly what `model` declared.
+    `step(label, awaitable)`, when given, awaits the lookups between requests under the
+    first call's `status`, so the placeholder keeps ticking through them.
 
     `contents` is copied, not extended: a caller that falls back to another model
     starts from the conversation it had, not from the lookups the first model made.
@@ -339,7 +345,11 @@ async def run(cog, model, contents: List[Any], gen_config: Optional[Dict[str, An
         calls =list(getattr(result.response, "function_calls", None) or ())
         if not offered or not calls or last:
             break
-        answered = await execute(cog, calls, ctx, offered)
+        lookups = execute(cog, calls, ctx, offered)
+        if step is not None:
+            first = _BY_NAME.get(calls[0].name)
+            lookups = step(first.status if first in offered else STATUS_THINKING, lookups)
+        answered = await lookups
         for call, value in answered:
             result.calls.append(function_call_label(call, value))
             if isinstance(value, dict):

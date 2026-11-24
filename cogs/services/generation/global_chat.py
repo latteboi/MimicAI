@@ -8,7 +8,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from ...utils.constants import (
     defaultConfig, STM_LIMIT_MAX, PLACEHOLDER_EMOJI,
-    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB,
+    GEMINI_FREE_TIER_BLOCKED, STATUS_SEARCHING_WEB, STATUS_READING,
 )
 from ...utils.constants import SAFETY_SETTINGS
 from ...utils.helpers import (subscription_settings, 
@@ -283,19 +283,24 @@ class GlobalChatMixin:
             # once this returns, so a failure in either still leaves a working card.
             placeholder_embed = build_global_chat_embed(
                 self.cog, host_user_id, profile_name, session_data,
-                description=custom_emoji, incoming=queued_turns,
+                description=self._placeholder(custom_emoji), incoming=queued_turns,
                 colour=discord.Colour.dark_grey())
 
             # The view is left alone: it is the card's Cancel.
             await interaction.edit_original_response(embed=placeholder_embed)
             placeholder_msg = await interaction.original_response()
+            # What the steps before the reply tick on.
+            card_status = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg,
+                           "message_type": "embed", "started": t1_start_mono}
 
             url_mode = profile_data.get('url_mode', 'off')
             if 'url_mode' not in profile_data:
                 url_mode = 'rag' if profile_data.get('url_fetching_enabled', False) else 'off'
 
             if url_mode == 'rag':
-                u_text, _, u_warn = await self.cog.tools_service._process_urls_in_content(combined_prompt_text, 0, {"url_fetching_enabled": True})
+                u_text, _, u_warn = await self._await_with_status(
+                    self.cog.tools_service._process_urls_in_content(combined_prompt_text, 0, {"url_fetching_enabled": True}),
+                    STATUS_READING, interaction.channel, None, card_status)
                 turn_warnings.extend(u_warn)
                 if u_text:
                     final_user_parts.append(f"<document_context>\n" + "\n".join(u_text) + "\n</document_context>")
@@ -320,8 +325,7 @@ class GlobalChatMixin:
                 # with no data policy -- this call does not take Global Chat's yet.
                 g_res = await self._await_with_status(
                     self.cog.tools_service._get_hybrid_grounding_context(combined_prompt_text, 0, g_hist, profile_data, None, safety_settings=d_safe),
-                    STATUS_SEARCHING_WEB, interaction.channel, None,
-                    {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg, "message_type": "embed"})
+                    STATUS_SEARCHING_WEB, interaction.channel, None, card_status)
                 if g_res:
                     g_ctx, g_srcs, _, g_warn = g_res
                     if g_warn: turn_warnings.append(g_warn)
@@ -359,7 +363,7 @@ class GlobalChatMixin:
                 policy={"policy_guild_id": interaction.guild_id, "conversation": True})
             chat_participant_names = [app_name] + [t['display_name'] for t in queued_turns]
             state_container = {"custom_emoji": custom_emoji, "placeholder_msg": placeholder_msg,
-                               "message_type": "embed"}
+                               "message_type": "embed", "started": t1_start_mono}
 
             # The session reply's own path -- primary, fallback race, the warnings -- on
             # the host's key. It used to be a copy of it with the fallback retried by hand,

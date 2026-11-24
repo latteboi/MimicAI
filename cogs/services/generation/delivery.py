@@ -152,8 +152,10 @@ class DeliveryMixin:
         # [FIX] Never execute realistic typing on placeholder dispatches or when bypassed
         if is_placeholder or bypass_typing:
             is_realistic_typing = False
+            if is_placeholder:
+                content = self._placeholder(content)
 
-        if target_message_to_edit and use_webhook and content != f"{PLACEHOLDER_EMOJI}":
+        if target_message_to_edit and use_webhook and not is_placeholder:
             try:
                 if isinstance(channel, (discord.TextChannel, discord.Thread)):
                     try:
@@ -177,7 +179,7 @@ class DeliveryMixin:
             if not content.endswith("\n​"):
                 content += "\n​"
 
-        if is_realistic_typing and isinstance(channel, (discord.TextChannel, discord.Thread)) and content != f"{PLACEHOLDER_EMOJI}":
+        if is_realistic_typing and isinstance(channel, (discord.TextChannel, discord.Thread)):
             webhook = self.cog.server_manager.run_webhook
             try:
                 if not await self.cog.server_manager._get_or_create_webhook(channel):

@@ -326,7 +326,7 @@ class SpeakAsMixin:
         text, _ = self._extract_and_apply_neuro_state(text, owner_id, profile_name)
 
         # The model routinely echoes the tag it was addressed in. Both are in
-        # SYSTEM_XML_TAGS, so PATTERN_SYSTEM_XML_BLOCKS would delete the entire reply
+        # SYSTEM_XML_TAGS, so strip_tag_blocks would delete the entire reply
         # rather than the wrapper -- the same trap _run_whisper_turn strips for
         # <private_response>. Unwrap before scrubbing, not after.
         for tag in ("rewrite_request", "source_text"):

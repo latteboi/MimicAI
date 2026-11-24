@@ -1362,7 +1362,7 @@ DEFAULT_HELP_DOCS = {
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Audio sounds garbled or erratic.' Fix: Lower the speech temperature back towards its default.\n"
         "- Symptom: 'No audio is generated.' Fix: The warning under the reply names the reason. Most often the server has no key for the speech model's provider -- Google for a Gemini speech model, OpenRouter for an OpenRouter one; the profile's own text model does not matter.\n"
-        "- Symptom: 'The channel goes quiet for a long time before the voice arrives.' Fix: Synthesis takes ten to thirty seconds. The placeholder reads 'Synthesising speech...' with a running timer for that whole stretch.\n"
+        "- Symptom: 'The channel goes quiet for a long time before the voice arrives.' Fix: Synthesis takes ten to thirty seconds. The placeholder reads 'Speaking...' with a running timer for that whole stretch.\n"
         "- Symptom: 'The voice stops before the end of a very long reply.' Fix: A Gemini voice line is capped at the audio its words can need and at the largest file the server can upload, because Gemini bills every second it generates and a model can run on past the words. An ordinary reply is voiced whole; one too long for the server's upload limit is cut off there, rather than paid for in full and then refused.\n"
         "- Symptom: 'The voice read my Director's Desk notes out loud.' Fix: This is a documented failure of the speech classifier on vague prompts. Each request already carries a preamble telling the model the notes are direction rather than lines; making the notes more concrete and less like dialogue makes it rarer."
     ),
