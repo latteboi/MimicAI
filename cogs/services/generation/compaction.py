@@ -20,7 +20,7 @@ Progress = Callable[[str], Awaitable[None]]
 
 async def _no_progress(_text: str) -> None:
     pass
-from ...utils.helpers import _resolve_zoneinfo, restamp_turn, resolve_thinking_params, turn_posted_at
+from ...utils.helpers import _format_api_error, _resolve_zoneinfo, restamp_turn, resolve_thinking_params, turn_posted_at
 from ...managers.session_manager import SessionManager, intern_turn, reply_tags, turn_lookup, with_reply
 
 #: What the settings modal wrote into every session it saved, typed or not: the shipped
@@ -466,7 +466,8 @@ class SessionCompactionMixin:
                     guild_id=guild_id, user_id=session.get("owner_id")),
                 _attempt, label="Session synopsis")
         except Exception as e:
-            print(f"[Compaction] Synopsis generation failed for channel {channel_id}: {e}")
+            # Phrased: `{e}` is the provider's JSON body, a kilobyte a line in the journal.
+            print(f"[Compaction] Synopsis generation failed for channel {channel_id}: {_format_api_error(e)}")
             return None
 
         text = getattr(resp, "text", None) if resp else None

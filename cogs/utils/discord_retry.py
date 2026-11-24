@@ -6,11 +6,10 @@ reach the service behind it ("upstream connect error or disconnect/reset before
 headers"), which is as transient as a 502 -- and one cost a regeneration its edit: the
 new reply stored, the old one left on screen.
 
-A connection reset on an interaction's callback (`defer`, `send_message`): aiohttp
-resends a request that meets a reset keep-alive connection only for idempotent methods,
-and the callback is a POST; discord.py's own reset retry tests BSD's and Windows' errno
-(54, 10054), never Linux's 104. So on prod a reset failed the command before its body
-ran, where dev (macOS) retried it unseen.
+A connection reset: discord.py's own reset retry tests BSD's and Windows' errno (54,
+10054), never Linux's 104, so on prod every reset raised where dev (macOS) retried it
+unseen -- a callback (`defer`) failed the command before its body ran, an
+`edit_original_response` left the session editor stale.
 
 Patched on the class, once, so the main bot, every child bot and every webhook in the
 process are covered by the one fix rather than a retry at each call site.
@@ -48,6 +47,9 @@ def install_retries() -> None:
             except discord.DiscordServerError as e:
                 if e.status != 503 or route.method not in _IDEMPOTENT or tries == _TRIES - 1:
                     raise
+            except OSError as e:
+                if e.errno != errno.ECONNRESET or route.method not in _IDEMPOTENT or tries == _TRIES - 1:
+                    raise
             # discord.py rewinds files only on its own retries; a fresh call starts at
             # tries 0, which it reads as "do not seek", and would upload zero bytes.
             for f in files or ():
@@ -62,7 +64,8 @@ def install_retries() -> None:
         try:
             return await original_webhook(self, route, session, files=files, **kwargs)
         except OSError as e:
-            if e.errno != errno.ECONNRESET or not route.path.endswith("/callback"):
+            if e.errno != errno.ECONNRESET or not (
+                    route.method in _IDEMPOTENT or route.path.endswith("/callback")):
                 raise
         # At once, on a fresh connection: the interaction has three seconds.
         for f in files or ():

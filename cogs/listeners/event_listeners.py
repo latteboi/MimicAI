@@ -12,7 +12,6 @@ from discord import app_commands
 from discord.ext import commands
 
 from ..utils.constants import *
-from ..utils.member_probe import start_member_probe
 from ..utils import data_policy, mem_probe, openrouter_signin
 from ..utils.content import (
     MENTION_POINTER_REGISTERED, MENTION_POINTER_UNREGISTERED, WELCOME_MESSAGE,
@@ -59,14 +58,6 @@ class EventListeners:
         await asyncio.to_thread(self.child_bot_manager._load_child_bots)
         self.all_bot_ids = {self.bot.user.id} | {int(bot_id) for bot_id in self.child_bots.keys()}
         await self.child_bot_manager.start_all_child_bots()
-
-        # Off unless MIMIC_MEMBER_PROBE is set. Reports once, then stops -- it exists
-        # to size the member cache against the work of removing it, which is a
-        # question asked once and not a thing to measure continuously. Chunking has
-        # already completed by the time on_ready fires, so the count here is final.
-        member_probe = start_member_probe(self.bot)
-        if member_probe is not None:
-            self._member_probe_task = member_probe
 
         if self.has_lock:
             # After start_all_child_bots above, so a blocked guild takes the children

@@ -1,4 +1,5 @@
 import datetime
+import errno
 import math
 import os
 import time
@@ -685,8 +686,9 @@ class ServerManager:
             if signer is _NO_SIGNER:
                 raise TypeError(f"run_webhook({op!r}) with content needs signer=")
             kwargs["content"] = self.cog.profile_manager.signed(channel, signer, kwargs["content"])
+        refresh = False
         for attempt in (0, 1):
-            webhook = await self._get_or_create_webhook(channel, force_refresh=bool(attempt))
+            webhook = await self._get_or_create_webhook(channel, force_refresh=refresh)
             if webhook is None:
                 return None
             try:
@@ -695,6 +697,15 @@ class ServerManager:
                 if attempt or e.code != UNKNOWN_WEBHOOK:
                     raise
                 self.invalidate_webhook(channel)
+                refresh = True
+                self._rewind_files(args, kwargs)
+                continue
+            except OSError as e:
+                # A reset send (Linux's errno; discord.py retries only BSD's and Windows')
+                # may have landed, but every caller resends it anyway, as the bot under its
+                # own name. Once more here keeps the profile's. Edits are discord_retry's.
+                if attempt or e.errno != errno.ECONNRESET:
+                    raise
                 self._rewind_files(args, kwargs)
                 continue
             _note_signature_lost(channel, kwargs.get("content"), result)

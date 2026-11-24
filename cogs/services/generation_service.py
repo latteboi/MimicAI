@@ -2075,9 +2075,7 @@ class GenerationService(HeartbeatMixin, PromptBuilderMixin, DeliveryMixin, Regen
                     except asyncio.CancelledError:
                         raise
                     except Exception as e:
-                        tts_reason = _format_api_error(e)
-                        print(f"Text-to-speech failed for '{profile_name}': {tts_reason}")
-                        turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason=tts_reason))
+                        turn_warnings.append(WARN_VOICE_SYNTHESIS_FAILED.format(reason=_format_api_error(e)))
                     finally:
                         if state_container:
                             state_container['phase_label'] = "Sending"

@@ -174,12 +174,8 @@ class ImageRoundMixin:
             self.cog._log_api_call(user_id=session.get('owner_id', 0), guild_id=channel.guild.id, context="image_generation_multi", model_used=image_model, status=status)
 
         except Exception as e:
+            # The channel is told it (`fail_reason`), so the journal is not.
             image_gen_error_msg = _format_api_error(e)
-            # A host refusing the content (`retryable = False`) is a decision about the
-            # prompt, and the channel is already told it in the host's words. Anything
-            # else is a fault worth a line, phrased: `{e}` is the provider's JSON body.
-            if getattr(e, "retryable", True) is not False:
-                print(f"Error generating image in multi-profile round: {image_gen_error_msg}")
         finally:
             # The heartbeat spawns its own placeholder when the generator is a
             # child bot that sends none of its own — in that case feedback_task

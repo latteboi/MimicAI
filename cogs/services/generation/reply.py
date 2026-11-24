@@ -594,10 +594,9 @@ class ReplyMixin:
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            # The refusal already in `attempt.error` is kept: it is the one that explains
-            # the turn, and this second failure is usually the same model saying so twice.
-            # Phrased rather than raw, for the reason `run_with_fallback`'s line is.
-            print(f"Retry without attachments failed: {type(e).__name__}: {_format_api_error(e)}")
+            # The refusal already in `attempt.error` is kept, and the channel told it: it
+            # is the one that explains the turn, and this second failure is usually the
+            # same model saying so twice.
             return
 
         attempt.media_dropped = kinds

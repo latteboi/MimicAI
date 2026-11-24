@@ -1166,10 +1166,12 @@ class MemoryManager:
                     and "429" not in err_str and "RESOURCE_EXHAUSTED" not in err_str and "503" not in err_str
                     and "UNAVAILABLE" not in err_str and "API Key not found" not in err_str
                     and not getattr(e, "rate_limited", False)):
-                print(f"LTM Gen err {user_dn}: {e}")
-                traceback.print_exc()
+                # The channel told is enough; the journal is for failures nobody saw.
                 if warning_channel:
                     await self.cog.generation_service._send_session_warning(warning_channel, f"Long-Term Memory creation failed ({_format_api_error(e)})")
+                else:
+                    print(f"LTM Gen err {user_dn}: {_format_api_error(e)}")
+                    traceback.print_exc()
         return None
 
     async def add_new_training_example(self, profile_owner_id: int, profile_name: str, usr_in:str, bot_out:str, guild_id: Optional[int])->Tuple[bool,str]:
