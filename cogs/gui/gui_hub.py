@@ -7,12 +7,16 @@ import datetime
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
 from ..utils.discord_cdn import unsigned_attachment_url
-from .base_components import (BlockedGuard, PageJumpModal, TabbedView, add_button, add_select,
+from .base_components import (BlockedGuard, PageJumpModal, TabbedView, TimeoutCleanupMixin,
+                              add_button, add_select, build_confirm_view,
                               build_pagination_controls, bulk_select_options,
                               paged_nav_options, refuse_unregistered, resolve_bulk_select,
-                              add_topgg_links)
+                              add_topgg_links, send_status, settle_status)
 from .gui_start import open_generate
-from .base_components import dismissible, text_embed
+from .base_components import closed_embed, dismissible, text_embed
+
+#: Said to a borrower wherever a borrow is taken: what they are and are not getting.
+BORROW_TERMS = "-# A borrow follows its owner's edits, and ends if they delete it or withdraw it from you."
 
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
@@ -293,7 +297,8 @@ class HubPublicLibraryView(HubBaseView):
         await i.response.defer(ephemeral=True)
         local_name = self.cog.transfer._generate_unique_local_name(i.user.id, p_info['profile_name'])
         if await self.cog.sharing._accept_share_request(i, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], local_name, is_public_borrow=True):
-            await i.followup.send(embed=text_embed(f"✅ Borrowed **{p_info['profile_name']}** as **{local_name}**."), ephemeral=True)
+            await i.followup.send(embed=text_embed(
+                f"✅ Borrowed **{p_info['profile_name']}** as **{local_name}**.\n{BORROW_TERMS}"), ephemeral=True)
 
     async def edit_intro_cb(self, i: discord.Interaction):
         # Deferred: gui_profiles imports this module at load time.
@@ -452,8 +457,8 @@ class HubIncomingView(HubBaseView):
             user_shares = [f"`{s['profile_name']}`" + (" (clone)" if s.get("kind") == "clone" else "")
                            for s in shares if s['sharer_id'] == self.selected_sharer_id]
             desc = (f"**Pending shares from {name}:**\n" + ", ".join(user_shares)
-                    + "\n\n-# A borrow follows its owner's edits; a (clone) becomes your own "
-                    "independent copy, without memories.\n"
+                    + f"\n\n{BORROW_TERMS}\n-# A (clone) becomes your own independent copy, "
+                    "without memories.\n"
                     "-# **Block Sender** rejects these and stops them sharing with you again.")
             embed = discord.Embed(title="Reviewing Shares", description=desc, color=discord.Color.blue())
             await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
@@ -965,6 +970,128 @@ class HubPublishView(HubShareManagerView):
         super().__init__(cog, interaction)
         self.selected_profiles = [name for name, _ in self._get_user_public_profiles()]
         self.setup_items()
+
+
+class BorrowersView(BlockedGuard, TimeoutCleanupMixin, ui.View):
+    """Who holds a borrow of one of your profiles, and withdrawing it from them.
+
+    The people you shared it with are named: you chose them. Library borrowers are a count
+    and are withdrawn together, never picked out -- borrowing from the Library tells its
+    author nothing about who did. `borrow_origin` tells the two apart, and anything it
+    cannot place is counted, not named.
+    """
+
+    #: Names per dropdown page: 25 options, less Select Page and Select All.
+    PER_PAGE = DROPDOWN_MAX_OPTIONS - 2
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, owner_id: int, profile_name: str):
+        super().__init__(timeout=300)
+        self.cog, self.original_interaction = cog, interaction
+        self.owner_id, self.profile_name = owner_id, profile_name
+        self.selected: Set[str] = set()
+        self.page = 0
+        self.load()
+
+    def load(self):
+        """Every borrow of the profile, by borrower and how it arrived: index lookups only."""
+        pm = self.cog.profile_manager
+        pid = pm._get_pid_from_name(self.owner_id, self.profile_name)
+        self.private: Dict[str, List[str]] = {}
+        self.library: Dict[str, List[str]] = {}
+        for borrower_id, borrow_pid in self.cog.borrows._borrowers_of(self.owner_id, pid):
+            side = self.private if pm.borrow_origin(borrow_pid) == "private" else self.library
+            side.setdefault(str(borrower_id), []).append(borrow_pid)
+        self.listed = self.cog.library._is_profile_public(self.owner_id, self.profile_name)
+        self.selected &= set(self.private)
+        self.setup_items()
+
+    def _people(self) -> List[Tuple[str, str]]:
+        """(borrower id, name) for everyone it was shared with, by name."""
+        named = []
+        for uid in self.private:
+            user = self.cog.bot.get_user(int(uid))
+            named.append((uid, user.name if user else f"ID: {uid}"))
+        return sorted(named, key=lambda p: p[1].lower())
+
+    def _page(self) -> List[Tuple[str, str]]:
+        return self._people()[self.page * self.PER_PAGE:(self.page + 1) * self.PER_PAGE]
+
+    def setup_items(self):
+        self.clear_items()
+        num_pages = max(1, (len(self.private) - 1) // self.PER_PAGE + 1)
+        self.page = max(0, min(self.page, num_pages - 1))
+        page = self._page()
+        if page:
+            options = bulk_select_options([uid for uid, _ in page], list(self.private),
+                                          self.selected.__contains__,
+                                          page_description="Tick or untick everyone on this page.",
+                                          all_description="Tick or untick everyone you shared it with.")
+            options += [discord.SelectOption(label=name[:100], value=uid, default=uid in self.selected)
+                        for uid, name in page]
+            add_select(self, options, self.select_people, row=0, min_values=0, max_values=len(options),
+                       placeholder="People you shared it with: tick to withdraw...")
+        build_pagination_controls(self, self.page, num_pages, 1, self._turn_page)
+        add_button(self, f"Withdraw from {len(self.selected)} Selected", self.withdraw_selected,
+                   row=2, style=discord.ButtonStyle.danger, disabled=not self.selected)
+        if self.library:
+            label = "Unpublish & Withdraw Library Borrows" if self.listed else "Withdraw Library Borrows"
+            add_button(self, f"{label} ({len(self.library)})", self.withdraw_library,
+                       row=2, style=discord.ButtonStyle.danger)
+
+    def build_embed(self) -> discord.Embed:
+        private, library = len(self.private), len(self.library)
+        lines = [f"**Shared privately with:** {private} {'person' if private == 1 else 'people'}",
+                 f"**Borrowed from the Library:** {library} {'person' if library == 1 else 'people'}"
+                 + (" (who is not shown)" if library else ""),
+                 "",
+                 "-# Withdrawing deletes their copy, with the memories it made, and cannot be undone. "
+                 "They are told the next time they open `/profile hub`."]
+        if self.listed:
+            lines.append("-# It is in the Public Library, so anyone can borrow it from there "
+                         "until you unpublish it.")
+        return discord.Embed(title=f"Borrowers: {self.profile_name}"[:256], description="\n".join(lines),
+                             color=discord.Color.blue())
+
+    async def select_people(self, i: discord.Interaction):
+        self.selected = resolve_bulk_select(i.data.get("values", []), [uid for uid, _ in self._page()],
+                                            list(self.private), self.selected)
+        self.setup_items()
+        await i.response.edit_message(view=self)
+
+    async def _turn_page(self, i: discord.Interaction, delta: int):
+        self.page += delta
+        self.setup_items()
+        await i.response.edit_message(view=self)
+
+    async def withdraw_selected(self, i: discord.Interaction):
+        await self._confirm(i, {p for uid in self.selected for p in self.private.get(uid, [])},
+                            len(self.selected), unpublish=False)
+
+    async def withdraw_library(self, i: discord.Interaction):
+        await self._confirm(i, {p for pids in self.library.values() for p in pids},
+                            len(self.library), unpublish=self.listed)
+
+    async def _confirm(self, i: discord.Interaction, borrow_pids: Set[str], people: int, unpublish: bool):
+        text = (f"Withdraw **{self.profile_name}** from {people} {'person' if people == 1 else 'people'}? "
+                "Their copies are deleted, with the memories they made. This cannot be undone.")
+        if unpublish:
+            text += "\n\nIt also leaves the Public Library, so nobody can borrow it again."
+
+        async def go(ci: discord.Interaction):
+            await send_status(ci, f"Withdrawing {self.profile_name}...")
+            ended = await self.cog.sharing.withdraw_borrows(self.owner_id, self.profile_name,
+                                                            borrow_pids, unpublish)
+            await settle_status(ci, embed=closed_embed(
+                "Withdrawn", f"{ended} {'copy' if ended == 1 else 'copies'} of **{self.profile_name}** deleted."
+                             + (" It is out of the Public Library." if unpublish else "")), view=None)
+            self.load()
+            try:
+                await self.original_interaction.edit_original_response(embed=self.build_embed(), view=self)
+            except discord.HTTPException:
+                pass
+
+        await i.response.send_message(embed=text_embed(text), view=build_confirm_view("Withdraw", go, i),
+                                      ephemeral=True)
 
 
 class BorrowDefaultsView(BlockedGuard, ui.View):

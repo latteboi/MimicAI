@@ -123,9 +123,11 @@ class ProfileDashboard:
         embed = discord.Embed(title=f"Profile Dashboard: '{profile_name}'", color=discord.Color.blue())
         profile_type = "Personal"
 
+        origin = self.cog.profile_manager.borrow_origin(pid_b) if is_borrowed else None
         if is_borrowed:
             owner_user = self.cog.bot.get_user(effective_owner_id)
-            profile_type = f"Borrowed (from {owner_user.name if owner_user else 'Unknown User'})"
+            via = {"library": " via the Library", "private": " via a private share"}.get(origin, "")
+            profile_type = f"Borrowed{via} (from {owner_user.name if owner_user else 'Unknown User'})"
 
         # Off this config, as `_get_user_profile_for_model` reads them -- which would read
         # the config and the prompts again, on a worker thread, for these alone.
@@ -183,6 +185,9 @@ class ProfileDashboard:
 
         embed.add_field(name=left_column[1][0], value=left_column[1][1], inline=True)
         library_value = "\U0001f310 `Published`" if is_public else "`Not published`"
+        if origin == "library" and not is_public:
+            # Read live, so the borrower learns it without anything being stored or sent.
+            library_value = "`Taken out of the Library`\nYou keep your borrow."
         # The owner's reach; on a borrow the count would be the source's.
         if borrowers and not is_borrowed:
             library_value += f"\n{borrowers} borrowing"

@@ -1021,6 +1021,7 @@ class StorageManager:
                 if source_pid not in live_pids:
                     borrowed_map.pop(borrowed_name)
                     shutil.rmtree(str(users_path / user_id_str / "profiles" / borrow_pid), ignore_errors=True)
+                    self.cog.sharing._note_ended(index, [(borrowed_name, owner_id)], "deleted")
                     cleaned_borrows += 1
                     data_changed = True
             

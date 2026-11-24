@@ -1048,16 +1048,28 @@ class MimicCog(EventListeners, commands.Cog):
         # [FIX] Defer immediately to prevent interaction timeout (Error 10062)
         await interaction.response.defer(ephemeral=True)
         
-        # Lazy Deletion Check (Disk I/O) happens safely after defer
-        removed = await asyncio.to_thread(
-            self.sharing._validate_and_clean_borrowed_profiles, interaction.user.id)
+        # Lazy Deletion Check (Disk I/O) happens safely after defer. It notes what it reaps,
+        # so the take after it names those too.
+        def _reap_and_read():
+            self.sharing._validate_and_clean_borrowed_profiles(interaction.user.id)
+            return self.sharing.take_ended_borrows(interaction.user.id)
+        ended = await asyncio.to_thread(_reap_and_read)
 
         view = HubPublicLibraryView(self, interaction)
         await view.update_display()
 
-        if removed > 0:
+        # Here and nowhere else: nobody is messaged unasked, so an ended borrow waits for
+        # the screen borrowing is done from.
+        lines = []
+        for note in ended:
+            owner = self.bot.get_user(int(note.get("owner") or 0))
+            act = "withdrew it from you" if note.get("why") == "withdrawn" else "deleted it"
+            lines.append(f"• **{note.get('name')}**: {owner.name if owner else 'its owner'} {act}.")
+        if lines:
             # Use followup because response was already deferred/used
-            await interaction.followup.send(embed=text_embed(f"ℹ️ Notice: {removed} borrowed profiles were removed because their original creators deleted them."), ephemeral=True)
+            await interaction.followup.send(embed=text_embed(
+                "ℹ️ **Borrowed profiles you no longer have**\n" + "\n".join(lines)
+                + "\n-# Each copy went with the memories it made."), ephemeral=True)
 
     session_group = app_commands.Group(name="session", description="Manage chat sessions.", guild_only=True)
 

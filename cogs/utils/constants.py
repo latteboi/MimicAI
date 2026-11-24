@@ -223,7 +223,7 @@ PROFILE_NAME_SIDECAR = "name.json"
 #: lets a rebuild classify a profile without opening it. Minted in
 #: _get_or_create_user_profile ('A'), _get_or_create_system_profile ('X') and
 #: _accept_share_request ('B' private share / 'C' public library). 'B' and 'C' both mean
-#: borrowed: the letter records how the borrow arrived, and nothing may branch on it.
+#: borrowed; the letter is how the borrow arrived, read through `borrow_origin`.
 PID_CLASS_PREFIXES = {"A": "personal", "X": "system", "B": "borrowed", "C": "borrowed"}
 
 #: A profile's voice samples: (sealed audio, sealed record of what it is and who vouched

@@ -1684,41 +1684,52 @@ class SessionManager:
             await interaction_for_feedback.followup.send(embed=embed, ephemeral=True)
         return True
 
+    async def _drop_missing_seats(self, channel_id: int, session: Dict) -> bool:
+        """Takes every seat whose profile no longer exists out of the cast, telling a child
+        bot it has left. True if any went: the caller saves."""
+        seats = session.get("profiles") or []
+        kept = []
+        for p in seats:
+            # By PID where the seat has one: by name, a profile deleted and another
+            # made under its name kept the seat, and spoke as the stranger.
+            p_owner_id = p["owner_id"]
+            p_index = self.cog.profile_manager._get_user_index(p_owner_id)
+            exists = (self.cog.profile_manager._get_name_from_pid(p_owner_id, p["pid"], include_borrowed=True)
+                      is not None if p.get("pid") else
+                      any(p["profile_name"] in p_index.get(c, {}) for c in ("personal", "borrowed", "system")))
+            if exists:
+                kept.append(p)
+            elif p.get("method") == "child_bot" and p.get("bot_id"):
+                await self.cog.manager_queue.put({
+                    "action": "send_to_child", "bot_id": p["bot_id"],
+                    "payload": {"action": "session_update_remove", "channel_id": channel_id}
+                })
+        if len(kept) == len(seats):
+            return False
+        # An emptied cast stays a session: /suspend ends one. This used to delete the
+        # channel's whole log when its last character was deleted.
+        session["profiles"] = kept
+        return True
+
+    async def drop_missing_seats(self, owner_ids) -> None:
+        """The seat check, now, in every live session seating a profile of these users: for
+        profiles that just went, which otherwise held their seats until the channel's next
+        message. Every path that removes a profile, its own or a borrower's, ends here."""
+        owners = {int(o) for o in owner_ids}
+        changed = False
+        for channel_id, session in list(self.cog.multi_profile_channels.items()):
+            if any(int(p["owner_id"]) in owners for p in session.get("profiles") or ()):
+                changed = await self._drop_missing_seats(channel_id, session) or changed
+        if changed:
+            self._save_multi_profile_sessions()
+
     async def _ensure_session_hydrated(self, channel_id: int, session_type: str) -> Optional[Dict]:
         """Checks if a session is in memory and hydrated. If not, loads it from disk."""
         session = self.cog.multi_profile_channels.get(channel_id)
 
-        # Lazily validate and clean up all session participants if the session is engaged
-        if session and session.get("profiles"):
-            cleaned_any = False
-            valid_profiles = []
-
-            for p in list(session["profiles"]):
-                p_owner_id = p["owner_id"]
-                p_name = p["profile_name"]
-
-                # By PID where the seat has one: by name, a profile deleted and another
-                # made under its name kept the seat, and spoke as the stranger.
-                p_index = self.cog.profile_manager._get_user_index(p_owner_id)
-                exists = (self.cog.profile_manager._get_name_from_pid(p_owner_id, p["pid"], include_borrowed=True)
-                          is not None if p.get("pid") else
-                          any(p_name in p_index.get(c, {}) for c in ("personal", "borrowed", "system")))
-
-                if exists:
-                    valid_profiles.append(p)
-                else:
-                    cleaned_any = True
-                    if p.get("method") == "child_bot" and p.get("bot_id"):
-                        await self.cog.manager_queue.put({
-                            "action": "send_to_child", "bot_id": p["bot_id"],
-                            "payload": {"action": "session_update_remove", "channel_id": channel_id}
-                        })
-
-            if cleaned_any:
-                # An emptied cast stays a session: /suspend ends one. This used to delete
-                # the channel's whole log when its last character was deleted.
-                session["profiles"] = valid_profiles
-                self._save_multi_profile_sessions()
+        # Every call, as a backstop: a path that removes a profile drops its seats itself.
+        if session and await self._drop_missing_seats(channel_id, session):
+            self._save_multi_profile_sessions()
 
         if session and session.get("is_hydrated"):
             return session

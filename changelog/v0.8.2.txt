@@ -1,11 +1,18 @@
 v0.8.2 Beta — 2026-11-24 (UTC)
-Placeholders show what a character is doing from the moment they appear, and linked pages, linked files and long messages can no longer stall the bot or slip past its checks.
+Placeholders show what a character is doing from the moment they appear, you can see who borrows your profiles and withdraw them, and linked pages, linked files and long messages can no longer stall the bot or slip past its checks.
+## **Added**
+- **Borrowers, in `/profile manage` → Sharing.** See who borrows a profile: the people you shared it with by name, Library borrowers only as a count. Withdraw it from any of the people you shared it with, or from every Library borrower at once, which also takes it out of the Public Library. Their copy is deleted, with the memories it made.
+- **`/profile hub` tells you when a borrowed profile has gone**, naming it and whether its owner deleted it or withdrew it from you.
 ## **Changed**
+- **A borrowed profile's dashboard says how you got it**, via the Library or a private share, and shows "Taken out of the Library" once its owner unpublishes it. You keep it.
+- **Deleting your account ends other people's borrows of your profiles at once**, rather than within a day.
+- **The Terms of Service and Privacy Policy are revised, effective 24 November 2026.** Terms 7 says a borrowed profile stays its owner's: it ends, with its memories, if they delete it, withdraw it from you or delete their account, and an owner never sees who borrowed theirs from the Public Library. Terms 11 and the Policy's Payments section say Stripe sells the Subscription as merchant of record, under the name Link, with Link's own terms, privacy policy and refund policy. The Policy also lists the note `/profile hub` keeps of a borrow that ended. `/terms` shows all of it. No need to accept again.
 - **URL Context set to RAG asks sites for uncompressed pages, and refuses one sent compressed anyway**, with "URL Fetching Failed (compressed response refused)". Linked images and files are fetched the same way.
 - **A reply's placeholder is one message that starts at 0:00.** The emoji shows large, with what the character is doing underneath and a timer that updates every 5 seconds, counting from when the placeholder appeared.
 - **The placeholder says what the character is doing:** Thinking, Looking it up, Remembering, Reading, Drawing, Speaking or Sending. Work behind the scenes, like switching to the Fallback model, shows as Thinking. "Waiting (2 of 3)" means the bot is busy with other replies.
 - **Child bots always post a placeholder, and type beside it.** It goes up at the same moment a webhook character's would. The **Child Bot Placeholder** setting (Edit Profile → Generation Visual) is gone.
 ## **Fixed**
+- **A deleted or withdrawn profile leaves every session's cast at once**, instead of keeping its seat until the channel's next message.
 - **URL Context set to RAG gives up on a slow site after 15 seconds** and says so ("the site took too long to answer"), instead of holding the round until the site finished.
 - **A linked image or file still downloading after 60 seconds is skipped**, as one over the size limit is, instead of holding the reply.
 - **A linked page can no longer write the bot's own prompt tags.** Anything shaped like one reaches the character as plain page text, so a page can't break out of the block it's quoted in, into the conversation or the character's memories.

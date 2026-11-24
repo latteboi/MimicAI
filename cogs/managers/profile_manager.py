@@ -474,6 +474,13 @@ class ProfileManager:
         letter. None for a folder that is not a minted PID."""
         return PID_CLASS_PREFIXES[pid[0]] if cls._is_pid(pid) else None
 
+    @classmethod
+    def borrow_origin(cls, pid: str) -> Optional[str]:
+        """How a borrow arrived: "library" ('C') or "private" ('B', a share). None for any
+        other PID. Provenance, not state: `_find_public_entry_id` says whether its source
+        is listed now."""
+        return {"C": "library", "B": "private"}.get(pid[0]) if cls._is_pid(pid) else None
+
     def _set_child_bot_config(self, user_id: int, profile_name: str, bot_config: Dict[str, Any]):
         p_data = self._get_profile(user_id, profile_name, is_borrowed=False)
         if p_data is not None:
@@ -553,8 +560,8 @@ class ProfileManager:
         The one delete, as `_rename_profile` is the one rename, and it forgets what holds
         the name in memory for the same reason. Left behind, a linked child bot kept its
         gateway connection and answered with no persona until a restart, and a new profile
-        given the old name wore the deleted one's avatar, rating and Global Chat. A seat in
-        a session is `_ensure_session_hydrated`'s to drop, by PID, on its next use.
+        given the old name wore the deleted one's avatar, rating and Global Chat. Its seats,
+        and its borrows' seats, go now (`drop_missing_seats`), by PID.
 
         The index is edited here on the loop -- `_get_user_index` hands back the dict every
         handler shares -- and saved only after the directories are gone: shard first, index
@@ -591,12 +598,13 @@ class ProfileManager:
         profiles_dir = os.path.join(USERS_DIR, str(user_id), "profiles")
 
         def _remove():
-            for pid in sources:
-                self.cog.sharing._cascade_delete_borrowed_profiles(user_id, pid)
+            ended = [e for pid in sources for e in self.cog.sharing._cascade_delete_borrowed_profiles(user_id, pid)]
             for pid in doomed:
                 shutil.rmtree(os.path.join(profiles_dir, pid), ignore_errors=True)
             self._save_user_index(user_id, index)
-        await asyncio.to_thread(_remove)
+            return ended
+        ended = await asyncio.to_thread(_remove)
+        await self.cog.session_manager.drop_missing_seats({user_id} | {borrower for borrower, _ in ended})
         return len(doomed)
 
     def _duplicate_profile(self, user_id: int, source_name: str, target_name: str) -> Tuple[bool, str]:

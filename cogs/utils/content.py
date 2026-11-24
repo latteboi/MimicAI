@@ -79,10 +79,10 @@ HELP_CATEGORIES = {
             "• **C** -- borrowed from the Public Library.\n"
             "• **X** -- a System Profile provided by the bot operator.\n\n"
             "Borrowed profiles (B and C) are read-only links back to the creator's master profile. You can override local behaviour "
-            "such as timezone and response mode, but the identity stays synchronised with the original -- and if the owner deletes or "
-            "renames it, your borrow is severed automatically.\n\n"
+            "such as timezone and response mode, but the identity stays synchronised with the original, through a rename too -- and if "
+            "the owner deletes it or withdraws it from you, your borrow is deleted, with the memories it made.\n\n"
             "The letter records where a borrow *came from*, not what it is now. A PID never changes, so a borrow of a profile that was "
-            "later unpublished keeps its C, and borrows predating the C class are all B. Read it as a hint, not as a rule the bot enforces.\n\n"
+            "later unpublished keeps its C. The owner's **Borrowers** screen reads it: B borrowers are named to them, C borrowers only counted.\n\n"
             "**Limits:** 100 personal profiles, 100 borrowed."
         ),
     },
@@ -535,7 +535,11 @@ HELP_CATEGORIES = {
             "Incoming Shares until they accept or reject it, and nobody is messaged either way. Accepted profiles keep their name, "
             "with a number added only if the recipient already has one called that.\n\n"
             "**Send** offers a *borrow*: a read-only link back to your master profile. The borrower gets your "
-            "character, and any edit you make reaches them. If you delete or rename the original, their copy is severed.\n\n"
+            "character, and any edit you make reaches them. If you delete the original, or withdraw it from them, their copy is "
+            "deleted with the memories it made, and they are told in `/profile hub`.\n\n"
+            "**Borrowers** (`/profile manage` -> **Sharing**) shows who borrows a profile: the people you shared it with by name, "
+            "Library borrowers only as a count. Withdraw it from any of the people you shared it with, or from every Library "
+            "borrower at once -- which also unpublishes it, so they cannot borrow it again.\n\n"
             "**Send as Clone** (on the Profile Cloning tab) offers an *independent copy* -- a new Class A profile the recipient owns and can edit "
             "freely, with no link back to you.\n\n"
             "Cloning deliberately scrubs Long-Term Memories, which are conversation history and not "
@@ -988,7 +992,7 @@ DEFAULT_HELP_DOCS = {
         "Mechanism: If the original owner deletes or renames their Personal Profile, the Cascade Deletion Protocol instantly severs all borrowed links. The borrowed variant will be automatically deleted from your list to prevent database corruption.\n"
         "Naming: Your own profiles always win a name clash. If you create a personal profile with the same name as a System Profile, yours is the one that runs; the System Profile is only reached when you have no profile of your own by that name.\n"
         "Troubleshooting / Symptoms:\n"
-        "- Symptom: 'A borrowed profile vanished from my list.' Fix: The owner deleted or renamed the original. Borrows are links, not copies; ask them to share it again.\n"
+        "- Symptom: 'A borrowed profile vanished from my list.' Fix: The owner deleted the original or withdrew it from you; `/profile hub` says which the next time you open it. A rename does not do this. Ask them to share it again.\n"
         "- Symptom: 'I cannot edit the persona of a profile I borrowed.' Fix: That is by design. Ask its owner to send it with Send as Clone from `/profile hub` -> Profile Cloning instead, which gives you an independent Class A copy you own."
     ),
     "profiles/default_settings.txt": (
@@ -1018,7 +1022,8 @@ DEFAULT_HELP_DOCS = {
         "Receiving: Incoming Shares can be closed to everyone with its Open/Closed toggle, and anyone can be blocked from its user list or with Block Sender while reviewing their shares. Blocking also takes back what they have waiting; closing leaves waiting shares to be answered.\n"
         "- Symptom: 'It says my share was not sent.' Fix: The recipient has not run `/start`, has closed Incoming Shares, has blocked you, or already has 25 of your profiles waiting. The bot does not say which.\n"
         "- Symptom: 'My profile is missing from Profile Sharing or Profile Cloning.' Fix: It is rated Not Allowed, which cannot be shared at all. Its Content Safety dashboard says why.\n"
-        "- Symptom: 'I cloned a profile but it has no memories.' Fix: Intended. LTM is never transferred by a clone."
+        "- Symptom: 'I cloned a profile but it has no memories.' Fix: Intended. LTM is never transferred by a clone.\n"
+        "Withdrawing: `/profile manage` -> Sharing -> Borrowers lists the people you shared a profile with by name, and Library borrowers as a count. Withdrawing deletes their copy and the memories it made, cannot be undone, and they are told the next time they open `/profile hub`. Library borrowers are withdrawn together, which also unpublishes the profile. A clone cannot be withdrawn: it is the recipient's own."
     ),
     "profiles/public_hub_publishing.txt": (
         "Concept: Publishing to the global Public Library (`/profile hub`) allows any user to borrow your profile.\n"
@@ -1569,7 +1574,7 @@ WELCOME_CHANNEL_HINTS = ("welcome", "general", "lobby", "chat", "main", "bot")
 #: Keep this in step with the site. It is the same document, not a summary of one:
 #: shortening a clause here would leave the bot and the website disagreeing about what
 #: the operator has undertaken.
-LEGAL_EFFECTIVE_DATE = "22 November, 2026 (UTC)"
+LEGAL_EFFECTIVE_DATE = "24 November, 2026 (UTC)"
 
 LEGAL_DOCUMENTS = {
     "Terms of Service": {
@@ -1734,7 +1739,12 @@ LEGAL_DOCUMENTS = {
             "profile edited after its rating is rated again before it is next shared or "
             "published, and leaves the Public Library if it is rated Not Allowed or "
             "refused. An Allowed rating is not an endorsement: every profile remains "
-            "bound by Section 3. **Official Instance:** We reserve the right to remove "
+            "bound by Section 3. A borrowed profile stays its owner's. It follows their "
+            "edits, stops running if its rating no longer allows it, and ends, with the "
+            "memories it made, if they delete it, withdraw it from you, or delete their "
+            "account. An owner can see which of the people they shared a profile with "
+            "still hold it, but not who borrowed it from the Public Library. "
+            "**Official Instance:** We reserve the right to remove "
             "any public content at our discretion."
         ),
         "8. Compatibility & Modifications": (
@@ -1901,7 +1911,8 @@ LEGAL_DOCUMENTS = {
             "maintain conversation history (Section 5).\n"
             "• **About Me:** Your provider choice, registration date, timezone, birthday "
             "(day and month only), sharing preferences, blocked sharers, recent Public "
-            "Library publish times, and Override Defaults.\n"
+            "Library publish times, Override Defaults, and the names of borrowed profiles "
+            "that ended, until /profile hub has shown them to you.\n"
             "• **Technical Credentials:** API keys (Google/OpenRouter) and the servers you "
             "assign them to. Discord Bot Tokens are strictly collected and stored *only* for "
             "the instance owner.\n"
@@ -1987,7 +1998,8 @@ LEGAL_DOCUMENTS = {
             "You control the data stored under your account, and can permanently delete "
             "profiles, memories, training examples, or voice recordings at any time. "
             "Memories, training examples, Bonds, and voice recordings are kept until they, "
-            "their profile, or your account are deleted.\n"
+            "their profile, or your account are deleted. A borrowed profile is also deleted, "
+            "with the memories it made, when its owner deletes it or withdraws it from you.\n"
             "\n"
             "To minimise our data footprint, **a Chat Session log is automatically purged "
             "after 30 days of inactivity**, or when its channel is deleted. An active "
@@ -2001,7 +2013,7 @@ LEGAL_DOCUMENTS = {
             "and support tickets stored under your account. The archive holds your API keys "
             "unencrypted, so keep it safe. Delete My Account erases everything stored under "
             "your account, withdraws your Public Library listings, unassigns your keys from "
-            "servers, and ends other users' borrows of your profiles within a day. It does "
+            "servers, and ends other users' borrows of your profiles. It does "
             "not erase the messages you sent in session channels, which remain until their "
             "log is purged; what other people's profiles remember about you, including "
             "Bonds, which belong to those profiles; or copies of your profiles you sent as "

@@ -455,6 +455,14 @@ class TransferService:
                 if changed:
                     self.cog.server_manager._save_server_index(str(gid), idx)
 
+            # 3b. End everyone's borrows of their profiles, each named to its borrower,
+            # while the borrow index still knows who holds them: 4b forgets it, and then
+            # only the daily sweep could find them.
+            index = self.cog.profile_manager._get_user_index(user_id)
+            ended = [e for category in ("personal", "system")
+                     for pid in (index.get(category) or {}).values()
+                     for e in self.cog.sharing._end_borrows(user_id, pid, "deleted")]
+
             # 4. Delete Core User Directory
             user_dir = os.path.join(self.cog.USERS_DIR, user_id_str)
             if os.path.exists(user_dir):
@@ -469,7 +477,8 @@ class TransferService:
             # 4d. And the subscription record, which lives outside the tree. Its key, which
             # nothing names any more, is deleted by the next reconcile's sweep.
             self.cog.subscriptions.drop_user(user_id)
-        await asyncio.to_thread(_scrub)
+            return ended
+        ended = await asyncio.to_thread(_scrub)
 
         # Deliberately not touched: data/mod/blacklist.json. An enforcement record is
         # about the account, not owned by it, and a ban that a user can lift by deleting
@@ -489,6 +498,10 @@ class TransferService:
         for k in keys_to_del:
             self.cog.global_chat_sessions.pop(k, None)
             self.cog.session_last_accessed.pop(k, None)
+
+        # 7. Their seats and their borrowers' seats, now: their index is gone from memory
+        # above, so every one of their profiles reads as missing.
+        await self.cog.session_manager.drop_missing_seats({user_id} | {borrower for borrower, _ in ended})
 
         await interaction.followup.send(embed=text_embed("Account Deleted. All your profiles, memories, and settings have been permanently erased from this instance."), ephemeral=True)
 

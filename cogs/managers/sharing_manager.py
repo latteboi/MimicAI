@@ -7,7 +7,7 @@ import datetime
 import asyncio
 import traceback
 import discord
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Set, Tuple
 from ..utils.user_defaults import apply_defaults, model_slot_defaults, setting_label
 from ..utils.constants import (
     USERS_DIR, defaultConfig, CONTENT_RATING_ADULT, CONTENT_RATING_CAPABILITIES, MODEL_PROVIDERS, PROVIDER_CHOICES, NOT_REGISTERED)
@@ -151,6 +151,8 @@ class SharingManager:
         # Group by owner to minimize I/O
         profiles_by_owner = {}
         ids_to_remove = []
+        #: local name -> owner, for the ones whose source is gone: the borrower is told.
+        sourceless: Dict[str, str] = {}
         for local_name in list(borrowed):
             b_config = self.cog.profile_manager._get_profile_config(user_id, local_name, True)
             if not b_config:
@@ -187,22 +189,28 @@ class SharingManager:
             for local_name, o_pid in items:
                 if o_pid not in valid_pids:
                     ids_to_remove.append(local_name)
+                    sourceless[local_name] = owner_id_str
 
         if ids_to_remove:
+            gone = []
             for local_name in ids_to_remove:
                 # No name fallback: a name is never a folder, and a racing clean got it first.
                 pid = borrowed.pop(local_name, None)
                 if pid:
                     shutil.rmtree(os.path.join(USERS_DIR, str(user_id), "profiles", pid),
                                   ignore_errors=True)
+                    if local_name in sourceless:
+                        gone.append((local_name, sourceless[local_name]))
 
+            self._note_ended(index, gone, "deleted")
             self.cog.profile_manager._save_user_index(user_id, index)
             removed_count = len(ids_to_remove)
 
         return removed_count
 
-    def _cascade_delete_borrowed_profiles(self, original_owner_id: int, deleted_pid: str):
-        """Instantly removes all borrowed variants linked to a deleted personal profile across the entire system."""
+    def _cascade_delete_borrowed_profiles(self, original_owner_id: int, deleted_pid: str) -> List[Tuple[int, str]]:
+        """Instantly removes all borrowed variants linked to a deleted personal profile across
+        the entire system. Returns `_end_borrows`'s (borrower, borrow PID) for each."""
         # Proactively remove the deleted profile from the global public database index.
         # By PID alone: matching the name as well removed the listing of any other profile
         # of this owner's that had once been called the same.
@@ -213,7 +221,34 @@ class SharingManager:
                 self.cog.public_profiles.pop(pub_id, None)
             self.cog.library._save_public_index()
 
-        if not os.path.isdir(USERS_DIR): return
+        return self._end_borrows(original_owner_id, deleted_pid, "deleted")
+
+    #: Ended borrows a user is told of at once (`take_ended_borrows`); the oldest go first.
+    ENDED_BORROW_NOTES = 25
+
+    def _note_ended(self, index: Dict[str, Any], ended: List[Tuple[str, Any]], why: str) -> None:
+        """Adds (local name, owner) borrows to the notes `take_ended_borrows` reads, in the
+        About Me of `index`, for the save the caller makes anyway. Every path that ends
+        someone else's borrow writes one, or its borrower never learns why it vanished."""
+        if not ended:
+            return
+        about = index["about"] = index.get("about") if isinstance(index.get("about"), dict) else {}
+        notes = (about.get("ended_borrows") or []) + [
+            {"name": name, "owner": str(owner), "why": why} for name, owner in ended]
+        about["ended_borrows"] = notes[-self.ENDED_BORROW_NOTES:]
+
+    def _end_borrows(self, owner_id: int, source_pid: str, why: str,
+                     only: Optional[Set[str]] = None) -> List[Tuple[int, str]]:
+        """Removes the borrows of one source -- every one, or those whose PIDs are in `only`
+        -- each borrower's copy with the memories it made, and leaves each borrower a note
+        `/profile hub` shows them. `why` is "deleted" or "withdrawn". Returns (borrower,
+        borrow PID) for each that went: the caller drops their seats (`drop_missing_seats`).
+
+        Only `_borrowers_of` names what goes, so `only` cannot reach past this source's
+        borrows whatever it holds. Blocking.
+        """
+        if not os.path.isdir(USERS_DIR):
+            return []
 
         # The reverse index names the borrowers outright, so only they are touched --
         # this used to open and decrypt every borrow config every user owned. A stale
@@ -222,15 +257,17 @@ class SharingManager:
         # _validate_and_clean_borrowed_profiles and the daily integrity sweep, both of
         # which already exist to reap borrows whose source is gone.
         by_user: Dict[int, List[str]] = {}
-        for borrower_id, borrow_pid in self.cog.borrows._borrowers_of(original_owner_id, deleted_pid):
-            by_user.setdefault(borrower_id, []).append(borrow_pid)
+        for borrower_id, borrow_pid in self.cog.borrows._borrowers_of(owner_id, source_pid):
+            if only is None or borrow_pid in only:
+                by_user.setdefault(borrower_id, []).append(borrow_pid)
 
+        ended: List[Tuple[int, str]] = []
         for uid, to_delete in by_user.items():
             user_id_str = str(uid)
             try:
                 index = self.cog.profile_manager._get_user_index(uid)
                 borrowed = index.get("borrowed", {})
-                removed = False
+                gone = []
 
                 # The index is keyed by the borrower's local name; the reverse index
                 # hands us PIDs. Inverting once is cheaper than a scan per PID, and the
@@ -246,9 +283,11 @@ class SharingManager:
                     borrowed.pop(local_name, None)
                     shutil.rmtree(os.path.join(USERS_DIR, user_id_str, "profiles", borrow_pid),
                                   ignore_errors=True)
-                    removed = True
+                    gone.append(local_name)
+                    ended.append((uid, borrow_pid))
 
-                if removed:
+                if gone:
+                    self._note_ended(index, [(name, owner_id) for name in gone], why)
                     self.cog.profile_manager._save_user_index(uid, index)
                 else:
                     # Nothing to save, so the reconcile in _save_user_index will not
@@ -257,8 +296,34 @@ class SharingManager:
                         self.cog.borrows._borrow_index_remove(user_id_str, borrow_pid)
                     self.cog.borrows._save_borrow_index()
             except Exception as e:
-                print(f"Error in cascade delete for user {user_id_str}: {e}")
-    
+                print(f"Error ending borrows for user {user_id_str}: {e}")
+        return ended
+
+    async def withdraw_borrows(self, owner_id: int, profile_name: str, borrow_pids: Set[str],
+                               unpublish: bool = False) -> int:
+        """Ends these borrows of one of the owner's profiles, and their seats in live sessions.
+        With `unpublish` the listing goes first, so nobody borrows it again in between.
+        Returns how many went."""
+        def _withdraw():
+            pid = self.cog.profile_manager._get_pid_from_name(owner_id, profile_name)
+            if not pid:
+                return []
+            if unpublish:
+                self.cog.library.unpublish_profile(owner_id, profile_name)
+            return self._end_borrows(owner_id, pid, "withdrawn", only=set(borrow_pids))
+        ended = await asyncio.to_thread(_withdraw)
+        await self.cog.session_manager.drop_missing_seats({borrower for borrower, _ in ended})
+        return len(ended)
+
+    def take_ended_borrows(self, user_id: int) -> List[Dict[str, str]]:
+        """This user's borrows that ended since they last opened `/profile hub`, cleared as
+        they are read. Blocking."""
+        about = self.cog.user_settings.get_user_about(user_id)
+        notes = about.pop("ended_borrows", None)
+        if notes:
+            self.cog.user_settings.save_user_about(user_id, about)
+        return notes or []
+
 
     async def _accept_share_request(self, interaction: discord.Interaction, sharer_id: int, target_pid: Optional[str], fallback_name: str, desired_name: str, is_public_borrow: bool = False) -> bool:
         """Creates the borrow. True if it was made; otherwise the reason has been sent.
@@ -368,18 +433,11 @@ class SharingManager:
             rescued = self.cog.user_settings._rescue_unusable_models(interaction.user.id, snapshot_data)
             adjustments.extend(("rescue", k) for k in rescued)
 
-            # The class letter records provenance, not current state: 'C' means the
-            # borrow arrived through the Public Library, 'B' through a private share
-            # code. A PID is the on-disk folder name and never changes, so the owner
-            # later unpublishing does not turn a C back into a B -- the pointer above
-            # is what tracks that.
-            #
-            # Nothing branches on the letter, and nothing may start to. Every borrow
-            # created before this existed is a 'B' whatever its origin, so code that
-            # needs to know whether a borrow is public must read `pointer` or ask
-            # _find_public_entry_id. Renaming the old folders to match would mean
-            # moving directories and rewriting index entries for cosmetics, with
-            # orphaned profiles as the failure mode; the mixed population stays.
+            # The letter is how the borrow arrived -- 'C' through the Public Library, 'B'
+            # through a private share -- and `borrow_origin` reads it. No borrow predates
+            # 'C', so every one carries the right letter. Provenance, not state: a PID is
+            # the folder name and never changes, so a C stays a C after its source is
+            # unpublished. Whether the source is listed now is _find_public_entry_id's.
             pid = self.cog.profile_manager._mint_pid(interaction.user.id, 'C' if is_public_borrow else 'B')
 
             if "borrowed" not in index or not isinstance(index["borrowed"], dict):

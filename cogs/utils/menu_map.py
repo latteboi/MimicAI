@@ -33,7 +33,7 @@ _TAB_TITLES = {
     "audio": "Audio (how the character sounds)",
     "memory": "Memory (what the character remembers, and how it recalls it)",
     "training": "Training (example replies that shape how it writes)",
-    "sharing": "Sharing (publish to the Public Library, offer as a borrow or a clone, and the library intro)",
+    "sharing": "Sharing (publish to the Public Library, offer as a borrow or a clone, see and withdraw borrowers, and the library intro)",
     "misc": "Misc (error wording, the typing placeholder and line spacing)",
 }
 

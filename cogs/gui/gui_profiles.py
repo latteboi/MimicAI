@@ -48,7 +48,7 @@ from ..services.api.google_rest import voice_id_of
 from ..utils.discord_cdn import is_web_url
 from ..utils.data_policy import may_pick_training_models
 from .gui_data import DataManageView, StyleGuideView
-from .gui_hub import HubCloneManagerView, HubShareManagerView
+from .gui_hub import BorrowersView, HubCloneManagerView, HubShareManagerView
 from .gui_sessions import CustomModelModal
 from .gui_settings import OllamaHostModal
 
@@ -1290,6 +1290,9 @@ PROFILE_ACTIONS = (
     _Action("clone", "sharing", "Send as Clone",
             "Offer it as an independent copy, without memories, that never follows your edits.",
             _method("_handle_share", True), _shareable),
+    _Action("borrowers", "sharing", "Borrowers",
+            "See who borrows it, and withdraw it from them.",
+            _method("_handle_borrowers"), _shareable),
     # No bulk form, which is also what keeps it out of /settings -> Defaults: one intro
     # stamped across forty characters describes none of them.
     _Action("library_intro", "sharing", "Library Intro",
@@ -1793,6 +1796,10 @@ class ProfileManageView(BlockedGuard, ui.View):
         await interaction.followup.send(embed=text_embed(message), ephemeral=True, **extra)
         self._build_view()
         await self._refresh_dashboard(interaction)
+
+    async def _handle_borrowers(self, interaction):
+        view = BorrowersView(self.cog, interaction, self.user_id, self.profile_name)
+        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
     async def _handle_delete(self, interaction):
         async def confirm_delete(i: discord.Interaction):
