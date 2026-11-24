@@ -1,7 +1,7 @@
 """The data policy screen: whether a server's messages may reach AI providers that train on them.
 
-The bot owner's alone, opened from /privacy; cogs/utils/data_policy says why a server's
-administrators cannot open a route. Everyone else reads the same fields on /privacy.
+The bot owner's alone, opened from /data; cogs/utils/data_policy says why a server's
+administrators cannot open a route. Everyone else reads the same fields on /data.
 """
 import asyncio
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
@@ -39,7 +39,7 @@ _PROVIDER_COPY = {
 def add_data_policy_fields(embed: discord.Embed, server_index) -> None:
     """One field per provider: whether this server has opened it, and what that means.
 
-    The bot owner's screen and every user's /privacy both render through here, so the two
+    The bot owner's screen and every user's /data both render through here, so the two
     cannot describe the same server differently.
     """
     for provider in TRAINING_PROVIDERS:
@@ -67,7 +67,7 @@ class DataPolicyView(BlockedGuard, ui.View):
         self.cog = cog
         self.guild = guild
         self.user_id = user_id
-        #: Rebuilds the /privacy screen this was opened from, for the Back button.
+        #: Rebuilds the /data screen this was opened from, for the Back button.
         self.on_back = on_back
         #: The provider awaiting confirmation, or None on the main screen.
         self.confirming: Optional[str] = None
@@ -105,7 +105,7 @@ class DataPolicyView(BlockedGuard, ui.View):
             description=(
                 "Whether this server's messages may be sent to AI providers that can train "
                 "on them. Both start closed, and only the bot's owner can open either. "
-                "Everyone can read this in `/privacy`."
+                "Everyone can read this in `/data`."
             ),
             color=discord.Color.blurple())
         add_data_policy_fields(e, index)

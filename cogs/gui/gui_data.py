@@ -23,6 +23,8 @@ from .base_components import (PAGE_NAV_VALUES, BaseBulkProfileView, BlockedGuard
 from .gui_data_policy import DataPolicyView, add_data_policy_fields
 from ..utils import data_policy
 from ..utils.data_policy import may_set_data_policy
+from ..managers import ignored_users
+from ..managers.ignored_users import IGNORED
 from .base_components import dismissible, text_embed
 
 class EditLtmModal(ui.Modal, title="Edit Long-Term Memory"):
@@ -879,9 +881,12 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
         super().__init__(timeout=300)
         self.cog = cog
         self.user_id = user_id
-        #: The server /privacy was run in, whose data policy a self-hosted instance shows.
+        #: The server /data was run in, whose data policy a self-hosted instance shows.
         #: None in a DM.
         self.guild = guild
+        self.ignored = user_id in IGNORED
+        add_button(self, "Read My Messages Again" if self.ignored else "Ignore My Messages",
+                   self.toggle_ignored, row=1, emoji="👁️" if self.ignored else "🙈")
         if guild is not None and may_set_data_policy(user_id):
             add_button(self, "Change Data Policy", self.open_data_policy, row=1, emoji="🛡️")
 
@@ -891,6 +896,15 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
             description="Request a full export of your data or permanently delete your account and all associated profiles, memories, and settings.",
             color=discord.Color.red()
         )
+        e.description += (
+            "\n\n**Your messages are ignored.** The bot reads nothing you post, edit or react with, "
+            "in any server: no session logs it, no character answers or remembers it, and replies "
+            "to you do not quote it. Commands and buttons still work." if self.ignored else
+            "\n\n**Your messages** are read in channels with a running session, so characters can "
+            "answer you. **Ignore My Messages** stops that everywhere; commands and buttons still "
+            "work. Only your Discord ID is stored for it, and Delete My Account leaves it, so the "
+            "bot never starts reading you again by itself. Messages already logged stay until their "
+            "log is purged or you delete them in Discord.")
         # Shown only where someone can change it: on the official bot both routes stay
         # closed for good, so there is nothing to read.
         if self.guild is not None and data_policy.SELF_HOSTED:
@@ -900,6 +914,11 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
             add_data_policy_fields(e, self.cog.server_manager._get_server_index(str(self.guild.id)))
             e.set_footer(text=self.guild.name)
         return e
+
+    async def toggle_ignored(self, interaction: discord.Interaction):
+        await ignored_users.set_ignored(self.user_id, not self.ignored)
+        view = PrivacyDashboardView(self.cog, self.user_id, self.guild)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
 
     async def open_data_policy(self, interaction: discord.Interaction):
         if not may_set_data_policy(interaction.user.id):

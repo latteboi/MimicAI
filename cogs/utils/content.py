@@ -62,7 +62,7 @@ HELP_CATEGORIES = {
             "wherever it is opened, and only the bot's owner can save one in `/settings`. OpenRouter requests for either only go "
             "to hosts that do not train on prompts, and a model no "
             "such host is known to serve is offered to the bot's owner alone. A server's administrators cannot change any of "
-            "this; only a self-hosted bot's owner can, one server at a time, from `/privacy` -- never on the official bot. Paid tier also escapes the rate limits that "
+            "this; only a self-hosted bot's owner can, one server at a time, from `/data` -- never on the official bot. Paid tier also escapes the rate limits that "
             "throttle long-term memory, grounding and the content classifier, and image generation is blocked on free keys entirely.\n\n"
             "**Preferred provider** (`/start`, or `/settings` -> Override Defaults): every model a character uses runs Primary -> Fallback on "
             "this provider. A Fallback you set on the other provider keeps a character speaking through an outage or a spent key on one. "
@@ -621,7 +621,9 @@ HELP_CATEGORIES = {
             "its picture becomes the avatar, if it is 4 MB or less. A card tagged NSFW is held: it runs nowhere until its content rating allows it. Set `profile_name` to add a file's lorebook -- a "
             "SillyTavern World Info file, or a card's -- to a profile you own instead, and `add` to add its fixed or training examples: "
             "a .txt of `SAID:` and `REPLY:` blocks with a `---` line between them, SillyTavern dialogue, or a JSON list of `said`/`reply`.\n\n"
-            "**`/privacy`** covers the other direction -- reviewing and deleting your data, up to removing your account's data entirely."
+            "**`/data`** covers the other direction -- reviewing and deleting your data, up to removing your account's data entirely. "
+            "It can also have the bot ignore your messages everywhere: nothing you post, edit or react with is logged, answered or "
+            "remembered, while commands and buttons keep working. `/terms` and `/privacy` show the Terms of Service and Privacy Policy."
         ),
     },
     "8. Getting Help and Fixing Things": {
@@ -645,7 +647,7 @@ HELP_CATEGORIES = {
             "the first thing anyone helping you needs.\n\n"
             "You need an account (`/start`). Up to 3 tickets can be open at once, each holds up to 30 messages, and a new "
             "one can be opened every 10 minutes. Either side can close a ticket; a closed ticket is deleted 30 days later, "
-            "and they are part of your `/privacy` export and go with your account."
+            "and they are part of your `/data` export and go with your account."
         ),
         "When a Profile Says Nothing": (
             "In order of likelihood:\n\n"
@@ -693,13 +695,13 @@ HELP_CATEGORIES = {
             "`/profile global_chat`\n\n"
             "**Sessions:** `/session config`, `/session swap`, `/session view`, `/session audit`, `/trigger`\n\n"
             "**In-channel:** `/whisper`, `/speak`, `/refresh`, `/cancel`, `/suspend`, `/purge`, `/compact`\n\n"
-            "**Setup and data:** `/settings`, `/export`, `/import`, `/privacy`, `/terms`, `/invite`, `/whoami`, `/viewavatar`\n\n"
+            "**Setup and data:** `/settings`, `/export`, `/import`, `/data`, `/terms`, `/privacy`, `/invite`, `/whoami`, `/viewavatar`\n\n"
             "**Documentation and support:** `/start` (guided setup), `/help` (this manual, MimicGuide and support tickets), `/news` (what changed in each release)\n\n"
             "**Support the project:** `/thanks` (Ko-fi, or vote and review on Top.gg)\n\n"
             "**Operator:** `/mod`, `/shutdown`\n\n"
             "`/refresh`, `/cancel`, `/suspend`, `/purge` (bar in a DM), `/memorise`, `/compact`, `/play stop`, `/session config` and `/session swap` require "
             "administrator permission — though an admin can set a channel to **Open casting**, which opens `/session config` "
-            "(Cast tab only) to everyone. `/mod` and `/shutdown` are bot-owner only, as is changing a server's data policy in `/privacy`."
+            "(Cast tab only) to everyone. `/mod` and `/shutdown` are bot-owner only, as is changing a server's data policy in `/data`."
         ),
     },
 }
@@ -772,10 +774,11 @@ WIZARD_COPY = {
         "attachments to the AI provider that character uses, and memory, ratings and web searches use "
         "the same providers. Each is billed to whichever API key pays for it, including work beyond "
         "the reply you see.\n"
-        "**What you control.** `/privacy` exports everything stored under your account, or deletes it.\n"
+        "**What you control.** `/data` exports everything stored under your account, or deletes it, "
+        "and can have the bot ignore your messages entirely.\n"
         "**Content.** Every character writes for a general audience; MimicAI hosts no adult content.\n\n"
         "This summarises the Terms of Service and Privacy Policy in force from {date}. "
-        "**Read the Terms** on the setup screen, or `/terms`, shows both in full."
+        "**Read the Terms** on the setup screen shows both in full, as do `/terms` and `/privacy`."
     ),
     # One per provider: the step says only what the provider chosen before it needs.
     "key": {
@@ -1095,7 +1098,7 @@ DEFAULT_HELP_DOCS = {
     "apis/google_gemini.txt": (
         "Requirements: A Google API key from Google AI Studio, submitted via `/start` or `/settings` -> API Keys.\n"
         "Capabilities: Powers standard text generation. Native Grounding and URL Context on a Gemini model use Google's own Search and URL fetching. Its Gemini image models draw pictures and its Gemini speech models speak, directed by the Director's Desk; OpenRouter offers other image and speech models alongside them.\n"
-        "Free versus paid tier: Google may train its models on what a free-tier key is sent, so `/settings` refuses a free-tier key from anyone but the bot's owner, and one saved before that is not used for a server's messages or for Global Chat. Conversations on Gemini need a billing-enabled (paid) key. A server's administrators cannot change that; only a self-hosted bot's owner can, one server at a time, from `/privacy` -- never on the official bot. Free keys also rate-limit hard, and image generation is blocked outright on them.\n"
+        "Free versus paid tier: Google may train its models on what a free-tier key is sent, so `/settings` refuses a free-tier key from anyone but the bot's owner, and one saved before that is not used for a server's messages or for Global Chat. Conversations on Gemini need a billing-enabled (paid) key. A server's administrators cannot change that; only a self-hosted bot's owner can, one server at a time, from `/data` -- never on the official bot. Free keys also rate-limit hard, and image generation is blocked outright on them.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The bot isn't responding in the server' or 'Bot is silent'. Fix: Ensure an administrator has assigned a billing-enabled (paid) Google API key to this server via `/settings` -> API Keys, and clicked Save Assignments. A free-tier key is not used in a server.\n"
         "- Symptom: 'Image generation failed' or 'Paid Key Required'. Fix: You are using a free-tier Google API key. You must configure billing in Google AI Studio to unlock image models.\n"
@@ -1121,7 +1124,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'No OpenRouter host is known to serve this model without training on prompts, so it is not offered here.' Fix: Only the bot's owner is offered such models. Pick another."
     ),
     "apis/data_policy.txt": (
-        "Command: `/privacy` shows everyone the data policy of the server it is run in: whether that server's messages may be sent to AI providers that can train on them. Only a self-hosted bot's owner can change it, with the Change Data Policy button there; on the official bot nobody can, and both routes stay closed.\n"
+        "Command: `/data` shows everyone the data policy of the server it is run in: whether that server's messages may be sent to AI providers that can train on them. Only a self-hosted bot's owner can change it, with the Change Data Policy button there; on the official bot nobody can, and both routes stay closed.\n"
         "Concept: Two routes can train on what they are sent: Google's free (unpaid) Gemini tier, and OpenRouter hosts whose policy allows training. Both are closed in every server and in every Global Chat. Discord's Developer Policy does not allow message content to be used to train AI models without Discord's permission, and that permission could only be given to the bot's developer, so only the bot's owner can open either route, and only on a self-hosted bot: the official bot has no such permission, so on it nobody can. A server's administrators cannot.\n"
         "Gemini free tier: While closed, a free-tier Google key is not used for the server's messages -- conversations, memories, web research, images and speech. Billing-enabled (paid) keys are unaffected.\n"
         "OpenRouter: While closed, the server's OpenRouter requests ask OpenRouter to use only hosts that do not train on prompts. A model no such host serves stops working in that server. The model pickers offer such models to the bot's owner alone, and the bot owner's data policy screen says how many models everyone else is offered.\n"
@@ -1132,7 +1135,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Global Chat says my Google key is on the free tier.' Fix: Assign a billing-enabled (paid) key to Personal in `/settings`, or add an OpenRouter key.\n"
         "- Symptom: 'An OpenRouter model stopped working in our server or in Global Chat.' Fix: No host that avoids training serves it. Pick another model.\n"
         "- Symptom: 'An OpenRouter model is missing from the list' or 'Typing its id is refused.' Fix: No host is known to serve it without training on prompts, so only the bot's owner is offered it.\n"
-        "- Symptom: 'Where is /data_policy?' or 'Our administrator can't allow the free tier.' Fix: The data policy is in `/privacy`. Everyone can read it there; only a self-hosted bot's owner can change it, and on the official bot nobody can."
+        "- Symptom: 'Where is /data_policy?' or 'Our administrator can't allow the free tier.' Fix: The data policy is in `/data`. Everyone can read it there; only a self-hosted bot's owner can change it, and on the official bot nobody can."
     ),
     "apis/ollama.txt": (
         "Availability: Only this bot's owner -- the person running the instance -- can use Ollama models. An Ollama host receives every message a profile sees, so it has to be the operator's own machine. Everyone else sees Google and OpenRouter only.\n"
@@ -1365,7 +1368,7 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'Paid Key Required' or a Gemini image model fails. Fix: Google blocks its image models on free-tier API keys. A valid billing account must be active in Google AI Studio -- or choose an OpenRouter image model instead.\n"
         "- Symptom: 'In a session, !image is answered as a normal message.' Fix: The session's Features do not allow you Image Generation; an administrator opens it in `/session config` -> Config -> Features.\n"
         "- Symptom: '!image does nothing.' Fix: Image generation is disabled for that profile, or its image slot holds something that cannot draw, such as a text model. Choose a Google or OpenRouter image model under Models -> Image Generation.\n"
-        "- Symptom: 'No OpenRouter host serves this model without the right to train on prompts.' Fix: The server has not been opened to OpenRouter hosts that may train, and that image model's host is not known to avoid it. Choose another image model; only a self-hosted bot's owner can change a server's data policy, from `/privacy`.\n"
+        "- Symptom: 'No OpenRouter host serves this model without the right to train on prompts.' Fix: The server has not been opened to OpenRouter hosts that may train, and that image model's host is not known to avoid it. Choose another image model; only a self-hosted bot's owner can change a server's data policy, from `/data`.\n"
         "- Symptom: 'My images stopped using web research.' Fix: Images no longer follow the profile's Grounding setting. Set `/profile manage` -> Images -> Image Output -> Search grounding to Legacy RAG.\n"
         "- Symptom: 'The aspect ratio I picked was ignored.' Fix: The profile's image model does not carry that ratio. The setting is kept on the profile and left out of the request rather than failing it, so switching back to a model that supports it restores the setting."
     ),
@@ -1490,7 +1493,7 @@ DEFAULT_HELP_DOCS = {
         "Concept: A support ticket writes to the people who run this bot from inside Discord, without a support server. Replies come back to the same place, and the Tickets button counts tickets with something new. Nothing is sent by DM: open `/help` to read replies.\n"
         "Opening one: `/help` -> Tickets -> New Ticket. Choose what it is about (Something's broken, Setup and API keys, Content rating, Idea or request, Something else), write the message, and optionally paste a link to a character's reply that went wrong (right-click the message -> Copy Message Link); that reply's generation trace is attached for the bot owner.\n"
         "Limits: An account is needed (`/start`). Up to 3 tickets open at once, up to 30 messages in one ticket, 2,000 characters a message, and one new ticket every 10 minutes; a refused or failed one does not count.\n"
-        "Closing and keeping: You or the bot owner can close a ticket; a closed one cannot be reopened, so open a new one if there is more to say. A closed ticket is deleted 30 days later, and opening an eleventh deletes your oldest closed one. Tickets are in your `/privacy` export and are deleted with your account.\n"
+        "Closing and keeping: You or the bot owner can close a ticket; a closed one cannot be reopened, so open a new one if there is more to say. A closed ticket is deleted 30 days later, and opening an eleventh deletes your oldest closed one. Tickets are in your `/data` export and are deleted with your account.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'The Tickets button is greyed out.' Fix: Create your account in `/start` first.\n"
         "- Symptom: 'New Ticket is greyed out.' Fix: The line under the list says why: 3 tickets already open, or one opened in the last 10 minutes.\n"
@@ -1498,11 +1501,12 @@ DEFAULT_HELP_DOCS = {
         "- Symptom: 'I can't reply to my ticket.' Fix: It is closed, or it has reached 30 messages. Open a new ticket."
     ),
     "features/data_portability.txt": (
-        "Commands: `/export`, `/import`, `/privacy`, in a server or a DM. Every reply, the export file included, is visible only to you.\n"
+        "Commands: `/export`, `/import`, `/data`, in a server or a DM. Every reply, the export file included, is visible only to you.\n"
         "Export: Writes selected profiles, and optionally their memories and training examples, to an encrypted `.mimic` file of up to 10 MB, the most Discord lets the bot send. Standard Export is sealed with this instance's own key and imports only on this instance. Export for Self-Hosted is sealed with a passphrase you choose, for moving to a self-hosted instance.\n"
         "Import: Takes a `.mimic` file of up to 25 MB, decrypts it (asking for the passphrase if it has one), numbers any name you already use (`name-2`), re-encrypts the content and files it into your account. It is refused whole if it holds more profiles than your limit has room for. A content rating does not carry over, bar Refused, so an imported profile must be submitted again before it can be shared. A Not Allowed one comes in held for a new rating, and runs only once that rating allows it. Passphrase files import on every instance, the official MimicAI bot included. Plaintext and legacy exports are refused everywhere.\n"
         "Character cards: `/import` also takes a character card: a PNG or CHARX of up to 25 MB, or its JSON of up to 2 MB. The card's text is sorted into persona sections by your own model (or filed as written, if no model will), shown as a draft to Save, Regenerate or Refine. On Save its example exchanges become fixed examples, its lorebook becomes the profile's, and its picture (a CHARX's main icon) -- posted in your DMs -- becomes the avatar; deleting that message removes it. A picture over 4 MB, more than the content rating reads, is imported without the avatar. A card tagged NSFW is held for its content rating, and runs nowhere until the rating allows it. A card's system prompt and post-history instructions are not imported. A lorebook on its own (a SillyTavern World Info JSON) is not a character: `/import` it with `profile_name` set to a profile you own, and its entries are added to that profile's lorebook, skipping any it already has. Examples are added the same way: `/import` with `profile_name` and `add` set to fixed_examples or training_examples. The file is a .txt of `SAID:` and `REPLY:` blocks with a `---` line between examples, a .txt of SillyTavern dialogue (`<START>`, `{{user}}:`, `{{char}}:`), a .json list of `{\"said\": ..., \"reply\": ...}`, or a card, whose example dialogue is read. One file goes to one place: split fixed and training examples into two files. Examples the profile already has are skipped, and as many are added as fit (20 fixed, 100 training). A training example needs a SAID, the line it is matched on, and each one costs an embedding call, so the import takes a moment and needs an API key.\n"
-        "Privacy: `/privacy` covers reviewing and deleting your stored data, including full account data deletion.\n"
+        "Privacy: `/data` covers reviewing and deleting your stored data, including full account data deletion. `/terms` and `/privacy` show the Terms of Service and Privacy Policy.\n"
+        "Ignoring messages: `/data` -> Ignore My Messages has the bot ignore everything you post, edit or react with, in every server: no session logs it, no character answers or remembers it, and a reply to one of your messages does not quote it. Commands and buttons still work. Only your Discord ID is stored for it, and Delete My Account leaves it in place. Messages already logged stay until their log is purged or you delete them in Discord. Read My Messages Again, in the same place, turns it off.\n"
         "Troubleshooting / Symptoms:\n"
         "- Symptom: 'Can other people see my export?' Fix: No. Every reply to `/export` and `/import`, the file included, is visible only to you, in a server as in a DM.\n"
         "- Symptom: 'Imported profiles came in with different names.' Fix: A name already existed in your account. Imports number the new one (`name-2`) rather than overwriting.\n"
@@ -1779,7 +1783,7 @@ LEGAL_DOCUMENTS = {
             "\n"
             "Access may be suspended for a fixed period or permanently. Whatever the "
             "restriction, your current standing is shown in /settings, and your data remains "
-            "available for export or deletion through /privacy. We may also decline to "
+            "available for export or deletion through /data. We may also decline to "
             "operate in a particular Discord server and remove the bot from it. Where we "
             "act, we keep a record of the account or server, the date, the restriction "
             "applied, and the reason, until one year after the restriction ends."
@@ -1840,7 +1844,7 @@ LEGAL_DOCUMENTS = {
             "When the Subscription is cancelled, lapses after a failed payment, or is "
             "refunded, it stops paying for model calls. Your profiles, memories and "
             "settings are kept, and /export stays free. Deleting your account through "
-            "/privacy cancels the Subscription immediately."
+            "/data cancels the Subscription immediately."
         ),
         "11.8 Refunds": (
             "Once per person, within 7 days of a payment, if less than 10% of that month's "
@@ -1884,7 +1888,8 @@ LEGAL_DOCUMENTS = {
             "stored unencrypted: profile names and IDs, which profiles borrow which, your "
             "About Me settings and defaults, each server's active sessions, key assignments "
             "and data policy, the Public Library listing, the list of support tickets (who "
-            "opened each, its category, status and dates, never what it says), and "
+            "opened each, its category, status and dates, never what it says), the list of "
+            "people who asked the bot to ignore their messages, and "
             "enforcement records, including the review list of profiles whose content rating "
             "awaits the instance owner's review."
         ),
@@ -1904,7 +1909,8 @@ LEGAL_DOCUMENTS = {
             "resentment score for each person the character talks to, stored with the "
             "profile under an ID derived from that person's Discord ID.\n"
             "• **Conversation Context:** Unified Chat Session logs, holding the messages "
-            "sent in a channel with an active session, by anyone, with the sender's display "
+            "sent in a channel with an active session, by anyone the bot has not been asked "
+            "to ignore (Section 5), with the sender's display "
             "name, Discord ID and timestamps; the profiles' replies; the emoji reactions "
             "left on its messages, with the reacting person's display name; whispers; and "
             "text read from linked pages. Global Chat logs. Both are retained temporarily to "
@@ -1963,7 +1969,7 @@ LEGAL_DOCUMENTS = {
             "\n"
             "**Training:** By default, no server's conversations are sent to Google's free "
             "Gemini tier or to OpenRouter hosts whose policy allows training on prompts. "
-            "Only the instance owner can open a server to either, and /privacy in that "
+            "Only the instance owner can open a server to either, and /data in that "
             "server shows its current policy. A Global Chat follows the policy of the server "
             "it is opened in. What you send in a DM under your own key follows your own "
             "provider account's settings.\n"
@@ -2008,7 +2014,7 @@ LEGAL_DOCUMENTS = {
             "A support ticket is deleted 30 days after it is closed, and opening an eleventh "
             "deletes your oldest closed one.\n"
             "\n"
-            "Through /privacy, Request Data Export gives you a decrypted copy of the "
+            "Through /data, Request Data Export gives you a decrypted copy of the "
             "profiles, memories, training examples, voice recordings, API keys, settings, "
             "and support tickets stored under your account. The archive holds your API keys "
             "unencrypted, so keep it safe. Delete My Account erases everything stored under "
@@ -2026,11 +2032,19 @@ LEGAL_DOCUMENTS = {
             "recover from a failure.\n"
             "\n"
             "Data held in a server's session logs or in other people's profiles cannot be "
-            "deleted through /privacy. Deleting one of your messages in Discord while the "
+            "deleted through /data. Deleting one of your messages in Discord while the "
             "bot is online removes it from the session log too, though not any long-term "
             "memory already written from it, and so does removing a profile's message after "
             "a report. Removing a reaction while the bot is online removes it from the log "
             "too. To ask for the removal of anything else, contact us (Section 8).\n"
+            "\n"
+            "Ignore My Messages, in /data, has the bot ignore everything you post, edit or "
+            "react with, in every server: no session logs it, no profile answers or "
+            "remembers it, and a reply to one of your messages does not quote it. Commands "
+            "and buttons you use still work. Only your Discord ID is stored for it, on the "
+            "list of people ignored, and Delete My Account leaves it there, so deleting your "
+            "account never starts the bot reading you again. Messages already in a session "
+            "log stay until it is purged or you delete them in Discord.\n"
             "\n"
             "Users may also export profiles, with their memories and training examples, as "
             "encrypted .mimic files through /export. A passphrase export can be imported on "
@@ -2039,7 +2053,7 @@ LEGAL_DOCUMENTS = {
             "\n"
             "The Subscription Record is kept while you have an account, so a returning "
             "subscriber is matched to the same Stripe customer, and is included in your "
-            "/privacy export. Delete My Account erases it and cancels any active "
+            "/data export. Delete My Account erases it and cancels any active "
             "Subscription. Stripe keeps its own records of payments under its own policy.\n"
             "\n"
             "Enforcement records are kept while a restriction is in force and for one year "
@@ -2065,7 +2079,7 @@ LEGAL_DOCUMENTS = {
             "policy."
         ),
         "8. Contact": (
-            "Questions about these terms or your data, requests to remove data that /privacy "
+            "Questions about these terms or your data, requests to remove data that /data "
             "cannot reach, and reports of a message a profile posted (Terms, Section 3) can "
             "be opened as a support ticket in /help or sent to mimicai.bot@gmail.com. For a "
             "self-hosted instance, contact the individual or entity hosting it, whom its "

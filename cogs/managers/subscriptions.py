@@ -6,7 +6,7 @@ A payment source only answers *who is entitled*: owner grants from `/mod`, and S
 (`key_for`), so neither OpenRouter's management API nor a payment provider is ever on the turn
 path. The design is in tests/MIMIC_SUBSCRIPTION.md, **Architecture**.
 
-`data/subscriptions.json.gz`, sealed, outside every user's folder because `/privacy`'s export
+`data/subscriptions.json.gz`, sealed, outside every user's folder because `/data`'s export
 dumps that folder decrypted. One row per Discord ID:
 
   tier, source        a SUBSCRIPTION_TIERS key; "grant" or "stripe"
@@ -224,7 +224,7 @@ class SubscriptionStore:
         return dict(grant) if grant else None
 
     def export_row(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """What `/privacy`'s export carries: never the key or its hash."""
+        """What `/data`'s export carries: never the key or its hash."""
         row = self.row(user_id)
         return {k: row[k] for k in ("tier", "source", "status", "since", "ends", "renews", "limit", "usage",
                                     "base", "synced") if k in row} if row else None

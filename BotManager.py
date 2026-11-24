@@ -65,8 +65,8 @@ async def on_ready():
     print(f"Bot is online as {bot.user.name} (ID: {bot.user.id})")
     print("Attempting to sync application (slash) commands...")
     if bot.user.id == OFFICIAL_BOT_ID:
-        # The official bot's /privacy shows no data policy (PrivacyDashboardView.embed).
-        bot.tree.get_command("privacy").description = "Export or delete your data."
+        # The official bot's /data shows no data policy (PrivacyDashboardView.embed).
+        bot.tree.get_command("data").description = "Export or delete your data, or have the bot ignore your messages."
     cog = bot.get_cog("MimicCog")
     if not (cog and cog.subscriptions.billing):  # a pause keeps it for subscribers
         # Self-hosts never show the subscription (tests/MIMIC_SUBSCRIPTION.md, Decided).

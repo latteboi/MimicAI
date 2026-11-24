@@ -6,7 +6,7 @@ Two levels, so nothing on the way to a ticket decrypts more than that one ticket
   category, status, times and unread flags -- never a word of what it says. Read once,
   held in memory, and the answer to every count and list `/help` draws.
 * `users/<id>/tickets/<n>.json.gz`, sealed: the messages, and a trace if one was attached,
-  read only when the ticket is opened. Under the user's own directory, so `/privacy`'s
+  read only when the ticket is opened. Under the user's own directory, so `/data`'s
   export carries it, and Delete My Account and the departed-user cleanup remove it with
   everything else -- each of them calls `drop_user` beside its rmtree, for the index.
 

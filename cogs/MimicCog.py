@@ -52,6 +52,7 @@ from .managers.storage_manager import MasterCipher, StorageManager
 from .managers.profile_manager import ProfileManager, attach_profile_managers
 from .managers.user_settings import UserSettings
 from .managers.borrow_index import BorrowIndex
+from .managers import ignored_users
 from .managers.sharing_manager import SharingManager
 from .managers.library_manager import LibraryManager
 from .managers.content_rating_manager import ContentRatingManager
@@ -370,6 +371,7 @@ class MimicCog(EventListeners, commands.Cog):
         # for having the sweep.
         self._next_blacklist_expiry: float = math.inf
         self.server_manager._load_blacklist()
+        ignored_users.load()
         self.session_last_accessed = {}
         self.eviction_heap = []
         # session_key -> session_type for logs with unpersisted appends. Bounded by the
@@ -966,9 +968,9 @@ class MimicCog(EventListeners, commands.Cog):
                 "more than the content rating reads, so it is not the avatar. Set one under "
                 "Appearance after saving."), ephemeral=True)
 
-    @app_commands.command(name="privacy", description="Export or delete your data, and see this server's data policy.")
+    @app_commands.command(name="data", description="Export or delete your data, have the bot ignore your messages, and see this server's data policy.")
     @app_commands.checks.cooldown(1, 10.0, key=lambda i: i.user.id)
-    async def privacy_slash(self, interaction: discord.Interaction):
+    async def data_slash(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
         # `get_guild`, not `interaction.guild`: only a server the bot is in has a data
         # policy to show.
@@ -2912,19 +2914,31 @@ class MimicCog(EventListeners, commands.Cog):
         self.session_manager._save_multi_profile_sessions()
         await interaction.response.send_message(embed=text_embed(result_msg), ephemeral=True)
 
-    @app_commands.command(name="terms", description="View the MimicAI Terms of Service and Privacy Policy.")
+    @app_commands.command(name="terms", description="Read the MimicAI Terms of Service.")
     @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
     async def terms_slash(self, interaction: discord.Interaction):
-        # The full text, not a link to it. Someone asking what the bot does with their
-        # API key should be able to read the answer without leaving Discord, and a
-        # self-hosted instance has no business pointing its users at the official
-        # site's copy. The link stays as a button so the canonical version is one
-        # click away and any drift between the two is visible.
+        await self.send_legal(interaction, ("Terms of Service", "Terms of Service (Subscription)"),
+                              "MimicAI Terms of Service")
+
+    @app_commands.command(name="privacy", description="Read the MimicAI Privacy Policy.")
+    @app_commands.checks.cooldown(10, 60.0, key=lambda i: i.user.id)
+    async def privacy_slash(self, interaction: discord.Interaction):
+        await self.send_legal(interaction, ("Privacy Policy",), "MimicAI Privacy Policy")
+
+    async def send_legal(self, interaction: discord.Interaction, documents, title: str):
+        """`LEGAL_DOCUMENTS` categories, in full, to read in Discord.
+
+        The full text, not a link to it. Someone asking what the bot does with their
+        API key should be able to read the answer without leaving Discord, and a
+        self-hosted instance has no business pointing its users at the official
+        site's copy. The link stays as a button so the canonical version is one
+        click away and any drift between the two is visible.
+        """
         await interaction.response.defer(ephemeral=True)
         from .utils.content import LEGAL_DOCUMENTS, LEGAL_EFFECTIVE_DATE
         view = DropdownContentView(
-            LEGAL_DOCUMENTS,
-            f"MimicAI Terms of Service & Privacy Policy · Effective {LEGAL_EFFECTIVE_DATE}",
+            {name: LEGAL_DOCUMENTS[name] for name in documents},
+            f"{title} · Effective {LEGAL_EFFECTIVE_DATE}",
             links=[("View on mimic-ai.org", "https://mimic-ai.org/")])
         view.block_exempt = True
         await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)

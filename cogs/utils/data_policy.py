@@ -3,7 +3,7 @@
 Two provider routes may use what they are sent to train models: Google's free (unpaid)
 Gemini tier, and the OpenRouter hosts whose policy allows training. Both are closed to a
 server's traffic until a self-hosted instance's owner opts that server in, per provider, on
-the data policy screen `/privacy` gives them. See GEMINI_FREE_TIER_BLOCKED in constants for why.
+the data policy screen `/data` gives them. See GEMINI_FREE_TIER_BLOCKED in constants for why.
 
 A Global Chat is a conversation wherever its card is opened, so it answers to the same
 policy: the server's when it is opened in one, and closed anywhere else, where there is no

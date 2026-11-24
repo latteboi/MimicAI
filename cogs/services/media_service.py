@@ -19,6 +19,7 @@ from ..utils.constants import (
     VOICE_SAMPLE_GEMINI_ACCEPTED, VOICE_SAMPLE_GEMINI_REFUSED, VOICE_SAMPLE_GEMINI_UNCHECKED,
 )
 from ..utils.constants import IMAGE_CONTENT_POLICY, SAFETY_SETTINGS
+from ..managers.ignored_users import IGNORED
 from ..utils.helpers import _add_inline_citations, _format_api_error, _format_citation_subtext, _scrub_response_text, generated_image_attachment, image_command_prefix, image_command_prompt, image_rag_enabled, image_suffix_for_mime, is_gateway_shutdown, resolve_image_output_params, resolve_typing_cursor, speaks_verbatim, tighten_line_spacing
 from ..utils.attachment_limits import over_attachment_limit, refuse_oversized_upload, skipped_attachment_note
 from .api.google_rest import GoogleSpeechModel
@@ -953,7 +954,7 @@ class MediaService:
                         ref_msg = await message.channel.fetch_message(message.reference.message_id)
                     except Exception: pass
                 
-                if ref_msg and isinstance(ref_msg, discord.Message):
+                if ref_msg and isinstance(ref_msg, discord.Message) and ref_msg.author.id not in IGNORED:
                     for attachment in ref_msg.attachments:
                         if (attachment.content_type and attachment.content_type.startswith("image/")
                                 and not over_attachment_limit(attachment)):

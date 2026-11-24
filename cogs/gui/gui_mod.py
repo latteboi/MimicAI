@@ -548,7 +548,7 @@ class ModBlacklistView(ModBaseView):
             if is_users:
                 embed.description = (
                     f"Blocked users: **{total}**{kept}\n\n"
-                    "A blocked user is never told. They keep `/privacy`, `/terms`, and a "
+                    "A blocked user is never told. They keep `/data`, `/terms`, `/privacy`, and a "
                     "`/settings` page showing that they are restricted and the dates — "
                     "not the reason, and not who set it.\n\n"
                     f"**{BLACKLIST_SCOPE_LABELS[BLACKLIST_SCOPE_GENERATION]}** is enforced "

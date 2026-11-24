@@ -241,7 +241,7 @@ def _standing_text(cog: 'MimicCog', user_id: int) -> str:
     if user_id not in cog.generation_blocked:
         return strike_line or "No restrictions."
     entry = cog.server_manager.blacklist_entry(user_id) or {}
-    lines = ["**Restricted.** Only `/privacy`, `/terms` and `/settings` are available to you."]
+    lines = ["**Restricted.** Only `/data`, `/terms`, `/privacy` and `/settings` are available to you."]
     try:
         since = int(datetime.datetime.fromisoformat(entry["at"]).timestamp())
         lines.append(f"Since <t:{since}:D>")

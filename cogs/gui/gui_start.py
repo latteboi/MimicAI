@@ -40,7 +40,7 @@ from ..utils import openrouter_signin
 from ..utils.user_defaults import offered_providers
 from ..managers.subscriptions import ACTIVE, tier_name
 from ..utils.data_policy import is_paid_gemini_slot, training_opt_in
-from ..utils.content import (HELP_CATEGORIES, LEGAL_EFFECTIVE_DATE, PERMISSION_EFFECTS,
+from ..utils.content import (HELP_CATEGORIES, LEGAL_DOCUMENTS, LEGAL_EFFECTIVE_DATE, PERMISSION_EFFECTS,
                              SERVER_KEY_UNASSIGNED, WIZARD_COPY, WIZARD_HOME, WIZARD_TOUR,
                              server_key_pitch)
 from .base_components import (PAGE_NAV_VALUES, BlockedGuard, DropdownContentView, PageJumpModal,
@@ -926,7 +926,9 @@ class StartWizardView(BlockedGuard, TimeoutCleanupMixin, KeyScopeMixin, ui.View)
         await interaction.response.send_modal(CreateAccountModal(self))
 
     async def _act_terms(self, interaction: discord.Interaction):
-        await self.cog.terms_slash.callback(self.cog, interaction)
+        # Both documents: Create Account asks for consent to the two.
+        await self.cog.send_legal(interaction, LEGAL_DOCUMENTS,
+                                  "MimicAI Terms of Service & Privacy Policy")
 
     async def _prefer(self, interaction: discord.Interaction, provider: str):
         """A provider button, which switches an account's provider. One left on a wizard

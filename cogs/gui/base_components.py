@@ -722,7 +722,8 @@ class DropdownContentView(BlockedGuard, ui.View):
             self.selected_page = list(self.content_dict[self.selected_category].keys())[0]
             self._build_view()
             await interaction.response.edit_message(embed=self.get_embed(), view=self)
-        add_select(self, cat_options, cat_callback, placeholder="Select Category...", row=0)
+        if len(cat_options) > 1:
+            add_select(self, cat_options, cat_callback, placeholder="Select Category...", row=0)
         
         page_options = [discord.SelectOption(label=page[:100], value=page[:100], default=(page == self.selected_page)) for page in self.content_dict[self.selected_category].keys()]
         async def page_callback(interaction: discord.Interaction):

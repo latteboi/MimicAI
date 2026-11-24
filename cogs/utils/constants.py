@@ -199,6 +199,10 @@ EMBEDDING_BASELINE_FILE = os.path.join(DATA_DIR, "embedding_baseline.json")
 # from "chunking has not finished". Safe to delete; a missing file costs one run.
 CLEANUP_STATE_FILE = os.path.join(DATA_DIR, "cleanup_state.json")
 
+# Discord IDs of people who asked, in /data, that the bot ignore their messages.
+# Plaintext. managers/ignored_users.py.
+IGNORED_USERS_FILE = os.path.join(DATA_DIR, "ignored_users.json")
+
 CHILD_BOTS_DIR = os.path.join(DATA_DIR, "child_bots")
 MODELS_DATA_DIR = os.path.join(DATA_DIR, "models")
 PRICING_CACHE_FILE = os.path.join(MODELS_DATA_DIR, "pricing_cache.json")
@@ -413,7 +417,7 @@ OLLAMA_OWNER_ONLY = (
 # its Terms allow API Data to reach only a Service Provider using it for no purpose of
 # its own. Google's free Gemini tier and OpenRouter hosts that may train both fail that,
 # so conversations are kept off them: a server's traffic unless the bot owner opts that
-# server in (from /privacy), and a Global Chat unless its card was opened in one. The
+# server in (from /data), and a Global Chat unless its card was opened in one. The
 # terms bind the developer, so no server administrator can opt in. A DM is not gated --
 # it is one user's own input under their own key.
 GEMINI_FREE_TIER_BLOCKED = (
@@ -2386,7 +2390,7 @@ GUILD_BLOCK_LABELS = {
 #: standing. Everything else refuses without a word -- saying why tells them what an alt
 #: has to avoid. Matched against `qualified_name`, so a subcommand sharing a name is not
 #: let through.
-BLACKLIST_EXEMPT_COMMANDS = frozenset({"privacy", "terms", "settings"})
+BLACKLIST_EXEMPT_COMMANDS = frozenset({"data", "privacy", "terms", "settings"})
 
 
 # --- Sessions: rounds, turns and delivery -------------------------------------

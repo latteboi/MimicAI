@@ -538,7 +538,7 @@ Discord's Developer Policy forbids using message content to train AI models with
 Discord's permission, and its Developer Terms let API Data go only to a Service Provider
 that uses it for no purpose of its own. Two routes fail that: Google's free Gemini tier and
 OpenRouter hosts whose policy allows training. Both are closed to a conversation until the
-bot owner opts its server in, on the screen `/privacy` gives them (`cogs/utils/data_policy.py`,
+bot owner opts its server in, on the screen `/data` gives them (`cogs/utils/data_policy.py`,
 stored sparse in the server's `index.json`); everyone else reads the policy there. The terms
 bind the developer, not a server, so no server administrator can: `training_opt_in` ignores
 a record anyone but the bot owner wrote. Only a self-hosted instance can open either route

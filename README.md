@@ -153,7 +153,8 @@ neuro-endocrine engine that carries four emotional variables between turns.
 `/export` and `/import` move profiles and memories as encrypted `.mimic` files. A standard
 export imports only on the instance that made it; a passphrase export moves to a
 self-hosted one. `/import` also reads character cards: PNG, CHARX or JSON.
-`/privacy` covers data deletion. Server administrators get channel suspension and purge;
+`/data` covers data deletion, and has the bot ignore someone's messages if they ask;
+`/terms` and `/privacy` show the Terms and Privacy Policy. Server administrators get channel suspension and purge;
 the bot owner gets a `/mod` dashboard with a blacklist, an automatic moderator, and a
 content classifier. MimicAI hosts no adult content: every reply, in every channel, is
 written for a general audience, and a profile rated Not Allowed runs nowhere.
@@ -166,7 +167,7 @@ written for a general audience, and a profile rated Not Allowed runs nowhere.
 - A Discord bot application (free).
 - At least one API key: **Google AI Studio (Gemini)** or **OpenRouter**. A Gemini key has
   to be paid-tier for conversations: Google may train on what a free-tier key is sent, so
-  the bot keeps server messages and Global Chat off one (see `/privacy`). Paid tier also avoids the
+  the bot keeps server messages and Global Chat off one (see `/data`). Paid tier also avoids the
   rate limits that throttle memory summarisation, training retrieval, grounding and image
   generation. Alternatively, point a profile at a local **Ollama** server and pay nothing.
 - Linux, macOS or Windows. Production runs on a **GCP e2-micro** (1 GB RAM, 0.25 vCPU)
@@ -182,8 +183,8 @@ written for a general audience, and a profile rated Not Allowed runs nowhere.
 2. Click **New Application** and name it.
 3. Under **Bot**:
    - **Reset Token** to get your bot token.
-   - Under *Privileged Gateway Intents*, enable **Presence**, **Server Members** and
-     **Message Content**. All three are required.
+   - Under *Privileged Gateway Intents*, enable **Server Members** and **Message Content**.
+     Both are required; Presence is not used.
 
 There is no invite link to build: the bot prints its own once it runs (step 3).
 

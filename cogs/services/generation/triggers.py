@@ -11,6 +11,7 @@ from ...utils.helpers import (
 from ...utils.attachment_limits import over_attachment_limit, skipped_attachment_note
 from ...utils.http_client import get_shared_client
 from ...managers.session_manager import feature_allowed, intern_turn, log_user_turn, reply_quote
+from ...managers.ignored_users import IGNORED
 from ...utils.constants import (
     defaultConfig, DISCORD_NOTICE_TAG, ROUND_EMOJI_MAX, ROUND_MEDIA_MAX, ROUND_MEDIA_SKIPPED_NOTE,
     ROUND_URL_MESSAGES_MAX, STICKER_TAG, is_guild_admin,
@@ -133,7 +134,9 @@ async def referenced_message(message: Any) -> Optional[Dict[str, Any]]:
             target = await message.channel.fetch_message(reference.message_id)
         except Exception:
             target = None
-    if target is None or isinstance(target, discord.DeletedReferencedMessage):
+    # Someone who asked to be ignored (/data) is not quoted by another's reply either.
+    if (target is None or isinstance(target, discord.DeletedReferencedMessage)
+            or target.author.id in IGNORED):
         return {"id": reference.message_id, "missing": True}
     return reply_snapshot(target)
 

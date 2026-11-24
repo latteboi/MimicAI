@@ -26,6 +26,7 @@ from ..services.generation.triggers import (emoji_files, mentioned_seat, referen
 from ..utils.fuzzy import MAX_CHOICES, rank_keyed
 from ..gui.base_components import text_embed
 from ..managers.session_manager import feature_access, feature_allowed, may_mute, retract_reaction
+from ..managers.ignored_users import IGNORED
 
 #: The reactions `/session config` -> Config -> Features opens or closes. Named, not every
 #: feature: Read Reactions' 👀 is a label, and a 👀 is read like any other emoji.
@@ -210,7 +211,7 @@ class EventListeners:
         """
         session = self.multi_profile_channels.get(getattr(channel, 'id', None))
         if (not session or not self.has_lock or getattr(user, 'bot', True)
-                or user.id in self.generation_blocked
+                or user.id in self.generation_blocked or user.id in IGNORED
                 or not self.session_manager.is_started(session)):
             return
         now = time.monotonic()
@@ -239,7 +240,7 @@ class EventListeners:
             return
 
         # generation_blocked, so both block scopes: this path ends in a model call.
-        if message.author.id in self.generation_blocked:
+        if message.author.id in self.generation_blocked or message.author.id in IGNORED:
             return
 
         # Before boot loads the sessions every session channel looks like a plain one.
@@ -520,7 +521,7 @@ class EventListeners:
         the session does not read stays on the message: pulling back is for controls."""
         session = self.multi_profile_channels.get(payload.channel_id)
         member = payload.member  # None in a DM
-        if (not session or member is None or member.bot
+        if (not session or member is None or member.bot or payload.user_id in IGNORED
                 or not self.session_manager.is_started(session)
                 or not feature_allowed(session, "read_reactions", self._reaction_user_is_admin(payload))):
             return
@@ -1156,7 +1157,7 @@ class EventListeners:
         # one. A message never edited has nothing to rewrite, and one whose edit time has not
         # moved since the cached copy has not been edited again.
         msg = payload.message
-        if msg.edited_at is None:
+        if msg.edited_at is None or msg.author.id in IGNORED:
             return
         if payload.cached_message is not None and payload.cached_message.edited_at == msg.edited_at:
             return
