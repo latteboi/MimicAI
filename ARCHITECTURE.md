@@ -244,6 +244,8 @@ servers/<guild_id>/
 public_profiles/                      the shared library index: each listing under its PID,
                                       with its display name and intro (plaintext: public)
 borrows.json                          plaintext reverse index: source PID -> borrow PIDs
+ltm_people.json.gz                    sealed index: Discord ID -> memory files holding one
+                                      written from their words (`forget_person`)
 tickets.json                          plaintext ticket index: who, category, status, times,
                                       unread flags -- never the text (`TicketStore`)
 mod/                                  blacklist, global prompt and system model overrides, docs

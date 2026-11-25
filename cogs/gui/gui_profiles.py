@@ -1978,7 +1978,8 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
             "voice_sample": await self.cog.voice_samples.voice_sample_summary(
                 self.parent.user_id, self.parent.profile_name),
             "bonds": await asyncio.to_thread(
-                self.cog.persona_content.bonds, self.parent.user_id, self.parent.profile_name)
+                self.cog.persona_content.bonds, self.parent.user_id, self.parent.profile_name,
+                (self.parent.user_id,))
                 if self.action.value == "neuro" else None})
         if field:
             e.add_field(name=field[0], value=str(field[1])[:1024], inline=False)

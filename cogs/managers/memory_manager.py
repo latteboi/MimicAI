@@ -68,6 +68,8 @@ from ..utils import fixed_examples
 # lost, or a deleted entry back. Anything slow, an embedding call, is done before taking it.
 # ponytail: one lock for every profile; per-profile locks if shard writes ever queue.
 _SHARD_WRITE_LOCK = asyncio.Lock()
+# Held by every read-modify-write of the who-said-what index (`MemoryManager._edit_people`).
+_PEOPLE_LOCK = threading.Lock()
 from ..services.api_service import get_embedding_vector
 from ..gui.base_components import text_embed
 
@@ -87,10 +89,14 @@ def _training_entry(said: str, reply: str, embedding: List[float], model: str) -
 
 
 def _ltm_entry(summary: str, embedding_b64: str, guild_id: int, model: str,
-               user_dn: Optional[str] = None, source: Optional[str] = None) -> Dict[str, str]:
+               user_dn: Optional[str] = None, source: Optional[str] = None,
+               who: Sequence[str] = ()) -> Dict[str, Any]:
     """One stored memory. `context_id` repeats the server its file is named for, so a file
-    read on its own -- an export, a dump -- still says where each memory belongs."""
-    entry = {
+    read on its own -- an export, a dump -- still says where each memory belongs.
+
+    `who` is the Discord IDs of the people whose words it was written from, what
+    `forget_person` erases by. Never in an export (`exported_ltm`): it names other people."""
+    entry: Dict[str, Any] = {
         # 64 random bits: delete_ltms removes every entry sharing an id, and 32 bits
         # collided in ~0.3% of profiles at LIMIT_LTM. Older 8-char ids stay valid.
         "id": os.urandom(8).hex(),
@@ -104,6 +110,8 @@ def _ltm_entry(summary: str, embedding_b64: str, guild_id: int, model: str,
         entry["usr"] = user_dn
     if source:
         entry["src"] = source
+    if who:
+        entry["who"] = list(who)
     return entry
 
 
@@ -330,12 +338,19 @@ def ltm_files(p_dir: str) -> List[Tuple[str, str]]:
             if name.endswith(".json.gz") and name[:-_GZ].isdigit()]
 
 
+def exported_ltm(data: Any) -> List[Dict[str, Any]]:
+    """A memory file's entries as an export carries them: without `who`, the Discord IDs of
+    the people each was written from. An export is read by its owner, or by whoever they
+    hand it to, and names nobody else."""
+    return [{k: v for k, v in e.items() if k != "who"}
+            for e in (data if isinstance(data, list) else ()) if isinstance(e, dict)]
+
+
 def read_ltm_dir(p_dir: str, fernet) -> List[Dict[str, Any]]:
     """Every memory in a profile folder, every server, oldest first: what an export holds."""
     entries = []
     for _gid, path in ltm_files(p_dir):
-        data = IOManager.read_json_gzip(path, fernet)
-        entries += [e for e in data if isinstance(e, dict)] if isinstance(data, list) else []
+        entries += exported_ltm(IOManager.read_json_gzip(path, fernet))
     entries.sort(key=lambda e: e.get("created_ts") or e.get("ts") or "")
     return entries
 
@@ -546,6 +561,115 @@ class MemoryManager:
         # Either name may resolve to no profile -- nothing to copy, and nowhere to put it.
         if src_dir and new_dir and os.path.isdir(src_dir):
             shutil.copytree(src_dir, new_dir, dirs_exist_ok=True)
+            self._index_ltm_copy(src_dir, new_dir)
+
+    # --- Whose words: data/ltm_people.json.gz --------------------------------------
+    # Discord ID -> the memory files (relative to USERS_DIR) holding a memory written from
+    # their words, so `forget_person` reads those files and not every one on disk. Sealed:
+    # it says who each character remembers. Only ever added to, bar an erase taking its
+    # own key and an account deletion its own folder: a stale path costs one read.
+
+    def _people_file(self) -> str:
+        return os.path.join(os.path.dirname(self.cog.USERS_DIR), "ltm_people.json.gz")
+
+    def _edit_people(self, edit: Callable[[Dict[str, List[str]]], bool]) -> None:
+        """Read the index, `edit` it in place, and write it back only if `edit` says it
+        changed. Blocking. Its own lock: a profile copy writes it outside the shard lock."""
+        path, fernet = self._people_file(), self.cog.storage_manager.fernet
+        with _PEOPLE_LOCK:
+            index = IOManager.read_json_gzip(path, fernet)
+            index = index if isinstance(index, dict) else {}
+            if edit(index):
+                IOManager.write_json_gzip(index, path, fernet)
+
+    def _index_people(self, who: Sequence[str], path: Optional[str]) -> None:
+        """Points each of `who` at the memory file `path`. Blocking."""
+        if not path:
+            return
+        rel = os.path.relpath(path, self.cog.USERS_DIR)
+
+        def add(index) -> bool:
+            new = [uid for uid in who if rel not in index.get(uid, ())]
+            for uid in new:
+                index.setdefault(uid, []).append(rel)
+            return bool(new)
+        self._edit_people(add)
+
+    def _index_ltm_copy(self, src_dir: str, dst_dir: str) -> None:
+        """A copied `ltm` folder's memories are found by the same people as the original's.
+        Every path that copies one calls this after the copy. Blocking.
+
+        ponytail: walks the whole index once per copy, never a shard; a copy racing an
+        erase can miss its copy -- take _SHARD_WRITE_LOCK around copies if that matters.
+        """
+        src = os.path.relpath(src_dir, self.cog.USERS_DIR) + os.sep
+        dst = os.path.relpath(dst_dir, self.cog.USERS_DIR) + os.sep
+
+        def add(index) -> bool:
+            changed = False
+            for paths in index.values():
+                new = [dst + p[len(src):] for p in paths if p.startswith(src)]
+                new = [p for p in new if p not in paths]
+                paths += new
+                changed |= bool(new)
+            return changed
+        self._edit_people(add)
+
+    def drop_owner_from_people(self, owner_id: int) -> None:
+        """Forgets every memory file under `owner_id`'s folder, which is being deleted:
+        an index names nothing a deleted account held. Blocking."""
+        prefix = str(owner_id) + os.sep
+
+        def drop(index) -> bool:
+            changed = False
+            for uid in list(index):
+                kept = [p for p in index[uid] if not p.startswith(prefix)]
+                if len(kept) != len(index[uid]):
+                    changed = True
+                    if kept:
+                        index[uid] = kept
+                    else:
+                        del index[uid]
+            return changed
+        self._edit_people(drop)
+
+    async def forget_person(self, user_id: int) -> Tuple[int, int]:
+        """Erases every memory written from `user_id`'s words, on every profile holding one,
+        copies included: (memories erased, profiles they were on).
+
+        By batch, not by memory: every memory one capture wrote carries everyone in its
+        excerpt, so one about someone else in the same conversation goes too. A memory
+        written before v0.8.4 names no one, and nothing finds it.
+        """
+        uid = str(user_id)
+        fernet = self.cog.storage_manager.fernet
+
+        def _forget() -> Tuple[int, int]:
+            index = IOManager.read_json_gzip(self._people_file(), fernet)
+            gone, profiles = 0, set()
+            for rel in (index.get(uid) or []) if isinstance(index, dict) else []:
+                path = os.path.join(self.cog.USERS_DIR, rel)
+                entries = IOManager.read_json_gzip(path, fernet)
+                if not isinstance(entries, list):
+                    continue   # gone, or quarantined: never a reason to delete
+                kept = [e for e in entries if not (isinstance(e, dict) and uid in (e.get("who") or ()))]
+                if len(kept) == len(entries):
+                    continue
+                if kept:
+                    IOManager.write_json_gzip(kept, path, fernet)
+                else:
+                    try:
+                        os.remove(path)
+                    except FileNotFoundError:
+                        pass
+                gone += len(entries) - len(kept)
+                profiles.add(os.path.dirname(os.path.dirname(rel)))
+            # Shards first, index second: a crash leaves the pointers, and pressing again finishes.
+            self._edit_people(lambda index: index.pop(uid, None) is not None)
+            return gone, len(profiles)
+
+        async with _SHARD_WRITE_LOCK:
+            return await asyncio.to_thread(_forget)
 
     def _resolve_ltm_storage_target(self, profile_owner_id: int, profile_name: str, session_owner_id: Optional[int]) -> Tuple[int, str]:
         """Resolves which user/profile folder LTM data should be read from or written to,
@@ -579,7 +703,8 @@ class MemoryManager:
                         user_dn: Optional[str] = None, *,
                         duplicate_similarity: Optional[float] = None,
                         source: Optional[str] = None,
-                        session_owner_id: Optional[int] = None) -> int:
+                        session_owner_id: Optional[int] = None,
+                        who: Sequence[str] = ()) -> int:
         """Appends (summary, embedding_b64) memories to one server's file, in one read and
         one write. Returns how many were stored.
 
@@ -596,7 +721,8 @@ class MemoryManager:
         by hand passes None and is always kept.
 
         `source` is how it came to be -- "auto", "memorise" or "manual" -- for the memory
-        screen. `user_dn` is who that was.
+        screen. `user_dn` is who that was. `who` is whose words they were written from
+        (`_ltm_entry`), indexed after the write so `forget_person` can find them.
         """
         if not guild_id or not memories:
             return 0
@@ -637,9 +763,11 @@ class MemoryManager:
             overflow = len(entries) - defaultConfig.LIMIT_LTM + len(memories)
             if overflow > 0:
                 del entries[:overflow]
-            entries += [_ltm_entry(summary, b64, guild_id, model, user_dn, source)
+            entries += [_ltm_entry(summary, b64, guild_id, model, user_dn, source, who)
                         for summary, b64 in memories]
             await asyncio.to_thread(self._save_ltm_shard, user_id, name, guild_id, entries)
+            if who:   # shard first, index second: a crash orphans a pointer, never a memory
+                await asyncio.to_thread(self._index_people, who, self._ltm_path(user_id, name, guild_id))
             return len(memories)
 
     async def update_ltm(self, profile_owner_id: int, profile_name: str, guild_id, ltm_id: str,

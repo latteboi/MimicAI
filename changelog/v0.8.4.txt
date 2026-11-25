@@ -1,7 +1,6 @@
 v0.8.4 Beta — 2026-11-25 (UTC)
-You can have the bot ignore your messages, and the Terms and Privacy Policy each have their own command.
+You can erase every memory a character wrote from a conversation you were in, and characters know you by an ID nobody can trace back to your Discord account.
 ## **Added**
-- **Ignore My Messages, in `/data`.** The bot stops reading anything you post, edit or react with, in every server: no session logs it, no character answers or remembers it, and replies to your messages don't quote it. Commands and buttons still work. Read My Messages Again turns it off. Messages already logged stay until their log is purged or you delete them in Discord.
+- **Erase Memories of Me, in `/data`.** Erases every memory any character wrote from a conversation you spoke in or were quoted in, whoever owns the character. A memory written from the same conversation goes too, even one about someone else. It works without an account. Memories written before this version don't record who spoke, so it can't find them.
 ## **Changed**
-- **`/privacy` is now `/data`**: export your data, delete your account, and now ignore your messages.
-- **`/terms` shows the Terms of Service, and `/privacy` the Privacy Policy.** `/terms` used to show both.
+- **Characters know you by a new ID**, made with a key only this bot holds, so nobody can work out your Discord account from it. `/settings` shows it. Bonds carry over to the new ID.

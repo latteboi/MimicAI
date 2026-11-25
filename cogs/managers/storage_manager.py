@@ -962,6 +962,8 @@ class StorageManager:
                     self.cog.tickets.drop_user(int(user_id_str))
                     # And their subscription record; its key goes on the next sweep.
                     self.cog.subscriptions.drop_user(int(user_id_str))
+                    # And their memory files, which the who-said-what index points at.
+                    self.cog.memory_manager.drop_owner_from_people(int(user_id_str))
                     cleaned_users_count += 1
         
 

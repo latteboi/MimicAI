@@ -3,6 +3,8 @@ import re
 import zlib
 import unicodedata
 import hashlib
+import hmac
+import base64
 import asyncio
 import platform
 import discord
@@ -322,9 +324,34 @@ def _pi(val): return int(val) if val and val.strip() else None
 def _ps(val): return val.strip() if val and val.strip() else None
 def _pb(val): return val.strip().lower() == "on"
 
+@functools.lru_cache(maxsize=1)
+def _handle_key() -> bytes:
+    """`_get_user_hash`'s key, HKDF'd from ENCRYPTION_KEY as the blob and signature keys are.
+    Non-alphabet characters are skipped in the decode, so a key read before BotManager strips
+    its quotes still gives the same bytes."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+    key = defaultConfig.ENCRYPTION_KEY
+    root = base64.urlsafe_b64decode(key if isinstance(key, bytes) else key.encode())
+    return HKDF(hashes.SHA256(), 32, None, b"mimicai:user-handle:v1").derive(root)
+
+
 def _get_user_hash(user_id: int) -> str:
-    import hashlib
-    # Prefix with 'U' and return 15 hex characters for a total 16-character PID
+    """How a person is shown to a model, and kept in bonds: `A` and 15 hex digits.
+
+    Keyed by this instance. A Discord ID is public, so a bare hash of one named everybody
+    to anyone holding a member list, every provider reading a prompt included, and was the
+    same ID on every instance. A new ENCRYPTION_KEY gives everyone a new one.
+    """
+    return "A" + hmac.new(_handle_key(), str(user_id).encode(), hashlib.sha256).hexdigest()[:15].upper()
+
+
+def _legacy_user_hash(user_id: int) -> str:
+    """The unkeyed ID every person was shown by before v0.8.4.
+
+    ponytail: read only to carry a bond across (`PersonaContent.bonds`) and to ping from a
+    turn logged before; delete once v0.8.4 has run 30 days and a few months of bonds.
+    """
     return "A" + hashlib.sha256(str(user_id).encode()).hexdigest()[:15].upper()
 
 class Timeout:
@@ -2200,7 +2227,8 @@ def ping_people(text: str, log: Optional[List[Dict[str, Any]]], guild=None) -> s
             uids[int(pid)] = name.group(1) if name else None
     if not uids:
         return text
-    hashes = {_get_user_hash(uid): uid for uid in uids}
+    # Both IDs: a turn logged before v0.8.4 shows its speaker by the legacy one.
+    hashes = {h: uid for uid in uids for h in (_get_user_hash(uid), _legacy_user_hash(uid))}
     text = _PERSON_ID.sub(lambda m: f"<@{hashes[m[1] or m[2]]}>" if (m[1] or m[2]) in hashes else m[0], text)
     people: Dict[str, Optional[int]] = {}
     for uid, shown in uids.items():

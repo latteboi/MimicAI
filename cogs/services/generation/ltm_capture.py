@@ -183,6 +183,15 @@ class LtmCaptureMixin:
         tags, find = reply_tags(turns), turn_lookup(log)
         excerpt = [with_reply(restamp_turn(t.get("content") or "", turn_posted_at(t), clock), t, clock, tags, find)
                    for t in turns]
+        # Whose words the summariser reads: everyone who spoke in the excerpt, and anyone a
+        # reply in it quotes. Every memory from it carries them all (`forget_person`).
+        who = set()
+        for t in turns:
+            quoted = find((t.get("reply_to") or {}).get("turn_id") or "") or {}
+            for said in (t, quoted):
+                pid = str(said.get("speaker_pid") or "")
+                if said.get("is_user") and pid.isdigit():
+                    who.add(pid)
 
         # The name this seat's turns carry, `<Name> [ID: ...]`, so the summariser is told
         # which speaker in the transcript it is writing for.
@@ -209,7 +218,7 @@ class LtmCaptureMixin:
                     owner_id, profile_name,
                     [(m, encode_embedding_b64(e)) for m, e in zip(memories, embeddings)],
                     guild_id, r_author, duplicate_similarity=LTM_DUPLICATE_SIMILARITY, source=source,
-                    session_owner_id=session.get("owner_id"))
+                    session_owner_id=session.get("owner_id"), who=sorted(who))
         if memories is None:
             # The bookmark stays, so the same turns are read again -- once another
             # interval's worth of replies has built up, not on every round while the

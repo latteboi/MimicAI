@@ -19,7 +19,7 @@ from ..utils.constants import (
 from ..utils.helpers import suppress_link_previews, clean_imported_text
 from ..utils import fixed_examples, lorebook
 from ..managers.storage_manager import IOManager, _get_compressor, _get_decompressor
-from ..managers.memory_manager import read_ltm_dir, write_imported_ltm
+from ..managers.memory_manager import exported_ltm, read_ltm_dir, write_imported_ltm
 from ..gui.base_components import text_embed
 from .api.stripe import StripeError
 try:
@@ -376,6 +376,8 @@ class TransferService:
                         
                         if data is not None:
                             decrypted_data = decrypt_payload(data)
+                            if os.path.basename(root) == "ltm":
+                                decrypted_data = exported_ltm(decrypted_data)
                             target_file = os.path.join(target_dir, file[:-3]) 
                             with open(target_file, 'wb') as f:
                                 f.write(json.dumps(decrypted_data, option=json.OPT_INDENT_2))
@@ -477,6 +479,8 @@ class TransferService:
             # 4d. And the subscription record, which lives outside the tree. Its key, which
             # nothing names any more, is deleted by the next reconcile's sweep.
             self.cog.subscriptions.drop_user(user_id)
+            # 4e. And their memory files, which the who-said-what index points at.
+            self.cog.memory_manager.drop_owner_from_people(user_id)
             return ended
         ended = await asyncio.to_thread(_scrub)
 

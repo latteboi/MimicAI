@@ -1,0 +1,7 @@
+v0.8.3 Beta — 2026-11-25 (UTC)
+You can have the bot ignore your messages, and the Terms and Privacy Policy each have their own command.
+## **Added**
+- **Ignore My Messages, in `/data`.** The bot stops reading anything you post, edit or react with, in every server: no session logs it, no character answers or remembers it, and replies to your messages don't quote it. Commands and buttons still work. Read My Messages Again turns it off. Messages already logged stay until their log is purged or you delete them in Discord.
+## **Changed**
+- **`/privacy` is now `/data`**: export your data, delete your account, and now ignore your messages.
+- **`/terms` shows the Terms of Service, and `/privacy` the Privacy Policy.** `/terms` used to show both.

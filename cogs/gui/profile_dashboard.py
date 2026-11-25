@@ -101,7 +101,7 @@ class ProfileDashboard:
             config = self.cog.profile_manager._get_profile_config(user_id, profile_name, is_borrowed) or {}
             mm = self.cog.memory_manager
             training = mm._load_training_shard(str(eff_owner), eff_name)
-            held = (self.cog.persona_content.bonds(user_id, profile_name)
+            held = (self.cog.persona_content.bonds(user_id, profile_name, people=(viewer_id,))
                     if viewer_id is not None and config.get("bond_engine_enabled") else None)
             if is_borrowed:
                 ids = (config.get("original_pid", "Unknown"), self.cog.profile_manager._get_pid_from_name_any(user_id, profile_name))

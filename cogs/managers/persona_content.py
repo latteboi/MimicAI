@@ -2,8 +2,9 @@
 character's birthday."""
 
 import os
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, Iterable, List, Any, Optional, Tuple
 from ..utils.constants import LIMIT_FIXED_EXAMPLES, LIMIT_LORE_ENTRIES
+from ..utils.helpers import _get_user_hash, _legacy_user_hash
 from ..utils import fixed_examples, lorebook
 from ..utils.bonds import apply_updates as apply_bond_updates
 
@@ -141,18 +142,35 @@ class PersonaContent:
             self.cog.profile_manager._save_profile_prompts(user_id, profile_name, prompts)
         return len(held) - len(kept)
 
-    def bonds(self, user_id: int, profile_name: str) -> Dict[str, List[int]]:
+    def bonds(self, user_id: int, profile_name: str, people: Iterable[int] = ()) -> Dict[str, List[int]]:
         """What this profile feels about each person it has scored: ID -> [affection,
-        resentment]. Its own, a borrow's included, as its neuro levels are."""
+        resentment]. Its own, a borrow's included, as its neuro levels are.
+
+        `people` are Discord IDs about to be looked up: a bond any of them has under the ID
+        shown before v0.8.4 (`_legacy_user_hash`) moves to today's and is saved. Blocking.
+        """
         data = self.cog.storage_manager._load_shard("bonds", user_id, profile_name)
-        return data if isinstance(data, dict) else {}
+        data = data if isinstance(data, dict) else {}
+        moved = False
+        for uid in people:
+            old, new = _legacy_user_hash(uid), _get_user_hash(uid)
+            if old in data and new not in data:
+                data[new] = data.pop(old)
+                moved = True
+        if moved and self._holds_folder(user_id, profile_name):
+            self.cog.storage_manager._save_shard("bonds", user_id, data, profile_name)
+        return data
+
+    def _holds_folder(self, user_id: int, profile_name: str) -> bool:
+        """Whether this owner holds the profile's folder: a System profile read from someone
+        else's seat has none here, and a bonds write would mint one."""
+        path = self.cog.storage_manager._get_shard_path("bonds", user_id, profile_name, strict=True)
+        return bool(path) and os.path.exists(os.path.join(os.path.dirname(path), "profile.json.gz"))
 
     def apply_bonds(self, user_id: int, profile_name: str, updates: Dict[str, Dict[str, int]]) -> None:
-        """A reply's `<bond_update>`, applied and saved. Only where this owner holds the
-        profile's folder: a System profile read from someone else's seat has none here, and
-        the write would mint one. Blocking, like the neuro save beside it."""
-        path = self.cog.storage_manager._get_shard_path("bonds", user_id, profile_name, strict=True)
-        if not path or not os.path.exists(os.path.join(os.path.dirname(path), "profile.json.gz")):
+        """A reply's `<bond_update>`, applied and saved, only where this owner holds the
+        profile's folder (`_holds_folder`). Blocking, like the neuro save beside it."""
+        if not self._holds_folder(user_id, profile_name):
             return
         self.cog.storage_manager._save_shard(
             "bonds", user_id, apply_bond_updates(self.bonds(user_id, profile_name), updates), profile_name)

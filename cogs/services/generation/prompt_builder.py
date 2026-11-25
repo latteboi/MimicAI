@@ -94,7 +94,8 @@ class PromptBuilderMixin:
                      self_id: str) -> List[Tuple[str, str]]:
         """(ID, name) for the last BOND_ROSTER_SIZE others with a public turn in this
         profile's history window, humans and characters alike, newest first. Read off each
-        turn's header, so the ID is the one the model sees there."""
+        turn's header, so the ID is the one the model sees there -- bar a person's turn logged
+        before v0.8.4, whose header holds the legacy ID: a person is named by today's."""
         log = (session or {}).get("unified_log") or []
         stm_length = int(profile_data.get("stm_length", defaultConfig.CHATBOT_MEMORY_LENGTH))
         people: Dict[str, str] = {}
@@ -102,8 +103,12 @@ class PromptBuilderMixin:
             if turn.get("type") or turn.get("is_hidden"):
                 continue
             match = _TURN_IDENTITY.match(turn.get("content") or "")
-            if match and match.group(2) != self_id and match.group(2) not in people:
-                people[match.group(2)] = match.group(1)
+            if not match:
+                continue
+            pid = str(turn.get("speaker_pid") or "")
+            bond_id = _get_user_hash(int(pid)) if turn.get("is_user") and pid.isdigit() else match.group(2)
+            if bond_id != self_id and bond_id not in people:
+                people[bond_id] = match.group(1)
                 if len(people) >= BOND_ROSTER_SIZE:
                     break
         return list(people.items())
@@ -412,7 +417,8 @@ class PromptBuilderMixin:
             people = (self._bond_roster(session, profile_data, self_id) if session
                       else [(_get_user_hash(uid), name) for uid, name in present_users][:BOND_ROSTER_SIZE])
             if people:
-                held = self.cog.persona_content.bonds(profile_owner_id, profile_name_to_use)
+                held = self.cog.persona_content.bonds(profile_owner_id, profile_name_to_use,
+                                                      people=[uid for uid, _ in present_users])
                 turn_parts.append(self.cog.global_prompts.get("BOND_STATE", DEFAULT_BOND_INSTRUCTION)
                                   .format(bonds=render_bonds(people, held)))
 

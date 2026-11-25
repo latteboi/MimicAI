@@ -646,6 +646,8 @@ class SharingManager:
                 if os.path.isdir(os.path.join(source_dir, "ltm")):
                     shutil.copytree(os.path.join(source_dir, "ltm"), os.path.join(target_dir, "ltm"),
                                     dirs_exist_ok=True)
+                    self.cog.memory_manager._index_ltm_copy(os.path.join(source_dir, "ltm"),
+                                                            os.path.join(target_dir, "ltm"))
 
                 if target_category not in owner_index or not isinstance(owner_index[target_category], dict):
                     owner_index[target_category] = {}

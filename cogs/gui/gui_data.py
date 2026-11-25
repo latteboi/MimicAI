@@ -870,6 +870,16 @@ class StyleGuideView(BlockedGuard, ui.View):
         await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
 
 
+#: Asked before `MemoryManager.forget_person`. It erases by conversation, so it says so.
+FORGET_ME_PROMPT = (
+    "This erases every memory a character wrote from a conversation you spoke in, on every character "
+    "that holds one, whoever owns it. A memory written from the same conversation goes too, even "
+    "where it is about someone else.\n\n"
+    "Memories written before v0.8.4 don't record who was in the conversation, so this can't find them. "
+    "To stop new memories being written from your messages, use **Ignore My Messages** as well.\n\n"
+    "This can't be undone.")
+
+
 class PrivacyDashboardView(BlockedGuard, ui.View):
     # Open to a blocked user. Export and deletion are theirs whatever their standing --
     # Privacy Policy §5 promises it -- and neither button reaches a model. The server's
@@ -887,6 +897,7 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
         self.ignored = user_id in IGNORED
         add_button(self, "Read My Messages Again" if self.ignored else "Ignore My Messages",
                    self.toggle_ignored, row=1, emoji="👁️" if self.ignored else "🙈")
+        add_button(self, "Erase Memories of Me", self.forget_me, row=1, emoji="🧹")
         if guild is not None and may_set_data_policy(user_id):
             add_button(self, "Change Data Policy", self.open_data_policy, row=1, emoji="🛡️")
 
@@ -905,6 +916,8 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
             "work. Only your Discord ID is stored for it, and Delete My Account leaves it, so the "
             "bot never starts reading you again by itself. Messages already logged stay until their "
             "log is purged or you delete them in Discord.")
+        e.description += ("\n\n**Erase Memories of Me** erases every memory a character wrote from "
+                          "a conversation you spoke in, whoever owns the character.")
         # Shown only where someone can change it: on the official bot both routes stay
         # closed for good, so there is nothing to read.
         if self.guild is not None and data_policy.SELF_HOSTED:
@@ -919,6 +932,18 @@ class PrivacyDashboardView(BlockedGuard, ui.View):
         await ignored_users.set_ignored(self.user_id, not self.ignored)
         view = PrivacyDashboardView(self.cog, self.user_id, self.guild)
         await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    async def forget_me(self, interaction: discord.Interaction):
+        async def confirm(i: discord.Interaction):
+            await i.response.defer()
+            memories, profiles = await self.cog.memory_manager.forget_person(self.user_id)
+            text = (f"Erased **{memories}** {'memory' if memories == 1 else 'memories'} from "
+                    f"**{profiles}** {'character' if profiles == 1 else 'characters'}." if memories else
+                    "No character holds a memory written from your messages.")
+            await i.edit_original_response(embed=dismissible(text_embed(text)), view=None)
+
+        await interaction.response.send_message(embed=text_embed(FORGET_ME_PROMPT, title="Erase memories of you?"),
+                                                view=build_confirm_view("Erase", confirm, interaction), ephemeral=True)
 
     async def open_data_policy(self, interaction: discord.Interaction):
         if not may_set_data_policy(interaction.user.id):
