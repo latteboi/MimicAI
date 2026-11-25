@@ -2939,7 +2939,9 @@ class MimicCog(EventListeners, commands.Cog):
         view = DropdownContentView(
             {name: LEGAL_DOCUMENTS[name] for name in documents},
             f"{title} · Effective {LEGAL_EFFECTIVE_DATE}",
-            links=[("View on mimic-ai.org", "https://mimic-ai.org/")])
+            # Carrd scroll points above each document on the site.
+            links=[("View on mimic-ai.org", "https://mimic-ai.org/#"
+                    + ("terms" if "Terms of Service" in documents else "privacy"))])
         view.block_exempt = True
         await interaction.followup.send(embed=view.get_embed(), view=view, ephemeral=True)
 
