@@ -168,7 +168,8 @@ _STATIC_DASHBOARDS = [
         "`/profile hub`",
         [
             ("Public Library (opens here)", [
-                "Browse and borrow published profiles; Sort steps through Most Borrowed, Newest and Recently Updated",
+                "Browse published profiles four cards to a page, each with its own Borrow button "
+                "(Edit Intro on your own); Sort steps through Most Borrowed, Newest and Recently Updated",
                 "Search by profile name, creator, display name or intro; Generate",
                 "Publish Yours: list or unlist your profiles (Apply Changes), Edit Intro with one "
                 "selected; a profile not rated yet is rated by the press"]),

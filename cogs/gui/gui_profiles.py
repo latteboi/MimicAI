@@ -1776,7 +1776,8 @@ class ProfileManageView(BlockedGuard, ui.View):
                 self.user_id, self.profile_name, "share")
             embed.add_field(name=f"'{self.profile_name}' cannot be shared"[:256],
                             value=reason or "Not available.", inline=False)
-        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+        # Onto the deferred reply, which becomes the hub's message: its tabs repaint it.
+        await view._paint(embed)
 
     async def _handle_publish(self, interaction):
         """Publish or unpublish this one profile, rating it first if it has no verdict."""

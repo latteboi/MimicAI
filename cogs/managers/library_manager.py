@@ -9,6 +9,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from ..utils.constants import (
     USERS_DIR, PUBLIC_PROFILES_DIR, CONTENT_RATING_PENDING, CONTENT_RATING_CAPABILITIES, LIMIT_PUBLISHES_PER_DAY)
 from ..utils.helpers import birth_time
+from ..utils.discord_cdn import unsigned_attachment_url
 from .storage_manager import IOManager
 
 #: A rating job delists from a worker thread while the loop publishes: serialised inside
@@ -245,18 +246,22 @@ class LibraryManager:
 
     # --- A listing's text ------------------------------------------------------------
     #
-    # What the Library searches and shows -- display name and intro -- is copied into the
-    # listing's own public-index entry, which is in memory whole, so a search or a page of
-    # the dropdown opens no profile. Public by definition, so plaintext. Written by
+    # What the Library searches and shows -- display name, intro and avatar -- is copied into
+    # the listing's own public-index entry, which is in memory whole, so a search or a page of
+    # cards opens no profile. Public by definition, so plaintext. Written by
     # _save_profile_by_pid on every save of a listed profile, by list_public when one is
     # listed, and refreshed for every listing by the boot sweep (_prune_public_index), which
     # also files each under its own PID: what lets a save find its listing in one lookup.
 
-    _LISTING_TEXT_KEYS = ("display_name", "intro")
+    _LISTING_TEXT_KEYS = ("display_name", "intro", "avatar")
+    #: What search reads: never the avatar's URL, which every listing's would match.
+    _SEARCHED_KEYS = ("display_name", "intro")
 
     @staticmethod
     def _listing_text(config: Dict[str, Any]) -> Dict[str, str]:
-        text = {"display_name": config.get("custom_display_name"), "intro": config.get("library_intro")}
+        # Unsigned: a signed link's query changes on every re-sign, and would rewrite the index.
+        text = {"display_name": config.get("custom_display_name"), "intro": config.get("library_intro"),
+                "avatar": unsigned_attachment_url(config.get("custom_avatar_url"))}
         return {k: str(v) for k, v in text.items() if v}
 
     def _with_listing_text(self, entry: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
@@ -289,7 +294,7 @@ class LibraryManager:
     def library_search_text(self, owner_id: int, pid: str) -> str:
         """A listing's display name and intro, lower-cased, for the Library's search."""
         listing = self._listing(owner_id, pid)
-        return "\n".join(listing[k] for k in self._LISTING_TEXT_KEYS if k in listing).lower()
+        return "\n".join(listing[k] for k in self._SEARCHED_KEYS if k in listing).lower()
 
     def library_display_name(self, owner_id: int, pid: str) -> str:
         """A listing's display name, or "" for none."""

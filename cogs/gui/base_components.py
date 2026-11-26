@@ -449,13 +449,14 @@ class ReportErrorMixin:
 
 
 class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
-    """Base for a screen whose tabs are sibling views: /hub, /settings, /mod.
+    """Base for a screen whose tabs are sibling views: /settings, /mod. The hub's tabs are
+    Components V2, so they have their own (`gui_hub.HubBaseView`).
 
     Each of the three carried its own copy of this constructor and a nav method per
     tab whose body -- defer, construct the sibling, repaint -- differed only in the
     class it named. Subclasses declare `TABS` instead:
 
-        TABS = (("Stats", "stats", lambda v: HubStatsView(v.cog, v.original_interaction)),)
+        TABS = (("Stats", "stats", lambda v: ModStatsView(v.cog, v.original_interaction)),)
 
     The factory is handed the view it is navigating away from, so a screen that
     ferries state between its tabs (the moderated user id, say) reads it off there.

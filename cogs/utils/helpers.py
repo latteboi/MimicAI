@@ -454,6 +454,12 @@ def _scrub_response_text(text: str, participant_names: Optional[List[str]] = Non
             scrubbed_text = PATTERN_BARE_TURN_TAG.sub('', scrubbed_text)
             scrubbed_text = PATTERN_METADATA.sub('', scrubbed_text)
             scrubbed_text = PATTERN_STRAY_WRAPPERS.sub('', scrubbed_text)
+            # The envelope's `</Name>`, whoever it names: the name scrub below knows only the
+            # seated display names, and a renamed profile's old name or a user's reached the
+            # channel. Outside code fences, where a lone `</div>` is code.
+            parts = scrubbed_text.split("```")
+            parts[::2] = [PATTERN_SPEAKER_CLOSE.sub('', part) for part in parts[::2]]
+            scrubbed_text = "```".join(parts)
 
             if participant_names:
                 escaped_names = tuple(re.escape(name.strip()) for name in participant_names if name and name.strip())

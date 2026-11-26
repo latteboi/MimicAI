@@ -340,6 +340,11 @@ class SharingManager:
                 for s in self._pending_shares(recipient_id)):
             await interaction.followup.send(embed=text_embed("That share is no longer waiting for you."), ephemeral=True)
             return False
+        # A Library page is a snapshot from when it opened: a listing its owner has since
+        # taken down stays on it, Borrow and all, until it is repainted.
+        if is_public_borrow and not (target_pid and self.cog.library._listing(sharer_id, target_pid)):
+            await interaction.followup.send(embed=text_embed("That profile is no longer in the Public Library."), ephemeral=True)
+            return False
         def _sync_prepare():
             current_name = self.cog.profile_manager._get_name_from_pid(sharer_id, target_pid) if target_pid else fallback_name
             if not current_name: current_name = fallback_name

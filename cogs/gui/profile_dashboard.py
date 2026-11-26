@@ -9,7 +9,7 @@ from ..utils.user_defaults import (
 from ..utils.constants import (
     defaultConfig, PRIMARY_MODEL_NAME, FALLBACK_MODEL_NAME, TTS_VOICE_GENDER, TTS_VOICE_CHARACTER, CONTENT_RATING_LABELS, CHANNEL_ACCESS_LABELS, CONTENT_RATING_REASON_LABELS, CONTENT_RATING_REASON_FALLBACK, CONTENT_RATING_PENDING, CONTENT_RATING_ADULT, CONTENT_RATING_EMOJI, DEFAULT_IMAGE_MODEL, DEFAULT_SPEECH_VOICE, SPEECH_LANGUAGE_NAMES, IMAGE_GROUNDING_LABELS)
 from ..utils.helpers import (
-    auto_tier, image_rag_enabled, ltm_auto_recall_enabled, always_reads_synopsis, grounding_mode_display, resolve_image_output_params, resolve_auto_models, neuro_levels, resolve_image_tools, resolve_unreadable_media_mode, resolve_url_mode, _get_user_hash)
+    auto_tier, birth_time, image_rag_enabled, ltm_auto_recall_enabled, always_reads_synopsis, grounding_mode_display, resolve_image_output_params, resolve_auto_models, neuro_levels, resolve_image_tools, resolve_unreadable_media_mode, resolve_url_mode, _get_user_hash)
 from ..utils.bonds import describe as describe_bond
 
 def feature_fields(config: Dict[str, Any], speech_providers: Set[str]) -> Tuple[str, str, str]:
@@ -107,7 +107,12 @@ class ProfileDashboard:
                 ids = (config.get("original_pid", "Unknown"), self.cog.profile_manager._get_pid_from_name_any(user_id, profile_name))
             else:
                 ids = (self.cog.profile_manager._get_profile_id(eff_owner, eff_name), None)
-            return (is_borrowed, eff_owner, eff_name, config,
+            # A profile made before `created_at` was stamped: its folder's birth, which no save
+            # resets. A copy of the data tree restamps it, so it is shown as an upper bound.
+            folder = (None if config.get("created_at")
+                      else self.cog.storage_manager._profile_dir(str(eff_owner), eff_name))
+            born = birth_time(folder) if folder else None
+            return (is_borrowed, eff_owner, eff_name, config, born,
                     mm._ltm_count(user_id, profile_name, guild_id), len(training) if training else 0,
                     held, self.cog.profile_manager._get_user_appearance(eff_owner, eff_name),
                     self.cog.content_rating._resolve_enforced_safety_level(user_id, profile_name),
@@ -116,7 +121,7 @@ class ProfileDashboard:
                     self.cog.library.distribution_of(user_id, profile_name), ids,
                     self.cog.user_settings.provider_preference(user_id),
                     self.cog.storage_manager.subscription_payer(guild_id, user_id))
-        (is_borrowed, effective_owner_id, effective_profile_name, config, ltm_count, train_count,
+        (is_borrowed, effective_owner_id, effective_profile_name, config, born, ltm_count, train_count,
          held, appearance_data, enforced, (verdict, verdict_reason), awaiting_rating,
          (is_public, borrowers), (pid_a, pid_b), preferred, paid) = await asyncio.to_thread(_read)
 
@@ -139,14 +144,11 @@ class ProfileDashboard:
         prim_model = config.get("primary_model", PRIMARY_MODEL_NAME)
         fall_model = config.get("fallback_model", FALLBACK_MODEL_NAME)
 
-        created_str = config.get('created_at')
-        created_display = "Unknown"
-        if created_str:
-            try:
-                dt = datetime.datetime.fromisoformat(created_str)
-                ts = int(dt.timestamp())
-                created_display = f"<t:{ts}:D>"
-            except: pass
+        created_display = f"By <t:{int(born)}:D>" if born else "Unknown"
+        try:
+            created_display = f"<t:{int(datetime.datetime.fromisoformat(config['created_at']).timestamp())}:D>"
+        except (KeyError, TypeError, ValueError):
+            pass
 
         display_name = appearance_data.get("custom_display_name") or effective_profile_name
 

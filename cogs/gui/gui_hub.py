@@ -4,13 +4,14 @@ import discord
 from discord import ui
 import asyncio
 import datetime
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+from collections import Counter
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
-from ..utils.discord_cdn import unsigned_attachment_url
-from .base_components import (BlockedGuard, PageJumpModal, TabbedView, TimeoutCleanupMixin,
+from ..utils.helpers import default_profile_avatar_url
+from .base_components import (BlockedGuard, TimeoutCleanupMixin,
                               add_button, add_select, build_confirm_view,
-                              build_pagination_controls, bulk_select_options,
-                              paged_nav_options, refuse_unregistered, resolve_bulk_select,
+                              build_pagination_controls, build_tab_nav_bar, bulk_select_options,
+                              refuse_unregistered, resolve_bulk_select,
                               add_topgg_links, send_status, settle_status)
 from .gui_start import open_generate
 from .base_components import closed_embed, dismissible, text_embed
@@ -23,7 +24,35 @@ if TYPE_CHECKING:
     from ..MimicCog import MimicCog
 
 
-class HubBaseView(TabbedView):
+def embed_panel(embed: discord.Embed) -> ui.Container:
+    """An embed's words as a V2 panel, for the hub tabs that build one. Fields stack -- V2
+    has no columns -- and blank spacer fields are dropped; a thumbnail sits beside the
+    title and description."""
+    head = "\n".join(filter(None, (f"## {embed.title}" if embed.title else "", embed.description or "")))
+    panel = ui.Container(accent_colour=embed.colour)
+    if head and embed.thumbnail.url:
+        panel.add_item(ui.Section(ui.TextDisplay(head), accessory=ui.Thumbnail(embed.thumbnail.url)))
+    elif head:
+        panel.add_item(ui.TextDisplay(head))
+    for field in embed.fields:
+        if (field.name or "").strip("​ ") or (field.value or "").strip("​ "):
+            panel.add_item(ui.TextDisplay(f"**{field.name}**\n{field.value}"))
+    if embed.footer.text:
+        panel.add_item(ui.TextDisplay(f"-# {embed.footer.text}"))
+    return panel
+
+
+class HubBaseView(BlockedGuard, ui.LayoutView):
+    """The hub's tabs, in Components V2: a panel, the tab's controls, then the tab bar.
+
+    Every tab, not only the Library: the V2 flag never comes off a message, and every tab is
+    reached on the Library's. A tab puts its controls in `row(n)` from `_build_rows` -- a V2
+    button lives in an action row, never loose -- and paints through `_paint`, with a panel
+    or an embed (`embed_panel`). `setup_items` lays the whole message out again, so an
+    `edit_message(view=self)` straight after it carries the panel too: a V2 message is
+    nothing but components, and one sent without its panel loses its words.
+    """
+
     #: The Library first: browsing is what most people open the hub for, and publishing
     #: lives on it (Publish Yours) rather than behind a mode toggle on the Sharing tab.
     #: Five tabs is Discord's five to a row, so a sixth needs a home inside one of these.
@@ -34,6 +63,105 @@ class HubBaseView(TabbedView):
         ("Profile Cloning", "clone", lambda v: HubCloneManagerView(v.cog, v.original_interaction)),
         ("Stats", "stats", lambda v: HubStatsView(v.cog, v.original_interaction)),
     )
+
+    def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, current_tab: str):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = interaction
+        #: The newest interaction known to have updated this message, and the newest press,
+        #: which may have (`_repaint_via`).
+        self._via, self._press = interaction, None
+        self.user_id = interaction.user.id
+        self.current_tab = current_tab
+        self.current_page = 0
+        self._rows: Dict[int, ui.ActionRow] = {}
+        self._panel: Optional[ui.Container] = None
+        self._tabs = ui.ActionRow()
+        build_tab_nav_bar(self._tabs, current_tab,
+                          [(label, key, self._go(factory)) for label, key, factory in self.TABS])
+
+    def _go(self, factory):
+        async def callback(i: discord.Interaction):
+            await i.response.defer()
+            await self._switch(factory(self), i)
+        return callback
+
+    async def _switch(self, view: 'HubBaseView', press: discord.Interaction):
+        """Paint `view` over this message through `press`, then stop this one: left running,
+        its timeout would later paint its own stale panel over whatever is showing by then."""
+        view._via, view._press = self._via, press
+        await view.update_display()
+        self.stop()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not await super().interaction_check(interaction):
+            return False
+        self._press = interaction
+        return True
+
+    def _repaint_via(self) -> discord.Interaction:
+        """The interaction to edit this message through: the newest press, once it has
+        answered by updating this message, else the last one that did. An interaction's
+        token lasts fifteen minutes from its own press; repainting through the one that
+        opened the hub left it dead to anyone using it for longer. A modal's submission is
+        not a press the view sees, so whatever takes one sets `_press` to it."""
+        answered = getattr(getattr(self._press, "response", None), "type", None)
+        if answered in (discord.InteractionResponseType.deferred_message_update,
+                        discord.InteractionResponseType.message_update):
+            self._via = self._press
+        return self._via
+
+    def row(self, n: int) -> ui.ActionRow:
+        """Control row `n`, under the panel; rows are laid out in order, the tab bar last."""
+        return self._rows.setdefault(n, ui.ActionRow())
+
+    def _build_rows(self):
+        """This tab's controls, into `row(n)`. None by default."""
+
+    def setup_items(self):
+        self._rows = {}
+        self._build_rows()
+        self._lay_out()
+
+    def _lay_out(self, controls: bool = True):
+        self.clear_items()
+        if self._panel is not None:
+            self.add_item(self._panel)
+        if controls:
+            for n in sorted(self._rows):
+                if self._rows[n].children:
+                    self.add_item(self._rows[n])
+            self.add_item(self._tabs)
+
+    async def _paint(self, panel):
+        """Show `panel` -- a `ui.Container`, or an embed drawn as one -- above the controls."""
+        self._panel = panel if isinstance(panel, ui.Container) else embed_panel(panel)
+        self._lay_out()
+        await self._repaint_via().edit_original_response(view=self)
+
+    async def _turn_page(self, i: discord.Interaction, delta: int):
+        self._press = i   # a page jump's modal submission, as well as a press
+        self.current_page += delta
+        self.setup_items()
+        await i.response.defer()
+        await self.update_display()
+
+    async def update_display(self):
+        raise NotImplementedError
+
+    async def on_timeout(self):
+        """The words stay and the controls go -- a V2 message with nothing in it is refused --
+        and any control inside the panel (the Library's Borrow buttons) is greyed."""
+        if self._panel is None:
+            return
+        self._lay_out(controls=False)
+        for item in self.walk_children():
+            if hasattr(item, "disabled"):
+                item.disabled = True
+        try:
+            await self._repaint_via().edit_original_response(view=self)
+        except discord.HTTPException:
+            pass   # gone, or past even the newest token's fifteen minutes
 
 
 def _borrower_count(cog, owner_id: int, pid: Optional[str]) -> int:
@@ -87,39 +215,45 @@ class HubStatsView(HubBaseView):
 
     async def update_display(self):
         embed = await asyncio.to_thread(self.build_embed)
-        await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+        await self._paint(embed)
 
 #: The Library's orders, in the order Sort steps through them.
 LIBRARY_SORTS = {"borrowed": "Most Borrowed", "new": "Newest", "updated": "Recently Updated"}
 
 
 class HubPublicLibraryView(HubBaseView):
-    #: Profiles per dropdown page: 25 options, less the three page controls above them.
-    PER_PAGE = 22
+    """The Public Library: a page of cards, each a listing's words beside its picture with its
+    own Borrow button underneath (Edit Intro on your own, greyed once borrowed). A card reads
+    its listing's public entry (`LibraryManager._listing`), so a page opens no profile.
+
+    Four to a page because Discord allows a message forty components: a card is five
+    (section, text, picture, row, button), and the page row and the tab bar twelve more.
+    """
+
+    PER_PAGE = 4
 
     def __init__(self, cog: 'MimicCog', interaction: discord.Interaction, filtered_list=None):
         super().__init__(cog, interaction, "library")
         #: A key of LIBRARY_SORTS.
         self.sort = "borrowed"
-        self.all_public = []
-        self._load_public_data()
-        self.filtered_list = filtered_list if filtered_list is not None else self.all_public
-        
-        # Two positions, because they move independently: the profile the embed shows,
-        # and the dropdown page being looked through. They used to be one number, which
-        # is why the dropdown was a window sliding round the shown profile and its
-        # "page" counter counted profiles.
-        self.selected_index = 0
-        self.current_page = 0
-        #: PID -> display name, for the dropdown page on show (`_load_display_names`).
-        self._display_names: Dict[str, str] = {}
-        
+        #: The search in force, lower-cased; "" for none.
+        self.search = ""
+        #: Creator id -> name, or None where Discord has none (`_resolve_owners`).
+        self._owners: Dict[int, Optional[str]] = {}
+        # On the loop this once, so the view has controls before its first paint; every
+        # repaint after reads the Library again in a worker (`update_display`).
+        self._take_in(self._sorted(self.cog.library._iter_public_entries()))
+        if filtered_list is not None:
+            self.filtered_list = filtered_list
         self.setup_items()
 
-    def _load_public_data(self):
-        # ponytail: one owner-index read per creator, on the loop, every Library open --
-        # cheap until creators outgrow the 200-entry user_indices LRU; then cache this list.
-        self.all_public = self._sorted(self.cog.library._iter_public_entries())
+    def _take_in(self, entries: List[dict]):
+        """`entries`, sorted, as the Library on show, under the search in force."""
+        self.all_public = entries
+        self.filtered_list = ([p for p in entries if self._matches(p, self.search)]
+                              if self.search else entries)
+        #: Listings per creator, counted over the whole Library, not a search's results.
+        self._shelf = Counter(p['owner_id'] for p in entries)
 
     def _sorted(self, entries):
         """Newest first, most recently updated first, or most borrowed first with newest
@@ -135,6 +269,13 @@ class HubPublicLibraryView(HubBaseView):
     def _num_pages(self) -> int:
         return max(1, (len(self.filtered_list) - 1) // self.PER_PAGE + 1)
 
+    def _page(self) -> List[dict]:
+        """The listings on the page on show, holding the page inside the list first: a search
+        or a re-sort can leave it past the end."""
+        self.current_page = max(0, min(self.current_page, self._num_pages() - 1))
+        start = self.current_page * self.PER_PAGE
+        return self.filtered_list[start:start + self.PER_PAGE]
+
     def _has_borrowed(self, p_info) -> bool:
         """Whether the viewer already holds a borrow of this listing: one borrow-index lookup.
 
@@ -145,151 +286,96 @@ class HubPublicLibraryView(HubBaseView):
         return any(borrower_id == self.user_id for borrower_id, _ in
                    self.cog.borrows._borrowers_of(p_info['owner_id'], p_info.get('original_pid')))
 
-    def setup_items(self):
-        for item in self.children[:]:
-            if item.row != 4: self.remove_item(item)
+    async def _resolve_owners(self, entries):
+        """The creators' names for these listings, fetched once each where Discord's cache has
+        none: a creator need not share a server with the bot any more."""
+        async def name_of(uid: int):
+            user = self.cog.bot.get_user(uid)
+            if user is None:
+                try:
+                    user = await self.cog.bot.fetch_user(uid)
+                except discord.HTTPException:
+                    pass
+            self._owners[uid] = user.name if user else None
 
-        total = len(self.filtered_list)
-        self.selected_index = max(0, min(self.selected_index, total - 1))
-        num_pages = self._num_pages()
-        self.current_page = max(0, min(self.current_page, num_pages - 1))
+        await asyncio.gather(*(name_of(uid) for uid in {p['owner_id'] for p in entries} - self._owners.keys()))
 
-        if total:
-            start = self.current_page * self.PER_PAGE
-            options = paged_nav_options(self.current_page, num_pages, nav_suffix=" of profiles")
-            for abs_index, p in enumerate(self.filtered_list[start:start + self.PER_PAGE], start):
-                owner = self.cog.bot.get_user(p['owner_id'])
-                # The name the listing's card is titled with, where it is not the profile's.
-                shown = self._display_names.get(p.get('original_pid')) or ""
-                description = " \u00B7 ".join(filter(None, (
-                    shown if shown.lower() != p['profile_name'].lower() else "",
-                    f"by {owner.name}" if owner else "")))
-                options.append(discord.SelectOption(
-                    label=p['profile_name'][:100], value=str(abs_index),
-                    description=description[:100] or None,
-                    default=(abs_index == self.selected_index)))
-            add_select(self, options, self.select_callback,
-                       placeholder="Select a profile to view...", row=0)
+    def _card(self, p_info) -> Tuple[str, str]:
+        """(words, picture URL) for one listing's card."""
+        pid, owner_id, name = p_info.get('original_pid'), p_info['owner_id'], p_info['profile_name']
+        listing = self.cog.library._listing(owner_id, pid) if pid else {}
+        avatar = listing.get("avatar") or ""
+        # A link Discord will not draw refuses the whole message, not just its card.
+        if not avatar.startswith(("https://", "http://")):
+            avatar = default_profile_avatar_url(name)
+        owner = (self._owners[owner_id] if owner_id in self._owners
+                 else getattr(self.cog.bot.get_user(owner_id), "name", None))
+        # Escaped: a name is the author's to choose, and V2 text is markdown throughout. The
+        # intro is not -- formatting it is the author's to choose too.
+        byline = [f"by **{discord.utils.escape_markdown(owner or 'Unknown')}**",
+                  f"{self._shelf[owner_id]} in the Library"]
+        borrowers = _borrower_count(self.cog, owner_id, pid)
+        if borrowers:
+            byline.append(f"Borrowed by {borrowers} {'user' if borrowers == 1 else 'users'}")
+        listed, updated = int(p_info.get('published_at') or 0), int(p_info.get('updated_at') or 0)
+        # Updated is when its rating last landed, and listing it was one: only a later one says more.
+        dates = [*([f"Listed <t:{listed}:R>"] if listed else []),
+                 *([f"Updated <t:{updated}:R>"] if updated > listed else [])]
+        lines = (f"### {discord.utils.escape_markdown(listing.get('display_name') or name)}",
+                 listing.get("intro") or "",
+                 "-# " + " · ".join(byline),
+                 "-# " + " · ".join(dates) if dates else "")
+        return "\n".join(filter(None, lines)), avatar
 
-            add_button(self, "◀", self.prev_profile_cb, row=1,
-                       disabled=(self.selected_index == 0))
-            add_button(self, "▶", self.next_profile_cb, row=1,
-                       disabled=(self.selected_index >= total - 1))
+    def _take(self, p_info) -> Dict[str, Any]:
+        """A card's own button: its owner's Edit Intro, else Borrow, greyed once held."""
+        if self.user_id == p_info['owner_id']:
+            return dict(label="Edit Intro", style=discord.ButtonStyle.blurple,
+                        callback=lambda i: self._edit_intro(i, p_info))
+        if self._has_borrowed(p_info):
+            return dict(label="Borrowed", style=discord.ButtonStyle.grey, disabled=True,
+                        callback=lambda i: self._borrow(i, p_info))
+        return dict(label="Borrow", style=discord.ButtonStyle.green,
+                    callback=lambda i: self._borrow(i, p_info))
 
-            p_info = self.filtered_list[self.selected_index]
-            if self.user_id == p_info['owner_id']:
-                add_button(self, "Edit Intro", self.edit_intro_cb, row=1,
-                           style=discord.ButtonStyle.blurple)
-            elif self._has_borrowed(p_info):
-                add_button(self, "Borrowed", self.borrow_cb, row=1,
-                           style=discord.ButtonStyle.grey, disabled=True)
-            else:
-                add_button(self, "Borrow", self.borrow_cb, row=1, style=discord.ButtonStyle.green)
+    def _build_rows(self):
+        page = self._page()
+        panel = ui.Container(accent_colour=discord.Colour.gold())
+        panel.add_item(ui.TextDisplay("## Public Library\n" + (
+            f"-# Page {self.current_page + 1} of {self._num_pages()} · {len(self.filtered_list)} "
+            f"profiles · {LIBRARY_SORTS[self.sort]}" if page else "No profiles found.")))
+        for n, p_info in enumerate(page):
+            if n:   # A gap between one card's button and the next card's name.
+                panel.add_item(ui.Separator(visible=False, spacing=discord.SeparatorSpacing.large))
+            words, picture = self._card(p_info)
+            panel.add_item(ui.Section(ui.TextDisplay(words), accessory=ui.Thumbnail(picture)))
+            take = ui.ActionRow()
+            add_button(take, **self._take(p_info))
+            panel.add_item(take)
+        self._panel = panel
 
-        add_button(self, "Search", self.search_cb, row=1)
-        add_button(self, "Generate", self.generate_cb, row=1,
-                   style=discord.ButtonStyle.blurple, emoji="✨")
-        add_button(self, f"Sort: {LIBRARY_SORTS[self.sort]}", self.sort_cb, row=2)
-        add_button(self, "Publish Yours", self.publish_cb, row=2,
-                   style=discord.ButtonStyle.green, emoji="🌐")
-
-    async def _load_display_names(self):
-        """The dropdown page's display names, off each listing's entry (`library_display_name`)."""
-        start = self.current_page * self.PER_PAGE
-        page = [p for p in self.filtered_list[start:start + self.PER_PAGE] if p.get('original_pid')]
-        self._display_names = {
-            p['original_pid']: self.cog.library.library_display_name(p['owner_id'], p['original_pid']) for p in page}
+        build_pagination_controls(self.row(0), self.current_page, self._num_pages(), 0, self._turn_page)
+        add_button(self.row(0), "Search", self.search_cb)
+        add_button(self.row(0), f"Sort: {LIBRARY_SORTS[self.sort]}", self.sort_cb)
+        add_button(self.row(1), "Generate", self.generate_cb, style=discord.ButtonStyle.blurple, emoji="✨")
+        add_button(self.row(1), "Publish Yours", self.publish_cb, style=discord.ButtonStyle.green, emoji="🌐")
 
     async def update_display(self):
-        if not self.filtered_list:
-            embed = discord.Embed(title="Public Library", description="No profiles found.", color=discord.Color.red())
-            await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
-            return
-
-        if self.selected_index >= len(self.filtered_list):
-            self.selected_index = 0
-        await self._load_display_names()
+        # Read again at every repaint, so a page shows the Library as it stands: a listing
+        # taken down since leaves, a new one arrives. Owner indexes in a worker, where a
+        # cache miss reads a file; the search's creator names off Discord's cache on the loop.
+        self._take_in(await asyncio.to_thread(
+            lambda: self._sorted(self.cog.library._iter_public_entries())))
+        await self._resolve_owners(self._page())
         self.setup_items()
-        
-        p_info = self.filtered_list[self.selected_index]
-        owner_id = p_info['owner_id']
-        original_pid = p_info.get('original_pid')
-        
-        # Load the heavy config data dynamically ONLY for the profile actively being viewed
-        cfg_data = {}
-        if original_pid:
-            # profile.json.gz, and the config nested inside it. This read used to name
-            # a `config.json.gz` that has never been written -- the profile file has
-            # been unified since before the hub existed -- so cfg_data was always {},
-            # and every library entry rendered with no avatar and the raw profile name
-            # instead of the creator's chosen display name.
-            profile_data = self.cog.profile_manager._get_profile_by_pid(owner_id, original_pid) or {}
-            cfg_data = profile_data.get("config") or {}
-        
-        owner = self.cog.bot.get_user(owner_id) or await self.cog.bot.fetch_user(owner_id)
-        owner_name = owner.name if owner else "Unknown"
-        
-        disp_name = cfg_data.get("custom_display_name", p_info['profile_name'])
-        avatar_url = unsigned_attachment_url(cfg_data.get("custom_avatar_url"))
+        await self._repaint_via().edit_original_response(view=self)
 
-        byline = f"Created by **{owner_name}**"
-        borrowers = len({borrower_id for borrower_id, _ in
-                         self.cog.borrows._borrowers_of(owner_id, original_pid)})
-        if borrowers:
-            byline += f" \u00B7 Borrowed by {borrowers} {'user' if borrowers == 1 else 'users'}"
-        intro = cfg_data.get("library_intro")
-        description = f"{intro}\n\n{byline}" if intro else byline
-
-        embed = discord.Embed(title=disp_name, description=description, color=discord.Color.random())
-        if avatar_url: embed.set_image(url=avatar_url)
-        embed.set_footer(text=f"ID: {p_info['id']} | {self.selected_index + 1} of {len(self.filtered_list)}")
-        
-        await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
-
-    async def _show_profile(self, i: discord.Interaction, index: int):
-        """Show one listing and turn the dropdown to the page it is on."""
-        self.selected_index = index
-        self.current_page = index // self.PER_PAGE
-        self.setup_items()
-        await i.response.defer()
-        await self.update_display()
-
-    async def select_callback(self, i: discord.Interaction):
-        value = i.data['values'][0]
-        if value == "jump_page":
-            async def _jump(inner: discord.Interaction, page: int):
-                self.current_page = page
-                await self._load_display_names()
-                self.setup_items()
-                await inner.response.edit_message(view=self)
-
-            await i.response.send_modal(PageJumpModal(self._num_pages(), _jump, zero_indexed=True))
-            return
-        if value in ("prev_page", "next_page"):
-            # Only the dropdown moves; the profile on show stays put.
-            self.current_page += -1 if value == "prev_page" else 1
-            await self._load_display_names()
-            self.setup_items()
-            await i.response.edit_message(view=self)
-            return
-        await self._show_profile(i, int(value))
-
-    async def prev_profile_cb(self, i: discord.Interaction):
-        await self._show_profile(i, max(0, self.selected_index - 1))
-
-    async def next_profile_cb(self, i: discord.Interaction):
-        await self._show_profile(i, min(len(self.filtered_list) - 1, self.selected_index + 1))
-
-    async def borrow_cb(self, i: discord.Interaction):
-        if self.selected_index >= len(self.filtered_list): return
+    async def _borrow(self, i: discord.Interaction, p_info):
         if await refuse_unregistered(self.cog, i):
             return
-        
-        p_info = self.filtered_list[self.selected_index]
         if i.user.id == p_info['owner_id']:
             await i.response.send_message(embed=text_embed("You cannot borrow your own profile."), ephemeral=True)
             return
-        
         if self._has_borrowed(p_info):
             await i.response.send_message(embed=text_embed("You already have this profile."), ephemeral=True)
             return
@@ -299,12 +385,12 @@ class HubPublicLibraryView(HubBaseView):
         if await self.cog.sharing._accept_share_request(i, p_info['owner_id'], p_info.get('original_pid'), p_info['profile_name'], local_name, is_public_borrow=True):
             await i.followup.send(embed=text_embed(
                 f"✅ Borrowed **{p_info['profile_name']}** as **{local_name}**.\n{BORROW_TERMS}"), ephemeral=True)
+            await self.update_display()   # its card reads Borrowed now
 
-    async def edit_intro_cb(self, i: discord.Interaction):
+    async def _edit_intro(self, i: discord.Interaction, p_info):
         # Deferred: gui_profiles imports this module at load time.
         from .gui_profiles import LibraryIntroModal
 
-        p_info = self.filtered_list[self.selected_index]
         if i.user.id != p_info['owner_id']:
             return
         # Resolved from the PID: an entry's stored name is a snapshot of when it was
@@ -314,7 +400,8 @@ class HubPublicLibraryView(HubBaseView):
             await i.response.send_message(embed=text_embed("That profile no longer exists."), ephemeral=True)
             return
 
-        async def repaint(_interaction: discord.Interaction):
+        async def repaint(submitted: discord.Interaction):
+            self._press = submitted
             await self.update_display()
 
         await i.response.send_modal(LibraryIntroModal(self.cog, i.user.id, name, on_saved=repaint))
@@ -337,13 +424,7 @@ class HubPublicLibraryView(HubBaseView):
         modal.add_item(inp)
         async def on_submit(mi: discord.Interaction):
             await mi.response.defer()
-            term = inp.value.lower().strip()
-            if term:
-                self.filtered_list = [p for p in self.all_public if self._matches(p, term)]
-            else:
-                self.filtered_list = self.all_public
-            self.selected_index = self.current_page = 0
-            self.setup_items()
+            self.search, self.current_page, self._press = inp.value.lower().strip(), 0, mi
             await self.update_display()
         modal.on_submit = on_submit
         await i.response.send_modal(modal)
@@ -351,10 +432,8 @@ class HubPublicLibraryView(HubBaseView):
     async def sort_cb(self, i: discord.Interaction):
         order = list(LIBRARY_SORTS)
         self.sort = order[(order.index(self.sort) + 1) % len(order)]
-        searching = self.filtered_list is not self.all_public
-        self.all_public = self._sorted(self.all_public)
-        self.filtered_list = self._sorted(self.filtered_list) if searching else self.all_public
-        self.selected_index = self.current_page = 0
+        self._take_in(self._sorted(self.all_public))
+        self.current_page = 0
         self.setup_items()
         await i.response.defer()
         await self.update_display()
@@ -363,8 +442,8 @@ class HubPublicLibraryView(HubBaseView):
         if await refuse_unregistered(self.cog, i):
             return
         await i.response.defer()
-        view = HubPublishView(self.cog, self.original_interaction)
-        await view.update_display()
+        await self._switch(HubPublishView(self.cog, self.original_interaction), i)
+
 
 class HubIncomingView(HubBaseView):
     """Shares waiting for you, and who may send them.
@@ -386,9 +465,7 @@ class HubIncomingView(HubBaseView):
     def _about(self):
         return self.cog.user_settings.get_user_about(self.user_id)
 
-    def setup_items(self):
-        for item in self.children[:]:
-            if item.row != 4: self.remove_item(item)
+    def _build_rows(self):
 
         shares = self.cog.sharing._pending_shares(self.user_id)
         
@@ -413,31 +490,31 @@ class HubIncomingView(HubBaseView):
                 count = len(sharers[sid])
                 options.append(discord.SelectOption(label=f"{name} ({count} profiles)", value=str(sid), default=(sid == self.selected_sharer_id)))
 
-            add_select(self, options, self.select_sharer,
+            add_select(self.row(0), options, self.select_sharer,
                        placeholder="Select a user to review shares...", min_values=1,
                        max_values=1, row=0)
 
         # Row 1: Pagination (if needed)
-        build_pagination_controls(self, self.current_page, num_pages, 1, self._turn_page)
+        build_pagination_controls(self.row(1), self.current_page, num_pages, 1, self._turn_page)
 
         # Row 2: Actions
         action_row = 2 if num_pages > 1 else 1 # Move up if no pagination
         
         if self.selected_sharer_id:
-            add_button(self, "Accept All", self.accept_all, style=discord.ButtonStyle.green,
+            add_button(self.row(action_row), "Accept All", self.accept_all, style=discord.ButtonStyle.green,
                        row=action_row)
-            add_button(self, "Reject All", self.reject_all, style=discord.ButtonStyle.danger,
+            add_button(self.row(action_row), "Reject All", self.reject_all, style=discord.ButtonStyle.danger,
                        row=action_row)
-            add_button(self, "Block Sender", self.block_sender, style=discord.ButtonStyle.danger,
+            add_button(self.row(action_row), "Block Sender", self.block_sender, style=discord.ButtonStyle.danger,
                        row=action_row, emoji="🚫")
-            add_button(self, "Cancel Selection", self.clear_selection, row=action_row)
+            add_button(self.row(action_row), "Cancel Selection", self.clear_selection, row=action_row)
             return
 
         if not self.cog.user_settings.is_registered(self.user_id):
             return
         about = self._about()
         closed = bool(about.get("shares_closed"))
-        add_button(self, f"Incoming Shares: {'Closed' if closed else 'Open'}", self.toggle_open,
+        add_button(self.row(action_row), f"Incoming Shares: {'Closed' if closed else 'Open'}", self.toggle_open,
                    style=discord.ButtonStyle.secondary if closed else discord.ButtonStyle.green,
                    row=action_row)
         blocked = (about.get("blocked_sharers") or [])[:self.BLOCK_LIMIT]
@@ -446,7 +523,7 @@ class HubIncomingView(HubBaseView):
             min_values=0, max_values=self.BLOCK_LIMIT, row=3,
             default_values=[discord.Object(id=uid) for uid in blocked])
         block_select.callback = self.set_blocked
-        self.add_item(block_select)
+        self.row(3).add_item(block_select)
 
     async def update_display(self):
         shares = self.cog.sharing._pending_shares(self.user_id)
@@ -461,13 +538,13 @@ class HubIncomingView(HubBaseView):
                     "without memories.\n"
                     "-# **Block Sender** rejects these and stops them sharing with you again.")
             embed = discord.Embed(title="Reviewing Shares", description=desc, color=discord.Color.blue())
-            await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+            await self._paint(embed)
             return
 
         if not self.cog.user_settings.is_registered(self.user_id):
             embed = discord.Embed(title="Incoming Shares", description=NOT_REGISTERED,
                                   color=discord.Color.dark_grey())
-            await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+            await self._paint(embed)
             return
 
         about = self._about()
@@ -484,7 +561,7 @@ class HubIncomingView(HubBaseView):
             title="Incoming Shares", color=discord.Color.blue() if shares else discord.Color.dark_grey(),
             description=f"{status}\n\n{waiting}\n\n-# Blocked: {blocked} of {self.BLOCK_LIMIT}. "
                         f"Blocking someone also takes back what they have waiting.")
-        await self.original_interaction.edit_original_response(content=None, embed=embed, view=self)
+        await self._paint(embed)
 
     async def select_sharer(self, i: discord.Interaction):
         self.selected_sharer_id = int(i.data['values'][0])
@@ -559,7 +636,7 @@ class HubIncomingView(HubBaseView):
             current_name = (pm._get_name_from_pid(sharer_id, target_pid) if target_pid else None) or fallback_name
 
             if current_name not in sharer_index.get("personal", []):
-                await self.cog.sharing._reject_share_request(self.original_interaction, sharer_id, target_pid, fallback_name, kind)
+                await self.cog.sharing._reject_share_request(i, sharer_id, target_pid, fallback_name, kind)
                 continue
 
             # The source's own name, amended only where this user already has it.
@@ -571,7 +648,7 @@ class HubIncomingView(HubBaseView):
                     accepted.append(f"{label} (clone)")
                 else:
                     failed.append(f"• **{current_name}** -- {message}")
-            elif await self.cog.sharing._accept_share_request(self.original_interaction, sharer_id, target_pid, current_name, local_name, is_public_borrow=False):
+            elif await self.cog.sharing._accept_share_request(i, sharer_id, target_pid, current_name, local_name, is_public_borrow=False):
                 accepted.append(label)
 
         msg = f"Accepted: {', '.join(accepted)}" if accepted else "No valid profiles found."
@@ -587,7 +664,7 @@ class HubIncomingView(HubBaseView):
         sharer_id = self.selected_sharer_id
         shares =[s for s in self.cog.sharing._pending_shares(self.user_id) if s['sharer_id'] == sharer_id]
         for s in shares:
-            await self.cog.sharing._reject_share_request(self.original_interaction, sharer_id, s.get('original_pid'), s['profile_name'], s.get("kind"))
+            await self.cog.sharing._reject_share_request(i, sharer_id, s.get('original_pid'), s['profile_name'], s.get("kind"))
         await i.followup.send(embed=text_embed("Rejected shares."), ephemeral=True)
         self.selected_sharer_id = None
         self.setup_items()
@@ -652,14 +729,12 @@ class HubShareManagerView(HubBaseView):
         return [(d["profile_name"], d["status"] == "locked")
                 for d in self.cog.library._iter_public_entries(self.user_id)]
 
-    def setup_items(self):
-        for item in self.children[:]:
-            if item.row != 4: self.remove_item(item)
+    def _build_rows(self):
 
         # Row 0 holds Clear and the page controls, directly above the select they act on:
         # rows 2 and 3 are recipients then Send, so Send reads as sending to them.
         if self.selected_profiles:
-            add_button(self, f"Clear ({len(self.selected_profiles)})", self.clear_selection,
+            add_button(self.row(0), f"Clear ({len(self.selected_profiles)})", self.clear_selection,
                        style=discord.ButtonStyle.secondary, row=0)
 
         # Row 1: Paginated Profiles.
@@ -669,7 +744,7 @@ class HubShareManagerView(HubBaseView):
         # full page plus the sentinels would be rejected outright.
         num_pages = max(1, (len(self.personal_profiles) - 1) // SHARE_PAGE_SIZE + 1)
         if self.current_page >= num_pages: self.current_page = max(0, num_pages - 1)
-        build_pagination_controls(self, self.current_page, num_pages, 0, self._turn_page)
+        build_pagination_controls(self.row(0), self.current_page, num_pages, 0, self._turn_page)
 
         start = self.current_page * SHARE_PAGE_SIZE
         page_profiles = self.personal_profiles[start : start + SHARE_PAGE_SIZE]
@@ -689,54 +764,58 @@ class HubShareManagerView(HubBaseView):
                     description=f"Not rated yet: rated when you {press}" if p in self.needs_rating else None))
 
         if options:
-            add_select(self, options, self.select_profiles, placeholder="Select profiles...",
+            add_select(self.row(1), options, self.select_profiles, placeholder="Select profiles...",
                        min_values=0, max_values=len(options), row=1)
 
         if self.PUBLISH:
-            add_button(self, "Apply Changes", self.apply_public, style=discord.ButtonStyle.green,
+            add_button(self.row(2), "Apply Changes", self.apply_public, style=discord.ButtonStyle.green,
                        row=2)
             # One intro at a time, so only with one profile selected.
-            add_button(self, "Edit Intro", self.edit_intro, row=2,
+            add_button(self.row(2), "Edit Intro", self.edit_intro, row=2,
                        disabled=len(self.selected_profiles) != 1)
-            add_button(self, "← Library", self.back_to_library, row=2)
+            add_button(self.row(2), "← Library", self.back_to_library, row=2)
             return
         user_sel = ui.UserSelect(placeholder="Select recipients...", min_values=1, max_values=10, row=2)
         user_sel.callback = self.select_users
-        self.add_item(user_sel)
+        self.row(2).add_item(user_sel)
         if self.CLONE:
-            add_button(self, "Send as Clone", self.send_clone, style=discord.ButtonStyle.blurple, row=3)
+            add_button(self.row(3), "Send as Clone", self.send_clone, style=discord.ButtonStyle.blurple, row=3)
         else:
-            add_button(self, "Send", self.send_private, style=discord.ButtonStyle.green, row=3)
+            add_button(self.row(3), "Send", self.send_private, style=discord.ButtonStyle.green, row=3)
 
     async def update_display(self):
         if not self._loaded:
             await self.load_profiles()
-        await self.original_interaction.edit_original_response(content=None, embed=self.build_embed(), view=self)
+        await self._paint(self.build_embed())
 
     def build_embed(self) -> discord.Embed:
-        rating = ("Profiles not rated yet are rated when you press it, which takes a few "
-                  "seconds; Not Allowed profiles cannot be ")
         if self.PUBLISH:
             title = "Publish to the Library"
-            desc = ("List your profiles in the Public Library for anyone to borrow, and deselect "
-                    "one to take it out. Existing borrows keep working either way.\n"
-                    f"{rating}published. Select a single profile to give it an intro.")
-        elif self.CLONE:
-            title = "Profile Cloning"
-            desc = ("Give your profiles away as copies.\n\n"
-                    "**Send as Clone** offers people who have set MimicAI up an independent copy of "
-                    "their own, without memories: they can edit it freely and it never follows your "
-                    "edits. The offer waits in their Incoming Shares until they answer it; nobody is "
-                    "messaged. To lend a profile that follows your edits, use **Profile Sharing**.\n"
-                    f"{rating}cloned.")
+            desc = ("List your profiles in the Public Library for anyone to borrow.\n"
+                    "• Select profiles to list them, deselect to take them out, then press "
+                    "**Apply Changes**.\n"
+                    "• Select just one to give it an intro with **Edit Intro**.\n"
+                    "-# Existing borrows keep working either way.\n"
+                    "-# Unrated profiles are rated when you apply (a few seconds each); "
+                    "Not Allowed ones cannot be published.")
         else:
-            title = "Profile Sharing"
-            desc = ("Offer profiles to people who have set MimicAI up. An offer waits in their "
-                    "Incoming Shares until they answer it; nobody is messaged.\n"
-                    "**Send** lends a borrow that follows your edits. To give them an independent "
-                    "copy instead, use **Profile Cloning**; to list a profile for everyone, "
-                    "**Public Library** → **Publish Yours**.\n"
-                    f"{rating}shared.")
+            send, verb = ("Send as Clone", "cloned") if self.CLONE else ("Send", "shared")
+            title, lead, aside = (
+                ("Profile Cloning",
+                 "Give someone their own copy. It has no memories, they can edit it, and your "
+                 "edits never reach it.",
+                 "To lend one that follows your edits instead: **Profile Sharing**.")
+                if self.CLONE else
+                ("Profile Sharing",
+                 "Lend profiles to other users. A borrow follows your edits.",
+                 "To give a copy away: **Profile Cloning**. To list it for everyone: "
+                 "**Public Library → Publish Yours**."))
+            desc = (f"{lead}\n"
+                    f"• Pick profiles and people, then press **{send}**.\n"
+                    "• It waits in their **Incoming Shares**; nobody is messaged.\n"
+                    f"-# {aside}\n"
+                    "-# Recipients need MimicAI set up. Unrated profiles are rated when you send "
+                    f"(a few seconds each); Not Allowed ones cannot be {verb}.")
         if not self.personal_profiles:
             desc += "\n\nYou have no profiles that can be offered here."
             
@@ -768,7 +847,7 @@ class HubShareManagerView(HubBaseView):
 
     async def back_to_library(self, i: discord.Interaction):
         await i.response.defer()
-        await HubPublicLibraryView(self.cog, self.original_interaction).update_display()
+        await self._switch(HubPublicLibraryView(self.cog, self.original_interaction), i)
 
     async def select_profiles(self, i: discord.Interaction):
         start = self.current_page * SHARE_PAGE_SIZE
@@ -838,7 +917,7 @@ class HubShareManagerView(HubBaseView):
         if self.processing: return
         self.processing = True
 
-        for item in self.children:
+        for item in self.walk_children():
             if isinstance(item, ui.Button) and str(item.label).startswith("Send"): item.disabled = True
         await i.response.edit_message(view=self)
 
@@ -903,7 +982,7 @@ class HubShareManagerView(HubBaseView):
         if self.processing: return
         self.processing = True
 
-        for item in self.children:
+        for item in self.walk_children():
             if isinstance(item, ui.Button) and item.label == "Apply Changes": item.disabled = True
         await i.response.edit_message(view=self)
 

@@ -11,9 +11,10 @@ import asyncio
 import discord
 from typing import Dict, List, Any, Optional, Tuple
 from ..utils.constants import (
-    USERS_DIR, CLASSIFIER_KEYS, SUBSCRIPTION_MODELS, defaultConfig, DEFAULT_SAFETY_SETTINGS, CONTENT_RATING_LABELS, CONTENT_RATING_REASON_LABELS, DEFAULT_CONTENT_CLASSIFIER_PROMPT, REFUSAL_CONFIRMERS, UNREVIEWED_REFUSALS, CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_GENERAL, CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED, PLACEMENT_REFUSALS, REFUSED_INDEX_FILE, CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS)
+    USERS_DIR, CLASSIFIER_KEYS, defaultConfig, DEFAULT_SAFETY_SETTINGS, CONTENT_RATING_LABELS, CONTENT_RATING_REASON_LABELS, DEFAULT_CONTENT_CLASSIFIER_PROMPT, REFUSAL_CONFIRMERS, UNREVIEWED_REFUSALS, CONTENT_RATING_UNRATED, CONTENT_RATING_PENDING, CONTENT_RATING_GENERAL, CONTENT_RATING_ADULT, CONTENT_RATING_REFUSED, PLACEMENT_REFUSALS, REFUSED_INDEX_FILE, CONTENT_RATING_CAPABILITIES, CONTENT_CAPABILITY_DENIALS)
 from ..utils.helpers import (
-    resolve_thinking_params, system_model, system_settings, resolve_openrouter_endpoint, resolve_openrouter_service_tier)
+    resolve_thinking_params, subscription_curated, system_model, system_settings, resolve_openrouter_endpoint,
+    resolve_openrouter_service_tier)
 from ..utils import fixed_examples, lorebook
 from ..utils.discord_cdn import signed_attachment_url
 from ..utils.http_client import get_capped, get_shared_client
@@ -27,8 +28,9 @@ _SAFETY_LEVEL_ORDER = ("restricted", "checking", "not_allowed", "blocked", "refu
 #: Rating jobs land in worker threads, and each read-modify-writes the whole file.
 _REFUSED_INDEX_LOCK = threading.Lock()
 
-#: The one line the classifier is asked for, bolded or quoted at most. Anything else is no
-#: verdict -- never Allowed: a model declining in words must not rate a profile clean.
+#: The one line the classifier is asked for, bolded or quoted at most, read through
+#: `_answer_line`. Anything else is no verdict -- never Allowed: a model declining in words
+#: must not rate a profile clean.
 #: GENERAL and ADULT are the shipped prompt's words before Allowed and Not Allowed, which a
 #: /mod override written then still asks for.
 _VERDICT_LINE = re.compile(r"\W*(NOT[_ ]ALLOWED|ALLOWED|GENERAL|ADULT)\b[^\w:]*(?::\W*(\w+))?")
@@ -37,6 +39,25 @@ _VERDICTS = {"ALLOWED": CONTENT_RATING_GENERAL, "GENERAL": CONTENT_RATING_GENERA
              "ADULT": CONTENT_RATING_ADULT}
 #: The refusal check's one word, matched the same way.
 _CONFIRM_LINE = re.compile(r"\W*(YES|NO)\b", re.IGNORECASE)
+#: What may sit beside an answer on its line: the bold, quotes or full stop a model adds.
+_ANSWER_DRESSING = " \t*_`'\".>"
+
+
+def _answer_line(pattern: re.Pattern, reply: str) -> Optional[re.Match]:
+    """The answer in a classifier's reply, `pattern` matched line by line; None for none.
+
+    Every line opening with an answer must give the same one, and one of them must be the
+    line asked for with nothing else on it (`_ANSWER_DRESSING` aside). A model reasoning
+    aloud -- "NOT_ALLOWED: ... no. Let me evaluate ... ALLOWED: NONE" -- contradicts itself,
+    which is no answer and goes to the Fallback, never its first word: read as a prefix,
+    that stored a profile Not Allowed that the reply went on to allow, and a resubmission
+    asked the same model for `_hold_floor`'s second opinion. Lines after the answer are
+    read past: matched, not compared.
+    """
+    opened = [(line, m) for line in reply.splitlines() if (m := pattern.match(line))]
+    if len({_VERDICTS.get(m.group(1).upper(), m.group(1).upper()) for _, m in opened}) != 1:
+        return None
+    return next((m for line, m in opened if not line[m.end():].strip(_ANSWER_DRESSING)), None)
 #: OpenRouter's out-of-credit refusal, as a classifier failure carries it (`openrouter.py`).
 _NO_CREDIT = "API Error 402"
 #: A provider refusing to read a profile at all: Google's filter that no setting reaches,
@@ -524,7 +545,7 @@ class ContentRatingManager:
         side = self.cog.user_settings.effective_provider(owner_id)
         settings = system_settings(self.cog, "classifier", side)
         chain = dict.fromkeys(
-            SUBSCRIPTION_MODELS[CLASSIFIER_KEYS[0]]
+            subscription_curated(self.cog, CLASSIFIER_KEYS[0])
             if self.cog.storage_manager.subscription_payer(None, owner_id)
             else (system_model(self.cog, k, side) for k in CLASSIFIER_KEYS))
         for role, value in zip(("primary", "fallback"), chain):
@@ -570,7 +591,7 @@ class ContentRatingManager:
             candidate = response.candidates[0] if response and response.candidates else None
             parts = (candidate.content.parts or []) if candidate and candidate.content else []
             raw = "".join(getattr(p, "text", None) or "" for p in parts).strip()
-            if answer.match(raw):
+            if _answer_line(answer, raw):
                 status = "success"
             else:
                 block = getattr(getattr(response, "prompt_feedback", None), "block_reason", None)
@@ -663,7 +684,7 @@ class ContentRatingManager:
                 if failures else True)
             return None
 
-        match = _VERDICT_LINE.match(raw)
+        match = _answer_line(_VERDICT_LINE, raw)
         verdict = _VERDICTS[match.group(1)]
 
         # Only a recognised category code survives. The prompt asks for one, but a
@@ -692,7 +713,7 @@ class ContentRatingManager:
                 owner_id, other, settings,
                 self.cog.global_prompts.get(*REFUSAL_CONFIRMERS[reason]),
                 payload, _CONFIRM_LINE) if other else ("no_key", "", ""))
-            confirmed = _CONFIRM_LINE.match(text) if status == "success" else None
+            confirmed = _answer_line(_CONFIRM_LINE, text) if status == "success" else None
             if confirmed and confirmed.group(1).upper() == "YES":
                 record["confirmed_by"] = other[1]
             elif reason not in UNREVIEWED_REFUSALS:
@@ -719,14 +740,14 @@ class ContentRatingManager:
             status, text, _why = await self._ask_classifier(
                 owner_id, second, settings, self.cog.global_prompts.get(*REFUSAL_CONFIRMERS[floor_reason]),
                 payload, _CONFIRM_LINE)
-            answer = _CONFIRM_LINE.match(text) if status == "success" else None
+            answer = _answer_line(_CONFIRM_LINE, text) if status == "success" else None
             if answer and answer.group(1).upper() == "NO":
                 return record
             held, reason = CONTENT_RATING_REFUSED, floor_reason
         else:
             status, text, _why = await self._ask_classifier(
                 owner_id, second, settings, prompt_text, payload, _VERDICT_LINE)
-            answer = _VERDICT_LINE.match(text) if status == "success" else None
+            answer = _answer_line(_VERDICT_LINE, text) if status == "success" else None
             held, reason = floor, floor_reason  # no answer: the stricter stands
             if answer:
                 code = (answer.group(2) or "").upper()

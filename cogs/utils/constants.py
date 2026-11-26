@@ -3224,12 +3224,14 @@ DEFAULT_ROLEPLAY_FORMATTING = (
     "\n"
     "- Dialogue is plain text: no quotation marks or asterisks. A beat may have no dialogue "
     "and be the action alone.\n"
+    "- A dialogue line is 1 to 3 sentences, never more. More to say is another beat, with "
+    "its own action.\n"
     "- An action is one line, starting \"-# *\" and ending \"*\".\n"
     "- No blank lines between beats or inside one. Use as many beats as the moment needs.\n"
     "- Keep this shape even where earlier turns, yours included, drifted from it. Other "
     "people's formatting is not a model.\n"
-    "Before finishing, check: no quotation marks, and every action on its own line inside "
-    "asterisks.\n"
+    "Before finishing, check: no quotation marks, no dialogue line over 3 sentences, and "
+    "every action on its own line inside asterisks.\n"
     "</roleplay_formatting>"
 )
 
@@ -3240,10 +3242,10 @@ DEFAULT_INTERNAL_MONOLOGUE = (
     "<internal_monologue>\n"
     "End every turn with one line of private thought, after a blank line:\n"
     "\n"
-    "-# The thought, in plain text.\n"
+    "-# The thought, in plain text, a sentence or two.\n"
     "\n"
-    "- One line, the last one anyone reads, starting \"-# \". No asterisks anywhere on it: "
-    "asterisks mark actions, and a thought is not one.\n"
+    "- One line of one or two sentences, never more, the last one anyone reads, starting "
+    "\"-# \". No asterisks anywhere on it: asterisks mark actions, and a thought is not one.\n"
     "- It is your own thinking in the moment, in your own voice, never a plan for the reply "
     "or a summary of it. It is the one place your private thinking shows.\n"
     "- Nobody hears it, so nobody answers it, and you never answer anyone else's.\n"
@@ -3723,12 +3725,15 @@ PATTERN_REASONING_ORPHANS = re.compile(r'</?(think|thought|reasoning)>', flags=r
 #: These run on user text with no timeout (`strip_history_envelope`), so no run may be split
 #: two ways. `(?=(x))\N` is an atomic group (3.10 has no `++`): the name, the whitespace and
 #: the timestamp bracket each end at the same `[`, `]` or line end however they are split.
-#: Overlapping, `[#1]` and 4,000 spaces took 24 s (cubic). A newline opening a blank line is no
-#: start: the next one finds the same header, without rescanning the run from each.
+#: Overlapping, `[#1]` and 4,000 spaces took 24 s (cubic).
 #: `tests/test_scrub_cost.py` holds both to the patterns they replaced.
-_HEADER_LEAD = (r'(?i)(?:^|\n(?![ \t]*\r?\n))'
-                r'(?:\[#\d+\][ \t]*<[^>\r\n]+>|<[^>\r\n]+>|(?:\[#\d+\])?(?=([^[\r\n]*))\1)'
-                r'(?=(\s*))\2\[')
+#: A header is one line, bar a `<Name>` alone on the line above it, and the match starts at
+#: `^` rather than taking the newline: as `\s*` before the `[`, a header written mid-reply
+#: took the line of prose above it as its "name", and taking the newline joined two lines.
+_HEADER_LEAD = (r'(?im)^'
+                r'(?:\[#\d+\][ \t]*<[^>\r\n]+>(?:\r?\n)?|<[^>\r\n]+>(?:\r?\n)?'
+                r'|(?:\[#\d+\])?(?=([^[\r\n]*))\1)'
+                r'(?=([ \t]*))\2\[')
 PATTERN_SYSTEM_HEADER = re.compile(
     _HEADER_LEAD + r'ID:[^\]\r\n]+\](?:\s*\[[^\]\r\n]+\]){0,3}(?::\s*|[ \t]*(?:\r?\n|$))')
 PATTERN_TIMESTAMP_HEADER = re.compile(
