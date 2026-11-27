@@ -286,6 +286,16 @@ class SettingsDefaultsView(_ActionStagingHost, ModelPickerMixin, SettingsBaseVie
         else:
             self._save_changes("openrouter_service_tier", value)
 
+    def _current_google_tier(self):
+        return self.defaults.get("google_service_tier")
+
+    def _set_google_tier(self, value):
+        """Cleared on None, as `_set_service_tier` is."""
+        if value is None:
+            self._clear("google_service_tier")
+        else:
+            self._save_changes("google_service_tier", value)
+
     def _get_selection_feedback_message(self) -> str:
         """Unused -- this view renders an embed -- but named by the mixin."""
         return ""

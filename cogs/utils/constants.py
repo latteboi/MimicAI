@@ -362,7 +362,7 @@ IMAGE_MODEL_KEYS = frozenset({'image_generation_model', 'image_generation_fallba
 AUDIO_MODEL_KEYS = frozenset({'speech_model', 'speech_fallback_model'})
 
 #: Slots whose model must run a web search: Google's `google_search`, or the search tool
-#: OpenRouter is sent in its place (OPENROUTER_SERVER_TOOLS). Ollama carries neither, so
+#: OpenRouter is sent in its place (OPENROUTER_RESEARCH_SEARCH). Ollama carries neither, so
 #: the pickers refuse it here -- an Ollama researcher answers from its own weights, and
 #: `grounding_sources` drops every answer it gives.
 SEARCH_MODEL_KEYS = frozenset({
@@ -398,6 +398,21 @@ OPENROUTER_SERVICE_TIERS = (
 
 #: The tiers that are actually sent. "" is absence, not a value.
 OPENROUTER_SERVICE_TIER_VALUES = frozenset(v for v, _l, _d in OPENROUTER_SERVICE_TIERS if v)
+
+#: Google's native `service_tier` (generateContent), the same shape. Its own key rather
+#: than OpenRouter's, because the two fail differently: Google's Flex answers 429/503 at
+#: capacity instead of routing at Standard (`GoogleRESTModel` retries it at Standard),
+#: and a key below Tier 2 is served Priority as Standard, silently (probed 2026-11-28).
+GOOGLE_SERVICE_TIERS = (
+    ("", "Standard", "Standard rates."),
+    ("flex", "Flex", "Half price, slower; retried at Standard when Google is at capacity."),
+    ("priority", "Priority", "About 1.8x Standard, faster. Tier 2+ keys; others get Standard."),
+)
+GOOGLE_SERVICE_TIER_VALUES = frozenset(v for v, _l, _d in GOOGLE_SERVICE_TIERS if v)
+
+#: What a served tier costs against the Standard rate table, for a turn no provider
+#: priced (`turn_cost`). Google's tables, 2026-11: Flex 0.5x, Priority 1.8x on every model.
+SERVICE_TIER_RATE_SHARE = {"flex": 0.5, "priority": 1.8}
 
 
 # --- What a provider refuses, and how that reads ------------------------------
@@ -1229,7 +1244,8 @@ SUBSCRIPTION_SETTINGS_KEY = 'subscription'
 #: subscription. A profile picks among them on Set Models' "API: Subscription" stop
 #: (`subscription_models`). Enforced where the key is used (`api_service.model_chain` and the
 #: backstop in `_instantiate_model`), because the list is also where model terms are checked.
-#: Grounding is Native only on a subscription, so its summariser has none.
+#: Grounding is RAG's researcher, on the text list like the rest so the bot owner's list governs
+#: it: a model there that never calls the search answers "found nothing", never a guess.
 SUBSCRIPTION_MODELS = {
     'primary_model': SUBSCRIPTION_TEXT_MODELS,
     'critic_model': SUBSCRIPTION_TEXT_MODELS,
@@ -1237,7 +1253,7 @@ SUBSCRIPTION_MODELS = {
     'director_model': SUBSCRIPTION_TEXT_MODELS,
     'training_analysis_model': SUBSCRIPTION_TEXT_MODELS,
     'compaction_model': SUBSCRIPTION_TEXT_MODELS,
-    'grounding_rag_model': (),
+    'grounding_rag_model': SUBSCRIPTION_TEXT_MODELS,
     'image_generation_model': (),
     'speech_model': (),
     # The System Models chains. The describer reads images, which DeepSeek cannot; the
@@ -1374,22 +1390,23 @@ MAX_URL_CONTEXT_CHARACTERS = 16000 # Approx 4000 tokens
 #: OpenRouter runs it, so a turn nobody searches costs nothing -- unlike the `web`
 #: plugin and the `:online` suffix, which search on every request.
 #:
-#: `max_uses` bounds what one reply can spend, except on a native search other than
-#: Anthropic's, which ignores it. Search takes `auto` (the model's own
-#: provider's search where it has one, Exa otherwise); fetch takes OpenRouter's own
-#: engine, which is free.
+#: Search takes `native`: the model's own provider's search (Anthropic, OpenAI, Google,
+#: xAI, Perplexity), which OpenRouter replaces with Exa for a model that has none. That is
+#: what makes it Native rather than RAG with extra steps. `max_uses` bounds what one reply
+#: can spend, except on a native search other than Anthropic's, which ignores it. Fetch
+#: takes OpenRouter's own engine, which is free.
 OPENROUTER_SERVER_TOOLS = {
     "google_search": {"type": "openrouter:web_search",
-                      "parameters": {"max_uses": 1, "max_results": 5}},
+                      "parameters": {"engine": "native", "max_uses": 1, "max_results": 5}},
     "url_context": {"type": "openrouter:web_fetch",
                     "parameters": {"engine": "openrouter", "max_uses": 3,
                                    "max_content_tokens": MAX_URL_CONTEXT_CHARACTERS // 4}},
 }
-#: What a MimicAI subscription key sends instead: every search through Exa (US$0.007), not
-#: `auto`, which gives Haiku Anthropic's own (about US$0.01 with its results, 2026-11-18). DeepSeek
-#: has no search of its own, so `auto` already meant Exa for it. Users' own keys keep `auto`.
-SUBSCRIPTION_SERVER_TOOLS = {**OPENROUTER_SERVER_TOOLS, "google_search": {
-    "type": "openrouter:web_search", "parameters": {"engine": "exa", "max_uses": 1, "max_results": 5}}}
+#: What RAG's researcher searches with on OpenRouter, on every key: OpenRouter's own Exa
+#: (US$0.007), never the model's native search (about US$0.01 with its results for Haiku,
+#: 2026-11-18). A Google researcher keeps `google_search`, the only search Google has.
+OPENROUTER_RESEARCH_SEARCH = {"type": "openrouter:web_search",
+                              "parameters": {"engine": "exa", "max_uses": 1, "max_results": 5}}
 
 # Raw bytes pulled from a linked page before scrubbing. The body is read into memory and
 # rewritten by regex passes, so uncapped it is the peak RSS of the whole URL path. 512 KB

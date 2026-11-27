@@ -18,16 +18,17 @@ from ..utils.constants import (
     THINKING_LEVELS_TO_GOOGLE, THINKING_LEVELS_TO_GOOGLE_BINARY,
     THINKING_LEVELS_TO_OLLAMA, GEMINI_FREE_TIER_BLOCKED, OLLAMA_OWNER_ONLY,
     OPENROUTER_DATA_POLICY_BLOCKED, IMAGE_MODEL_NO_OLLAMA, SPEECH_MODEL_NO_OLLAMA,
-    OPENROUTER_SERVER_TOOLS, SUBSCRIPTION_SERVER_TOOLS,
+    OPENROUTER_SERVER_TOOLS, OPENROUTER_RESEARCH_SEARCH,
     API_KEY_COOLING_DOWN, NO_MODEL_SET, KEY_CHECK_MODEL_MISSING,
     SUBSCRIPTION_LAPSED, SUBSCRIPTION_MODEL_REFUSED, SUBSCRIPTION_SETTINGS_KEY, SUBSCRIPTION_USED_UP,
 )
 from ..utils.data_policy import openrouter_data_collection
 from ..managers.storage_manager import IOManager
 from ..utils.blob_stream import InlineBlobExtractor, is_blob_sentinel, sentinel_path
-from ..utils.constants import SAFETY_SETTINGS
+from ..utils.constants import SAFETY_SETTINGS, SERVICE_TIER_RATE_SHARE
 from ..utils.helpers import (_format_api_error, billable_output_tokens, is_real_model, subscription_allowed, system_settings,
                             resolve_openrouter_endpoint, resolve_openrouter_service_tier,
+                            resolve_google_service_tier,
                             google_thinking_caps, resolve_image_output_params,
                             resolve_image_tools, resolve_media_resolution,
                             resolve_native_tools, resolve_openrouter_image_detail,
@@ -234,7 +235,8 @@ class APIService:
         #: the Hosts screen -- see openrouter_endpoints.
         self._endpoint_listings: "OrderedDict[str, Tuple[float, Tuple[Endpoint, ...]]]" = OrderedDict()
 
-    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None, speech: bool = False, functions=()):
+    def _instantiate_model(self, raw_model_name: str, guild_id, user_id, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, profile_settings=None, openrouter_key_error: str = None, google_key_error: str = None, use_broad_openrouter_heuristic: bool = True, config_owner_id=None, policy_guild_id=None, conversation: bool = False, image_config=None, speech: bool = False, functions=(),
+                           research: bool = False):
         """One adapter for `raw_model_name`, keyed and policed for where it will run.
 
         `guild_id` picks whose key pays: the server's, or `user_id`'s own when None. A
@@ -252,7 +254,8 @@ class APIService:
 
         `tools` are the native tools in Google's spelling (`google_search`, `url_context`);
         OpenRouter is sent its own server tools for the same jobs (OPENROUTER_SERVER_TOOLS)
-        and Ollama nothing. `functions` are the character's own -- the `tool_loop.functions_for`
+        and Ollama nothing. `research=True` is RAG's researcher, whose search on OpenRouter is
+        Exa (OPENROUTER_RESEARCH_SEARCH) rather than the model's native one. `functions` are the character's own -- the `tool_loop.functions_for`
         tuple the caller also handed the prompt builder -- declared on every provider that
         can carry one, which is why they are a separate argument rather than one list to
         be sorted out downstream. Ollama takes neither. The model keeps the tuple as
@@ -354,7 +357,8 @@ class APIService:
                     actual_name, api_key=api_key, system_instruction=system_instruction,
                     image_params=resolve_image_output_params(image_config, f"OPENROUTER/{actual_name}"))
                 return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
-            server = SUBSCRIPTION_SERVER_TOOLS if on_subscription else OPENROUTER_SERVER_TOOLS
+            server = ({**OPENROUTER_SERVER_TOOLS, "google_search": OPENROUTER_RESEARCH_SEARCH}
+                      if research else OPENROUTER_SERVER_TOOLS)
             model = OpenRouterModel(actual_name, api_key=api_key, system_instruction=system_instruction, thinking_params=t_params, image_detail=image_detail, service_tier=service_tier, data_collection=data_collection,
                                     endpoint=endpoint,
                                     tools=declarations(functions),
@@ -403,7 +407,8 @@ class APIService:
                 declared = as_google_tool(declarations(functions))
                 if declared:
                     google_tools.append(declared)
-                model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=google_tools or None, media_resolution=media_res)
+                model = GoogleGenAIModel(api_key=api_key, model_name=actual_name, system_instruction=system_instruction, safety_settings=safety_settings, thinking_params=t_params, tools=google_tools or None, media_resolution=media_res,
+                                         service_tier=resolve_google_service_tier(p_settings))
                 model.functions = tuple(functions)
             return _with_key_cooldown_tracking(self.cog, model, api_key, actual_name)
 
@@ -994,7 +999,10 @@ class APIService:
         billed = meta.get("cost")
         if isinstance(billed, (int, float)) and not isinstance(billed, bool):
             return float(billed), True
-        return self._calculate_turn_cost(meta.get("model", "") or "",
-                                         meta.get("input_tokens", 0) or 0,
-                                         billable_output_tokens(meta),
-                                         meta.get("cached_tokens", 0) or 0), False
+        # ponytail: one share for input, cached input and output alike, which Google's
+        # tables bear out per model; a share per model if a table ever splits them.
+        share = SERVICE_TIER_RATE_SHARE.get(meta.get("service_tier"), 1.0)
+        return share * self._calculate_turn_cost(meta.get("model", "") or "",
+                                                 meta.get("input_tokens", 0) or 0,
+                                                 billable_output_tokens(meta),
+                                                 meta.get("cached_tokens", 0) or 0), False

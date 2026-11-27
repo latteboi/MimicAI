@@ -144,7 +144,7 @@ cogs/
     transfer_service.py    cog.transfer: .mimic export/import, privacy export, account deletion
   listeners/               gateway events; inherited by MimicCog
   gui/                     Discord UI views and modals; profile_dashboard.py is
-                           cog.profile_dashboard, the profile dashboard embed
+                           cog.profile_dashboard, the profile dashboard's words
   utils/                   constants, helpers, content, fuzzy, http_client, memory_tuning,
                            loop_probe, discord_cdn
 ```

@@ -8,8 +8,7 @@ import re
 import datetime
 import traceback
 import time
-from types import SimpleNamespace
-from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional
+from typing import TYPE_CHECKING, List, Dict, Set, Any, Optional, Tuple
 from ..utils.content import OLLAMA_GUIDE_TEXT
 from ..utils.helpers import (
     _estimate_text_tokens, _pf, _pi, _ps, _pb, clean_model_name, is_real_model, is_shipped_ltm_prompt,
@@ -21,7 +20,7 @@ from ..utils.helpers import (
     describe_voice_samples, prune_openrouter_endpoints, resolve_openrouter_endpoint,
     resolve_unreadable_media_mode, system_model, auto_tier, resolve_auto_model, auto_thinking,
     _format_api_error, speaks_verbatim, stored_google_voice, _get_user_hash, neuro_levels,
-    subscription_curated,
+    subscription_curated, default_profile_avatar_url,
 )
 from ..utils import fixed_examples, lorebook
 from ..utils.token_advice import FOOTER as TOKEN_ADVICE_FOOTER, LARGE, profile_advice, standing_text
@@ -38,7 +37,7 @@ from .base_components import (
     BaseBulkProfileView, ConfigModal, ActionTextInputModal, TimeoutCleanupMixin,
     ReportErrorMixin, add_button, add_select, redraw_select, build_pagination_controls,
     build_confirm_view, invalidate_model_cache, PageJumpModal, paged_nav_options,
-    refuse_unregistered, add_topgg_links,
+    refuse_unregistered, add_topgg_links, PanelView, closed_panel, fit_texts, INTO_V2,
 )
 from ..services.api.openrouter_catalogue import (
     AUTHOR_PREFIX, BROWSE_CHEAPEST, BROWSE_POPULAR, BROWSE_TRENDING,
@@ -161,8 +160,8 @@ def ProfileBirthdayModal(cog, profile_name: str, current: Optional[Dict[str, int
 PROFILE_TABS = ("home", "persona", "params", "tools", "images", "audio", "memory",
                 "training", "sharing", "misc")
 
-#: Tab buttons to an action row, for both the dashboard's strip and the bulk wizard's.
-#: Discord's own limit, and the two strips share it so they cannot wrap differently.
+#: Tab buttons to an action row, for the bulk wizard's strips: Discord's own limit, and its
+#: two strips share it so they cannot wrap differently.
 _TAB_BUTTONS_PER_ROW = 5
 
 class _Bulk:
@@ -423,7 +422,7 @@ def _open_screen(action_value: str):
     async def run(view, interaction, profile):
         action = PROFILE_ACTIONS_BY_VALUE[action_value]
         screen = ProfileFunctionView(view, action)
-        await interaction.response.edit_message(embed=await screen.embed(), view=screen)
+        await interaction.response.edit_message(view=screen.framed(await screen.embed()))
     return run
 
 
@@ -863,8 +862,8 @@ def _subscription_note(note: str, line: str):
 #: cannot describe them differently. The bulk copies were bare (label, value) pairs.
 _GROUNDING_MODES = (
     ("Off", "off", "No web search."),
-    ("Native", "native", "The model's own provider searches. Google or OpenRouter."),
-    ("RAG", "tool", "The character searches when a reply needs a fact it lacks."),
+    ("Native", "native", "The model's own built-in search. Google or OpenRouter."),
+    ("RAG", "tool", "The character searches when it needs a fact. Generally cheaper than Native."),
     ("Legacy RAG", "rag", "A second model decides and searches before every round."))
 _URL_MODES = (
     ("Off", "off", "Links posted in chat are ignored."),
@@ -942,7 +941,7 @@ PROFILE_ACTIONS = (
                              "grounding_rag_model", "grounding_rag_fallback_model",
                              "ltm_model", "ltm_fallback_model",
                              "ollama_host_url", "openrouter_service_tier",
-                             "openrouter_endpoints"))),
+                             "openrouter_endpoints", "google_service_tier"))),
     _Action("gen_params", "params", "Generation Parameters", "How random or predictable its replies are: Temperature, Top P and Top K.",
             _modal("ProfileParamsModal"),
             bulk=_Bulk(_bulk_modal("ProfileParamsModal"), scope="all",
@@ -1029,10 +1028,11 @@ PROFILE_ACTIONS = (
                     "-# **RAG** costs nothing on turns nobody searches, and the researcher gets "
                     "one query, not the conversation. **Legacy RAG** pays a call every round "
                     "to ask whether to search.\n"
-                    "-# **Native** searches through the model's own provider. Images have their "
-                    "own setting in **Image Output**.",
-                    "-# Where a MimicAI subscription pays, RAG and Legacy RAG search as **Native**, "
-                    "and its web searches cost a lot of the allowance.")),
+                    "-# **Native** uses the model's own built-in search (on OpenRouter, Exa for a "
+                    "model with none). **RAG** searches through OpenRouter's Exa and is generally "
+                    "cheaper. Images have their own setting in **Image Output**.",
+                    "-# Where a MimicAI subscription pays, Legacy RAG searches as **RAG**. Web "
+                    "searches cost a lot of the allowance, Native's the most.")),
             bulk=_Bulk(_bulk_choice("Select Grounding Mode...", _GROUNDING_MODES,
                                     to_payload=lambda v: {"grounding_mode": v}),
                        scope="all", label="Grounding Mode", keys=("grounding_mode",))),
@@ -1355,7 +1355,29 @@ PROFILE_ACTIONS = (
 PROFILE_ACTIONS_BY_VALUE = {a.value: a for a in PROFILE_ACTIONS}
 
 
-class ProfileManageView(BlockedGuard, ui.View):
+#: The tabs whose fields are paragraphs under bold labels, as the user laid out Params.
+_PARAGRAPH_TABS = {"params", "memory", "training"}
+
+#: How long such a value may run on its label's line before it starts on the next: past
+#: this it wraps under the label on a phone anyway.
+_LABEL_LINE = 80
+
+
+class ProfileManageView(BlockedGuard, ui.LayoutView):
+    """The profile dashboard, in Components V2: every tab a section of its own -- its settings,
+    with a ✏️ that opens its dropdown in its place -- under the name and avatar.
+
+    The sections are the tab strip, so they cost it nothing: ten sections and the header come
+    to 35 of Discord's 40 components, the open one's dropdown taking its button's place, and
+    the row under them the rest. A component more on the panel needs one taken off first --
+    `LayoutView` refuses the 41st inside `_build_view`, and the dashboard does not open.
+
+    The V2 flag never comes off a message, so every screen this one swaps itself for is V2
+    as well (`PanelView`): Token Advice, a setting's own screen, Content Safety, and what the
+    message is left showing once the profile is renamed, duplicated or deleted. Anything
+    deeper -- the models, memories, training and lore -- opens a message of its own.
+    """
+
     def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str, is_borrowed: bool, target_user_id: Optional[int] = None, is_mod_view: bool = False):
         super().__init__(timeout=600)
         self.cog = cog
@@ -1379,23 +1401,65 @@ class ProfileManageView(BlockedGuard, ui.View):
         self.profile_name = profile_name
         self.is_borrowed = is_borrowed
         self.is_mod_view = is_mod_view
-        # Whose profile list the mod-mode Back button returns to. Kept separate from
+        # Whose profile this is in /mod, handed on to Content Safety. Kept separate from
         # self.user_id because a system profile rewrites that to the bot owner's id.
         self.mod_return_user_id = target_user_id
         self.current_tab = "home"
         self.is_read_only = self.is_system and original_interaction.user.id != owner_id
-        
+        #: The dashboard's words as `dashboard_parts` last read them: the embed (title, notes,
+        #: avatar) and each tab's fields. Empty until `render`, which every paint goes through.
+        self._embed: Optional[discord.Embed] = None
+        self._sections: Dict[str, List[Tuple[str, str]]] = {}
+
         self._build_view()
 
+    async def render(self) -> 'ProfileManageView':
+        """Read the dashboard's words again and lay it out, returning the view to paint: a V2
+        message is nothing but its components, so no repaint can skip this."""
+        self._embed, self._sections = await self.cog.profile_dashboard.dashboard_parts(
+            self.original_interaction, self.profile_name, target_user_id=self.user_id)
+        self._build_view()
+        return self
+
+    def _header(self) -> str:
+        title = self._embed.title if self._embed else f"Profile Dashboard: '{self.profile_name}'"
+        notes = self._embed.description if self._embed else None
+        return "\n".join(filter(None, (f"## {title}", notes)))
+
+    def _avatar(self) -> str:
+        """The avatar it posts with: its own, else the default face it speaks with."""
+        own = self._embed.thumbnail.url if self._embed else None
+        return own or default_profile_avatar_url(self.profile_name)
+
+    def _section_text(self, tab: str, actions: List['_Action']) -> str:
+        """A tab's heading and its fields; a tab with no field names what is on it instead.
+
+        A field's lines run together with ` · `, but a subtext line or a model chain's keeps
+        its own. An unnamed field, or one named as its tab, shows bare. In `_PARAGRAPH_TABS`
+        fields are paragraphs under bold labels, one too long for the label's line under it.
+        """
+        fields = []
+        for name, value in self._sections.get(tab, ()):
+            rows = []
+            for row in value.splitlines():
+                if rows and not row.startswith(("-#", "*")) and not rows[-1].startswith(("-#", "*")):
+                    rows[-1] += f" · {row}"
+                else:
+                    rows.append(row)
+            value = "\n".join(rows)
+            if name.lower() in ("", tab):
+                fields.append(value)
+            elif tab in _PARAGRAPH_TABS:
+                own_line = rows[0].startswith("-#") or len(rows[0]) > _LABEL_LINE
+                fields.append(f"**{name}:**{chr(10) if own_line else ' '}{value}")
+            else:
+                fields.append(f"{name}: {value}" if len(rows) == 1 else f"{name}\n{value}")
+        if not fields:
+            fields.append("-# " + " · ".join(a.option(self).label for a in actions if a.tab == tab))
+        return f"**{tab.title()}**\n" + ("\n\n" if tab in _PARAGRAPH_TABS else "\n").join(fields)
+
     def _build_view(self):
-        # Deferred import to avoid a circular import with gui_mod (which imports ProfileManageView from this module)
-        from .gui_mod import ModBaseView
-
         self.clear_items()
-        if self.is_read_only:
-            return
-
-        is_mod = getattr(self, 'is_mod_view', False)
 
         # Re-read on every build: the config gates hide rows for features that are off,
         # and every path that can turn one on comes back through here.
@@ -1404,7 +1468,7 @@ class ProfileManageView(BlockedGuard, ui.View):
         visible = [a for a in PROFILE_ACTIONS if a.visible(self)]
 
         # A tab with nothing on it is not offered: every row can be gated, so a tab can
-        # empty out entirely on a borrowed profile, and the button used to open a screen
+        # empty out entirely on a borrowed profile, and its button used to open a screen
         # with no dropdown under it at all.
         valid_tabs = [t for t in PROFILE_TABS
                       if (t != "persona" or not self.is_borrowed)
@@ -1412,68 +1476,33 @@ class ProfileManageView(BlockedGuard, ui.View):
         if self.current_tab not in valid_tabs and valid_tabs:
             self.current_tab = valid_tabs[0]
 
-        # --- 1. Category Dropdown (Row 0) ---
-        options = [a.option(self) for a in visible if a.tab == self.current_tab]
+        head, *texts = fit_texts([self._header(), *(self._section_text(t, visible) for t in valid_tabs)])
+        panel = ui.Container(accent_colour=discord.Colour.blue())
+        panel.add_item(ui.Section(ui.TextDisplay(head), accessory=ui.Thumbnail(self._avatar())))
+        panel.add_item(ui.Separator())
+        for tab, text in zip(valid_tabs, texts):
+            if self.is_read_only or tab == self.current_tab:
+                panel.add_item(ui.TextDisplay(text))
+                if not self.is_read_only:
+                    add_select(row := ui.ActionRow(), [a.option(self) for a in visible if a.tab == tab],
+                               self.dropdown_callback, placeholder=f"{tab.title()}: choose a setting…")
+                    panel.add_item(row)
+            else:
+                button = ui.Button(emoji="✏️", style=discord.ButtonStyle.secondary)
+                button.callback = self.create_nav_callback(tab)
+                panel.add_item(ui.Section(ui.TextDisplay(text), accessory=button))
+        self.add_item(panel)
+        if self.is_read_only:
+            return
 
-        if options:
-            add_select(self, options, self.dropdown_callback,
-                       placeholder=f"Select an action for {self.current_tab.title()}...", row=0)
-
-        # --- 2. Navigation Buttons (Rows 1-2) ---
-        # Discord fits five components to an action row and there are more tabs than
-        # that. All of them pinned to row 1 raises "item would not fit at row 1" inside
-        # __init__, so the whole dashboard failed to open rather than degrading. Rows
-        # are filled before a new one is started: an even split reads as a grid, which
-        # invites scanning two dimensions for a list that only has one.
-        per_row = _TAB_BUTTONS_PER_ROW
-        for position, tab in enumerate(valid_tabs):
-            btn = ui.Button(
-                label=tab.title(),
-                style=discord.ButtonStyle.primary if self.current_tab == tab else discord.ButtonStyle.secondary,
-                row=1 + (position // per_row),
-                disabled=(self.current_tab == tab)
-            )
-            btn.callback = self.create_nav_callback(tab)
-            self.add_item(btn)
-
-        # Below the strip, never sharing its last row: a full row of tabs plus a button
-        # is six items, and Discord refuses the sixth inside __init__ -- the dashboard
-        # would not open at all for the tab count that happens to land on a boundary.
-        # Row 3 is free; the /mod nav bar sits on row 4.
-        below_strip = min(3, 1 + (len(valid_tabs) + per_row - 1) // per_row)
+        controls = ui.ActionRow()
         large = sum(item.size == LARGE for item in self._token_advice())
-        add_button(self, f"Token Advice · {large}" if large else "Token Advice", self._show_token_advice,
-                   emoji="💡", row=below_strip)
-        add_button(self, "Refresh", self._repaint, emoji="🔄", row=below_strip)
-        if self.current_tab == "home":
-            more = self.original_interaction.user.id in self.cog.dashboard_all_models
-            add_button(self, "Show Fewer Models" if more else "Show More Models",
-                       self._toggle_models, row=below_strip)
-        if is_mod:
-            self._add_mod_back_button(below_strip)
-            ModBaseView.attach_nav(
-                self, "profiles",
-                source=SimpleNamespace(cog=self.cog,
-                                       original_interaction=self.original_interaction,
-                                       target_user_id=self.mod_return_user_id))
-
-    def _add_mod_back_button(self, row: int = 2):
-        """Back to the moderated user's profile list.
-
-        The mod nav bar's own "Profiles" button is disabled here -- build_tab_nav_bar
-        disables the button for the current tab -- so without this there is no way
-        back to the list at all, and going out via another tab dropped the target
-        user id.
-        """
-        from .gui_mod import ModProfilesView
-
-        async def back_cb(interaction: discord.Interaction):
-            await interaction.response.defer()
-            view = ModProfilesView(self.cog, self.original_interaction,
-                                   target_user_id=self.mod_return_user_id)
-            await view.update_display()
-        add_button(self, "← Back to Profile List", back_cb, style=discord.ButtonStyle.secondary,
-                   row=row)
+        add_button(controls, f"Token Advice · {large}" if large else "Token Advice",
+                   self._show_token_advice, emoji="💡")
+        add_button(controls, "Refresh", self._repaint, emoji="🔄")
+        more = self.original_interaction.user.id in self.cog.dashboard_all_models
+        add_button(controls, "Show Fewer Models" if more else "Show More Models", self._toggle_models)
+        self.add_item(controls)
 
     def _token_advice(self):
         """What this profile's settings cost (`token_advice.profile_advice`). A borrow's lore
@@ -1491,32 +1520,46 @@ class ProfileManageView(BlockedGuard, ui.View):
         await self._repaint(interaction)
 
     async def _repaint(self, interaction: discord.Interaction):
-        """Rebuild the buttons and the embed from what is stored now."""
+        """Rebuild the dashboard from what is stored now."""
         await interaction.response.defer()
-        self._build_view()
         await self._refresh_dashboard(interaction)
 
     async def _show_token_advice(self, interaction: discord.Interaction):
         view = TokenAdviceView(self)
-        await interaction.response.edit_message(embed=view.embed(), view=view)
+        await interaction.response.edit_message(view=view.framed(view.embed()))
 
     def create_nav_callback(self, tab_name):
+        """A section's ✏️: its dropdown opens in its place, and the open one closes."""
         async def callback(interaction: discord.Interaction):
             self.current_tab = tab_name
             self._build_view()
             await interaction.response.edit_message(view=self)
         return callback
 
-    async def _refresh_dashboard(self, interaction: discord.Interaction):
-        """Repaint the dashboard embed on the message the view owns.
+    async def _refresh_dashboard(self, interaction: Optional[discord.Interaction] = None):
+        """Repaint the dashboard on the message the view owns, from what is stored now.
 
-        Every settings modal hands this back as its completion callback. It used to be
-        redefined as an identical four-line `refresh_cb` closure inside eleven separate
-        dropdown branches.
+        Every settings modal hands this back as its completion callback, and every screen
+        returning here calls it. Clears what a message turned V2 may not keep, for the
+        screens that open in a message of their own and come back.
         """
-        new_embed = await self.cog.profile_dashboard._build_profile_manage_embed(
-            interaction, self.profile_name, target_user_id=self.user_id)
-        await self.original_interaction.edit_original_response(embed=new_embed, view=self)
+        await self.render()
+        await self.original_interaction.edit_original_response(**INTO_V2, view=self)
+
+    async def reopen(self, interaction: discord.Interaction):
+        """Back to the dashboard from a screen it swapped itself for, through that press."""
+        await self.render()
+        await interaction.response.edit_message(view=self)
+
+    async def close_child(self, interaction: discord.Interaction):
+        """Done on a screen with a message of its own (memories, training, lore, the style
+        guide): it closes, and the dashboard above shows what was changed there."""
+        await interaction.response.edit_message(
+            content=None, embed=dismissible(text_embed("Back on the dashboard above.")), view=None)
+        try:
+            await self._refresh_dashboard()
+        except discord.HTTPException:
+            pass   # past the dashboard token's fifteen minutes: its own Refresh still works
 
     async def dropdown_callback(self, interaction: discord.Interaction, owner: Optional[ui.View] = None):
         """`owner` is the view the select sits on, when it is not the dashboard (Token Advice)."""
@@ -1657,15 +1700,15 @@ class ProfileManageView(BlockedGuard, ui.View):
         await interaction.response.defer()
         await view.refresh_state()
         view._build_view()
-        await self.original_interaction.edit_original_response(
-            content=None, embed=view.get_embed(), view=view)
+        await self.original_interaction.edit_original_response(view=view.framed(view.get_embed()))
 
     async def _act_library_intro(self, interaction):
         await interaction.response.send_modal(
             LibraryIntroModal(self.cog, self.user_id, self.profile_name))
 
     async def _handle_appearance(self, interaction):
-        modal = AppearanceModal(self.cog, self.original_interaction, self.profile_name, target_user_id=self.user_id)
+        modal = AppearanceModal(self.cog, self.original_interaction, self.profile_name, target_user_id=self.user_id,
+                                on_saved=self._refresh_dashboard)
         await interaction.response.send_modal(modal)
 
     async def _handle_rename(self, interaction):
@@ -1679,18 +1722,18 @@ class ProfileManageView(BlockedGuard, ui.View):
             
             is_valid, err_msg = self.cog.profile_manager._is_valid_profile_name(new_name)
             if not is_valid:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Rename failed: {err_msg}"))); return
+                await self._close(f"Rename failed: {err_msg}"); return
                 
             if not new_name or new_name.lower() == 'clyde':
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed("Rename failed: Invalid name."))); return
+                await self._close("Rename failed: Invalid name."); return
             user_index = self.cog.profile_manager._get_user_index(self.user_id)
             if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed("Rename failed: Name already exists."))); return
+                await self._close("Rename failed: Name already exists."); return
             
             if self.cog.profile_manager._rename_profile(self.user_id, old_name, new_name, self.is_borrowed):
                 invalidate_model_cache(self.cog, self.user_id, old_name)
                 
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Profile '{old_name}' renamed to '{new_name}'.")))
+                await self._close(f"Profile '{old_name}' renamed to '{new_name}'.")
                 await maybe_prompt_rating_after_edit(self.cog, i, self.user_id, new_name)
         modal.on_submit = rename_submit
         await interaction.response.send_modal(modal)
@@ -1708,26 +1751,25 @@ class ProfileManageView(BlockedGuard, ui.View):
             
             is_valid, err_msg = self.cog.profile_manager._is_valid_profile_name(new_name)
             if not is_valid:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Duplicate failed: {err_msg}"))); return
+                await self._close(f"Duplicate failed: {err_msg}"); return
                 
             user_index = self.cog.profile_manager._get_user_index(self.user_id)
             if new_name in user_index.get("personal", []) or new_name in user_index.get("borrowed", []):
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed("Duplicate failed: Name already exists."))); return
+                await self._close("Duplicate failed: Name already exists."); return
             
             limit = defaultConfig.LIMIT_PROFILES
             if len(user_index.get("personal", {})) >= limit:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed("Limit reached."))); return
+                await self._close("Limit reached."); return
             
             success, msg = self.cog.profile_manager._duplicate_profile(self.user_id, self.profile_name, new_name)
             if success:
                 # Stopped first: this dashboard's timeout would otherwise overwrite the
                 # message, and with it the copy's dashboard if that was opened here.
                 self.stop()
-                await self.original_interaction.edit_original_response(
-                    content=None, embed=text_embed(f"Duplicated to '{new_name}'."),
-                    view=OpenDashboardView(self.cog, self.original_interaction, new_name))
+                await self.original_interaction.edit_original_response(view=OpenDashboardPanel(
+                    self.cog, self.original_interaction, new_name, f"Duplicated to '{new_name}'."))
             else:
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Duplicate failed: {msg}")))
+                await self._close(f"Duplicate failed: {msg}")
         modal.on_submit = duplicate_submit
         await interaction.response.send_modal(modal)
 
@@ -1806,7 +1848,7 @@ class ProfileManageView(BlockedGuard, ui.View):
         async def confirm_delete(i: discord.Interaction):
             await i.response.defer()
             if await self.cog.profile_manager.delete_profiles(self.user_id, [self.profile_name]):
-                await self.original_interaction.edit_original_response(content=None, view=None, embed=dismissible(text_embed(f"Profile '{self.profile_name}' deleted.")))
+                await self._close(f"Profile '{self.profile_name}' deleted.")
         confirm_view = build_confirm_view("Confirm Deletion", confirm_delete, interaction)
         await interaction.response.send_message(embed=text_embed(f"Delete profile '{self.profile_name}'?"), view=confirm_view, ephemeral=True)
 
@@ -1814,8 +1856,13 @@ class ProfileManageView(BlockedGuard, ui.View):
         view = SingleProfileTimezoneView(self.cog, self, profile, is_borrowed)
         await interaction.response.send_message(embed=text_embed(view._get_header_content()), view=view, ephemeral=True)
 
+    async def _close(self, text: str):
+        """The dashboard closed for good, saying why: a V2 message takes no embed again."""
+        self.stop()
+        await self.original_interaction.edit_original_response(view=closed_panel(text))
+
     async def on_timeout(self):
-        try: await self.original_interaction.edit_original_response(content=None, embed=dismissible(text_embed("Manager timed out.")), view=None)
+        try: await self.original_interaction.edit_original_response(view=closed_panel("Manager timed out."))
         except: pass
 
 
@@ -1837,6 +1884,21 @@ class OpenDashboardView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         self.stop()
         await interaction.response.defer()
         await self.cog._open_profile_manage(interaction, self.profile_name, repaint=True)
+
+
+class OpenDashboardPanel(PanelView):
+    """`OpenDashboardView` where a dashboard was: that message is V2 for good."""
+
+    open_dashboard = OpenDashboardView.open_dashboard
+
+    def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str,
+                 text: str):
+        super().__init__(timeout=600)
+        self.cog = cog
+        self.original_interaction = original_interaction
+        self.profile_name = profile_name
+        add_button(self, "Open Dashboard", self.open_dashboard, style=discord.ButtonStyle.blurple)
+        self.framed(text_embed(text))
 
 
 class GuidanceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
@@ -1869,7 +1931,7 @@ class GuidanceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         return text_embed(f"{does}\n```\n{text}\n```", title=title)
 
 
-class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
+class TokenAdviceView(PanelView):
     """Token Advice: what this profile's settings and the text it always sends cost, on
     the dashboard's own message, with a way to each setting and Back to the tab.
 
@@ -1933,13 +1995,10 @@ class TokenAdviceView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
     async def _back_callback(self, interaction: discord.Interaction):
         self.stop()
-        self.parent._build_view()
-        embed = await self.cog.profile_dashboard._build_profile_manage_embed(
-            interaction, self.parent.profile_name, target_user_id=self.parent.user_id)
-        await interaction.response.edit_message(embed=embed, view=self.parent)
+        await self.parent.reopen(interaction)
 
 
-class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
+class ProfileFunctionView(PanelView):
     """One setting's screen, rendered from its `_Screen` declaration.
 
     Swaps onto the dashboard's own message rather than stacking a fresh ephemeral under
@@ -1995,7 +2054,7 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
         _write_profile_config(self.cog, self.parent.user_id, self.parent.profile_name,
                               self.parent.is_borrowed, updates)
         self._build_view()
-        await interaction.response.edit_message(embed=await self.embed(), view=self)
+        await interaction.response.edit_message(view=self.framed(await self.embed()))
 
     def _build_view(self):
         self.clear_items()
@@ -2081,7 +2140,7 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     async def _reset_bonds_callback(self, interaction: discord.Interaction):
         await asyncio.to_thread(self.cog.persona_content.reset_bonds,
                                 self.parent.user_id, self.parent.profile_name)
-        await interaction.response.edit_message(embed=await self.embed(), view=self)
+        await interaction.response.edit_message(view=self.framed(await self.embed()))
 
     async def _mood_avatars_callback(self, interaction: discord.Interaction):
         await interaction.response.send_modal(MoodAvatarModal(
@@ -2089,15 +2148,11 @@ class ProfileFunctionView(BlockedGuard, TimeoutCleanupMixin, ui.View):
 
     async def _after_modal(self, interaction: discord.Interaction):
         self._build_view()
-        await self.original_interaction.edit_original_response(embed=await self.embed(), view=self)
+        await self.original_interaction.edit_original_response(view=self.framed(await self.embed()))
 
     async def _back_callback(self, interaction: discord.Interaction):
         self.stop()
-        self.parent._build_view()
-        embed = await self.cog.profile_dashboard._build_profile_manage_embed(
-            interaction, self.parent.profile_name,
-            target_user_id=self.parent.user_id)
-        await interaction.response.edit_message(embed=embed, view=self.parent)
+        await self.parent.reopen(interaction)
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: ui.Item):
         print(f"ProfileFunctionView({self.action.value}) error: {error}")
@@ -3485,6 +3540,8 @@ class ModelPickerMixin(ReportErrorMixin):
 
         if self.view_mode == 'openrouter' and self._tier_applies():
             self._add_openrouter_buttons(row=row)
+        elif self.view_mode == 'google' and self._tier_applies():
+            self._add_google_tier_button(row=row)
 
     #: Slots whose models go through an adapter other than chat: OpenRouter's image and
     #: speech endpoints are adapters of their own and take neither a tier nor a pin. Only
@@ -3552,14 +3609,37 @@ class ModelPickerMixin(ReportErrorMixin):
     #: How `None` reads on a screen whose cycle includes it.
     _TIER_UNSET_WORDING = "Unchanged"
 
-    def _next_service_tier(self):
-        """The value one press of a tier button moves to."""
+    def _next_service_tier(self, current=...):
+        """The value one press of a tier button moves to: OpenRouter's, or `current`'s."""
         cycle = self._tier_cycle()
-        current = self._current_service_tier()
+        if current is ...:
+            current = self._current_service_tier()
         return cycle[(cycle.index(current) + 1) % len(cycle)] if current in cycle else cycle[0]
 
+    _GOOGLE_TIER_WORDING = {value: label for value, label, _desc in GOOGLE_SERVICE_TIERS}
+
+    def _add_google_tier_button(self, *, row: int):
+        """The Google tab's tier: one cycling button, as Google has no hosts to pin. It
+        steps through the same `_tier_cycle` as OpenRouter's, so each screen's own "not
+        set" (Unchanged, Platform default) comes with it."""
+        current = self._current_google_tier()
+        style, wording = self.tier_wording(current, self._GOOGLE_TIER_WORDING)
+
+        async def tier_cb(i: discord.Interaction):
+            self._set_google_tier(self._next_service_tier(current))
+            self._build_view()
+            await i.response.edit_message(**self._picker_render())
+        add_button(self, f"Tier: {wording}", tier_cb, style=style, row=row)
+
+    def _current_google_tier(self):
+        """Overridden, with `_set_google_tier`, by each screen with no profile to read."""
+        return self._get_current_profile_data().get("google_service_tier") or ""
+
+    def _set_google_tier(self, value):
+        self._save_changes("google_service_tier", value)
+
     @classmethod
-    def tier_wording(cls, value):
+    def tier_wording(cls, value, wordings=None):
         """(button style, wording) for a stored tier.
 
         Falls through to Auto rather than raising: an imported profile or a shard
@@ -3567,11 +3647,12 @@ class ModelPickerMixin(ReportErrorMixin):
         picker has to render it. `resolve_openrouter_service_tier` refuses the same
         value at the wire, so nothing unknown is ever actually sent.
         """
+        wordings = wordings or cls._TIER_WORDING
         if value is None:
             return discord.ButtonStyle.secondary, cls._TIER_UNSET_WORDING
-        if value not in cls._TIER_WORDING:
+        if value not in wordings:
             value = ""
-        return cls._TIER_BUTTON_STYLES[value], cls._TIER_WORDING[value]
+        return cls._TIER_BUTTON_STYLES[value], wordings[value]
 
     def _set_service_tier(self, value):
         """Overridden where "not set" is an absence rather than a stored value."""
@@ -4481,7 +4562,7 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
             'speech_model', 'speech_fallback_model',
             'grounding_rag_model', 'grounding_rag_fallback_model',
             'ltm_model', 'ltm_fallback_model',
-            'ollama_host_url', 'openrouter_service_tier')}
+            'ollama_host_url', 'openrouter_service_tier', 'google_service_tier')}
         self.show_fallback_indicator = None
 
         # Seeded from whatever an earlier visit already staged, so reopening the picker
@@ -4538,6 +4619,9 @@ class ModelApplyView(ModelPickerMixin, _BulkSubView):
 
     def _current_service_tier(self):
         return self.models_state.get("openrouter_service_tier")
+
+    def _current_google_tier(self):
+        return self.models_state.get("google_service_tier")
 
     def _save_changes(self, key: str, value: Any):
         if key == "show_fallback_indicator":
@@ -5457,10 +5541,7 @@ class SingleProfileTimezoneView(_TimezonePickerView):
             owner_id, name, self.profile_config, self.is_borrowed)
         invalidate_model_cache(self.cog, owner_id, name)
 
-        new_embed = await self.cog.profile_dashboard._build_profile_manage_embed(
-            interaction, name, target_user_id=owner_id)
-        await self.parent_manage_view.original_interaction.edit_original_response(
-            embed=new_embed, view=self.parent_manage_view)
+        await self.parent_manage_view._refresh_dashboard(interaction)
         await interaction.response.edit_message(
             content=None, embed=dismissible(text_embed(f"✅ Timezone set to **{canonical_tz}**.")), view=None)
 
@@ -5710,10 +5791,12 @@ class BulkDeleteView(_BulkSubView):
 
 class AppearanceModal(ui.Modal):
     def __init__(self, cog: 'MimicCog', original_interaction: discord.Interaction, profile_name: str,
-                 target_user_id: Optional[int] = None):
+                 target_user_id: Optional[int] = None, on_saved=None):
         super().__init__(title=f"Appearance: '{profile_name[:20]}'")
         self.cog = cog
         self.original_interaction = original_interaction
+        #: Repaints the dashboard this was opened from (`_refresh_dashboard`).
+        self.on_saved = on_saved
         self.profile_name = profile_name
         self.owner_id = target_user_id or original_interaction.user.id
 
@@ -5790,9 +5873,8 @@ class AppearanceModal(ui.Modal):
 
         # A linked child bot is not touched: its name and avatar are set on its own
         # application in the Discord Developer Portal.
-        new_embed = await self.cog.profile_dashboard._build_profile_manage_embed(
-            self.original_interaction, self.profile_name, target_user_id=owner_id)
-        await self.original_interaction.edit_original_response(embed=new_embed)
+        if self.on_saved is not None:
+            await self.on_saved(interaction)
         await interaction.followup.send(embed=text_embed("Appearance updated."), ephemeral=True)
         # The display name and avatar are part of the classified surface, so an
         # appearance edit invalidates a rating exactly as a persona edit does.
@@ -6702,7 +6784,7 @@ class BulkManageView(_ActionStagingHost, BaseBulkProfileView):
             self.cog, "BULK_APPLY", "", self.user_id, callback=modal_callback))
 
 
-class ContentSafetyView(BlockedGuard, ui.View):
+class ContentSafetyView(PanelView):
     """The Content Safety dashboard for one profile.
 
     Replaces the profile dashboard rather than opening beside it, because it is not
@@ -6971,7 +7053,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
     async def _rerender(self, i: discord.Interaction):
         await self.refresh_state()
         self._build_view()
-        await i.edit_original_response(embed=self.get_embed(), view=self)
+        await i.edit_original_response(view=self.framed(self.get_embed()))
 
     async def _repaint(self, i: discord.Interaction):
         """Redraws from state already in hand.
@@ -6981,7 +7063,7 @@ class ContentSafetyView(BlockedGuard, ui.View):
         it reads can have changed since the click that got us here.
         """
         self._build_view()
-        await i.edit_original_response(embed=self.get_embed(), view=self)
+        await i.edit_original_response(view=self.framed(self.get_embed()))
 
     async def _await_verdict(self, i: discord.Interaction):
         """Shows that the job started, waits for it, then shows the verdict.
@@ -6998,6 +7080,8 @@ class ContentSafetyView(BlockedGuard, ui.View):
     # --- actions --------------------------------------------------------------
 
     async def back_cb(self, i: discord.Interaction):
+        # Stopped: left running, its timeout would strip the dashboard's controls.
+        self.stop()
         view = ProfileManageView(self.cog, self.original_interaction, self.profile_name,
                                  self.is_borrowed, self.mod_return_user_id, self.is_mod_view)
         await i.response.defer()

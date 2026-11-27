@@ -206,7 +206,7 @@ class GlobalChatMixin:
         # The host's own copy from here on, as a session reads a seated borrow's: a borrow
         # owns its config, and its models and sampling are what the host set on it.
         is_borrowed = profile_name in self.cog.profile_manager._get_user_index(host_user_id).get("borrowed", [])
-        # On the host's own key: where that is the subscription, RAG searches as Native.
+        # On the host's own key: where that is the subscription, Legacy RAG searches as RAG.
         profile_data = subscription_settings(self.cog, 
             self.cog.profile_manager._get_profile_config(host_user_id, profile_name, is_borrowed) or {},
             None, host_user_id)

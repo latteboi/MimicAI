@@ -148,6 +148,10 @@ _NO_CIRCULATION: set = set()
 _NO_CIRCULATION_MAX = 64
 
 
+class _RetryAtStandard(Exception):
+    pass
+
+
 class _RetryWithoutBuiltins(Exception):
     """Internal signal, as RetryUncapped: redo this call now `_NO_CIRCULATION` knows."""
 
@@ -159,8 +163,13 @@ class GoogleRESTModel:
     .prompt_feedback and token counts.
     """
 
-    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, image_params=None, media_resolution=None):
+    def __init__(self, api_key, model_name, system_instruction=None, safety_settings=None, thinking_params=None, tools=None, image_params=None, media_resolution=None,
+                 service_tier=None):
         self.api_key = api_key
+        #: `resolve_google_service_tier`'s, or None for Standard. Dropped for the rest of
+        #: this instance's life the first time Flex is at capacity.
+        self.service_tier = service_tier
+        self._asked_tier = None
         self.model_name = model_name.replace("OPENROUTER/", "").replace("GOOGLE/", "")
         self.system_instruction = system_instruction
         self.safety_settings = safety_settings
@@ -599,6 +608,10 @@ class GoogleRESTModel:
             if gen_cfg:
                 payload["generationConfig"] = gen_cfg
             capped = "maxOutputTokens" in gen_cfg
+            # `asked_tier` survives a Flex retry: the audit then shows Flex served as Standard.
+            asked_tier = self.service_tier or self._asked_tier
+            if self.service_tier:
+                payload["service_tier"] = self.service_tier
 
             model_path = self.model_name if self.model_name.startswith("models/") else f"models/{self.model_name}"
 
@@ -627,6 +640,11 @@ class GoogleRESTModel:
                         # helpers._get_friendly_api_error matches on, so pass it through
                         # intact. Error bodies are small; read it in one go.
                         detail = (await response.aread()).decode('utf-8', 'replace')
+                        # Flex at capacity is Google's 429 or 503, with no fallback of its
+                        # own. Retried here, before the cooldown tracker reads a 429 as the
+                        # key's quota and rests the model on it.
+                        if self.service_tier == "flex" and response.status_code in (429, 503):
+                            raise _RetryAtStandard()
                         if capped and refused_output_cap(self.model_name, response.status_code, detail):
                             raise RetryUncapped()
                         if (circulating and response.status_code == 400
@@ -646,6 +664,11 @@ class GoogleRESTModel:
         except httpx.RequestError as e:
             extractor.cleanup()
             raise Exception(f"Google API Network Error: {str(e)}")
+        except _RetryAtStandard:
+            extractor.cleanup()
+            print(f"{self.model_name}: Flex at capacity; retrying at Standard.")
+            self._asked_tier, self.service_tier = self.service_tier, None
+            return await self.generate_content_async(contents, generation_config, stream_state)
         except (RetryUncapped, _RetryWithoutBuiltins):
             extractor.cleanup()
             return await self.generate_content_async(contents, generation_config, stream_state)
@@ -667,7 +690,11 @@ class GoogleRESTModel:
             parsed = json.loads(skeleton)
         skeleton = None
         mem_probe.describe_bulk(parsed)
-        return GoogleRESTResponse(parsed, blob_paths=blob_paths)
+        result = GoogleRESTResponse(parsed, blob_paths=blob_paths)
+        if not asked_tier:
+            # Every untiered turn is "standard"; stored, it is a key on every turn saying nothing.
+            result.service_tier = None
+        return result
 
 
 class GoogleRESTResponse:
@@ -697,6 +724,9 @@ class GoogleRESTResponse:
         self.thinking_tokens = (self.usage_metadata.thoughts_token_count or 0) if self.usage_metadata else 0
         #: The part of `input_tokens` served from Gemini's implicit prefix cache.
         self.cached_tokens = (self.usage_metadata.cached_content_token_count or 0) if self.usage_metadata else 0
+        #: The tier Google served, which is not always the one asked for: Priority on a
+        #: key below Tier 2 comes back "standard". `record_billed_usage` stores it.
+        self.service_tier = (body.get("usageMetadata") or {}).get("serviceTier")
 
         if self.candidates and self.candidates[0].content and self.candidates[0].content.parts:
             for part in self.candidates[0].content.parts:

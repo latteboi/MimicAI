@@ -227,6 +227,12 @@ class _SessionPairView(_SlotPairView):
     def _set_service_tier(self, value):
         self._put_settings({"openrouter_service_tier": value or None})
 
+    def _current_google_tier(self):
+        return self._settings().get("google_service_tier") or ""
+
+    def _set_google_tier(self, value):
+        self._put_settings({"google_service_tier": value or None})
+
     def _add_openrouter_buttons(self, *, row: int):
         lit = bool(self._current_service_tier()) or any(
             resolve_openrouter_endpoint(self._settings(), m) for m in self._pinnable_openrouter_models())

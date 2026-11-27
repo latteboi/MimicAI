@@ -14,7 +14,7 @@ from .base_components import (BlockedGuard, TimeoutCleanupMixin,
                               refuse_unregistered, resolve_bulk_select,
                               add_topgg_links, send_status, settle_status)
 from .gui_start import open_generate
-from .base_components import closed_embed, dismissible, text_embed
+from .base_components import closed_embed, dismissible, embed_panel, text_embed
 
 #: Said to a borrower wherever a borrow is taken: what they are and are not getting.
 BORROW_TERMS = "-# A borrow follows its owner's edits, and ends if they delete it or withdraw it from you."
@@ -22,24 +22,6 @@ BORROW_TERMS = "-# A borrow follows its owner's edits, and ends if they delete i
 if TYPE_CHECKING:
     # This only runs during "hinting" and prevents the circular crash
     from ..MimicCog import MimicCog
-
-
-def embed_panel(embed: discord.Embed) -> ui.Container:
-    """An embed's words as a V2 panel, for the hub tabs that build one. Fields stack -- V2
-    has no columns -- and blank spacer fields are dropped; a thumbnail sits beside the
-    title and description."""
-    head = "\n".join(filter(None, (f"## {embed.title}" if embed.title else "", embed.description or "")))
-    panel = ui.Container(accent_colour=embed.colour)
-    if head and embed.thumbnail.url:
-        panel.add_item(ui.Section(ui.TextDisplay(head), accessory=ui.Thumbnail(embed.thumbnail.url)))
-    elif head:
-        panel.add_item(ui.TextDisplay(head))
-    for field in embed.fields:
-        if (field.name or "").strip("​ ") or (field.value or "").strip("​ "):
-            panel.add_item(ui.TextDisplay(f"**{field.name}**\n{field.value}"))
-    if embed.footer.text:
-        panel.add_item(ui.TextDisplay(f"-# {embed.footer.text}"))
-    return panel
 
 
 class HubBaseView(BlockedGuard, ui.LayoutView):

@@ -4,7 +4,7 @@ import traceback
 
 import discord
 from discord import ui
-from typing import Awaitable, Callable, Optional, Sequence, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional, Sequence, Tuple
 
 from ..utils.constants import (CAST_POLICY_OPEN, CAST_REFUSAL, MEMBERS_INFORMED_PROMPT,
                                NOT_REGISTERED, PLACEHOLDER_EMOJI, TOPGG_LINKS,
@@ -374,6 +374,114 @@ class BlockedGuard:
 
 
 #: The two bulk sentinels a paginated multi-select carries above its real options.
+#: What an edit turning an embed message into Components V2 clears. discord.py sets the flag
+#: for a `LayoutView`; Discord refuses it beside content or embeds the message still holds.
+INTO_V2 = {"content": None, "embeds": [], "attachments": []}
+
+#: Discord's cap on the words in one Components V2 message, across all its text displays.
+V2_TEXT_LIMIT = 4000
+
+
+def fit_texts(texts: Sequence[str], limit: int = V2_TEXT_LIMIT) -> List[str]:
+    """`texts` cut to `limit` characters between them, every one past a shared ceiling cut to
+    it: a V2 message over its 4,000 is refused whole, where an embed cut each field to its own
+    1,024. One ceiling, so a short text keeps all its words and no long one loses its heading."""
+    texts = list(texts)
+    budget, left = limit, len(texts)
+    for length in sorted(map(len, texts)):
+        if length * left > budget:
+            break
+        budget, left = budget - length, left - 1
+    if not left:
+        return texts
+    cap = budget // left
+    return [t if len(t) <= cap else t[:max(0, cap - 1)] + "…" for t in texts]
+
+
+def embed_panel(embed: discord.Embed) -> ui.Container:
+    """An embed's words as a V2 panel. Fields stack -- V2 has no columns -- and blank spacer
+    fields are dropped; a thumbnail sits beside the title and description."""
+    head = "\n".join(filter(None, (f"## {embed.title}" if embed.title else "", embed.description or "")))
+    fields = [f"**{field.name}**\n{field.value}" for field in embed.fields
+              if (field.name or "").strip("\u200b ") or (field.value or "").strip("\u200b ")]
+    foot = [f"-# {embed.footer.text}"] if embed.footer.text else []
+    head, *rest = fit_texts([head, *fields, *foot])
+    panel = ui.Container(accent_colour=embed.colour)
+    if head and embed.thumbnail.url:
+        panel.add_item(ui.Section(ui.TextDisplay(head), accessory=ui.Thumbnail(embed.thumbnail.url)))
+    elif head:
+        panel.add_item(ui.TextDisplay(head))
+    for text in rest:
+        panel.add_item(ui.TextDisplay(text))
+    return panel
+
+
+class PanelView(BlockedGuard, ui.LayoutView):
+    """A screen written as an embed over rows of controls, drawn in Components V2.
+
+    For a screen that opens on a V2 message -- the profile dashboard's -- which never takes an
+    embed again. Controls go in as on a `ui.View`, `add_button(self, ..., row=n)`, and each row
+    becomes an action row under the panel. `framed(embed)` puts the embed's words above them
+    and returns the view, so a repaint is `edit_message(view=self.framed(embed))`.
+
+    On timeout the words stay and the controls go: a V2 message with nothing in it is refused,
+    so the `view=None` `TimeoutCleanupMixin` sends cannot close one. Reads
+    `self.original_interaction`, as that mixin does.
+    """
+
+    def __init__(self, *, timeout: Optional[float] = 180):
+        self._panel: Optional[ui.Container] = None
+        self._grid: Dict[int, list] = {}
+        super().__init__(timeout=timeout)
+
+    def add_item(self, item: ui.Item):
+        if item._is_v2():
+            return super().add_item(item)
+        self._grid.setdefault(item.row or 0, []).append(item)
+        self._lay_out()
+        return self
+
+    def clear_items(self):
+        self._grid = {}
+        self._lay_out()
+        return self
+
+    def _lay_out(self, controls: bool = True):
+        super().clear_items()
+        if self._panel is not None:
+            super().add_item(self._panel)
+        if controls:
+            for n in sorted(self._grid):
+                super().add_item(ui.ActionRow(*self._grid[n]))
+
+    @property
+    def controls(self) -> list:
+        """The buttons and selects, row by row: what `children` lists on a `ui.View`. Here
+        `children` is the panel and the action rows holding them."""
+        return [item for n in sorted(self._grid) for item in self._grid[n]]
+
+    def framed(self, embed: discord.Embed) -> 'PanelView':
+        self._panel = embed_panel(embed)
+        self._lay_out()
+        return self
+
+    async def on_timeout(self):
+        interaction = getattr(self, "original_interaction", None)
+        if self._panel is None or interaction is None:
+            return
+        self._lay_out(controls=False)
+        try:
+            await interaction.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass   # gone, or past the token's fifteen minutes
+
+
+def closed_panel(text: str) -> ui.LayoutView:
+    """`dismissible(text_embed(text))` for a V2 message, which can take no embed: what one
+    shows once its controls are gone."""
+    return PanelView(timeout=None).framed(dismissible(text_embed(text)))
+
+
 SELECT_PAGE = "toggle_page"
 SELECT_ALL = "toggle_all"
 
@@ -490,9 +598,7 @@ class TabbedView(BlockedGuard, TimeoutCleanupMixin, ui.View):
     def attach_nav(cls, target_view: ui.View, current_tab: str, *, source):
         """Render this screen's nav bar onto `target_view`.
 
-        `source` is what the tab factories read. Normally the view itself, but
-        ProfileManageView passes a stand-in so the /mod nav bar can be grafted onto a
-        screen that is not one of the mod tabs.
+        `source` is what the tab factories read: the view itself.
         """
         def nav(factory):
             async def callback(i: discord.Interaction):

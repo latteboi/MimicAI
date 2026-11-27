@@ -10,6 +10,7 @@ import urllib.parse
 from typing import TYPE_CHECKING, List, Dict, Any, Optional, Tuple
 from ..utils.helpers import (_estimate_text_tokens, _get_user_hash, _yield_message_chunks,
                              billable_output_tokens, clean_model_name, openrouter_routing, resolve_auto_model,
+                             resolve_google_service_tier,
                              resolve_critic_settings, strip_history_envelope, turn_posted_at)
 from ..utils.data_policy import may_pick_training_models
 from ..utils import follow_ups
@@ -3763,7 +3764,17 @@ class SessionAuditView(BlockedGuard, ui.View):
                         # rates for a listed model id. Say so when the profile has asked
                         # for a tier, rather than quoting a number the turn will not cost.
                         pinned, tier = openrouter_routing(self.cog, p_cfg, prim_mod)
-                        if pinned:
+                        # `_instantiate_model`'s test, not `model_provider`'s: a bare
+                        # `google/...` id goes to OpenRouter.
+                        name = str(prim_mod or "")
+                        if name.startswith("GOOGLE/") or "/" not in name:
+                            # Google's tiers have fixed shares of the rate table, so the
+                            # projection can price one rather than caveat it.
+                            google_tier = resolve_google_service_tier(p_cfg)
+                            est_cost *= SERVICE_TIER_RATE_SHARE.get(google_tier, 1.0)
+                            tier_note = (f"\n*(Priced at the `{google_tier}` tier.)*"
+                                         if google_tier else "")
+                        elif pinned:
                             tier_note = (f"\n*(Priced at standard rates; this model is pinned to "
                                          f"`{pinned}`, so the billed figure may differ.)*")
                         elif tier:

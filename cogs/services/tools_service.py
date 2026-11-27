@@ -30,8 +30,8 @@ _GROUNDING_DECISION = re.compile(r'^[\s*_`"\'>-]*yes\b', re.IGNORECASE)
 
 
 #: The search tool, in Google's spelling. One object, because it is constant and both
-#: grounding paths send exactly it; on OpenRouter `_instantiate_model` sends that
-#: provider's own search tool in its place (OPENROUTER_SERVER_TOOLS).
+#: grounding paths send exactly it; on OpenRouter `_instantiate_model` sends Exa in its
+#: place (OPENROUTER_RESEARCH_SEARCH).
 _GOOGLE_SEARCH_TOOL = {"google_search": {}}
 
 #: What the researcher is sampled at. Low, in both paths: this call reports what a
@@ -443,7 +443,8 @@ class ToolsService:
             name, guild_id, owner_id, instruction, safety_settings,
             resolve_thinking_params(p_cfg, "grounding", "fallback" if is_fallback else "primary",
                                     cog=self.cog),
-            [_GOOGLE_SEARCH_TOOL], p_cfg, config_owner_id=owner_id, **(policy or {}))
+            [_GOOGLE_SEARCH_TOOL], p_cfg, config_owner_id=owner_id, research=True,
+            **(policy or {}))
 
     async def _get_hybrid_grounding_context(self, user_query: str, guild_id: int, conversation_history: List, p_cfg: Optional[Dict[str, Any]], owner_id: Optional[int], safety_settings: Optional[Dict] = None, is_for_image: bool = False, warning_channel: Optional[discord.abc.Messageable] = None) -> Optional[Tuple[str, List[Dict], bool, Optional[str]]]:
         status = "api_error"
@@ -513,7 +514,7 @@ class ToolsService:
             p_cfg = p_cfg or {}
 
             rag_primary, rag_fallbacks = self.cog.api_service.model_chain(
-                p_cfg, "grounding_rag_model", owner_id)
+                p_cfg, "grounding_rag_model", owner_id, guild_id=guild_id, user_id=owner_id)
 
             # Set inside the attempt so the log names the model the call was actually
             # made against -- including which of the chain it ended up on.
@@ -612,7 +613,8 @@ class ToolsService:
         p_cfg = (self.cog.profile_manager._get_profile_config(
             owner_id, profile_name, is_borrowed) or {}) if owner_id else {}
 
-        primary, fallbacks = self.cog.api_service.model_chain(p_cfg, "grounding_rag_model", owner_id)
+        primary, fallbacks = self.cog.api_service.model_chain(
+            p_cfg, "grounding_rag_model", owner_id, guild_id=guild_id, user_id=owner_id)
         instructions = self.cog.global_prompts.get("WEB_SEARCH_RESEARCH",
                                                    DEFAULT_WEB_SEARCH_RESEARCH)
         status = "api_error"

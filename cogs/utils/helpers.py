@@ -46,7 +46,7 @@ from .constants import (
     DEFAULT_KICKSTART_CONTINUE, DEFAULT_KICKSTART_IDLE, DEFAULT_KICKSTART_UNANSWERED,
     DEFAULT_WHISPER_RECAP,
     SUPERSEDED_LTM_SUMMARIZATION_HASHES,
-    OPENROUTER_SERVICE_TIER_VALUES,
+    OPENROUTER_SERVICE_TIER_VALUES, GOOGLE_SERVICE_TIER_VALUES,
     UNREADABLE_MEDIA_DEFAULT, UNREADABLE_MEDIA_KEYS, UNREADABLE_MEDIA_LABELS,
     UNREADABLE_MEDIA_VALUES,
     GOOGLE_VOICE_PREFIX, PROSE_DIRECTED_TTS_MODELS, TTS_VOICE_LOOKUP,
@@ -1517,6 +1517,13 @@ def resolve_openrouter_service_tier(config: Optional[Dict[str, Any]]) -> Optiona
     return value if value in OPENROUTER_SERVICE_TIER_VALUES else None
 
 
+def resolve_google_service_tier(config: Optional[Dict[str, Any]]) -> Optional[str]:
+    """The profile's native Google service tier, or None for Standard. Validated as the
+    OpenRouter one is: an unknown value is a 400 on every turn."""
+    value = str((config or {}).get("google_service_tier") or "").lower()
+    return value if value in GOOGLE_SERVICE_TIER_VALUES else None
+
+
 #: What a pinned OpenRouter endpoint tag may look like before it goes on the wire: a
 #: host slug and up to four variant segments (`google-vertex/global/priority`,
 #: `deepinfra/fp4`). Always used with fullmatch.
@@ -1974,14 +1981,13 @@ def resolve_grounding_mode(config: Optional[Dict[str, Any]]) -> str:
 
 def subscription_settings(cog, config: Dict[str, Any], guild_id: Optional[int],
                           user_id: Optional[int]) -> Dict[str, Any]:
-    """A turn's `config` as it runs where a MimicAI subscription pays: RAG and Legacy RAG
-    search as Native, the only search a subscription runs (its grounding summariser has no
-    models). A copy, never written back. Asked once per turn path, before `functions_for`, so
-    the prompt, the tools and the Legacy RAG gate all read it. `guild_id` and `user_id` as
-    the turn hands `_instantiate_model`."""
-    if (resolve_grounding_mode(config) in ("tool", "rag")
+    """A turn's `config` as it runs where a MimicAI subscription pays: Legacy RAG searches as
+    RAG, so the subscription never pays a gate call every round. A copy, never written back.
+    Asked once per turn path, before `functions_for`, so the prompt, the tools and the Legacy
+    RAG gate all read it. `guild_id` and `user_id` as the turn hands `_instantiate_model`."""
+    if (resolve_grounding_mode(config) == "rag"
             and cog.storage_manager.subscription_payer(guild_id, user_id)):
-        return {**config, "grounding_mode": "native"}
+        return {**config, "grounding_mode": "tool"}
     return config
 
 

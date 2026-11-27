@@ -22,7 +22,7 @@ from .utils.character_card import (CardError, card_portrait, prompt_text, profil
 from .utils.memory_tuning import low_memory
 from .utils.signatures import unsign
 from .listeners.event_listeners import EventListeners
-from .gui.base_components import (ActionTextInputModal, DropdownContentView, build_confirm_view,
+from .gui.base_components import (INTO_V2, ActionTextInputModal, DropdownContentView, build_confirm_view,
                                   add_topgg_links, cast_refusal, refuse_uninformed,
                                   refuse_unregistered, text_embed,
                                   send_status, settle_status, update_status)
@@ -707,15 +707,15 @@ class MimicCog(EventListeners, commands.Cog):
         index = self.profile_manager._get_user_index(interaction.user.id)
         is_view_borrowed = profile_name in index.get("borrowed", [])
 
-        embed = await self.profile_dashboard._build_profile_manage_embed(interaction, profile_name)
-        view = ProfileManageView(self, interaction, profile_name, is_view_borrowed)
+        view = await ProfileManageView(self, interaction, profile_name, is_view_borrowed).render()
         if deferral is not None:
             await deferral
 
         if repaint:
-            await interaction.edit_original_response(content=None, embed=embed, view=view)
+            # The message it replaces may hold an embed, which a V2 message may not keep.
+            await interaction.edit_original_response(**INTO_V2, view=view)
         else:
-            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+            await interaction.followup.send(view=view, ephemeral=True)
         # On open rather than on every repaint: it hashes the whole persona, and the
         # repaint straight after an edit is the post-edit prompt's decision to make.
         # This catches imports, restores and prompts that were ignored. After the send,

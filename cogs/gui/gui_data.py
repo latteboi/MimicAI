@@ -538,7 +538,7 @@ class DataManageView(BlockedGuard, ui.View):
                 await i.response.edit_message(embed=view.embed(), view=view)
             add_button(self, "Analyse", analyse_cb, style=discord.ButtonStyle.blurple, row=4)
         if self.parent_manage_view:
-            add_button(self, "Back to Dashboard", self.back_callback, row=4, emoji="⬅️")
+            add_button(self, "Done", self.back_callback, row=4, emoji="✅")
 
     @staticmethod
     def _pages(items: list, size: int = DATA_PAGE_SIZE) -> int:
@@ -557,8 +557,10 @@ class DataManageView(BlockedGuard, ui.View):
             await interaction.response.edit_message(embed=embed, view=self)
 
     async def start(self):
+        # A message of its own: the dashboard's is Components V2, which takes no embed, and
+        # this screen's Analyse goes on into the model pickers.
         if not self.original_interaction.response.is_done():
-            await self.original_interaction.response.defer()
+            await self.original_interaction.response.defer(ephemeral=True, thinking=True)
         await self._reload()
         await self._show(self.original_interaction)
 
@@ -616,10 +618,8 @@ class DataManageView(BlockedGuard, ui.View):
         await interaction.response.send_modal(TestMatchModal(self))
 
     async def back_callback(self, i: discord.Interaction):
-        await i.response.defer()
-        embed = await self.cog.profile_dashboard._build_profile_manage_embed(self.original_interaction, self.profile_name, target_user_id=self.parent_manage_view.user_id)
-        self.parent_manage_view._build_view()
-        await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
+        self.stop()
+        await self.parent_manage_view.close_child(i)
 
     async def add_callback(self, interaction: discord.Interaction):
         if self.mode == 'training':
@@ -808,6 +808,8 @@ class StyleGuideView(BlockedGuard, ui.View):
         self.on = False
 
     async def start(self):
+        # A message of its own, as DataManageView's: Analyse goes on into the model pickers.
+        await self.original_interaction.response.defer(ephemeral=True, thinking=True)
         await self._show(self.original_interaction)
 
     def _write(self, **changes):
@@ -838,7 +840,7 @@ class StyleGuideView(BlockedGuard, ui.View):
                    style=discord.ButtonStyle.secondary if self.on else discord.ButtonStyle.success)
         add_button(self, "Analyse…", self._analyse, style=discord.ButtonStyle.blurple)
         add_button(self, "Clear", self._clear, style=discord.ButtonStyle.danger, disabled=not guide)
-        add_button(self, "Back to Dashboard", self._back, row=1, emoji="⬅️")
+        add_button(self, "Done", self._back, row=1, emoji="✅")
         if interaction.response.is_done():
             await interaction.edit_original_response(embed=embed, view=self)
         else:
@@ -863,11 +865,8 @@ class StyleGuideView(BlockedGuard, ui.View):
         await i.response.edit_message(embed=view.embed(), view=view)
 
     async def _back(self, i: discord.Interaction):
-        await i.response.defer()
-        embed = await self.cog.profile_dashboard._build_profile_manage_embed(
-            self.original_interaction, self.profile_name, target_user_id=self.user_id)
-        self.parent_manage_view._build_view()
-        await self.original_interaction.edit_original_response(embed=embed, view=self.parent_manage_view)
+        self.stop()
+        await self.parent_manage_view.close_child(i)
 
 
 #: Asked before `MemoryManager.forget_person`. It erases by conversation, so it says so.

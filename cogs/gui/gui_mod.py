@@ -19,7 +19,7 @@ from ..utils.helpers import (_sanitise_filename, birth_time, is_real_model, prun
 from ..utils.loop_probe import rss_bytes, snapshot as loop_probe_snapshot
 from ..utils import signatures
 from ..utils.user_defaults import auto_wording, model_slot_defaults, other_provider
-from .base_components import (BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
+from .base_components import (INTO_V2, BlockedGuard, TabbedView, TimeoutCleanupMixin, add_button,
                               add_select, build_confirm_view, invalidate_model_cache)
 
 if TYPE_CHECKING:
@@ -1617,12 +1617,7 @@ class ModProfilesView(ModBaseView):
             async def refused_sel(i: discord.Interaction):
                 owner, _, pname = i.data['values'][0].partition(":")
                 self.target_user_id = int(owner)
-                await i.response.defer()
-                pm_view = ProfileManageView(self.cog, self.original_interaction, pname, False,
-                                            target_user_id=int(owner), is_mod_view=True)
-                embed = await self.cog.profile_dashboard._build_profile_manage_embed(
-                    self.original_interaction, pname, target_user_id=int(owner))
-                await self.original_interaction.edit_original_response(embed=embed, view=pm_view)
+                await self._open_dashboard(i, pname, False)
             options = []
             for owner, name, at, flagged, review in self.refused_rows[:DROPDOWN_MAX_OPTIONS]:
                 user = self.cog.bot.get_user(owner)
@@ -1648,11 +1643,7 @@ class ModProfilesView(ModBaseView):
                 options = [discord.SelectOption(label=p[:100], value=p[:100]) for p in page_items]
                 async def sel_cb(i: discord.Interaction):
                     pname = i.data['values'][0]
-                    is_b = pname in index.get("borrowed", [])
-                    await i.response.defer()
-                    pm_view = ProfileManageView(self.cog, self.original_interaction, pname, is_b, target_user_id=self.target_user_id, is_mod_view=True)
-                    embed = await self.cog.profile_dashboard._build_profile_manage_embed(self.original_interaction, pname, target_user_id=self.target_user_id)
-                    await self.original_interaction.edit_original_response(embed=embed, view=pm_view)
+                    await self._open_dashboard(i, pname, pname in index.get("borrowed", []))
                 add_select(self, options, sel_cb, placeholder="Select a profile to manage...",
                            row=1)
 
@@ -1660,6 +1651,17 @@ class ModProfilesView(ModBaseView):
                     self._add_page_controls(num_pages, 2)
 
         self._add_nav_buttons()
+
+    async def _open_dashboard(self, i: discord.Interaction, pname: str, is_borrowed: bool):
+        """`pname`'s dashboard in a message of its own under this list, which stays to pick
+        the next from: the dashboard is Components V2, and this list an embed. The list is
+        redrawn after, for the owner a review pick switched to, and so the pick clears."""
+        await i.response.defer(ephemeral=True, thinking=True)
+        dashboard = await ProfileManageView(self.cog, i, pname, is_borrowed,
+                                            target_user_id=self.target_user_id, is_mod_view=True).render()
+        await i.edit_original_response(**INTO_V2, view=dashboard)
+        self._build_view()
+        await self.original_interaction.edit_original_response(embed=self._get_embed(), view=self)
 
     def _get_embed(self):
         embed = discord.Embed(title="Moderator Profile Dashboard", color=discord.Color.red())
